@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=69", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dataset-fixer"
+dynamic = ["version"]
+description = "Safe, reproducible YOLO and COCO dataset transformations"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "matplotlib>=3.7",
+  "numpy>=1.24",
+  "Pillow>=10",
+  "PyYAML>=6",
+  "shapely>=2",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+coco-rle = ["pycocotools>=2.0.7", "opencv-python-headless>=4.8"]
+comparison = ["ultralytics>=8.3", "scipy>=1.10", "pandas>=2", "openpyxl>=3.1"]
+sahi = ["sahi>=0.11.20", "ultralytics>=8.3"]
+comparison-coco = ["pycocotools>=2.0.7"]
+test = ["pytest>=8", "pytest-cov>=5"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools_scm]
+fallback_version = "0.1.0"
+write_to = "src/dataset_fixer/_version.py"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
