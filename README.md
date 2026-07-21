@@ -1,5 +1,14 @@
 # dataset-fixer
 
+[![CI](https://github.com/mooch443/dataset-fixer/actions/workflows/ci.yml/badge.svg)](https://github.com/mooch443/dataset-fixer/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+> **AI-generation disclosure:** This project is largely AI-generated. Its
+> architecture, implementation, tests, and documentation were produced with
+> substantial assistance from OpenAI's Codex under human direction and review.
+> Users should independently validate behavior for their datasets and research
+> workflows.
+
 `dataset-fixer` loads YOLO or COCO datasets, validates them immediately, and
 writes safe, reproducible YOLO derivatives for detection, segmentation, pose,
 and POLO point-localization tasks.
@@ -73,6 +82,23 @@ Every transformation supports `visualize=`, `progress=`, and `dry_run=`. The
 default destination is a readable sibling name containing the operation and an
 eight-character settings fingerprint. An explicit destination must not exist
 and cannot contain, equal, or be contained by the source.
+
+## Colab tutorials
+
+Three end-to-end notebooks document the central workflows using deterministic,
+synthetic example datasets released under this repository's MIT License:
+
+- [Controlled, group-aware splitting](notebooks/01_controlled_splitting.ipynb)
+  demonstrates `Dataset.split()` and physical-group isolation.
+- [Task-aware tiling](notebooks/02_task_aware_tiling.ipynb) demonstrates regular
+  detection grids and randomized POLO coverage tiling.
+- [Fixed-cohort model comparison](notebooks/03_fixed_cohort_model_comparison.ipynb)
+  trains two small checkpoints and demonstrates cached `Dataset.compare_models()`.
+
+Each notebook includes an “Open in Colab” badge, licensing notes, expected
+runtime, validation checks, and guidance for replacing the generated data with
+a real dataset. See the [notebook guide](notebooks/README.md) and the
+[example-data generator](examples/README.md).
 
 ## Cached model comparison
 
@@ -156,3 +182,13 @@ The intentionally small public API is:
 
 Operation-specific previews and audits are controlled with each method's
 `visualize=` parameter. Consistency checks run automatically during loading.
+
+## Development
+
+The GitHub Actions pipeline tests Python 3.10–3.13, exercises the optional
+comparison and SAHI dependency set, builds the wheel and source distribution,
+checks package metadata, and smoke-tests installation from the wheel.
+
+## License
+
+`dataset-fixer` is released under the [MIT License](LICENSE).

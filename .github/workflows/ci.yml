@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --editable ".[test]"
+
+      - name: Run tests
+        env:
+          MPLBACKEND: Agg
+        run: python -m pytest
+
+  optional-integrations:
+    name: Optional comparison and SAHI integrations
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install optional integrations
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --editable ".[test,comparison,sahi]"
+
+      - name: Run tests with optional integrations installed
+        env:
+          MPLBACKEND: Agg
+        run: python -m pytest
+
+      - name: Verify optional backends can be imported
+        run: python -c "import sahi, scipy, ultralytics; print(sahi.__version__, scipy.__version__, ultralytics.__version__)"
+
+  package:
+    name: Build and inspect wheel
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Validate package metadata
+        run: python -m twine check dist/*
+
+      - name: Test wheel installation
+        run: |
+          python -m pip install --force-reinstall --no-deps dist/*.whl
+          cd "${RUNNER_TEMP}"
+          python -c "from dataset_fixer import Dataset, ComparisonResult; print(Dataset, ComparisonResult)"
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
