@@ -87,27 +87,41 @@ def _run_native(
     except ImportError as exc:
         raise ImportError("Native inference requires Ultralytics; install dataset-fixer[comparison]") from exc
     model = YOLO(str(spec.path))
-    sources = [str(record.image_path) for record in cohort.records]
     kwargs: dict[str, Any] = {
-        "source": sources,
         "imgsz": spec.resolution,
         "conf": confidence_floor,
         "iou": threshold,
         "verbose": False,
-        "stream": True,
+        "stream": False,
         "augment": bool(settings.get("augment", False)),
     }
     if device is not None:
         kwargs["device"] = device
     if settings.get("precision") == "half":
         kwargs["half"] = True
-    iterator = model.predict(**kwargs)
-    iterator = tqdm(iterator, total=len(sources), desc=f"{spec.name} native {threshold:g}", disable=not progress)
     output: dict[str, list[Prediction]] = {}
-    for index, result in enumerate(iterator):
-        if index >= len(cohort.records):
-            raise DatasetValidationError(f"{spec.name} returned extra inference results")
-        record = cohort.records[index]
+    iterator = tqdm(
+        cohort.records,
+        total=len(cohort.records),
+        desc=f"{spec.name} native {threshold:g}",
+        disable=not progress,
+    )
+    for record in iterator:
+        # Ultralytics converts a list of path strings to image arrays internally and
+        # then reports synthetic paths such as ``image0.jpg``. Inference one image
+        # at a time so result identity remains independently verifiable instead of
+        # trusting positional ordering from a batched loader.
+        results = model.predict(source=str(record.image_path), **kwargs)
+        if len(results) != 1:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Native inference did not return exactly one result for a cohort image",
+                    source=f"{spec.name}: {record.image_path}",
+                    value=len(results),
+                    expected="exactly one result",
+                )
+            )
+        result = results[0]
         result_path = getattr(result, "path", None)
         if result_path is not None:
             from pathlib import Path

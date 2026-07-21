@@ -85,20 +85,21 @@ and cannot contain, equal, or be contained by the source.
 
 ## Colab tutorials
 
-Three end-to-end notebooks document the central workflows using deterministic,
-synthetic example datasets released under this repository's MIT License:
+Three end-to-end notebooks document the central workflows using official images
+and YOLO labels downloaded from a pinned commit of the public MIT-licensed
+[SAWIT dataset](https://github.com/dtnguyen0304/sawit):
 
 - [Controlled, group-aware splitting](notebooks/01_controlled_splitting.ipynb)
   demonstrates `Dataset.split()` and physical-group isolation.
 - [Task-aware tiling](notebooks/02_task_aware_tiling.ipynb) demonstrates regular
-  detection grids and randomized POLO coverage tiling.
+  detection grids and negative-tile policies.
 - [Fixed-cohort model comparison](notebooks/03_fixed_cohort_model_comparison.ipynb)
   trains two small checkpoints and demonstrates cached `Dataset.compare_models()`.
 
-Each notebook includes an “Open in Colab” badge, licensing notes, expected
-runtime, validation checks, and guidance for replacing the generated data with
-a real dataset. See the [notebook guide](notebooks/README.md) and the
-[example-data generator](examples/README.md).
+Each notebook includes an “Open in Colab” badge, kernel-safe installation,
+licensing notes, expected runtime, validation checks, and source provenance.
+See the [notebook guide](notebooks/README.md) and the
+[public-data downloader](examples/README.md).
 
 ## Cached model comparison
 

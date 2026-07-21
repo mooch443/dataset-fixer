@@ -1,20 +1,22 @@
-# MIT-licensed example datasets
+# Public MIT-licensed example dataset
 
-`create_example_datasets.py` deterministically generates the small datasets
-used by the Colab tutorials. The generated images and annotations are original
-synthetic assets and are released under the repository's MIT License.
+The tutorials use a small, unmodified subset of
+[SAWIT](https://github.com/dtnguyen0304/sawit), a public real-world camera-trap
+object-detection dataset whose repository declares the MIT License. Images and
+official YOLO annotations are downloaded directly from a pinned upstream commit.
 
 ```shell
-python examples/create_example_datasets.py /tmp/dataset-fixer-examples
+python examples/download_public_examples.py /tmp/dataset-fixer-examples
 ```
 
-The command creates:
+The downloader creates:
 
-- `raw_sequences`: grouped YOLO detection images for demonstrating physical
-  group-aware splitting;
-- `detection`: fixed train/validation detection data for training and model
-  comparison;
-- `polo`: point-and-radius annotations for randomized coverage tiling.
+- `sawit_unsplit`: official images and labels in one source split for controlled
+  re-splitting;
+- `sawit_fixed`: the same official files in a deterministic train/validation
+  layout for tiling and model comparison.
 
-The generator uses a fixed seed by default, has no network dependency, and may
-be rerun to reproduce the exact same annotations and image contents.
+`SOURCE.json` records the upstream URL and commit, selection rule, license, and
+SHA-256 of every downloaded image and label. `UPSTREAM_LICENSE` is the license
+file fetched from that same pinned commit. The tutorials do not generate or
+alter pixels or annotations.

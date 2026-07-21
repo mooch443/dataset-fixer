@@ -3,22 +3,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from dataset_fixer import Dataset
-from examples.create_example_datasets import create_example_datasets
+from examples.download_public_examples import SAWIT_COMMIT, SAWIT_LICENSE, SAWIT_REPOSITORY
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_mit_example_datasets_are_valid_and_deterministic(tmp_path: Path) -> None:
-    first = create_example_datasets(tmp_path / "examples", seed=42)
-    original = (first["detection"] / "labels" / "val" / "row-00" / "row-00__frame-000.txt").read_bytes()
-    second = create_example_datasets(tmp_path / "examples", seed=42)
-    assert (second["detection"] / "labels" / "val" / "row-00" / "row-00__frame-000.txt").read_bytes() == original
-    assert Dataset.open(first["raw_sequences"], task="detect", progress=False).splits == ("train",)
-    assert Dataset.open(first["detection"], task="detect", progress=False).splits == ("train", "val")
-    assert Dataset.open(first["polo"], task="polo", progress=False).splits == ("train", "val")
-    assert (tmp_path / "examples" / "DATA_LICENSE.txt").is_file()
+def test_public_example_source_is_pinned_and_explicitly_licensed() -> None:
+    assert SAWIT_REPOSITORY == "https://github.com/dtnguyen0304/sawit"
+    assert len(SAWIT_COMMIT) == 40
+    assert SAWIT_LICENSE == "MIT"
 
 
 def test_colab_notebooks_have_disclosure_license_and_clean_outputs() -> None:
@@ -36,5 +30,8 @@ def test_colab_notebooks_have_disclosure_license_and_clean_outputs() -> None:
         assert "colab.research.google.com/github/mooch443/dataset-fixer" in text
         assert "AI-generation disclosure" in text
         assert "MIT License" in text
+        assert "dtnguyen0304/sawit" in text
+        assert "sys.executable" in text
+        assert "import dataset_fixer" in text
         assert api in text
         assert all(not cell.get("outputs") for cell in notebook["cells"] if cell["cell_type"] == "code")

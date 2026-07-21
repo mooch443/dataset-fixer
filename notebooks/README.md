@@ -1,8 +1,9 @@
 # Colab tutorials
 
 These notebooks are designed to run from top to bottom in Google Colab. Each
-one installs the package from this public repository and generates deterministic
-MIT-licensed example data locally in the Colab session.
+one installs the package into the active kernel and downloads official images
+and YOLO annotations from a pinned commit of the public MIT-licensed
+[SAWIT dataset](https://github.com/dtnguyen0304/sawit).
 
 | Notebook | Main API | Expected CPU runtime |
 | --- | --- | --- |
@@ -14,6 +15,7 @@ The comparison tutorial trains two tiny detection runs. A GPU runtime is
 recommended for that notebook, although it also runs on CPU with longer
 training time.
 
-All generated example images and annotations are covered by the repository's
-[MIT License](../LICENSE). The notebooks contain the same AI-generation
-disclosure as the main README.
+The notebooks do not generate or alter example pixels or annotations. The
+downloader records the upstream URL, pinned commit, MIT license, selection rule,
+and SHA-256 hashes. The notebooks contain the same AI-generation disclosure as
+the main README.

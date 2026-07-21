@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import pickle
+import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -19,9 +21,9 @@ from dataset_fixer.comparison.cache import (
     write_notebook_numpy_cache,
 )
 from dataset_fixer.comparison.cohort import freeze_cohort
-from dataset_fixer.comparison.inference import resolve_backend
+from dataset_fixer.comparison.inference import _run_native, resolve_backend
 from dataset_fixer.comparison.metrics import evaluate_configuration, optimal_match
-from dataset_fixer.comparison.types import Prediction
+from dataset_fixer.comparison.types import ModelSpec, Prediction
 from PIL import Image
 
 
@@ -137,6 +139,32 @@ def test_pose_never_resolves_to_sahi(monkeypatch: pytest.MonkeyPatch) -> None:
     assert resolve_backend("auto", "pose") == "native"
     with pytest.raises(ValueError, match="SAHI"):
         resolve_backend("sahi", "pose")
+
+
+def test_native_inference_verifies_each_image_identity(
+    detect_dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cohort = freeze_cohort(Dataset.open(detect_dataset, task="detect", progress=False), "val")
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    calls: list[str] = []
+
+    class FakeYOLO:
+        def __init__(self, path: str) -> None:
+            assert path == str(checkpoint)
+
+        def predict(self, *, source, **kwargs):
+            assert isinstance(source, str), "cohort images must be inferred independently"
+            calls.append(source)
+            boxes = types.SimpleNamespace(xyxy=[], conf=[], cls=[])
+            return [types.SimpleNamespace(path=source, boxes=boxes, masks=None, keypoints=None)]
+
+    monkeypatch.setitem(sys.modules, "ultralytics", types.SimpleNamespace(YOLO=FakeYOLO))
+    predictions = _run_native(
+        ModelSpec("model", checkpoint), cohort, 0.5, 0.1, None, False, {}
+    )
+    assert calls == [str(record.image_path) for record in cohort.records]
+    assert list(predictions) == [record.image_id for record in cohort.records]
 
 
 def test_compare_models_facade_atomic_result(
