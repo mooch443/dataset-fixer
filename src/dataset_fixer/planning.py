@@ -229,6 +229,8 @@ def derived_name(current: str, operation: str, settings: dict[str, Any]) -> str:
         detail = f"empty-max{int(float(settings['max_empty_fraction']) * 100)}"
     elif operation == "tile":
         detail = f"tile-{settings['mode']}-{settings['tile_size']}"
+    elif operation == "augment":
+        detail = f"augment-{settings['copies']}x"
     return slugify(f"{current}__{detail}__{settings_fingerprint(settings)}")
 
 

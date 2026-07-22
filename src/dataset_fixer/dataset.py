@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable, Hashable, Iterable, Mapping, Sequence
 
+from .augmentation import augment_dataset, serialize_pipeline
 from .errors import DatasetValidationError, ValidationIssue
 from .io import _label_path_for_image, load_source
 from .models import DatasetMetadata, Sample, Task
@@ -321,6 +322,115 @@ class Dataset:
                 "mode": mode, "splits": split_values, "tile_size": tile_size,
                 "overlap": overlap, "min_area_ratio": min_area_ratio, "negative_tiles": negative_tiles,
                 "allow_lossy": allow_lossy, "visualize": visualize, "settings": dict(settings),
+            },
+            public_settings,
+        )
+        return self._with_plan(operation, samples=self._samples, name=name, projection_exact=False)
+
+    def augment(
+        self,
+        transforms: Any,
+        *,
+        copies: int = 1,
+        splits: Iterable[str] | None = ("train",),
+        include_original: bool = True,
+        min_area: float = 0.0,
+        min_visibility: float = 0.0,
+        allow_lossy: bool = False,
+        seed: int = 42,
+        name: str | None = None,
+        visualize: bool = True,
+        progress: bool = True,
+        **compose_args: Any,
+    ) -> "Dataset":
+        """Plan reproducible, task-aware Albumentations copies for selected splits.
+
+        ``transforms`` accepts an Albumentations Compose object, a sequence of
+        transforms, or an ``albumentations.to_dict()`` result. Remaining keyword
+        arguments are forwarded to ``albumentations.Compose`` when a sequence is
+        supplied. Dataset files are created only by :meth:`export`.
+        """
+
+        if isinstance(copies, bool) or not isinstance(copies, int) or copies < 1:
+            raise ValueError("copies must be at least 1")
+        if not isinstance(include_original, bool):
+            raise TypeError("include_original must be a bool")
+        if min_area < 0:
+            raise ValueError("min_area must be non-negative")
+        if not 0 <= min_visibility <= 1:
+            raise ValueError("min_visibility must be in [0, 1]")
+        if not isinstance(seed, int) or isinstance(seed, bool):
+            raise TypeError("seed must be an integer")
+        split_values = tuple(splits) if splits is not None else tuple(self.splits)
+        selected = {normalize_split(split) for split in split_values}
+        missing = selected - set(self.splits)
+        if missing:
+            raise ValueError(f"Unknown augmentation splits {sorted(missing)}; available splits are {self.splits}")
+        if self.task is Task.SEGMENT and self._projection_exact:
+            unsupported = [
+                annotation.source_id
+                for sample in self._samples
+                if sample.split in selected
+                for annotation in sample.annotations
+                if annotation.rle is not None or not annotation.polygon
+            ]
+            if unsupported:
+                raise DatasetValidationError(
+                    ValidationIssue(
+                        "Albumentations requires polygon-representable segmentation instances",
+                        value=unsupported[:10],
+                        expected="one polygon per annotation",
+                        suggestion="export the COCO source with allow_lossy=True before planning augmentation",
+                    )
+                )
+        if self.task is Task.POLO and self._projection_exact:
+            clipped_circles = [
+                annotation.source_id
+                for sample in self._samples
+                if sample.split in selected
+                for annotation in sample.annotations
+                if annotation.point is not None
+                and annotation.radius is not None
+                and (
+                    annotation.point[0] - annotation.radius < 0
+                    or annotation.point[1] - annotation.radius < 0
+                    or annotation.point[0] + annotation.radius > sample.width
+                    or annotation.point[1] + annotation.radius > sample.height
+                )
+            ]
+            if clipped_circles:
+                raise DatasetValidationError(
+                    ValidationIssue(
+                        "POLO radius circles must be fully represented before augmentation",
+                        value=clipped_circles[:10],
+                        expected="every selected point radius entirely inside its source image",
+                        suggestion="remove or correct edge-clipped POLO annotations before augmenting",
+                    )
+                )
+        serialized = serialize_pipeline(transforms, dict(compose_args))
+        public_settings = {
+            "pipeline": serialized,
+            "splits": sorted(selected),
+            "copies": copies,
+            "include_original": include_original,
+            "min_area": min_area,
+            "min_visibility": min_visibility,
+            "allow_lossy": allow_lossy,
+            "seed": seed,
+            "visualize": visualize,
+        }
+        operation = PlannedOperation(
+            "augment",
+            {
+                "pipeline": serialized,
+                "splits": split_values,
+                "copies": copies,
+                "include_original": include_original,
+                "min_area": min_area,
+                "min_visibility": min_visibility,
+                "allow_lossy": allow_lossy,
+                "seed": seed,
+                "visualize": visualize,
             },
             public_settings,
         )
@@ -646,6 +756,8 @@ class Dataset:
                 elif operation.kind == "tile":
                     tile_settings = kwargs.pop("settings")
                     current = tile_dataset(current, **kwargs, settings=tile_settings)
+                elif operation.kind == "augment":
+                    current = augment_dataset(current, **kwargs)
                 else:
                     raise RuntimeError(f"Unknown planned operation {operation.kind!r}")
             return export_dataset(

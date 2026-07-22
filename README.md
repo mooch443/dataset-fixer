@@ -27,7 +27,7 @@ print(exported.location)
 print(exported.data_yaml)
 ```
 
-`split()`, `remove_classes()`, `rebalance_empty()`, and `tile()` are immutable
+`split()`, `remove_classes()`, `rebalance_empty()`, `augment()`, and `tile()` are immutable
 in-memory planning operations. Only `export()` writes files. Export validates
 before atomic publication, records every effective setting and tool/environment
 version, and maps each output image back to its parent and ultimate original in
@@ -67,6 +67,36 @@ canonical = balanced.export(
     splits=("train", "val"),
 )
 ```
+
+Albumentations is optional. Install it with
+`pip install "dataset-fixer[augment]"`, then pass either a transform sequence,
+an `A.Compose`, or an `A.to_dict()` result:
+
+```python
+import albumentations as A
+
+augmented = dataset.augment(
+    [
+        A.HorizontalFlip(p=0.5),
+        A.Affine(scale=(0.9, 1.1), rotate=(-10, 10), p=0.7),
+        A.RandomBrightnessContrast(p=0.3),
+    ],
+    copies=2,
+    splits=("train",),
+    include_original=True,
+    seed=42,
+    visualize=True,
+)
+exported = augmented.export(destination="/datasets/orchard_augmented")
+```
+
+The package installs its own bounding-box and keypoint processors so annotation
+rows cannot become detached from instances. Pose keypoints honor `flip_idx` on
+horizontal flips. Segments and POLO radii are transformed through synchronized
+masks. The exact serialized pipeline, per-image seed, applied transforms,
+dropped annotations, and warnings are retained in the manifest, provenance, and
+`reports/augmentation.json`. Validation rejects tensor/normalized image outputs
+because exported datasets require RGB `uint8` images.
 
 No output directory is created before the final call. A virtual dataset exposes
 its projected classes, splits, settings, history, and pending operation names,

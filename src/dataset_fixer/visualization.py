@@ -139,6 +139,8 @@ def save_class_count_summary(
     before: dict[str, int],
     after: dict[str, int],
     output: Path,
+    *,
+    title: str = "Class counts before and after removal",
 ) -> Path:
     labels = sorted((set(before) | set(after)) - {"background"}) + ["background"]
     before_values = [before.get(label, 0) for label in labels]
@@ -149,7 +151,7 @@ def save_class_count_summary(
     ax.bar([value + 0.2 for value in x], after_values, width=0.4, label="after")
     ax.set_xticks(x, labels, rotation=30, ha="right")
     ax.set_ylabel("count")
-    ax.set_title("Class counts before and after removal")
+    ax.set_title(title)
     ax.text(
         0.99,
         0.98,

@@ -443,6 +443,8 @@ def _operation_detail(operation: str, settings: dict[str, Any]) -> str:
         return f"tile-grid-{settings['tile_size']}-o{int(round(settings['overlap'] * 100))}"
     if operation == "tile-coverage":
         return f"tile-coverage-{settings['tile_size']}"
+    if operation == "augment":
+        return f"augment-{settings['copies']}x"
     return operation
 
 

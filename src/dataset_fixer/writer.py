@@ -136,6 +136,10 @@ class OutputBuilder:
                 "class_mapping",
                 "split_group",
                 "empty_image",
+                "augmentation_index",
+                "augmentation",
+                "augmentation_seed",
+                "albumentations_applied",
             )
             if key in parent
         }

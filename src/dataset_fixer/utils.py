@@ -63,7 +63,10 @@ def to_jsonable(value: Any) -> Any:
 
 def package_versions() -> dict[str, str]:
     result: dict[str, str] = {}
-    for name in ("dataset-fixer", "numpy", "Pillow", "PyYAML", "matplotlib", "shapely", "tqdm", "ultralytics", "sahi"):
+    for name in (
+        "dataset-fixer", "numpy", "Pillow", "PyYAML", "matplotlib", "shapely", "tqdm",
+        "albumentations", "ultralytics", "sahi",
+    ):
         try:
             result[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
