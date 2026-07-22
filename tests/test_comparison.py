@@ -33,7 +33,7 @@ def test_cohort_is_ordered_and_content_addressed(detect_dataset: Path) -> None:
     second = freeze_cohort(dataset, "val")
     assert first.fingerprint == second.fingerprint
     assert [record.relative_path for record in first.records] == sorted(record.relative_path for record in first.records)
-    label = detect_dataset / "labels" / "val" / "val_0.txt"
+    label = detect_dataset / "val" / "labels" / "val_0.txt"
     label.write_text("0 0.4 0.5 0.25 0.25\n", encoding="utf-8")
     changed = freeze_cohort(Dataset.open(detect_dataset, task="detect", progress=False), "val")
     assert changed.fingerprint != first.fingerprint

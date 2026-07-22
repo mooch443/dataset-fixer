@@ -20,15 +20,18 @@ dataset = Dataset.open("/datasets/orchard", task="polo")
 split = dataset.split({"train": 0.75, "val": 0.25}, seed=42)
 clean = split.remove_classes(["damaged"])
 tiled = clean.tile(mode="coverage", tile_size=480)
+exported = tiled.export(destination="/datasets/orchard_ready")
 
-print(tiled.name)
-print(tiled.location)
-print(tiled.data_yaml)
+print(tiled)               # virtual pipeline; nothing has been written
+print(exported.location)
+print(exported.data_yaml)
 ```
 
-Every operation creates a new directory, validates before publishing, records
-all effective settings and tool/environment versions, and maps each output
-image back to its parent and ultimate original in `provenance.jsonl`.
+`split()`, `remove_classes()`, `rebalance_empty()`, and `tile()` are immutable
+in-memory planning operations. Only `export()` writes files. Export validates
+before atomic publication, records every effective setting and tool/environment
+version, and maps each output image back to its parent and ultimate original in
+`provenance.jsonl`.
 
 ## Loading and validation
 
@@ -58,8 +61,17 @@ resplit = dataset.split(
 
 clean = resplit.remove_classes(["damaged"], visualize=True)
 grid = clean.tile(mode="grid", tile_size=480, overlap=0.2)
-canonical = clean.export(splits=("train", "val"))
+balanced = grid.rebalance_empty(0.20, splits=("train",), seed=42)
+canonical = balanced.export(
+    destination="/datasets/orchard_ready",
+    splits=("train", "val"),
+)
 ```
+
+No output directory is created before the final call. A virtual dataset exposes
+its projected classes, splits, settings, history, and pending operation names,
+but `location` still identifies the immutable source, `data_yaml` is `None`, and
+`training_ready` is false until export.
 
 Grid tiling clips boxes, polygons, and pose instances and requires POLO circles
 to fit fully inside a crop. `negative_tiles` accepts `"all"`, `"none"`, or a
@@ -78,10 +90,24 @@ coverage = dataset.tile(
 )
 ```
 
-Every transformation supports `visualize=`, `progress=`, and `dry_run=`. The
-default destination is a readable sibling name containing the operation and an
-eight-character settings fingerprint. An explicit destination must not exist
-and cannot contain, equal, or be contained by the source.
+`rebalance_empty(max_empty_fraction=...)` deterministically downsamples empty
+images without duplicating data. The cap is applied independently to each
+selected split; non-selected splits are preserved. If the requested ratio would
+require more empty images, the existing images are retained rather than copied.
+
+Visualization preferences are recorded on virtual operations and rendered
+during export. `export(progress=True)` shows progress and ETA for copying,
+tiling, staged-output validation, and final verification. Its destination must
+not exist and cannot contain, equal, or be contained by the source.
+
+Canonical exports use split-first layout:
+
+```text
+data.yaml
+train/images/  train/labels/
+val/images/    val/labels/
+test/images/   test/labels/
+```
 
 ## Colab tutorials
 

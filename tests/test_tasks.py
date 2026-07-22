@@ -59,19 +59,17 @@ def test_grid_tiling_transforms_segment_and_pose(tmp_path: Path) -> None:
         extra={"kpt_shape": [2, 3], "flip_idx": [1, 0], "kpt_names": {0: ["left", "right"]}},
     )
     segment_tiles = Dataset.open(segment, task="segment", progress=False).tile(
-        destination=tmp_path / "segment_tiles",
         tile_size=100,
         overlap=0.2,
         visualize=False,
         progress=False,
-    )
+    ).export(destination=tmp_path / "segment_tiles", visualize=False, progress=False)
     pose_tiles = Dataset.open(pose, task="pose", progress=False).tile(
-        destination=tmp_path / "pose_tiles",
         tile_size=100,
         overlap=0.2,
         visualize=False,
         progress=False,
-    )
+    ).export(destination=tmp_path / "pose_tiles", visualize=False, progress=False)
     assert any(annotation.polygon for sample in segment_tiles._samples for annotation in sample.annotations)
     assert any(annotation.keypoints for sample in pose_tiles._samples for annotation in sample.annotations)
     assert all(
@@ -95,7 +93,6 @@ def test_polo_coverage_reports_and_visual_audit(tmp_path: Path) -> None:
     dataset = Dataset.open(source, task="polo", progress=False)
     tiled = dataset.tile(
         mode="coverage",
-        destination=tmp_path / "coverage",
         tile_size=100,
         large_image_threshold=200,
         scale_range=(1.0, 1.0),
@@ -107,7 +104,7 @@ def test_polo_coverage_reports_and_visual_audit(tmp_path: Path) -> None:
         seed=3,
         visualize=True,
         progress=False,
-    )
+    ).export(destination=tmp_path / "coverage", visualize=False, progress=False)
     summary = tiled.location / "coverage_summary"
     for filename in ("label_coverage.csv", "label_hit_summary.csv", "class_coverage_summary.csv", "tile_summary.csv"):
         assert (summary / filename).is_file()
@@ -140,6 +137,6 @@ def test_coco_detection_export_compacts_categories(tmp_path: Path) -> None:
     exported = dataset.export(destination=tmp_path / "coco_yolo", visualize=False, progress=False)
     assert exported.classes == {0: "apple", 1: "pear"}
     data = yaml.safe_load(exported.data_yaml.read_text(encoding="utf-8"))
-    assert data["train"] == "images/train" and data["val"] == "images/val"
-    labels = "\n".join(path.read_text(encoding="utf-8") for path in (exported.location / "labels").rglob("*.txt"))
+    assert data["train"] == "train/images" and data["val"] == "val/images"
+    labels = "\n".join(path.read_text(encoding="utf-8") for path in exported.location.rglob("*.txt") if "labels" in path.parts)
     assert labels.startswith(("0 ", "1 "))

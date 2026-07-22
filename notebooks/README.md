@@ -15,6 +15,10 @@ The comparison tutorial trains two tiny detection runs. A GPU runtime is
 recommended for that notebook, although it also runs on CPU with longer
 training time.
 
+The transformation tutorials demonstrate the lazy API explicitly: operations
+build a virtual pipeline, and only `export()` creates a dataset directory. All
+exported examples use `train/images` + `train/labels` split-first layout.
+
 The notebooks do not generate or alter example pixels or annotations. The
 downloader records the upstream URL, pinned commit, MIT license, selection rule,
 and SHA-256 hashes. The notebooks contain the same AI-generation disclosure as

@@ -26,21 +26,21 @@ def make_yolo_dataset(
     train_rows = train_rows or ["0 0.5 0.5 0.25 0.25", "1 0.25 0.25 0.2 0.2"]
     val_rows = val_rows if val_rows is not None else ["0 0.5 0.5 0.25 0.25"]
     for index, row in enumerate(train_rows):
-        image = root / "images" / "train" / f"group_{index // 2}" / f"train_{index}.jpg"
+        image = root / "train" / "images" / f"group_{index // 2}" / f"train_{index}.jpg"
         make_image(image, size=size)
-        label = root / "labels" / "train" / f"group_{index // 2}" / f"train_{index}.txt"
+        label = root / "train" / "labels" / f"group_{index // 2}" / f"train_{index}.txt"
         label.parent.mkdir(parents=True, exist_ok=True)
         label.write_text(row + "\n", encoding="utf-8")
     for index, row in enumerate(val_rows):
-        image = root / "images" / "val" / f"val_{index}.jpg"
+        image = root / "val" / "images" / f"val_{index}.jpg"
         make_image(image, size=size, color=(110, 80, 130))
-        label = root / "labels" / "val" / f"val_{index}.txt"
+        label = root / "val" / "labels" / f"val_{index}.txt"
         label.parent.mkdir(parents=True, exist_ok=True)
         label.write_text(row + "\n", encoding="utf-8")
     data = {
         "path": str(root.resolve()),
-        "train": "images/train",
-        "val": "images/val",
+        "train": "train/images",
+        "val": "val/images",
         "test": None,
         "names": names,
         "name": root.name,

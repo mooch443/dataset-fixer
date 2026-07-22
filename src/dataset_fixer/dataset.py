@@ -1,21 +1,35 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Hashable, Iterable, Mapping, Sequence
 
 from .errors import DatasetValidationError, ValidationIssue
 from .io import _label_path_for_image, load_source
 from .models import DatasetMetadata, Sample, Task
-from .operations import export_dataset, remove_classes, split_dataset
+from .operations import (
+    export_dataset,
+    rebalance_empty_dataset,
+    remove_classes as materialize_remove_classes,
+    split_dataset,
+)
+from .planning import (
+    PlannedOperation,
+    derived_name,
+    plan_split,
+    project_remove_classes,
+    resolve_removed_classes,
+    select_empty_images,
+)
 from .tiling import tile_dataset
-from .utils import normalize_split
+from .utils import ensure_safe_destination, normalize_split, settings_fingerprint, slugify
 from .validation import validate_dataset
 from .visualization import visualize_samples
 
 
 class Dataset:
-    """A validated, immutable view of a YOLO or COCO dataset."""
+    """A validated dataset or immutable virtual transformation pipeline."""
 
     def __init__(
         self,
@@ -29,6 +43,10 @@ class Dataset:
         data_yaml: Path | None,
         source_format: str,
         warnings: list[str],
+        base: "Dataset | None" = None,
+        plan: tuple[PlannedOperation, ...] = (),
+        projection_exact: bool = True,
+        planned_splits: tuple[str, ...] | None = None,
     ) -> None:
         self._location = location.resolve()
         self._name = name
@@ -39,9 +57,16 @@ class Dataset:
         self._data_yaml = data_yaml.resolve() if data_yaml else None
         self._source_format = source_format
         self._warnings = tuple(warnings)
+        self._base = base
+        self._plan = plan
+        self._projection_exact = projection_exact
+        self._planned_splits = planned_splits
         self._provenance = _load_provenance(self._location, samples)
         for sample in self._samples:
-            key = str(Path("images") / sample.split / sample.relative_path)
+            try:
+                key = str(sample.image_path.resolve().relative_to(self._location))
+            except ValueError:
+                key = str(Path("images") / sample.split / sample.relative_path)
             if key in self._provenance:
                 sample.provenance = dict(self._provenance[key])
 
@@ -77,7 +102,8 @@ class Dataset:
         yaml_path = _resolve_data_yaml(requested, root)
         source_format = (
             "yolo"
-            if yaml_path is not None or any(path.is_file() for path in (root / "labels").rglob("*.txt"))
+            if yaml_path is not None
+            or any(path.is_file() and "labels" in path.parts for path in root.rglob("*.txt"))
             else "coco"
         )
         if source_format == "yolo":
@@ -104,9 +130,8 @@ class Dataset:
 
     @property
     def data_yaml(self) -> Path | None:
-        """Canonical training YAML, or ``None`` for a not-yet-exported COCO source."""
-
-        return self._data_yaml
+        """Canonical training YAML, or ``None`` while transformations are pending."""
+        return None if self._plan else self._data_yaml
 
     @property
     def task(self) -> Task:
@@ -114,6 +139,8 @@ class Dataset:
 
     @property
     def splits(self) -> tuple[str, ...]:
+        if self._planned_splits is not None:
+            return self._planned_splits
         present = {sample.split for sample in self._samples}
         return tuple(split for split in ("train", "val", "test") if split in present)
 
@@ -123,11 +150,14 @@ class Dataset:
 
     @property
     def settings(self) -> dict[str, Any]:
+        if self._plan:
+            return {"pending_operations": [operation.public_record() for operation in self._plan]}
         return dict(self._manifest.get("settings") or {})
 
     @property
     def history(self) -> tuple[dict[str, Any], ...]:
-        return tuple(dict(item) for item in self._manifest.get("history") or [])
+        stored = [dict(item) for item in self._manifest.get("history") or []]
+        return tuple([*stored, *(operation.public_record() for operation in self._plan)])
 
     @property
     def provenance(self) -> dict[str, dict[str, Any]]:
@@ -135,6 +165,8 @@ class Dataset:
 
     @property
     def training_ready(self) -> bool:
+        if self._plan:
+            return False
         try:
             self.assert_trainable(backend=False)
         except DatasetValidationError:
@@ -145,7 +177,6 @@ class Dataset:
         self,
         ratios: Mapping[str, float],
         *,
-        destination: str | Path | None = None,
         name: str | None = None,
         source_splits: Iterable[str] | None = None,
         group_by: Callable[[Path], Hashable] | None = None,
@@ -153,51 +184,108 @@ class Dataset:
         seed: int = 42,
         visualize: bool = True,
         progress: bool = True,
-        dry_run: bool = False,
     ) -> "Dataset":
-        return split_dataset(
-            self,
-            dict(ratios),
-            destination=destination,
-            name=name,
-            source_splits=source_splits,
-            group_by=group_by,
-            assign=assign,
-            seed=seed,
-            visualize=visualize,
-            progress=progress,
-            dry_run=dry_run,
+        source_split_values = tuple(source_splits) if source_splits is not None else None
+        projected, settings, _ = plan_split(
+            self._samples, ratios, source_splits=source_split_values, group_by=group_by, assign=assign, seed=seed
+        )
+        settings["visualize"] = visualize
+        operation = PlannedOperation(
+            "split",
+            {
+                "ratios": dict(ratios), "source_splits": source_split_values,
+                "group_by": group_by, "assign": assign, "seed": seed, "visualize": visualize,
+            },
+            settings,
+        )
+        return self._with_plan(
+            operation, samples=projected, name=name,
+            planned_splits=tuple(split for split in ("train", "val", "test") if settings["ratios"].get(split, 0) > 0),
         )
 
     def remove_classes(
         self,
         classes: Iterable[str | int],
         *,
-        destination: str | Path | None = None,
         name: str | None = None,
         splits: Iterable[str] | None = None,
         drop_empty_images: bool = False,
         visualize: bool = True,
         progress: bool = True,
-        dry_run: bool = False,
     ) -> "Dataset":
-        return remove_classes(
-            self,
-            classes,
-            destination=destination,
+        selectors = tuple(classes)
+        split_values = tuple(splits) if splits is not None else None
+        removed, mapping, metadata = resolve_removed_classes(self._metadata, selectors)
+        selected = {normalize_split(split) for split in split_values} if split_values else set(self.splits)
+        projected = project_remove_classes(
+            self._samples, selected_splits=selected, mapping=mapping, drop_empty_images=drop_empty_images
+        )
+        settings = {
+            "removed_classes": {class_id: self._metadata.names[class_id] for class_id in sorted(removed)},
+            "splits": sorted(selected), "drop_empty_images": drop_empty_images,
+            "class_mapping": mapping, "visualize": visualize,
+        }
+        operation = PlannedOperation(
+            "remove-classes",
+            {
+                "classes": selectors, "splits": split_values,
+                "drop_empty_images": drop_empty_images, "visualize": visualize,
+            },
+            settings,
+        )
+        return self._with_plan(
+            operation,
+            samples=projected,
+            metadata=metadata,
             name=name,
-            splits=splits,
-            drop_empty_images=drop_empty_images,
-            visualize=visualize,
-            progress=progress,
-            dry_run=dry_run,
+            planned_splits=tuple(split for split in ("train", "val", "test") if split in selected),
+        )
+
+    def rebalance_empty(
+        self,
+        max_empty_fraction: float,
+        *,
+        splits: Iterable[str] | None = ("train",),
+        seed: int = 42,
+        name: str | None = None,
+        visualize: bool = True,
+        progress: bool = True,
+    ) -> "Dataset":
+        """Deterministically cap empty images without duplicating source images."""
+
+        split_values = tuple(splits) if splits is not None else None
+        selected = {normalize_split(split) for split in split_values} if split_values else set(self.splits)
+        projected, summary = select_empty_images(
+            self._samples,
+            max_empty_fraction=float(max_empty_fraction),
+            selected_splits=selected,
+            seed=seed,
+        )
+        settings = {
+            "max_empty_fraction": float(max_empty_fraction), "splits": sorted(selected),
+            "seed": seed, "summary": summary if self._projection_exact else "resolved during export",
+            "visualize": visualize,
+        }
+        operation = PlannedOperation(
+            "rebalance-empty",
+            {
+                "max_empty_fraction": float(max_empty_fraction),
+                "splits": split_values,
+                "seed": seed,
+                "visualize": visualize,
+            },
+            settings,
+        )
+        return self._with_plan(
+            operation,
+            samples=projected if self._projection_exact else self._samples,
+            name=name,
         )
 
     def tile(
         self,
         *,
         mode: str = "grid",
-        destination: str | Path | None = None,
         name: str | None = None,
         splits: Iterable[str] | None = None,
         tile_size: int = 480,
@@ -207,25 +295,36 @@ class Dataset:
         allow_lossy: bool = False,
         visualize: bool = True,
         progress: bool = True,
-        dry_run: bool = False,
         **settings: Any,
     ) -> "Dataset":
-        return tile_dataset(
-            self,
-            mode=mode,
-            destination=destination,
-            name=name,
-            splits=splits,
-            tile_size=tile_size,
-            overlap=overlap,
-            min_area_ratio=min_area_ratio,
-            negative_tiles=negative_tiles,
-            allow_lossy=allow_lossy,
-            visualize=visualize,
-            progress=progress,
-            dry_run=dry_run,
-            settings=settings,
+        retired = sorted({"destination", "dry_run"} & settings.keys())
+        if retired:
+            raise TypeError(
+                f"{', '.join(retired)} can only be used with export(); tile() is an in-memory planning operation"
+            )
+        mode = mode.lower()
+        if mode not in {"grid", "coverage"}:
+            raise ValueError("mode must be 'grid' or 'coverage'")
+        if mode == "coverage" and self.task is not Task.POLO:
+            raise DatasetValidationError("Coverage tiling is only available for task='polo'")
+        split_values = tuple(splits) if splits is not None else None
+        public_settings = {
+            "mode": mode, "tile_size": tile_size, "overlap": overlap,
+            "min_area_ratio": min_area_ratio, "negative_tiles": negative_tiles,
+            "allow_lossy": allow_lossy,
+            "splits": sorted({normalize_split(split) for split in split_values} if split_values else set(self.splits)),
+            "visualize": visualize, **settings,
+        }
+        operation = PlannedOperation(
+            "tile",
+            {
+                "mode": mode, "splits": split_values, "tile_size": tile_size,
+                "overlap": overlap, "min_area_ratio": min_area_ratio, "negative_tiles": negative_tiles,
+                "allow_lossy": allow_lossy, "visualize": visualize, "settings": dict(settings),
+            },
+            public_settings,
         )
+        return self._with_plan(operation, samples=self._samples, name=name, projection_exact=False)
 
     def export(
         self,
@@ -238,6 +337,16 @@ class Dataset:
         progress: bool = True,
         dry_run: bool = False,
     ) -> "Dataset":
+        if self._plan:
+            return self._export_plan(
+                destination=destination,
+                name=name,
+                splits=splits,
+                allow_lossy=allow_lossy,
+                visualize=visualize,
+                progress=progress,
+                dry_run=dry_run,
+            )
         return export_dataset(
             self,
             destination=destination,
@@ -277,6 +386,11 @@ class Dataset:
     ):
         """Compare model-plus-inference configurations on one frozen cohort."""
 
+        if self._plan:
+            raise DatasetValidationError(
+                "Model comparison requires a fixed on-disk cohort; call dataset.export(...) first"
+            )
+
         from .comparison import compare_models
 
         return compare_models(
@@ -302,6 +416,11 @@ class Dataset:
         save_to: str | Path | None = None,
         show: bool = True,
     ):
+        if self._plan and not self._projection_exact:
+            raise DatasetValidationError(
+                "This pipeline contains deferred tiling, so exact output pixels do not exist yet; "
+                "call export() before visualizing tiled results"
+            )
         if n <= 0 or columns <= 0:
             raise ValueError("n and columns must be positive")
         normalized = normalize_split(split) if split is not None else None
@@ -327,6 +446,16 @@ class Dataset:
         backend: bool | str = "auto",
     ) -> None:
         """Raise before training if structural or installed-backend checks fail."""
+
+        if self._plan:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "This dataset has pending virtual transformations",
+                    value=[operation.kind for operation in self._plan],
+                    expected="an exported dataset",
+                    suggestion="call dataset.export(...) and train using the returned dataset.data_yaml",
+                )
+            )
 
         issues: list[ValidationIssue] = []
         required = tuple(normalize_split(split) for split in required_splits)
@@ -385,10 +514,149 @@ class Dataset:
                 ) from exc
 
     def __repr__(self) -> str:
+        counts = self._summary_counts()
+        operations = [operation.kind for operation in self._plan]
         return (
-            f"Dataset(name={self.name!r}, task={self.task.value!r}, "
-            f"splits={self.splits!r}, location={str(self.location)!r})"
+            f"Dataset(name={self.name!r}, task={self.task.value!r}, classes={self.classes!r}, "
+            f"splits={counts['splits']!r}, images={counts['images']!r}, "
+            f"empty={counts['empty']!r}, materialized={not bool(self._plan)}, "
+            f"pending={operations!r}, location={str(self.location)!r})"
         )
+
+    def __str__(self) -> str:
+        counts = self._summary_counts()
+        classes = ", ".join(f"{class_id}:{name}" for class_id, name in self.classes.items()) or "none"
+        empty = counts["empty"]
+        empty_text = "pending export" if empty is None else f"{empty} ({counts['empty_fraction']:.1%})"
+        state = "virtual pipeline" if self._plan else "materialized"
+        lines = [
+            f"Dataset {self.name!r} [{self.task.value}; {state}]",
+            f"  classes: {classes}",
+            f"  splits: {counts['splits']}",
+            f"  images: {counts['images']} | annotations: {counts['annotations']} | empty: {empty_text}",
+            f"  location: {self.location}",
+        ]
+        if self._plan:
+            lines.append("  pending: " + " → ".join(operation.kind for operation in self._plan))
+            lines.append("  export required: data_yaml and training_ready are unavailable until export()")
+        elif self.data_yaml is not None:
+            lines.append(f"  data_yaml: {self.data_yaml}")
+        return "\n".join(lines)
+
+    def _summary_counts(self) -> dict[str, Any]:
+        split_counts = {split: sum(sample.split == split for sample in self._samples) for split in self.splits}
+        if self._plan and not self._projection_exact:
+            return {
+                "splits": split_counts,
+                "images": "pending export",
+                "annotations": "pending export",
+                "empty": None,
+                "empty_fraction": 0.0,
+            }
+        images = len(self._samples)
+        empty = sum(not sample.annotations for sample in self._samples)
+        return {
+            "splits": split_counts,
+            "images": images,
+            "annotations": sum(len(sample.annotations) for sample in self._samples),
+            "empty": empty,
+            "empty_fraction": empty / images if images else 0.0,
+        }
+
+    def _with_plan(
+        self,
+        operation: PlannedOperation,
+        *,
+        samples: list[Sample],
+        metadata: DatasetMetadata | None = None,
+        name: str | None = None,
+        projection_exact: bool | None = None,
+        planned_splits: tuple[str, ...] | None = None,
+    ) -> "Dataset":
+        virtual_name = slugify(name) if name else derived_name(self.name, operation.kind, operation.settings)
+        return Dataset(
+            location=self.location,
+            name=virtual_name,
+            task=self.task,
+            metadata=metadata or self._metadata.copy(),
+            samples=samples,
+            manifest=self._manifest,
+            data_yaml=self._data_yaml,
+            source_format=self._source_format,
+            warnings=list(self._warnings),
+            base=self._base or self,
+            plan=(*self._plan, operation),
+            projection_exact=self._projection_exact if projection_exact is None else projection_exact,
+            planned_splits=planned_splits if planned_splits is not None else self._planned_splits,
+        )
+
+    def _export_plan(
+        self,
+        *,
+        destination: str | Path | None,
+        name: str | None,
+        splits: Iterable[str] | None,
+        allow_lossy: bool,
+        visualize: bool,
+        progress: bool,
+        dry_run: bool,
+    ) -> "Dataset":
+        base = self._base
+        if base is None:
+            raise RuntimeError("Virtual dataset is missing its materialized base")
+        export_settings = {
+            "pipeline": [operation.public_record() for operation in self._plan],
+            "splits": sorted(normalize_split(split) for split in splits) if splits else list(self.splits),
+            "allow_lossy": allow_lossy,
+        }
+        final_name = slugify(name or self.name)
+        final_destination = (
+            Path(destination).expanduser().resolve()
+            if destination is not None
+            else (base.location.parent / f"{final_name}__export__{settings_fingerprint(export_settings)}").resolve()
+        )
+        final_destination.parent.mkdir(parents=True, exist_ok=True)
+        ensure_safe_destination(base.location, final_destination)
+        print(self)
+        print(f"\nExport destination: {final_destination}")
+        if dry_run:
+            print("Dry run complete; the virtual pipeline was not materialized.")
+            return self
+
+        with tempfile.TemporaryDirectory(
+            prefix=f".{final_destination.name}.pipeline-", dir=final_destination.parent
+        ) as temporary:
+            current = base
+            temporary_root = Path(temporary)
+            for index, operation in enumerate(self._plan, start=1):
+                step_destination = temporary_root / f"step-{index:03d}-{operation.kind}"
+                print(f"\nMaterializing pipeline step {index}/{len(self._plan)}: {operation.kind}")
+                kwargs = dict(operation.kwargs)
+                kwargs["destination"] = step_destination
+                kwargs["name"] = None
+                kwargs["progress"] = progress
+                kwargs["dry_run"] = False
+                if operation.kind == "split":
+                    current = split_dataset(current, **kwargs)
+                elif operation.kind == "remove-classes":
+                    current = materialize_remove_classes(current, **kwargs)
+                elif operation.kind == "rebalance-empty":
+                    current = rebalance_empty_dataset(current, **kwargs)
+                elif operation.kind == "tile":
+                    tile_settings = kwargs.pop("settings")
+                    current = tile_dataset(current, **kwargs, settings=tile_settings)
+                else:
+                    raise RuntimeError(f"Unknown planned operation {operation.kind!r}")
+            return export_dataset(
+                current,
+                destination=final_destination,
+                name=final_name,
+                splits=splits,
+                allow_lossy=allow_lossy,
+                visualize=visualize,
+                progress=progress,
+                dry_run=False,
+            )
 
 
 def _resolve_data_yaml(requested: Path, root: Path) -> Path | None:
@@ -423,7 +691,13 @@ def _load_provenance(root: Path, samples: list[Sample]) -> dict[str, dict[str, A
             )
     if issues:
         raise DatasetValidationError(issues)
-    expected = {str(Path("images") / sample.split / sample.relative_path) for sample in samples}
+    expected: set[str] = set()
+    for sample in samples:
+        try:
+            expected.add(str(sample.image_path.resolve().relative_to(root.resolve())))
+        except ValueError:
+            # Virtual projections still point to immutable source images.
+            continue
     missing = expected - records.keys()
     if missing:
         raise DatasetValidationError(

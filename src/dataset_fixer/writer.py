@@ -46,6 +46,12 @@ class OutputBuilder:
         self.staging = Path(tempfile.mkdtemp(prefix=f".{self.destination.name}.tmp-", dir=self.destination.parent))
         self.reports_dir = self.staging / "reports"
         self.reports_dir.mkdir(parents=True, exist_ok=True)
+        source_reports = self.source_root / "reports"
+        if source_reports.is_dir():
+            shutil.copytree(source_reports, self.reports_dir, dirs_exist_ok=True)
+        source_coverage = self.source_root / "coverage_summary"
+        if source_coverage.is_dir():
+            shutil.copytree(source_coverage, self.staging / "coverage_summary", dirs_exist_ok=True)
         self.records: list[dict[str, Any]] = []
         self.visuals: list[str] = []
         self.warnings: list[str] = []
@@ -64,7 +70,7 @@ class OutputBuilder:
         provenance: dict[str, Any] | None = None,
     ) -> None:
         relative_path = relative_path or sample.relative_path
-        output = self.staging / "images" / split / relative_path
+        output = self.staging / split / "images" / relative_path
         output.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(sample.image_path, output)
         self._write_label(output, split, annotations if annotations is not None else sample.annotations, sample.width, sample.height)
@@ -81,7 +87,7 @@ class OutputBuilder:
         provenance: dict[str, Any] | None = None,
         jpeg_quality: int = 95,
     ) -> None:
-        output = self.staging / "images" / split / relative_path
+        output = self.staging / split / "images" / relative_path
         output.parent.mkdir(parents=True, exist_ok=True)
         suffix = output.suffix.lower()
         converted = image.convert("RGB") if suffix in {".jpg", ".jpeg"} else image
@@ -95,8 +101,8 @@ class OutputBuilder:
     def _write_label(
         self, output_image: Path, split: str, annotations: list[Annotation], width: int, height: int
     ) -> None:
-        relative = output_image.relative_to(self.staging / "images" / split)
-        label = self.staging / "labels" / split / relative.with_suffix(".txt")
+        relative = output_image.relative_to(self.staging / split / "images")
+        label = self.staging / split / "labels" / relative.with_suffix(".txt")
         label.parent.mkdir(parents=True, exist_ok=True)
         rows = [annotation_to_yolo(a, self.task, width, height, self.metadata) for a in annotations]
         label.write_text("\n".join(rows) + ("\n" if rows else ""), encoding="utf-8")
@@ -111,6 +117,20 @@ class OutputBuilder:
     ) -> None:
         immediate_sha = sample.source_sha256 or sha256_file(sample.image_path)
         parent = sample.provenance or {}
+        inherited = {
+            key: parent[key]
+            for key in (
+                "crop",
+                "zoom",
+                "scale",
+                "tile_index",
+                "tile_mode",
+                "class_mapping",
+                "split_group",
+                "empty_image",
+            )
+            if key in parent
+        }
         record = {
             "output_image": str(output.relative_to(self.staging)),
             "output_sha256": sha256_file(output),
@@ -134,6 +154,7 @@ class OutputBuilder:
                     "settings": self.settings,
                 },
             ],
+            **inherited,
             **(provenance or {}),
         }
         self.records.append(record)
@@ -144,9 +165,9 @@ class OutputBuilder:
             # Validate against the private staging root, then rewrite this to
             # the final absolute destination immediately before publication.
             "path": str((dataset_root or self.staging).resolve()),
-            "train": "images/train" if "train" in available else None,
-            "val": "images/val" if "val" in available else None,
-            "test": "images/test" if "test" in available else None,
+            "train": "train/images" if "train" in available else None,
+            "val": "val/images" if "val" in available else None,
+            "test": "test/images" if "test" in available else None,
             "names": {int(k): v for k, v in sorted(self.metadata.names.items())},
             "channels": self.metadata.channels,
         }
@@ -237,13 +258,20 @@ class OutputBuilder:
         )
         return manifest
 
-    def publish(self, *, class_mapping: dict[int, int] | None = None) -> dict[str, Any]:
+    def publish(
+        self,
+        *,
+        class_mapping: dict[int, int] | None = None,
+        progress: bool = True,
+    ) -> dict[str, Any]:
         self.write_yaml()
         manifest = self.write_reports(class_mapping=class_mapping)
         # Load and fully validate the private tree before the atomic rename.
         from .dataset import Dataset
 
-        candidate = Dataset.open(self.staging, progress=False)
+        if progress:
+            print("Validating complete staged output before atomic publication...")
+        candidate = Dataset.open(self.staging, progress=progress)
         manifest["training_ready"]["ready"] = candidate.training_ready
         (self.staging / "dataset-fixer.json").write_text(
             json.dumps(to_jsonable(manifest), indent=2, sort_keys=True), encoding="utf-8"

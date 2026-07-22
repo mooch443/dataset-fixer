@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 
 from .errors import DatasetValidationError, ValidationIssue
 from .models import Annotation, DatasetMetadata, Sample, Task
+from .planning import select_empty_images
 from .utils import ensure_safe_destination, normalize_split, settings_fingerprint, slugify, to_jsonable
 from .visualization import save_class_count_summary, save_class_removal_preview, save_split_preview, save_split_summary
 from .writer import OutputBuilder
@@ -116,7 +117,7 @@ def split_dataset(
         if visualize:
             summary = save_split_summary(samples, assignments, builder.reports_dir / "split_summary.jpg")
             builder.visuals.append(str(summary.relative_to(builder.staging)))
-        return _publish(builder)
+        return _publish(builder, progress=progress)
     except Exception:
         builder.cleanup()
         raise
@@ -201,7 +202,7 @@ def remove_classes(
                 dict(before_counts), after_counts, dataset._metadata, builder.reports_dir / "class_counts.jpg"
             )
             builder.visuals.append(str(summary.relative_to(builder.staging)))
-        return _publish(builder, class_mapping=mapping)
+        return _publish(builder, class_mapping=mapping, progress=progress)
     except Exception:
         builder.cleanup()
         raise
@@ -238,7 +239,71 @@ def export_dataset(
         for sample in iterator:
             annotations = [_make_representable(a, allow_lossy, builder) for a in sample.annotations]
             builder.add_copy(sample, split=sample.split, annotations=annotations)
-        return _publish(builder)
+        return _publish(builder, progress=progress)
+    except Exception:
+        builder.cleanup()
+        raise
+
+
+def rebalance_empty_dataset(
+    dataset: "Dataset",
+    max_empty_fraction: float,
+    *,
+    destination: str | Path | None,
+    name: str | None,
+    splits: Iterable[str] | None,
+    seed: int,
+    visualize: bool,
+    progress: bool,
+    dry_run: bool,
+) -> "Dataset":
+    selected = {normalize_split(split) for split in splits} if splits else set(dataset.splits)
+    kept, summary = select_empty_images(
+        dataset._samples,
+        max_empty_fraction=float(max_empty_fraction),
+        selected_splits=selected,
+        seed=seed,
+    )
+    settings = {
+        "max_empty_fraction": float(max_empty_fraction),
+        "splits": sorted(selected),
+        "seed": seed,
+        "summary": summary,
+        "visualize": visualize,
+    }
+    builder = _builder(dataset, destination, name, "rebalance-empty", settings)
+    try:
+        _print_start(builder, kept, settings)
+        if dry_run:
+            builder.cleanup()
+            return dataset
+        iterator = tqdm(kept, desc="Writing empty-image balance", unit="image", disable=not progress)
+        for sample in iterator:
+            builder.add_copy(
+                sample,
+                split=sample.split,
+                provenance={"empty_image": not bool(sample.annotations)},
+            )
+        (builder.reports_dir / "empty_image_balance.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        if visualize and kept:
+            from .visualization import visualize_samples
+
+            preview = builder.reports_dir / "empty_image_balance.jpg"
+            visualize_samples(
+                kept,
+                dataset.task,
+                dataset._metadata,
+                split=None,
+                n=min(12, len(kept)),
+                seed=seed,
+                columns=3,
+                save_to=preview,
+                show=False,
+            )
+            builder.visuals.append(str(preview.relative_to(builder.staging)))
+        return _publish(builder, progress=progress)
     except Exception:
         builder.cleanup()
         raise
@@ -357,11 +422,18 @@ def _print_start(builder: OutputBuilder, samples: list[Sample], settings: dict[s
     print(f"Estimated work: {estimated} {'tiles' if 'estimated_tiles' in settings else 'images'}")
 
 
-def _publish(builder: OutputBuilder, class_mapping: dict[int, int] | None = None) -> "Dataset":
+def _publish(
+    builder: OutputBuilder,
+    class_mapping: dict[int, int] | None = None,
+    *,
+    progress: bool = True,
+) -> "Dataset":
     from .dataset import Dataset
 
-    builder.publish(class_mapping=class_mapping)
-    result = Dataset.open(builder.destination, progress=False)
+    builder.publish(class_mapping=class_mapping, progress=progress)
+    if progress:
+        print("Opening published dataset for final verification...")
+    result = Dataset.open(builder.destination, progress=progress)
     duration = time.time() - builder.started
     print(f"\nCreated {result.name}")
     print(f"Location: {result.location}")

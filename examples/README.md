@@ -16,6 +16,9 @@ The downloader creates:
 - `sawit_fixed`: the same official files in a deterministic train/validation
   layout for tiling and model comparison.
 
+Both use the canonical split-first structure (`train/images`, `train/labels`,
+`val/images`, and `val/labels`).
+
 `SOURCE.json` records the upstream URL and commit, selection rule, license, and
 SHA-256 of every downloaded image and label. `UPSTREAM_LICENSE` is the license
 file fetched from that same pinned commit. The tutorials do not generate or

@@ -34,8 +34,16 @@ def download_sawit_examples(root: str | Path, *, images_per_class: int = 8) -> d
     expected = root / "SOURCE.json"
     if expected.is_file() and unsplit.is_dir() and fixed.is_dir():
         source = json.loads(expected.read_text(encoding="utf-8"))
-        if source.get("commit") == SAWIT_COMMIT and source.get("images_per_class") == images_per_class:
+        if (
+            source.get("commit") == SAWIT_COMMIT
+            and source.get("images_per_class") == images_per_class
+            and source.get("layout") == "split-first"
+        ):
             return {"unsplit": unsplit, "fixed": fixed}
+
+    for generated in (unsplit, fixed):
+        if generated.exists():
+            shutil.rmtree(generated)
 
     root.mkdir(parents=True, exist_ok=True)
     image_entries = _github_directory("data/images/test")
@@ -82,6 +90,7 @@ def download_sawit_examples(root: str | Path, *, images_per_class: int = 8) -> d
         "license": SAWIT_LICENSE,
         "license_file": str(license_path),
         "images_per_class": images_per_class,
+        "layout": "split-first",
         "selection": "lexicographically first files for IMG-Frog-, IMG-Liz-, and IMG-Bird-",
         "files": records,
     }
@@ -134,8 +143,8 @@ def _materialize_fixed(root: Path, records: list[dict[str, Any]], cache: Path, i
 
 def _copy_pair(root: Path, split: str, record: dict[str, Any], cache: Path) -> None:
     category = record["category"]
-    image_output = root / "images" / split / category / record["image"]
-    label_output = root / "labels" / split / category / record["label"]
+    image_output = root / split / "images" / category / record["image"]
+    label_output = root / split / "labels" / category / record["label"]
     image_output.parent.mkdir(parents=True, exist_ok=True)
     label_output.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(cache / "images" / record["image"], image_output)
@@ -145,8 +154,8 @@ def _copy_pair(root: Path, split: str, record: dict[str, Any], cache: Path) -> N
 def _write_yaml(root: Path, *, train: bool, val: bool) -> None:
     value = {
         "path": str(root.resolve()),
-        "train": "images/train" if train else None,
-        "val": "images/val" if val else None,
+        "train": "train/images" if train else None,
+        "val": "val/images" if val else None,
         "test": None,
         "names": CLASS_NAMES,
         "name": root.name,

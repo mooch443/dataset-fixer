@@ -182,7 +182,7 @@ def _tile_grid(
             builder.add_image(sample, image, split=sample.split, relative_path=rel, annotations=[], provenance=provenance)
         if visualize:
             _save_staging_contact_sheet(builder, dataset.task, "reports/grid_tiles_audit.jpg")
-        return _publish(builder)
+        return _publish(builder, progress=progress)
     except Exception:
         builder.cleanup()
         raise
@@ -466,7 +466,7 @@ def _tile_coverage(
         _write_coverage_reports(builder.staging / "coverage_summary", coverage_rows, image_rows, class_totals, split_summary, selected)
         if visualize:
             _save_staging_contact_sheet(builder, dataset.task, "coverage_summary/random_tile_contact_sheet.jpg")
-        return _publish(builder)
+        return _publish(builder, progress=progress)
     except Exception:
         builder.cleanup()
         raise
