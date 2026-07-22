@@ -37,6 +37,7 @@ def tile_dataset(
     progress: bool,
     dry_run: bool,
     settings: dict[str, Any],
+    validate_output: bool = True,
 ) -> "Dataset":
     mode = mode.lower()
     if mode == "grid":
@@ -53,6 +54,7 @@ def tile_dataset(
             visualize=visualize,
             progress=progress,
             dry_run=dry_run,
+            validate_output=validate_output,
         )
     if mode == "coverage":
         return _tile_coverage(
@@ -65,6 +67,7 @@ def tile_dataset(
             progress=progress,
             dry_run=dry_run,
             overrides=settings,
+            validate_output=validate_output,
         )
     raise ValueError("mode must be 'grid' or 'coverage'")
 
@@ -104,6 +107,7 @@ def _tile_grid(
     visualize: bool,
     progress: bool,
     dry_run: bool,
+    validate_output: bool,
 ) -> "Dataset":
     if not 0 <= min_area_ratio <= 1:
         raise ValueError("min_area_ratio must be in [0, 1]")
@@ -182,7 +186,7 @@ def _tile_grid(
             builder.add_image(sample, image, split=sample.split, relative_path=rel, annotations=[], provenance=provenance)
         if visualize:
             _save_staging_contact_sheet(builder, dataset.task, "reports/grid_tiles_audit.jpg")
-        return _publish(builder, progress=progress)
+        return _publish(builder, progress=progress, validate_output=validate_output)
     except Exception:
         builder.cleanup()
         raise
@@ -280,6 +284,7 @@ def _tile_coverage(
     progress: bool,
     dry_run: bool,
     overrides: dict[str, Any],
+    validate_output: bool,
 ) -> "Dataset":
     if dataset.task is not Task.POLO:
         raise ValueError("coverage tiling is POLO-specific; use mode='grid' for other tasks")
@@ -466,7 +471,7 @@ def _tile_coverage(
         _write_coverage_reports(builder.staging / "coverage_summary", coverage_rows, image_rows, class_totals, split_summary, selected)
         if visualize:
             _save_staging_contact_sheet(builder, dataset.task, "coverage_summary/random_tile_contact_sheet.jpg")
-        return _publish(builder, progress=progress)
+        return _publish(builder, progress=progress, validate_output=validate_output)
     except Exception:
         builder.cleanup()
         raise

@@ -36,6 +36,7 @@ def split_dataset(
     visualize: bool,
     progress: bool,
     dry_run: bool,
+    validate_output: bool = True,
 ) -> "Dataset":
     normalized = {normalize_split(k): float(v) for k, v in ratios.items()}
     if any(v < 0 for v in normalized.values()) or not math.isclose(sum(normalized.values()), 1.0, abs_tol=1e-9):
@@ -117,7 +118,7 @@ def split_dataset(
         if visualize:
             summary = save_split_summary(samples, assignments, builder.reports_dir / "split_summary.jpg")
             builder.visuals.append(str(summary.relative_to(builder.staging)))
-        return _publish(builder, progress=progress)
+        return _publish(builder, progress=progress, validate_output=validate_output)
     except Exception:
         builder.cleanup()
         raise
@@ -134,6 +135,7 @@ def remove_classes(
     visualize: bool,
     progress: bool,
     dry_run: bool,
+    validate_output: bool = True,
 ) -> "Dataset":
     selected_splits = {normalize_split(s) for s in splits} if splits else set(dataset.splits)
     selected_samples = [s for s in dataset._samples if s.split in selected_splits]
@@ -202,7 +204,12 @@ def remove_classes(
                 dict(before_counts), after_counts, dataset._metadata, builder.reports_dir / "class_counts.jpg"
             )
             builder.visuals.append(str(summary.relative_to(builder.staging)))
-        return _publish(builder, class_mapping=mapping, progress=progress)
+        return _publish(
+            builder,
+            class_mapping=mapping,
+            progress=progress,
+            validate_output=validate_output,
+        )
     except Exception:
         builder.cleanup()
         raise
@@ -218,6 +225,7 @@ def export_dataset(
     visualize: bool,
     progress: bool,
     dry_run: bool,
+    validate_output: bool = True,
 ) -> "Dataset":
     selected = {normalize_split(s) for s in splits} if splits else set(dataset.splits)
     samples = [s for s in dataset._samples if s.split in selected]
@@ -239,7 +247,7 @@ def export_dataset(
         for sample in iterator:
             annotations = [_make_representable(a, allow_lossy, builder) for a in sample.annotations]
             builder.add_copy(sample, split=sample.split, annotations=annotations)
-        return _publish(builder, progress=progress)
+        return _publish(builder, progress=progress, validate_output=validate_output)
     except Exception:
         builder.cleanup()
         raise
@@ -256,6 +264,7 @@ def rebalance_empty_dataset(
     visualize: bool,
     progress: bool,
     dry_run: bool,
+    validate_output: bool = True,
 ) -> "Dataset":
     selected = {normalize_split(split) for split in splits} if splits else set(dataset.splits)
     kept, summary = select_empty_images(
@@ -303,7 +312,7 @@ def rebalance_empty_dataset(
                 show=False,
             )
             builder.visuals.append(str(preview.relative_to(builder.staging)))
-        return _publish(builder, progress=progress)
+        return _publish(builder, progress=progress, validate_output=validate_output)
     except Exception:
         builder.cleanup()
         raise
@@ -427,13 +436,18 @@ def _publish(
     class_mapping: dict[int, int] | None = None,
     *,
     progress: bool = True,
+    validate_output: bool = True,
 ) -> "Dataset":
     from .dataset import Dataset
 
-    builder.publish(class_mapping=class_mapping, progress=progress)
-    if progress:
-        print("Opening published dataset for final verification...")
-    result = Dataset.open(builder.destination, progress=progress)
+    manifest = builder.publish(
+        class_mapping=class_mapping,
+        progress=progress,
+        validate=validate_output,
+    )
+    if progress and validate_output:
+        print("Reusing validated in-memory index; published dataset is not rescanned.")
+    result = builder.result_dataset(manifest)
     duration = time.time() - builder.started
     print(f"\nCreated {result.name}")
     print(f"Location: {result.location}")

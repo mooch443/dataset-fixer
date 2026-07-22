@@ -53,6 +53,7 @@ class OutputBuilder:
         if source_coverage.is_dir():
             shutil.copytree(source_coverage, self.staging / "coverage_summary", dirs_exist_ok=True)
         self.records: list[dict[str, Any]] = []
+        self.output_samples: list[Sample] = []
         self.visuals: list[str] = []
         self.warnings: list[str] = []
 
@@ -74,7 +75,11 @@ class OutputBuilder:
         output.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(sample.image_path, output)
         self._write_label(output, split, annotations if annotations is not None else sample.annotations, sample.width, sample.height)
-        self._record(sample, output, split, annotations if annotations is not None else sample.annotations, provenance)
+        output_annotations = annotations if annotations is not None else sample.annotations
+        self._record(sample, output, split, output_annotations, provenance)
+        self.output_samples.append(
+            Sample(output, relative_path, split, sample.width, sample.height, list(output_annotations))
+        )
 
     def add_image(
         self,
@@ -97,6 +102,9 @@ class OutputBuilder:
             converted.save(output)
         self._write_label(output, split, annotations, image.width, image.height)
         self._record(sample, output, split, annotations, provenance)
+        self.output_samples.append(
+            Sample(output, relative_path, split, image.width, image.height, list(annotations))
+        )
 
     def _write_label(
         self, output_image: Path, split: str, annotations: list[Annotation], width: int, height: int
@@ -263,19 +271,56 @@ class OutputBuilder:
         *,
         class_mapping: dict[int, int] | None = None,
         progress: bool = True,
+        validate: bool = True,
     ) -> dict[str, Any]:
         self.write_yaml()
         manifest = self.write_reports(class_mapping=class_mapping)
         # Load and fully validate the private tree before the atomic rename.
         from .dataset import Dataset
 
-        if progress:
-            print("Validating complete staged output before atomic publication...")
-        candidate = Dataset.open(self.staging, progress=progress)
-        manifest["training_ready"]["ready"] = candidate.training_ready
+        if validate:
+            if progress:
+                print("Validating complete staged output before atomic publication...")
+            candidate = Dataset.open(self.staging, progress=progress)
+            manifest["training_ready"]["ready"] = candidate.training_ready
+            manifest["training_ready"]["backend_checked"] = False
+        else:
+            manifest["validation"] = {
+                "passed": None,
+                "deferred_to_final_export": True,
+                "warnings": self.warnings,
+            }
         (self.staging / "dataset-fixer.json").write_text(
             json.dumps(to_jsonable(manifest), indent=2, sort_keys=True), encoding="utf-8"
         )
         self.write_yaml(dataset_root=self.destination)
         os.replace(self.staging, self.destination)
         return manifest
+
+    def result_dataset(self, manifest: dict[str, Any]) -> "Dataset":
+        """Build a Dataset from already-known outputs without reopening every image."""
+
+        from .dataset import Dataset
+
+        samples = [
+            Sample(
+                image_path=self.destination / sample.image_path.relative_to(self.staging),
+                relative_path=sample.relative_path,
+                split=sample.split,
+                width=sample.width,
+                height=sample.height,
+                annotations=list(sample.annotations),
+            )
+            for sample in self.output_samples
+        ]
+        return Dataset(
+            location=self.destination,
+            name=self.name,
+            task=self.task,
+            metadata=self.metadata.copy(),
+            samples=samples,
+            manifest=manifest,
+            data_yaml=self.destination / "data.yaml",
+            source_format="yolo",
+            warnings=list(self.warnings),
+        )

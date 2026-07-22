@@ -96,9 +96,12 @@ selected split; non-selected splits are preserved. If the requested ratio would
 require more empty images, the existing images are retained rather than copied.
 
 Visualization preferences are recorded on virtual operations and rendered
-during export. `export(progress=True)` shows progress and ETA for copying,
-tiling, staged-output validation, and final verification. Its destination must
-not exist and cannot contain, equal, or be contained by the source.
+during export. Intermediate plan steps reuse their in-memory sample index and
+are not reopened or revalidated. `export(progress=True)` shows progress and ETA
+for copying, tiling, and the single complete staged-output validation performed
+before atomic publication. The validated index is reused after publication, so
+the final dataset is not scanned a second time. Its destination must not exist
+and cannot contain, equal, or be contained by the source.
 
 Canonical exports use split-first layout:
 

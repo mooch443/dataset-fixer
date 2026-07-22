@@ -162,7 +162,26 @@ def test_export_announces_prepublication_and_final_validation_progress(
     plan.export(destination=tmp_path / "progress", visualize=False, progress=True)
     output = capsys.readouterr().out
     assert "Validating complete staged output before atomic publication" in output
-    assert "Opening published dataset for final verification" in output
+    assert "published dataset is not rescanned" in output
+
+
+def test_multi_step_export_performs_one_complete_dataset_rescan(
+    detect_dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+    plan = dataset.remove_classes(["damaged"], visualize=False).rebalance_empty(
+        0.5, splits=("train",), visualize=False
+    )
+    original_open = Dataset.open.__func__
+    calls: list[Path] = []
+
+    def counted_open(cls, location, **kwargs):
+        calls.append(Path(location))
+        return original_open(cls, location, **kwargs)
+
+    monkeypatch.setattr(Dataset, "open", classmethod(counted_open))
+    plan.export(destination=tmp_path / "single-validation", visualize=False, progress=False)
+    assert len(calls) == 1
 
 
 def test_grid_tile_geometry_and_source_immutability(detect_dataset: Path, tmp_path: Path) -> None:

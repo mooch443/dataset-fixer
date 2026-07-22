@@ -636,6 +636,7 @@ class Dataset:
                 kwargs["name"] = None
                 kwargs["progress"] = progress
                 kwargs["dry_run"] = False
+                kwargs["validate_output"] = False
                 if operation.kind == "split":
                     current = split_dataset(current, **kwargs)
                 elif operation.kind == "remove-classes":
