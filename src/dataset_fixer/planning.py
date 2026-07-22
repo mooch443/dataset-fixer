@@ -186,11 +186,11 @@ def select_empty_images(
     max_empty_fraction: float,
     selected_splits: set[str],
     seed: int,
-) -> tuple[list[Sample], dict[str, dict[str, int | float]]]:
+) -> tuple[list[Sample], dict[str, dict[str, Any]]]:
     if not 0 <= max_empty_fraction < 1:
         raise ValueError("max_empty_fraction must be in [0, 1)")
     keep_ids: set[int] = set()
-    summary: dict[str, dict[str, int | float]] = {}
+    summary: dict[str, dict[str, Any]] = {}
     for split in sorted({sample.split for sample in samples}):
         rows = [sample for sample in samples if sample.split == split]
         positives = [sample for sample in rows if sample.annotations]
@@ -208,10 +208,9 @@ def select_empty_images(
         kept = positives + kept_empty
         keep_ids.update(id(sample) for sample in kept)
         summary[split] = {
-            "positive_images": len(positives),
-            "empty_images_before": len(empties),
-            "empty_images_after": len(kept_empty),
-            "empty_fraction_after": len(kept_empty) / len(kept) if kept else 0.0,
+            "before": {"annotated": len(positives), "background": len(empties)},
+            "after": {"annotated": len(positives), "background": len(kept_empty)},
+            "background_fraction_after": len(kept_empty) / len(kept) if kept else 0.0,
         }
     return [clone_sample(sample) for sample in samples if id(sample) in keep_ids], summary
 

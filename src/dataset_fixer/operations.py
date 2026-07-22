@@ -16,7 +16,13 @@ from .errors import DatasetValidationError, ValidationIssue
 from .models import Annotation, DatasetMetadata, Sample, Task
 from .planning import select_empty_images
 from .utils import ensure_safe_destination, normalize_split, settings_fingerprint, slugify, to_jsonable
-from .visualization import save_class_count_summary, save_class_removal_preview, save_split_preview, save_split_summary
+from .visualization import (
+    save_class_count_summary,
+    save_class_removal_preview,
+    save_empty_image_balance_summary,
+    save_split_preview,
+    save_split_summary,
+)
 from .writer import OutputBuilder
 
 if TYPE_CHECKING:
@@ -182,26 +188,57 @@ def remove_classes(
             builder.cleanup()
             return dataset
         before_counts = Counter(a.class_id for s in selected_samples for a in s.annotations)
+        before_background = sum(not sample.annotations for sample in selected_samples)
+        after_counts: Counter[int] = Counter()
+        after_background = 0
         iterator = tqdm(selected_samples, desc="Removing classes", unit="image", disable=not progress)
         for sample in iterator:
             annotations = [a.clone(class_id=mapping[a.class_id]) for a in sample.annotations if a.class_id in mapping]
             if drop_empty_images and not annotations:
                 continue
+            after_counts.update(annotation.class_id for annotation in annotations)
+            after_background += not annotations
             builder.add_copy(sample, split=sample.split, annotations=annotations, provenance={"class_mapping": mapping})
         (builder.reports_dir / "class_counts.json").write_text(
             json.dumps(
                 {
-                    "before": {str(k): v for k, v in before_counts.items()},
-                    "after": {str(mapping[k]): v for k, v in before_counts.items() if k in mapping},
+                    "definition": "class values count annotations; background counts images with no annotations",
+                    "before": {
+                        **{str(class_id): before_counts.get(class_id, 0) for class_id in sorted(dataset._metadata.names)},
+                        "background": before_background,
+                    },
+                    "after": {
+                        **{str(class_id): after_counts.get(class_id, 0) for class_id in sorted(metadata.names)},
+                        "background": after_background,
+                    },
+                    "names_before": {
+                        **{str(class_id): class_name for class_id, class_name in sorted(dataset._metadata.names.items())},
+                        "background": "background",
+                    },
+                    "names_after": {
+                        **{str(class_id): class_name for class_id, class_name in sorted(metadata.names.items())},
+                        "background": "background",
+                    },
                 },
                 indent=2,
             ),
             encoding="utf-8",
         )
         if visualize:
-            after_counts = {key: value for key, value in before_counts.items() if key in mapping}
+            before_named = {
+                class_name: before_counts.get(class_id, 0)
+                for class_id, class_name in sorted(dataset._metadata.names.items())
+            }
+            before_named["background"] = before_background
+            after_named = {
+                class_name: after_counts.get(class_id, 0)
+                for class_id, class_name in sorted(metadata.names.items())
+            }
+            after_named["background"] = after_background
             summary = save_class_count_summary(
-                dict(before_counts), after_counts, dataset._metadata, builder.reports_dir / "class_counts.jpg"
+                before_named,
+                after_named,
+                builder.reports_dir / "class_counts.jpg",
             )
             builder.visuals.append(str(summary.relative_to(builder.staging)))
         return _publish(
@@ -297,20 +334,8 @@ def rebalance_empty_dataset(
             json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
         )
         if visualize and kept:
-            from .visualization import visualize_samples
-
             preview = builder.reports_dir / "empty_image_balance.jpg"
-            visualize_samples(
-                kept,
-                dataset.task,
-                dataset._metadata,
-                split=None,
-                n=min(12, len(kept)),
-                seed=seed,
-                columns=3,
-                save_to=preview,
-                show=False,
-            )
+            save_empty_image_balance_summary(summary, preview)
             builder.visuals.append(str(preview.relative_to(builder.staging)))
         return _publish(builder, progress=progress, validate_output=validate_output)
     except Exception:

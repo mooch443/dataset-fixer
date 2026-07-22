@@ -274,8 +274,13 @@ def _cohort_figure(root: Path, cohort: Cohort, meta: dict[str, Any]) -> list[str
     counts={name:0 for name in cohort.classes.values()}
     for record in cohort.records:
         for ann in record.annotations: counts[cohort.classes[int(ann["class_id"])]]+=1
-    rows=[{"class_name":name,"annotations":value} for name,value in counts.items()]
-    fig,ax=plt.subplots(figsize=(max(6,.6*len(rows)),4)); ax.bar([r["class_name"] for r in rows],[r["annotations"] for r in rows],color=COLORS[0]); ax.tick_params(axis="x",rotation=35); ax.set(title=f"Frozen cohort composition — {len(cohort.records)} images",ylabel="Annotations")
+    rows=[{"class_name":name,"count":value,"unit":"annotations"} for name,value in counts.items()]
+    rows.append({
+        "class_name": "background",
+        "count": sum(not record.annotations for record in cohort.records),
+        "unit": "empty images",
+    })
+    fig,ax=plt.subplots(figsize=(max(6,.6*len(rows)),4)); ax.bar([r["class_name"] for r in rows],[r["count"] for r in rows],color=[*([COLORS[0]]*(len(rows)-1)),COLORS[4]]); ax.tick_params(axis="x",rotation=35); ax.set(title=f"Frozen cohort composition — {len(cohort.records)} images",ylabel="Count (annotations; background = empty images)")
     return _save_figure(root,"cohort_composition",fig,rows,meta)
 
 

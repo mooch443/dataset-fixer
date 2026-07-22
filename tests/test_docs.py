@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from examples.download_public_examples import SAWIT_COMMIT, SAWIT_LICENSE, SAWIT_REPOSITORY
+from dataset_fixer.public_examples import SAWIT_COMMIT, SAWIT_LICENSE, SAWIT_REPOSITORY
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,7 +31,11 @@ def test_colab_notebooks_have_disclosure_license_and_clean_outputs() -> None:
         assert "AI-generation disclosure" in text
         assert "MIT License" in text
         assert "dtnguyen0304/sawit" in text
-        assert "sys.executable" in text
+        assert "git+https://github.com/mooch443/dataset-fixer.git" in text
+        assert "git', 'clone" not in text
+        assert "subprocess" not in text
+        assert "examples.download_public_examples" not in text
+        assert "dataset_fixer.public_examples" in text
         assert "import dataset_fixer" in text
         assert api in text
         assert all(not cell.get("outputs") for cell in notebook["cells"] if cell["cell_type"] == "code")

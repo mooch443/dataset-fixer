@@ -136,21 +136,68 @@ def save_split_summary(samples: list[Sample], assignments: dict[str, str], outpu
 
 
 def save_class_count_summary(
-    before: dict[int, int], after: dict[int, int], metadata: DatasetMetadata, output: Path
+    before: dict[str, int],
+    after: dict[str, int],
+    output: Path,
 ) -> Path:
-    class_ids = sorted(set(before) | set(after))
-    labels = [metadata.names.get(class_id, str(class_id)) for class_id in class_ids]
-    x = list(range(len(class_ids)))
-    fig, ax = plt.subplots(figsize=(max(7, len(class_ids) * 0.8), 4.5))
-    ax.bar([value - 0.2 for value in x], [before.get(i, 0) for i in class_ids], width=0.4, label="before")
-    ax.bar([value + 0.2 for value in x], [after.get(i, 0) for i in class_ids], width=0.4, label="after")
+    labels = sorted((set(before) | set(after)) - {"background"}) + ["background"]
+    before_values = [before.get(label, 0) for label in labels]
+    after_values = [after.get(label, 0) for label in labels]
+    x = list(range(len(labels)))
+    fig, ax = plt.subplots(figsize=(max(7, len(labels) * 0.8), 4.5))
+    ax.bar([value - 0.2 for value in x], before_values, width=0.4, label="before")
+    ax.bar([value + 0.2 for value in x], after_values, width=0.4, label="after")
     ax.set_xticks(x, labels, rotation=30, ha="right")
-    ax.set_ylabel("annotations")
+    ax.set_ylabel("count")
     ax.set_title("Class counts before and after removal")
+    ax.text(
+        0.99,
+        0.98,
+        "class bars = annotations\nbackground = empty images",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=8,
+        color="#555555",
+    )
     ax.legend()
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(output, bbox_inches="tight", dpi=140)
+    plt.close(fig)
+    return output
+
+
+def save_empty_image_balance_summary(summary: dict[str, dict[str, Any]], output: Path) -> Path:
+    """Plot annotated/background image distributions before and after balancing."""
+
+    splits = list(summary)
+    categories = ["annotated", "background"]
+    colors = {"annotated": "#4477AA", "background": "#CC6677"}
+    fig, axes = plt.subplots(1, 2, figsize=(max(9, len(splits) * 2.4), 4.5), sharey=True)
+    for ax, phase in zip(axes, ("before", "after")):
+        x = list(range(len(splits)))
+        width = 0.36
+        for offset, category in zip((-width / 2, width / 2), categories):
+            values = [int(summary[split][phase][category]) for split in splits]
+            bars = ax.bar(
+                [value + offset for value in x],
+                values,
+                width=width,
+                label=category,
+                color=colors[category],
+            )
+            ax.bar_label(bars, padding=2, fontsize=8)
+        ax.set_xticks(x, splits)
+        ax.set_title(phase.capitalize())
+        ax.set_xlabel("split")
+        ax.grid(axis="y", alpha=0.2)
+    axes[0].set_ylabel("images")
+    axes[1].legend(frameon=False)
+    fig.suptitle("Annotated and background image distribution")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output, bbox_inches="tight", dpi=160)
     plt.close(fig)
     return output
 

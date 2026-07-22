@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import os
 import pickle
 import sys
@@ -242,3 +243,9 @@ def test_comparison_visuals_have_data_and_metadata_sidecars(
         assert (destination / "figures" / f"{name}.png").is_file()
         assert (destination / "figures" / "data" / f"{name}.csv").is_file()
         assert (destination / "figures" / "metadata" / f"{name}.json").is_file()
+    with (destination / "figures" / "data" / "cohort_composition.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        composition = list(csv.DictReader(handle))
+    assert composition[-1]["class_name"] == "background"
+    assert composition[-1]["unit"] == "empty images"

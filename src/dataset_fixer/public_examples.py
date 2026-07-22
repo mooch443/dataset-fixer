@@ -1,4 +1,8 @@
-"""Download a small, pinned subset of the public MIT-licensed SAWIT dataset."""
+"""Download a small, pinned subset of the public MIT-licensed SAWIT dataset.
+
+This module is installed with :mod:`dataset_fixer`, so tutorials and users do
+not need a checkout of this repository to obtain the public example data.
+"""
 
 from __future__ import annotations
 
@@ -184,13 +188,3 @@ def _sha256(path: Path) -> str:
             digest.update(block)
     return digest.hexdigest()
 
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("destination", nargs="?", default="public-example-datasets")
-    parser.add_argument("--images-per-class", type=int, default=8)
-    arguments = parser.parse_args()
-    for key, value in download_sawit_examples(arguments.destination, images_per_class=arguments.images_per_class).items():
-        print(f"{key}: {value}")

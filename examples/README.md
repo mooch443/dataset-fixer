@@ -5,8 +5,10 @@ The tutorials use a small, unmodified subset of
 object-detection dataset whose repository declares the MIT License. Images and
 official YOLO annotations are downloaded directly from a pinned upstream commit.
 
-```shell
-python examples/download_public_examples.py /tmp/dataset-fixer-examples
+```python
+from dataset_fixer.public_examples import download_sawit_examples
+
+paths = download_sawit_examples("/tmp/dataset-fixer-examples")
 ```
 
 The downloader creates:

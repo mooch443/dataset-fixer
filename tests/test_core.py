@@ -73,7 +73,7 @@ def test_remove_classes_compacts_and_chains_original(detect_dataset: Path, tmp_p
     )
     clean = split.remove_classes(
         ["fruit"],
-        visualize=False,
+        visualize=True,
         progress=False,
     )
     assert clean.classes == {0: "damaged"}
@@ -86,6 +86,12 @@ def test_remove_classes_compacts_and_chains_original(detect_dataset: Path, tmp_p
     assert records
     assert all(record["original_dataset"] == "orchard" for record in records)
     assert all("class_mapping" in record for record in records)
+    counts = json.loads((clean.location / "reports" / "class_counts.json").read_text(encoding="utf-8"))
+    assert counts["before"]["background"] == 0
+    assert counts["after"]["background"] == 3
+    assert counts["names_before"]["background"] == "background"
+    assert counts["names_after"]["background"] == "background"
+    assert (clean.location / "reports" / "class_counts.jpg").is_file()
 
 
 def test_virtual_pipeline_repr_and_empty_image_rebalancing(
@@ -130,6 +136,29 @@ def test_virtual_pipeline_repr_and_empty_image_rebalancing(
     assert (exported.location / "train" / "labels").is_dir()
     assert not (exported.location / "images").exists()
     assert yaml.safe_load(exported.data_yaml.read_text(encoding="utf-8"))["train"] == "train/images"
+
+
+def test_empty_balance_report_is_a_distribution_plot(tmp_path: Path) -> None:
+    from conftest import make_yolo_dataset
+
+    source = make_yolo_dataset(
+        tmp_path / "empty_report_source",
+        task="detect",
+        train_rows=["0 0.5 0.5 0.2 0.2", "", "", ""],
+        val_rows=["0 0.5 0.5 0.2 0.2", ""],
+    )
+    exported = (
+        Dataset.open(source, task="detect", progress=False)
+        .rebalance_empty(0.5, splits=("train",), seed=42, visualize=True)
+        .export(destination=tmp_path / "empty_report", visualize=False, progress=False)
+    )
+    report = json.loads(
+        (exported.location / "reports" / "empty_image_balance.json").read_text(encoding="utf-8")
+    )
+    assert report["train"]["before"] == {"annotated": 1, "background": 3}
+    assert report["train"]["after"] == {"annotated": 1, "background": 1}
+    assert report["val"]["before"] == {"annotated": 1, "background": 1}
+    assert (exported.location / "reports" / "empty_image_balance.jpg").is_file()
 
 
 def test_empty_rebalancing_after_deferred_tiling(tmp_path: Path) -> None:
