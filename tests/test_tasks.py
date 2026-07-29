@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,8 @@ import yaml
 from PIL import Image
 
 from dataset_fixer import Dataset, DatasetValidationError, Task
+from dataset_fixer.models import Annotation, Sample
+from dataset_fixer.visualization import save_coverage_annotated_original
 from conftest import make_image, make_yolo_dataset
 
 
@@ -151,7 +154,227 @@ def test_polo_coverage_reports_and_visual_audit(tmp_path: Path) -> None:
     assert list((summary / "annotated_originals").rglob("*.jpg"))
     rows = list(csv.DictReader((summary / "label_coverage.csv").open(encoding="utf-8")))
     assert rows and all(float(row["actual_coverages"]) >= 1 for row in rows)
+    assert all(row["coverage_type"] == "sparse" for row in rows)
     assert all(annotation.radius == 10 for sample in tiled._samples for annotation in sample.annotations)
+    with Image.open(next((summary / "annotated_originals").rglob("*.jpg"))) as preview:
+        assert preview.height > 260
+
+
+def test_coverage_visual_keeps_legend_off_image_and_boxes_segmentations(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "blue.jpg"
+    make_image(image_path, size=(120, 100), color=(20, 90, 150))
+    polygon = [(30.0, 20.0), (90.0, 50.0), (45.0, 80.0)]
+    sample = Sample(
+        image_path=image_path,
+        relative_path=Path("blue.jpg"),
+        split="val",
+        width=120,
+        height=100,
+        annotations=[
+            Annotation(
+                class_id=0,
+                polygon=polygon,
+                bbox=(30.0, 20.0, 90.0, 80.0),
+            )
+        ],
+    )
+    output = tmp_path / "coverage_visual.jpg"
+    save_coverage_annotated_original(
+        sample,
+        {0: 3},
+        {0: 5},
+        {0: "dense"},
+        [],
+        output,
+        {
+            "target_appearances_per_object": 5,
+            "sparse_appearances_per_object": 1,
+            "max_tiles_per_source_image": 100,
+            "min_nearby_objects_for_full_coverage": 5,
+            "dense_neighbor_radius_px": 50.0,
+            "background_ratio": 0.1,
+            "polo_radius_px": 15.0,
+            "jpeg_quality": 100,
+        },
+    )
+
+    with Image.open(output) as preview:
+        assert preview.size[0] >= 900
+        scale = preview.size[0] / 120
+        displayed_image_height = round(100 * scale)
+        assert preview.size[1] > displayed_image_height
+        pixels = preview.convert("RGB")
+        # The triangle does not pass through its top-right bounding-box corner;
+        # a magenta pixel there therefore comes from the new segmentation box.
+        corner_x, corner_y = round(90 * scale), round(20 * scale)
+        nearby = [
+            pixels.getpixel((x, y))
+            for x in range(corner_x - 8, corner_x + 9)
+            for y in range(corner_y - 8, corner_y + 9)
+        ]
+        assert any(red > 170 and blue > 130 and green < 140 for red, green, blue in nearby)
+
+
+def test_coverage_background_ratio_applies_to_complete_output(tmp_path: Path) -> None:
+    positive = "0 0.5 0.5 0.2 0.2"
+    rows = [positive, positive, positive, *([""] * 7)]
+    source = make_yolo_dataset(
+        tmp_path / "coverage_with_existing_backgrounds",
+        task="detect",
+        names=["fruit"],
+        train_rows=rows,
+        val_rows=rows,
+        size=(160, 120),
+    )
+
+    tiled = (
+        Dataset.open(source, task="detect", progress=False)
+        .tile(
+            mode="coverage",
+            tile_size=100,
+            large_image_threshold=500,
+            background_ratio=0.25,
+            visualize=False,
+            progress=False,
+        )
+        .export(
+            destination=tmp_path / "coverage_with_final_background_ratio",
+            visualize=False,
+            progress=False,
+        )
+    )
+
+    for split in ("train", "val"):
+        output = [sample for sample in tiled._samples if sample.split == split]
+        assert len(output) == 4
+        assert sum(not sample.annotations for sample in output) == 1
+        assert sum(not sample.annotations for sample in output) / len(output) == 0.25
+
+    summary = {
+        row["split"]: row
+        for row in csv.DictReader(
+            (tiled.location / "coverage_summary" / "tile_summary.csv").open(encoding="utf-8")
+        )
+    }
+    for split in ("train", "val", "all"):
+        assert float(summary[split]["background_fraction"]) == 0.25
+    assert int(summary["train"]["candidate_background_source_images"]) == 7
+    assert int(summary["train"]["dropped_background_source_images"]) == 6
+    assert int(summary["train"]["target_background_images"]) == 1
+    assert int(summary["train"]["actual_background_images"]) == 1
+    class_counts = json.loads(
+        (tiled.location / "reports" / "class_counts.json").read_text(encoding="utf-8")
+    )
+    assert class_counts["operation"] == "tile-coverage"
+    assert class_counts["after"]["background"] == 2
+    assert class_counts["image_composition"]["after"] == {
+        "annotated": 6,
+        "background": 2,
+        "total": 8,
+        "background_fraction": 0.25,
+    }
+    assert class_counts["annotation_counts"]["after"]["0"] == 6
+
+
+def test_coverage_balances_background_source_types(tmp_path: Path) -> None:
+    positive = "0 0.5 0.5 0.1 0.1"
+    source = make_yolo_dataset(
+        tmp_path / "coverage_background_source_mix",
+        task="detect",
+        names=["fruit"],
+        train_rows=[positive, positive, "", ""],
+        val_rows=[positive, positive, "", ""],
+        size=(300, 260),
+    )
+
+    tiled = (
+        Dataset.open(source, task="detect", progress=False)
+        .tile(
+            mode="coverage",
+            tile_size=100,
+            large_image_threshold=200,
+            scale_range=(1.0, 1.0),
+            target_appearances_per_object=1,
+            sparse_appearances_per_object=1,
+            background_ratio=0.5,
+            seed=13,
+            visualize=False,
+            progress=False,
+        )
+        .export(
+            destination=tmp_path / "coverage_balanced_background_sources",
+            visualize=False,
+            progress=False,
+        )
+    )
+
+    sampling = json.loads(
+        (
+            tiled.location
+            / "coverage_summary"
+            / "background_sampling.json"
+        ).read_text(encoding="utf-8")
+    )
+    for split in ("train", "val"):
+        details = sampling["splits"][split]
+        assert details["status"] == "target and equal source mix met"
+        assert details["target_background_images"] == 2
+        assert details["actual_background_images"] == 2
+        assert details["actual_from_empty_source_images"] == 1
+        assert details["actual_from_populated_image_space"] == 1
+        assert details["actual_background_fraction"] == 0.5
+
+    background_sources = Counter(
+        record.get("background_source")
+        for record in tiled.provenance.values()
+        if record.get("output_annotation_count") == 0
+    )
+    assert background_sources == {
+        "empty_source_image": 2,
+        "populated_image_empty_space": 2,
+    }
+
+
+def test_grid_negative_fraction_applies_to_complete_output(tmp_path: Path) -> None:
+    positive = "0 0.5 0.5 0.2 0.2"
+    rows = [positive, positive, positive, *([""] * 7)]
+    source = make_yolo_dataset(
+        tmp_path / "grid_with_existing_backgrounds",
+        task="detect",
+        names=["fruit"],
+        train_rows=rows,
+        val_rows=rows,
+        size=(160, 120),
+    )
+
+    tiled = (
+        Dataset.open(source, task="detect", progress=False)
+        .tile(
+            mode="grid",
+            tile_size=200,
+            negative_tiles=0.25,
+            visualize=False,
+            progress=False,
+        )
+        .export(
+            destination=tmp_path / "grid_with_final_background_ratio",
+            visualize=False,
+            progress=False,
+        )
+    )
+
+    for split in ("train", "val"):
+        output = [sample for sample in tiled._samples if sample.split == split]
+        assert len(output) == 4
+        assert sum(not sample.annotations for sample in output) == 1
+        assert sum(not sample.annotations for sample in output) / len(output) == 0.25
+    class_counts = json.loads(
+        (tiled.location / "reports" / "class_counts.json").read_text(encoding="utf-8")
+    )
+    assert class_counts["operation"] == "tile-grid"
+    assert class_counts["after"]["background"] == 2
 
 
 @pytest.mark.parametrize("task", ["detect", "segment", "pose", "polo"])

@@ -99,6 +99,22 @@ def test_split_grouping_manifest_and_provenance(detect_dataset: Path, tmp_path: 
     assert yaml.safe_load(result.data_yaml.read_text(encoding="utf-8"))["path"] == str(result.location)
 
 
+def test_split_ratios_are_normalized_weights(detect_dataset: Path) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+
+    planned = dataset.split(
+        {"train": 80, "val": 20},
+        visualize=False,
+        progress=False,
+    )
+
+    assert planned.history[-1]["settings"]["ratios"] == {
+        "train": pytest.approx(0.8),
+        "val": pytest.approx(0.2),
+    }
+    assert len(planned._samples) == len(dataset._samples)
+
+
 def test_remove_classes_compacts_and_chains_original(detect_dataset: Path, tmp_path: Path) -> None:
     dataset = Dataset.open(detect_dataset, task="detect", progress=False)
     split = dataset.split(
@@ -142,7 +158,6 @@ def test_rename_classes_is_virtual_validated_and_exported(
 
     planned = dataset.rename_classes(
         {0: "apple", "damaged": "blemished"},
-        visualize=True,
         progress=False,
     )
 
@@ -171,7 +186,7 @@ def test_rename_classes_is_virtual_validated_and_exported(
         for annotation in sample.annotations
     ] == original_ids
     assert (exported.location / "reports" / "class_renames.json").is_file()
-    assert (exported.location / "reports" / "rename_classes_summary.jpg").is_file()
+    assert not (exported.location / "reports" / "rename_classes_summary.jpg").exists()
     assert all("class_renames" in record for record in exported.provenance.values())
     data = yaml.safe_load(exported.data_yaml.read_text(encoding="utf-8"))
     assert data["names"] == {0: "apple", 1: "blemished"}

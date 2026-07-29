@@ -133,6 +133,7 @@ class OutputBuilder:
                 "scale",
                 "tile_index",
                 "tile_mode",
+                "background_source",
                 "class_mapping",
                 "class_renames",
                 "split_group",

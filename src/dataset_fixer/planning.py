@@ -57,11 +57,7 @@ def plan_split(
     assign: Callable[[Path], str | None] | None,
     seed: int,
 ) -> tuple[list[Sample], dict[str, Any], dict[str, str]]:
-    normalized = {normalize_split(key): float(value) for key, value in ratios.items()}
-    if any(value < 0 for value in normalized.values()) or not math.isclose(
-        sum(normalized.values()), 1.0, abs_tol=1e-9
-    ):
-        raise ValueError(f"Split ratios must be non-negative and sum to 1.0, got {normalized}")
+    normalized = normalize_split_ratios(ratios)
     selected = {normalize_split(value) for value in source_splits} if source_splits else {
         sample.split for sample in samples
     }
@@ -122,6 +118,23 @@ def plan_split(
     }
     projected = [clone_sample(sample, split=assignments[str(sample.image_path)]) for sample in chosen]
     return projected, settings, assignments
+
+
+def normalize_split_ratios(ratios: Mapping[str, float]) -> dict[str, float]:
+    """Normalize non-negative split weights into fractions that sum to one."""
+
+    parsed = {normalize_split(key): float(value) for key, value in ratios.items()}
+    total = sum(parsed.values())
+    if (
+        not parsed
+        or any(not math.isfinite(value) or value < 0 for value in parsed.values())
+        or not math.isfinite(total)
+        or total <= 0
+    ):
+        raise ValueError(
+            f"Split ratios must contain finite non-negative weights with a positive total, got {parsed}"
+        )
+    return {split: value / total for split, value in parsed.items()}
 
 
 def resolve_removed_classes(

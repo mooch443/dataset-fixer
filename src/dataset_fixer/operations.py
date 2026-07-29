@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import inspect
 import json
-import math
 import random
 import tempfile
 import time
@@ -14,11 +13,10 @@ from tqdm.auto import tqdm
 
 from .errors import DatasetValidationError, ValidationIssue
 from .models import Annotation, DatasetMetadata, Sample, Task
-from .planning import resolve_renamed_classes, select_empty_images
+from .planning import normalize_split_ratios, resolve_renamed_classes, select_empty_images
 from .utils import ensure_safe_destination, normalize_split, settings_fingerprint, slugify, to_jsonable
 from .visualization import (
     save_class_count_summary,
-    save_class_rename_summary,
     save_class_removal_preview,
     save_empty_image_balance_summary,
     save_split_preview,
@@ -45,9 +43,7 @@ def split_dataset(
     dry_run: bool,
     validate_output: bool = True,
 ) -> "Dataset":
-    normalized = {normalize_split(k): float(v) for k, v in ratios.items()}
-    if any(v < 0 for v in normalized.values()) or not math.isclose(sum(normalized.values()), 1.0, abs_tol=1e-9):
-        raise ValueError(f"Split ratios must be non-negative and sum to 1.0, got {normalized}")
+    normalized = normalize_split_ratios(ratios)
     selected = {normalize_split(s) for s in source_splits} if source_splits else set(dataset.splits)
     samples = [sample for sample in dataset._samples if sample.split in selected]
     if not samples:
@@ -110,7 +106,19 @@ def split_dataset(
     builder = _builder(dataset, destination, name, "split", settings)
     try:
         if visualize:
-            preview = save_split_preview(samples, assignments, builder.reports_dir / "split_preview.jpg")
+            group_lookup = {
+                image: group
+                for group, details in resolved_groups.items()
+                for image in details["images"]
+            }
+            preview = save_split_preview(
+                samples,
+                assignments,
+                group_lookup,
+                dataset.task,
+                dataset._metadata,
+                builder.reports_dir / "split_preview.jpg",
+            )
             builder.visuals.append(str(preview.relative_to(builder.staging)))
             print(f"Split sanity preview: {preview}")
         _print_start(builder, samples, settings)
@@ -297,7 +305,6 @@ def rename_classes(
     *,
     destination: str | Path | None,
     name: str | None,
-    visualize: bool,
     progress: bool,
     dry_run: bool,
     validate_output: bool = True,
@@ -306,14 +313,12 @@ def rename_classes(
     settings = {
         "renamed_classes": renamed,
         "class_ids_changed": False,
-        "visualize": visualize,
     }
     builder = _builder(dataset, destination, name, "rename-classes", settings, metadata=metadata)
     try:
-        if visualize:
-            preview = save_class_rename_summary(renamed, builder.reports_dir / "rename_classes_summary.jpg")
-            builder.visuals.append(str(preview.relative_to(builder.staging)))
-            print(f"Class-rename audit: {preview}")
+        inherited_preview = builder.reports_dir / "rename_classes_summary.jpg"
+        if inherited_preview.exists():
+            inherited_preview.unlink()
         _print_start(builder, dataset._samples, settings)
         if dry_run:
             print("Dry run complete; no dataset was published.")

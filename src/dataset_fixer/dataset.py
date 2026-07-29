@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Hashable, Iterable, Literal, Mapping, Sequence
@@ -248,11 +249,16 @@ class Dataset:
         """Plan a deterministic, leakage-aware reassignment of whole images.
 
         Parameters:
-            ratios: Target fractions keyed by ``"train"``, ``"val"``, and/or
-                ``"test"``. Positive values are normalized to sum to one.
+            ratios: Target weights keyed by ``"train"``, ``"val"``, and/or
+                ``"test"``. Values such as ``0.8/0.2`` and ``80/20`` are
+                equivalent because finite non-negative weights are normalized
+                to sum to one. Every selected input image is assigned to
+                exactly one requested output split. Whole groups and explicit
+                assignments can make achieved fractions differ from targets.
             name: Optional virtual-derivative name.
-            source_splits: Existing splits eligible for reassignment. ``None``
-                uses all splits.
+            source_splits: Existing splits included in the reassignment corpus.
+                ``None`` includes all splits; unselected splits are omitted from
+                this operation's output.
             group_by: Optional callback from image path to a stable group key.
                 Images with the same key remain in one output split.
             assign: Optional callback that pins an image to a split. Return
@@ -298,9 +304,12 @@ class Dataset:
         Parameters:
             classes: Class names or integer IDs to remove.
             name: Optional virtual-derivative name.
-            splits: Splits affected by removal; ``None`` selects all splits.
-            drop_empty_images: Remove images that become annotation-free.
-                Otherwise they remain valid negative/background examples.
+            splits: Splits included in the output; ``None`` selects all splits.
+                Unselected splits are omitted because class metadata and IDs
+                are compacted globally.
+            drop_empty_images: Remove every selected output image with no
+                remaining annotations, including inputs that were already
+                empty. Otherwise they remain negative/background examples.
             visualize: Produce before/after class-count audits at export.
             progress: Show export-time progress.
 
@@ -341,7 +350,6 @@ class Dataset:
         renames: Mapping[str | int, str],
         *,
         name: str | None = None,
-        visualize: bool = True,
         progress: bool = True,
     ) -> "Dataset":
         """Plan class-name changes without changing class IDs or annotations.
@@ -350,7 +358,6 @@ class Dataset:
             renames: Mapping from existing class names or integer IDs to new
                 non-empty names. Final class names must remain unique.
             name: Optional virtual-derivative name.
-            visualize: Produce a before/after class-name audit table at export.
             progress: Show export-time copying progress.
 
         Returns:
@@ -364,13 +371,11 @@ class Dataset:
         settings = {
             "renamed_classes": renamed,
             "class_ids_changed": False,
-            "visualize": visualize,
         }
         operation = PlannedOperation(
             "rename-classes",
             {
                 "renames": requested,
-                "visualize": visualize,
             },
             settings,
         )
@@ -396,7 +401,9 @@ class Dataset:
         Parameters:
             max_empty_fraction: Maximum fraction of selected output images that
                 may have no annotations, in ``[0, 1)``.
-            splits: Splits to rebalance. ``None`` selects all splits.
+            splits: Splits whose complete output composition is rebalanced.
+                ``None`` selects all splits. Unselected splits are copied
+                unchanged.
             seed: Deterministic negative-image sampling seed.
             name: Optional virtual-derivative name.
             visualize: Produce before/after background-balance reports.
@@ -482,7 +489,8 @@ class Dataset:
 
         Common parameters:
             name: Optional name for the virtual derivative.
-            splits: Splits to tile; defaults to every available split.
+            splits: Splits included in the tiled output; defaults to every
+                available split. Unselected splits are omitted.
             tile_size: Grid window edge or coverage output edge, in pixels.
             min_area_ratio: Minimum retained fraction of an object's original
                 box/mask area. Applies to clipped detection, segmentation, and
@@ -496,8 +504,11 @@ class Dataset:
         Grid parameters:
             overlap: Fractional overlap between adjacent windows in ``[0, 1)``.
             negative_tiles: ``"all"`` keeps every empty window, ``"none"``
-                removes them, and a non-negative float caps empty windows to
-                that ratio relative to positive windows.
+                removes them, and a float in ``[0, 1)`` targets that final
+                background fraction independently in each selected split. The
+                calculation includes uncropped small images and uses the
+                nearest achievable whole-image count. The operation raises if
+                too few empty grid windows exist.
 
         Coverage parameters:
             scale_range: Inclusive random zoom range. A sampled zoom ``z`` uses
@@ -512,8 +523,17 @@ class Dataset:
                 the dense target.
             dense_neighbor_radius_px: Source-pixel radius used for neighbor
                 counting; defaults to half ``tile_size``.
-            background_ratio: Requested object-free crops relative to positive
-                coverage crops.
+            background_ratio: Target fraction of all output images that contain
+                no annotations, applied independently to each selected split.
+                This includes copied small images and generated crops. Existing
+                empty images and object-free regions cropped from populated
+                images are sampled in an equal 50/50 mix where possible. If
+                one source type cannot supply its half, the other type fills
+                the remainder and the export records a warning and exact counts
+                in ``coverage_summary/tile_summary.csv``.
+                The nearest achievable whole-image count is used, and export
+                raises rather than silently returning a different count when
+                insufficient object-free crops exist. Must be in ``[0, 1)``.
             large_image_threshold: Images whose largest edge is at or below
                 this value are copied once instead of coverage-sampled.
                 ``None`` uses ``tile_size``.
@@ -536,6 +556,24 @@ class Dataset:
         mode = mode.lower()
         if mode not in {"grid", "coverage"}:
             raise ValueError("mode must be 'grid' or 'coverage'")
+        if mode == "grid":
+            if not (
+                negative_tiles in {"all", "none"}
+                or (
+                    isinstance(negative_tiles, (int, float))
+                    and not isinstance(negative_tiles, bool)
+                    and math.isfinite(float(negative_tiles))
+                    and 0 <= float(negative_tiles) < 1
+                )
+            ):
+                raise ValueError(
+                    "negative_tiles must be 'all', 'none', or a finite final background fraction in [0, 1)"
+                )
+        elif (
+            not math.isfinite(float(background_ratio))
+            or not 0 <= float(background_ratio) < 1
+        ):
+            raise ValueError("background_ratio must be a finite final background fraction in [0, 1)")
         split_values = tuple(splits) if splits is not None else None
         appearance_overrides = dict(object_appearance_overrides or {})
         if mode == "coverage" and appearance_overrides and self._projection_exact:
@@ -615,11 +653,15 @@ class Dataset:
             transforms: Albumentations ``Compose`` object, one transform, a
                 transform sequence, or an ``albumentations.to_dict()`` result.
             copies: Augmented outputs generated per selected source image.
-            splits: Splits to augment; defaults to training only.
-            include_original: Keep each selected source image alongside copies.
+            splits: Splits to augment; defaults to training only. Unselected
+                splits are copied once unchanged. Passing ``None`` selects all
+                available splits.
+            include_original: Keep each selected source image alongside its
+                augmented copies. It does not affect unselected splits.
             min_area: Albumentations minimum retained box area in pixels.
-            min_visibility: Minimum retained box visibility fraction in
-                ``[0, 1]``.
+            min_visibility: Per-box minimum fraction of its pre-transform area
+                that must remain visible, in ``[0, 1]``. This filters
+                annotations; it is not an output-image composition ratio.
             allow_lossy: Allow transformed segmentation masks to collapse to
                 their largest YOLO-representable polygon.
             seed: Base seed; each source/copy receives a stable derived seed.
@@ -740,7 +782,8 @@ class Dataset:
             destination: Final output root. ``None`` derives a sibling path from
                 the dataset name, operation, and settings fingerprint.
             name: Optional output dataset name stored in metadata.
-            splits: Splits to publish; ``None`` publishes every available split.
+            splits: Splits included in the published output; ``None`` publishes
+                every available split. Unselected splits are omitted.
             allow_lossy: Permit explicit lossy conversion of COCO RLE/multipart
                 masks to one YOLO polygon.
             visualize: Render pending operation audits and final reports.
@@ -828,8 +871,10 @@ class Dataset:
                 ``"calibrate_then_test"``.
             training_provenance: Whether unverifiable training/evaluation
                 overlap raises, warns, or is ignored.
-            confidence_thresholds: Candidate model confidence thresholds.
-            postprocess_thresholds: Candidate NMS/NMM match thresholds.
+            confidence_thresholds: Candidate per-prediction score cutoffs in
+                ``[0, 1]``; these do not control a dataset percentage.
+            postprocess_thresholds: Candidate NMS/NMM overlap-match thresholds
+                in ``[0, 1]``; these do not control output composition.
             resolution: Default model input/slice size.
             comparison_unit: ``"model"`` requires one inference backend across
                 candidates; ``"system"`` permits backend-specific systems.
@@ -848,9 +893,10 @@ class Dataset:
             sahi_mode: Standard whole-image, sliced-only, or combined SAHI.
             slice_height: SAHI slice height; defaults to ``resolution``.
             slice_width: SAHI slice width; defaults to ``resolution``.
-            overlap: Default SAHI overlap ratio for both axes.
-            overlap_height_ratio: Optional vertical overlap override.
-            overlap_width_ratio: Optional horizontal overlap override.
+            overlap: Fraction of adjacent SAHI slice edges shared on both axes,
+                in ``[0, 1)``.
+            overlap_height_ratio: Optional vertical slice-overlap override.
+            overlap_width_ratio: Optional horizontal slice-overlap override.
             postprocess_type: SAHI postprocessor name, such as ``"GREEDYNMM"``.
             postprocess_match_metric: SAHI ``"IOU"`` or ``"IOS"`` matching.
             postprocess_class_agnostic: Merge across classes when true.
@@ -865,6 +911,17 @@ class Dataset:
             raise DatasetValidationError(
                 "Model comparison requires a fixed on-disk cohort; call dataset.export(...) first"
             )
+        slice_overlaps = {
+            "overlap": overlap,
+            "overlap_height_ratio": overlap_height_ratio,
+            "overlap_width_ratio": overlap_width_ratio,
+        }
+        for parameter, value in slice_overlaps.items():
+            if value is None:
+                continue
+            parsed = float(value)
+            if not math.isfinite(parsed) or not 0 <= parsed < 1:
+                raise ValueError(f"{parameter} must be a finite SAHI slice fraction in [0, 1)")
 
         from .comparison import compare_models
 

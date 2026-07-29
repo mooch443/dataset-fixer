@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import random
 from collections import Counter, defaultdict
@@ -15,7 +16,11 @@ from .errors import DatasetValidationError, ValidationIssue
 from .models import Annotation, Sample, Task
 from .operations import _builder, _print_start, _publish
 from .utils import normalize_split
-from .visualization import save_coverage_annotated_original, save_grid_preview
+from .visualization import (
+    save_coverage_annotated_original,
+    save_tiling_count_summary,
+    save_tiling_preview,
+)
 
 if TYPE_CHECKING:
     from .dataset import Dataset
@@ -128,24 +133,40 @@ def _tile_grid(
         "estimated_tiles": total_tiles,
     }
     builder = _builder(dataset, destination, name, "tile-grid", op_settings)
+    _clear_inherited_tiling_reports(builder)
     try:
-        if visualize and samples:
-            sample = max(samples, key=lambda s: s.width * s.height)
-            preview = save_grid_preview(sample, grid_boxes(sample.width, sample.height, tile_size, overlap), builder.reports_dir / "grid_preview.jpg")
-            builder.visuals.append(str(preview.relative_to(builder.staging)))
-            print(f"Grid sanity preview: {preview}")
         _print_start(builder, samples, op_settings)
         if dry_run:
             builder.cleanup()
             return dataset
 
-        positive_count = 0
-        negatives: list[tuple[Sample, tuple[int, int, int, int], Path, dict[str, Any]]] = []
+        positive_counts: Counter[str] = Counter()
+        negatives: dict[
+            str,
+            list[tuple[Sample, tuple[int, int, int, int], Path, dict[str, Any]]],
+        ] = defaultdict(list)
         iterator = tqdm(total=total_tiles, desc="Generating grid tiles", unit="tile", disable=not progress)
         for sample in samples:
             boxes = grid_boxes(sample.width, sample.height, tile_size, overlap)
             if len(boxes) == 1 and boxes[0] == (0, 0, sample.width, sample.height):
-                builder.add_copy(sample, split=sample.split)
+                provenance = {
+                    "crop": [0, 0, sample.width, sample.height],
+                    "scale": 1.0,
+                    "zoom": 1.0,
+                    "tile_mode": "grid",
+                }
+                if sample.annotations:
+                    builder.add_copy(sample, split=sample.split, provenance=provenance)
+                    positive_counts[sample.split] += 1
+                else:
+                    negatives[sample.split].append(
+                        (
+                            sample,
+                            boxes[0],
+                            sample.relative_path,
+                            provenance,
+                        )
+                    )
                 iterator.update(1)
                 continue
             with Image.open(sample.image_path) as opened:
@@ -165,28 +186,98 @@ def _tile_grid(
                             annotations=transformed,
                             provenance=provenance,
                         )
-                        positive_count += 1
+                        positive_counts[sample.split] += 1
                     else:
-                        negatives.append((sample, (left, top, right, bottom), rel, provenance))
+                        negatives[sample.split].append(
+                            (sample, (left, top, right, bottom), rel, provenance)
+                        )
                     iterator.update(1)
         iterator.close()
 
-        if negative_tiles == "all":
-            chosen_negatives = negatives
-        elif negative_tiles == "none":
-            chosen_negatives = []
-        elif isinstance(negative_tiles, (int, float)):
-            if float(negative_tiles) < 0:
-                raise ValueError("negative tile ratio must be non-negative")
-            count = min(len(negatives), int(round(positive_count * float(negative_tiles))))
-            chosen_negatives = random.Random(42).sample(negatives, count)
-        else:
-            raise ValueError("negative_tiles must be 'all', 'none', or a non-negative ratio")
+        chosen_negatives: list[
+            tuple[Sample, tuple[int, int, int, int], Path, dict[str, Any]]
+        ] = []
+        for split in sorted(selected):
+            candidates = negatives[split]
+            if negative_tiles == "all":
+                chosen = candidates
+            elif negative_tiles == "none":
+                chosen = []
+            elif isinstance(negative_tiles, (int, float)):
+                ratio = float(negative_tiles)
+                if not 0 <= ratio < 1:
+                    raise ValueError("numeric negative_tiles must be in [0, 1)")
+                count = _background_images_for_ratio(
+                    positive_counts[split],
+                    ratio,
+                )
+                if count > len(candidates):
+                    raise DatasetValidationError(
+                        ValidationIssue(
+                            "Grid tiling cannot satisfy the requested final background fraction",
+                            source=split,
+                            value={
+                                "positive_output_images": positive_counts[split],
+                                "available_background_windows": len(candidates),
+                                "requested_background_images": count,
+                                "negative_tiles": ratio,
+                            },
+                            expected="enough empty grid windows to reach the requested final fraction",
+                            suggestion="lower negative_tiles, use negative_tiles='all', or provide more background images",
+                        )
+                    )
+                chosen = (
+                    candidates
+                    if count == len(candidates)
+                    else random.Random(f"42:{split}").sample(candidates, count)
+                )
+            else:
+                raise ValueError(
+                    "negative_tiles must be 'all', 'none', or a final background fraction in [0, 1)"
+                )
+            chosen_negatives.extend(chosen)
         for sample, crop, rel, provenance in chosen_negatives:
             with Image.open(sample.image_path) as opened:
                 image = ImageOps.exif_transpose(opened).convert("RGB").crop(crop)
             builder.add_image(sample, image, split=sample.split, relative_path=rel, annotations=[], provenance=provenance)
+        _write_tiling_class_counts(
+            builder,
+            samples,
+            dataset._metadata.names,
+            visualize=visualize,
+        )
         if visualize:
+            boxes_by_source = {
+                str(sample.image_path): (
+                    []
+                    if (
+                        boxes := grid_boxes(
+                            sample.width,
+                            sample.height,
+                            tile_size,
+                            overlap,
+                        )
+                    )
+                    == [(0, 0, sample.width, sample.height)]
+                    else boxes
+                )
+                for sample in samples
+            }
+            preview_items = _select_tiling_preview_items(
+                samples,
+                boxes_by_source,
+                {record["parent_image"] for record in builder.records},
+                small_limit=tile_size,
+            )
+            if preview_items:
+                preview = save_tiling_preview(
+                    preview_items,
+                    dataset.task,
+                    dataset._metadata,
+                    builder.reports_dir / "grid_preview.jpg",
+                    mode="grid",
+                )
+                builder.visuals.append(str(preview.relative_to(builder.staging)))
             _save_staging_contact_sheet(builder, dataset.task, "reports/grid_tiles_audit.jpg")
         return _publish(builder, progress=progress, validate_output=validate_output)
     except Exception:
@@ -349,25 +440,8 @@ def _tile_coverage(
     )
     rng = random.Random(int(cfg["seed"]))
     builder = _builder(dataset, destination, name, "tile-coverage", cfg)
+    _clear_inherited_tiling_reports(builder)
     try:
-        if visualize and samples:
-            preview_sample = max(samples, key=lambda s: s.width * s.height)
-            preview_boxes = []
-            if preview_sample.annotations:
-                first = preview_sample.annotations[0]
-                candidate = _make_crop_containing(
-                    first,
-                    preview_sample.width,
-                    preview_sample.height,
-                    dataset.task,
-                    cfg,
-                    rng,
-                )
-                if candidate:
-                    preview_boxes.append(candidate)
-            preview = save_grid_preview(preview_sample, preview_boxes, builder.reports_dir / "coverage_preview.jpg")
-            builder.visuals.append(str(preview.relative_to(builder.staging)))
-            print(f"Coverage sanity preview: {preview}")
         _print_start(builder, samples, cfg)
         if dry_run:
             builder.cleanup()
@@ -378,6 +452,8 @@ def _tile_coverage(
         class_totals: dict[tuple[str, int], Counter] = defaultdict(Counter)
         split_summary: dict[str, Counter] = defaultdict(Counter)
         records: list[dict[str, Any]] = []
+        small_backgrounds: dict[str, list[Sample]] = defaultdict(list)
+        small_preview_sources: list[Sample] = []
         iterator = tqdm(samples, desc="Coverage tiling", unit="image", disable=not progress)
         for sample in iterator:
             if max(sample.width, sample.height) <= int(cfg["large_image_threshold"]):
@@ -385,19 +461,31 @@ def _tile_coverage(
                     _coverage_small_annotation(annotation, dataset.task, cfg)
                     for annotation in sample.annotations
                 ]
+                targets = {idx: 1 for idx in range(len(sample.annotations))}
+                counts = {idx: 1 for idx in range(len(sample.annotations))}
+                _append_coverage_rows(sample, targets, counts, False, coverage_rows, image_rows, class_totals, cfg)
+                if not annotations:
+                    small_backgrounds[sample.split].append(sample)
+                    split_summary[sample.split]["candidate_background_source_images"] += 1
+                    continue
                 with Image.open(sample.image_path) as opened:
                     image = ImageOps.exif_transpose(opened).convert("RGB")
                     rel = sample.relative_path.with_suffix(".jpg")
                     builder.add_image(sample, image, split=sample.split, relative_path=rel, annotations=annotations, jpeg_quality=int(cfg["jpeg_quality"]))
-                targets = {idx: 1 for idx in range(len(sample.annotations))}
-                counts = {idx: 1 for idx in range(len(sample.annotations))}
-                _append_coverage_rows(sample, targets, counts, False, coverage_rows, image_rows, class_totals, cfg)
-                split_summary[sample.split].update(total_output_images=1, copied_small_images=1)
-                split_summary[sample.split]["positive_output_images" if annotations else "empty_output_images"] += 1
+                small_preview_sources.append(sample)
+                split_summary[sample.split].update(
+                    total_output_images=1,
+                    copied_small_images=1,
+                    positive_output_images=1,
+                )
                 iterator.set_postfix(produced=len(builder.records), refresh=False)
                 continue
 
             targets = _coverage_targets(sample, cfg)
+            coverage_types = {
+                idx: _coverage_type(sample, idx, cfg)
+                for idx in range(len(sample.annotations))
+            }
             generated: list[dict[str, Any]] = []
             attempts = 0
             max_attempts = max(1, sum(targets.values()) * int(cfg["max_attempts_per_target"]))
@@ -486,8 +574,11 @@ def _tile_coverage(
             record = {
                 "sample": sample,
                 "targets": targets,
+                "coverage_types": coverage_types,
                 "counts": dict(counts),
+                "tile_boxes": [tile["box"] for tile in generated],
                 "background_boxes": [],
+                "background_box_origins": [],
                 "next_tile_idx": len(generated),
             }
             records.append(record)
@@ -500,20 +591,193 @@ def _tile_coverage(
                 )
 
         for split in selected:
+            positive_count = int(split_summary[split]["positive_output_images"])
+            desired = _background_images_for_ratio(
+                positive_count,
+                float(cfg["background_ratio"]),
+            )
+            candidates = small_backgrounds[split]
             split_records = [r for r in records if r["sample"].split == split]
-            desired = int(round(split_summary[split]["positive_output_images"] * float(cfg["background_ratio"])))
-            allocated = _allocate_backgrounds(split_records, desired, dataset.task, cfg, rng)
-            split_summary[split]["target_empty_images_from_file_ratio"] = desired
-            split_summary[split]["missed_empty_images_from_file_ratio"] = max(0, desired - allocated)
-            if allocated < desired:
+            empty_source_records = [
+                record for record in split_records if not record["sample"].annotations
+            ]
+            populated_records = [
+                record for record in split_records if record["sample"].annotations
+            ]
+
+            # Reserve half of the final background-image target for each source
+            # type. For odd totals, wholly empty sources receive the extra image.
+            target_from_empty_sources = (desired + 1) // 2
+            target_from_populated_space = desired // 2
+            kept_sources: list[Sample] = []
+            unused_source_candidates = list(candidates)
+
+            def take_empty_source_images(count: int) -> int:
+                if count <= 0 or not unused_source_candidates:
+                    return 0
+                selected_count = min(count, len(unused_source_candidates))
+                selected = (
+                    list(unused_source_candidates)
+                    if selected_count == len(unused_source_candidates)
+                    else rng.sample(unused_source_candidates, selected_count)
+                )
+                selected_paths = {str(sample.image_path) for sample in selected}
+                unused_source_candidates[:] = [
+                    sample
+                    for sample in unused_source_candidates
+                    if str(sample.image_path) not in selected_paths
+                ]
+                kept_sources.extend(selected)
+                return selected_count
+
+            empty_source_count = take_empty_source_images(target_from_empty_sources)
+            empty_source_count += _allocate_backgrounds(
+                empty_source_records,
+                target_from_empty_sources - empty_source_count,
+                dataset.task,
+                cfg,
+                rng,
+                origin="empty_source_image",
+            )
+            populated_space_count = _allocate_backgrounds(
+                populated_records,
+                target_from_populated_space,
+                dataset.task,
+                cfg,
+                rng,
+                origin="populated_image_empty_space",
+            )
+
+            fallback_reasons: list[str] = []
+            if empty_source_count < target_from_empty_sources:
+                fallback_reasons.append(
+                    "wholly empty source images could not supply their equal share"
+                )
+            if populated_space_count < target_from_populated_space:
+                fallback_reasons.append(
+                    "populated images did not provide enough object-free crop locations"
+                )
+
+            # Preserve the overall fraction even if one source type cannot meet
+            # its half by cross-filling from any remaining candidate pool.
+            remaining = desired - empty_source_count - populated_space_count
+            if remaining > 0:
+                added = take_empty_source_images(remaining)
+                empty_source_count += added
+                remaining -= added
+            if remaining > 0:
+                added = _allocate_backgrounds(
+                    empty_source_records,
+                    remaining,
+                    dataset.task,
+                    cfg,
+                    rng,
+                    origin="empty_source_image",
+                )
+                empty_source_count += added
+                remaining -= added
+            if remaining > 0:
+                added = _allocate_backgrounds(
+                    populated_records,
+                    remaining,
+                    dataset.task,
+                    cfg,
+                    rng,
+                    origin="populated_image_empty_space",
+                )
+                populated_space_count += added
+                remaining -= added
+
+            for sample in kept_sources:
+                with Image.open(sample.image_path) as opened:
+                    image = ImageOps.exif_transpose(opened).convert("RGB")
+                    rel = sample.relative_path.with_suffix(".jpg")
+                    builder.add_image(
+                        sample,
+                        image,
+                        split=split,
+                        relative_path=rel,
+                        annotations=[],
+                        provenance={
+                            "tile_mode": "coverage-background-copy",
+                            "background_source": "empty_source_image",
+                            "zoom": 1.0,
+                            "scale": 1.0,
+                        },
+                        jpeg_quality=int(cfg["jpeg_quality"]),
+                    )
+                split_summary[split].update(
+                    total_output_images=1,
+                    empty_output_images=1,
+                    copied_small_images=1,
+                    copied_background_images=1,
+                )
+                small_preview_sources.append(sample)
+
+            actual = empty_source_count + populated_space_count
+            balanced = (
+                empty_source_count == target_from_empty_sources
+                and populated_space_count == target_from_populated_space
+            )
+            split_summary[split].update(
+                target_background_images=desired,
+                actual_background_images=actual,
+                target_background_from_empty_source_images=target_from_empty_sources,
+                target_background_from_populated_image_space=target_from_populated_space,
+                background_from_empty_source_images=empty_source_count,
+                background_from_populated_image_space=populated_space_count,
+                background_source_balance_fallback_images=(
+                    abs(empty_source_count - target_from_empty_sources)
+                    if actual == desired
+                    else 0
+                ),
+                candidate_empty_source_images=len(candidates) + len(empty_source_records),
+                candidate_populated_source_images=len(populated_records),
+                dropped_background_source_images=len(candidates) - len(kept_sources),
+                missed_background_images=max(0, desired - actual),
+            )
+            if actual == desired and not balanced:
                 builder.warnings.append(
-                    f"{split}: allocated {allocated}/{desired} requested object-free background tiles"
+                    f"{split}: reached the requested {float(cfg['background_ratio']):.1%} "
+                    "background fraction, but could not use an equal mix of wholly empty "
+                    "source images and empty regions from populated images: "
+                    + "; ".join(fallback_reasons)
+                )
+            if actual < desired:
+                raise DatasetValidationError(
+                    ValidationIssue(
+                        "Coverage tiling cannot satisfy the requested final background fraction",
+                        source=split,
+                        value={
+                            "positive_output_images": positive_count,
+                            "produced_background_images": actual,
+                            "requested_background_images": desired,
+                            "background_ratio": float(cfg["background_ratio"]),
+                            "requested_from_empty_source_images": target_from_empty_sources,
+                            "produced_from_empty_source_images": empty_source_count,
+                            "available_small_empty_source_images": len(candidates),
+                            "large_empty_source_images": len(empty_source_records),
+                            "requested_from_populated_image_space": target_from_populated_space,
+                            "produced_from_populated_image_space": populated_space_count,
+                            "populated_source_images": len(populated_records),
+                            "reason": "; ".join(fallback_reasons)
+                            or "all background candidate pools were exhausted",
+                        },
+                        expected="enough object-free source images or crop locations to reach the requested final fraction",
+                        suggestion=(
+                            "lower background_ratio, raise max_background_attempts_per_tile or "
+                            "max_tiles_per_source_image, or provide more background imagery"
+                        ),
+                    )
                 )
             for record in split_records:
                 sample = record["sample"]
                 with Image.open(sample.image_path) as opened:
                     source = ImageOps.exif_transpose(opened).convert("RGB")
-                    for crop in record["background_boxes"]:
+                    for crop, origin in zip(
+                        record["background_boxes"],
+                        record["background_box_origins"],
+                    ):
                         crop_image = source.crop(crop)
                         if crop_image.size != (tile_size, tile_size):
                             crop_image = crop_image.resize((tile_size, tile_size), Image.Resampling.BILINEAR)
@@ -528,7 +792,8 @@ def _tile_coverage(
                             provenance={
                                 "crop": list(crop),
                                 "tile_index": index,
-                                "tile_mode": "coverage-background",
+                                "tile_mode": f"coverage-background-{origin}",
+                                "background_source": origin,
                                 "zoom": tile_size / (crop[2] - crop[0]),
                                 "scale": tile_size / (crop[2] - crop[0]),
                             },
@@ -536,15 +801,60 @@ def _tile_coverage(
                         )
                         record["next_tile_idx"] += 1
                         split_summary[split].update(total_output_images=1, empty_output_images=1, tiled_output_images=1, empty_tiled_images=1)
-                if visualize:
+                if visualize and (sample.annotations or record["background_boxes"]):
                     output = builder.staging / "coverage_summary" / "annotated_originals" / split / f"{sample.image_path.stem}_coverage.jpg"
                     save_coverage_annotated_original(
-                        sample, record["counts"], record["targets"], record["background_boxes"], output, cfg
+                        sample,
+                        record["counts"],
+                        record["targets"],
+                        record["coverage_types"],
+                        record["background_boxes"],
+                        output,
+                        cfg,
                     )
                     builder.visuals.append(str(output.relative_to(builder.staging)))
 
-        _write_coverage_reports(builder.staging / "coverage_summary", coverage_rows, image_rows, class_totals, split_summary, selected)
+        _write_coverage_reports(
+            builder.staging / "coverage_summary",
+            coverage_rows,
+            image_rows,
+            class_totals,
+            split_summary,
+            selected,
+            background_ratio=float(cfg["background_ratio"]),
+        )
+        _write_tiling_class_counts(
+            builder,
+            samples,
+            dataset._metadata.names,
+            visualize=visualize,
+        )
         if visualize:
+            boxes_by_source = {
+                str(record["sample"].image_path): [
+                    *record["tile_boxes"],
+                    *record["background_boxes"],
+                ]
+                for record in records
+            }
+            boxes_by_source.update(
+                {str(sample.image_path): [] for sample in small_preview_sources}
+            )
+            preview_items = _select_tiling_preview_items(
+                samples,
+                boxes_by_source,
+                {record["parent_image"] for record in builder.records},
+                small_limit=int(cfg["large_image_threshold"]),
+            )
+            if preview_items:
+                preview = save_tiling_preview(
+                    preview_items,
+                    dataset.task,
+                    dataset._metadata,
+                    builder.reports_dir / "coverage_preview.jpg",
+                    mode="coverage",
+                )
+                builder.visuals.append(str(preview.relative_to(builder.staging)))
             _save_staging_contact_sheet(builder, dataset.task, "coverage_summary/random_tile_contact_sheet.jpg")
         return _publish(builder, progress=progress, validate_output=validate_output)
     except Exception:
@@ -554,31 +864,49 @@ def _tile_coverage(
 
 def _coverage_targets(sample: Sample, cfg: dict[str, Any]) -> dict[int, int]:
     targets: dict[int, int] = {}
-    radius = float(cfg["dense_neighbor_radius_px"])
-    overrides = cfg["object_appearance_overrides"]
-    for i, annotation in enumerate(sample.annotations):
-        override = overrides.get(annotation.source_id)
-        if override is None and annotation.source_id is not None:
-            override = overrides.get(str(annotation.source_id))
+    for index, annotation in enumerate(sample.annotations):
+        override = _coverage_override(annotation, cfg)
         if override is not None:
-            targets[i] = int(override)
+            targets[index] = override
             continue
-        anchor = _annotation_anchor(annotation)
-        nearby = sum(
-            j != i
-            and math.hypot(
-                anchor[0] - _annotation_anchor(other)[0],
-                anchor[1] - _annotation_anchor(other)[1],
-            )
-            <= radius
-            for j, other in enumerate(sample.annotations)
-        )
-        targets[i] = int(
-            cfg["target_appearances_per_object"]
-            if nearby >= int(cfg["min_nearby_objects_for_full_coverage"])
-            else cfg["sparse_appearances_per_object"]
+        targets[index] = int(
+            cfg[
+                "target_appearances_per_object"
+                if _coverage_type(sample, index, cfg) == "dense"
+                else "sparse_appearances_per_object"
+            ]
         )
     return targets
+
+
+def _coverage_override(annotation: Annotation, cfg: dict[str, Any]) -> int | None:
+    overrides = cfg["object_appearance_overrides"]
+    override = overrides.get(annotation.source_id)
+    if override is None and annotation.source_id is not None:
+        override = overrides.get(str(annotation.source_id))
+    return int(override) if override is not None else None
+
+
+def _coverage_type(sample: Sample, index: int, cfg: dict[str, Any]) -> str:
+    annotation = sample.annotations[index]
+    if _coverage_override(annotation, cfg) is not None:
+        return "override"
+    anchor = _annotation_anchor(annotation)
+    radius = float(cfg["dense_neighbor_radius_px"])
+    nearby = sum(
+        other_index != index
+        and math.hypot(
+            anchor[0] - _annotation_anchor(other)[0],
+            anchor[1] - _annotation_anchor(other)[1],
+        )
+        <= radius
+        for other_index, other in enumerate(sample.annotations)
+    )
+    return (
+        "dense"
+        if nearby >= int(cfg["min_nearby_objects_for_full_coverage"])
+        else "sparse"
+    )
 
 
 def _annotation_anchor(annotation: Annotation) -> tuple[float, float]:
@@ -687,6 +1015,8 @@ def _allocate_backgrounds(
     task: Task,
     cfg: dict[str, Any],
     rng: random.Random,
+    *,
+    origin: str,
 ) -> int:
     allocated = 0
     cap = cfg["max_tiles_per_source_image"]
@@ -704,8 +1034,25 @@ def _allocate_backgrounds(
         if any(_boxes_intersect(crop, existing) for existing in record["background_boxes"]):
             continue
         record["background_boxes"].append(crop)
+        record["background_box_origins"].append(origin)
         allocated += 1
     return allocated
+
+
+def _background_images_for_ratio(positive_images: int, background_ratio: float) -> int:
+    """Return the nearest background count for a final output fraction."""
+
+    if positive_images <= 0 or background_ratio <= 0:
+        return 0
+    exact = positive_images * background_ratio / (1.0 - background_ratio)
+    candidates = {int(math.floor(exact)), int(math.ceil(exact))}
+    return min(
+        candidates,
+        key=lambda count: (
+            abs(count / (positive_images + count) - background_ratio),
+            count,
+        ),
+    )
 
 
 def _append_coverage_rows(
@@ -721,9 +1068,7 @@ def _append_coverage_rows(
     for idx, annotation in enumerate(sample.annotations):
         count, target = int(counts.get(idx, 0)), targets[idx]
         anchor = _annotation_anchor(annotation)
-        override = cfg["object_appearance_overrides"].get(annotation.source_id)
-        if override is None and annotation.source_id is not None:
-            override = cfg["object_appearance_overrides"].get(str(annotation.source_id))
+        coverage_type = _coverage_type(sample, idx, cfg)
         coverage_rows.append(
             {
                 "split": sample.split,
@@ -740,13 +1085,7 @@ def _append_coverage_rows(
                 "source_image_width": sample.width,
                 "source_image_height": sample.height,
                 "is_large_image": is_large,
-                "coverage_type": (
-                    "override"
-                    if override is not None
-                    else "dense"
-                    if target == cfg["target_appearances_per_object"]
-                    else "sparse"
-                ),
+                "coverage_type": coverage_type,
             }
         )
         totals = class_totals[(sample.split, annotation.class_id)]
@@ -754,14 +1093,22 @@ def _append_coverage_rows(
     total = len(sample.annotations)
     hit = sum(counts.get(i, 0) >= 1 for i in range(total))
     requested, actual = sum(targets.values()), sum(counts.get(i, 0) for i in range(total))
-    dense = sum(v == cfg["target_appearances_per_object"] for v in targets.values())
+    dense = sum(
+        _coverage_type(sample, index, cfg) == "dense"
+        for index in range(total)
+    )
+    overrides = sum(
+        _coverage_type(sample, index, cfg) == "override"
+        for index in range(total)
+    )
     image_rows.append(
         {
             "split": sample.split,
             "image": sample.image_path.name,
             "total_labels": total,
             "dense_labels": dense,
-            "sparse_labels": total - dense,
+            "sparse_labels": total - dense - overrides,
+            "override_labels": overrides,
             "labels_covered_at_least_once": hit,
             "labels_never_covered": total - hit,
             "percent_labels_covered_at_least_once": 100 * hit / total if total else 0,
@@ -791,6 +1138,8 @@ def _write_coverage_reports(
     class_totals: dict[tuple[str, int], Counter],
     split_summary: dict[str, Counter],
     splits: set[str],
+    *,
+    background_ratio: float,
 ) -> None:
     _write_csv(root / "label_coverage.csv", coverage_rows)
     aggregate_image_rows = list(image_rows)
@@ -807,6 +1156,7 @@ def _write_coverage_reports(
                 "total_labels": total_labels,
                 "dense_labels": sum(row["dense_labels"] for row in selected_rows),
                 "sparse_labels": sum(row["sparse_labels"] for row in selected_rows),
+                "override_labels": sum(row["override_labels"] for row in selected_rows),
                 "labels_covered_at_least_once": hit,
                 "labels_never_covered": total_labels - hit,
                 "percent_labels_covered_at_least_once": 100 * hit / total_labels if total_labels else 0,
@@ -851,9 +1201,253 @@ def _write_coverage_reports(
         )
     _write_csv(root / "class_coverage_summary.csv", class_rows)
     keys = sorted({key for summary in split_summary.values() for key in summary})
-    tile_rows = [{"split": split, **{key: split_summary[split][key] for key in keys}} for split in sorted(splits)]
-    tile_rows.append({"split": "all", **{key: sum(split_summary[s][key] for s in splits) for key in keys}})
+
+    def tile_row(split: str, summary: Counter) -> dict[str, Any]:
+        total = summary["total_output_images"]
+        return {
+            "split": split,
+            **{key: summary[key] for key in keys},
+            "background_fraction": summary["empty_output_images"] / total if total else 0.0,
+        }
+
+    tile_rows = [tile_row(split, split_summary[split]) for split in sorted(splits)]
+    combined = Counter()
+    for split in splits:
+        combined.update(split_summary[split])
+    tile_rows.append(tile_row("all", combined))
     _write_csv(root / "tile_summary.csv", tile_rows)
+
+    sampling_payload: dict[str, Any] = {
+        "definition": (
+            "background_ratio is the fraction of output images with no annotations; "
+            "class annotation instances are not part of this calculation"
+        ),
+        "requested_background_fraction": background_ratio,
+        "target_formula": (
+            "nearest whole number to "
+            "positive_output_images * background_ratio / (1 - background_ratio)"
+        ),
+        "source_policy": (
+            "target an equal mix of wholly empty source images and object-free "
+            "regions cropped from populated images, then cross-fill if one source is insufficient"
+        ),
+        "splits": {},
+    }
+    summaries = {
+        **{split: split_summary[split] for split in sorted(splits)},
+        "all": combined,
+    }
+    for split, summary in summaries.items():
+        total = int(summary["total_output_images"])
+        target = int(summary["target_background_images"])
+        actual = int(summary["actual_background_images"])
+        target_empty = int(summary["target_background_from_empty_source_images"])
+        target_populated = int(summary["target_background_from_populated_image_space"])
+        actual_empty = int(summary["background_from_empty_source_images"])
+        actual_populated = int(summary["background_from_populated_image_space"])
+        if actual < target:
+            status = "target missed"
+            reason = (
+                "candidate pools were exhausted; inspect missed_background_images "
+                "and the candidate-source counts"
+            )
+        elif actual_empty == target_empty and actual_populated == target_populated:
+            status = "target and equal source mix met"
+            reason = None
+        else:
+            status = "overall target met with source fallback"
+            deficient = []
+            if actual_empty < target_empty:
+                deficient.append("wholly empty source images")
+            if actual_populated < target_populated:
+                deficient.append("object-free regions in populated images")
+            reason = f"insufficient candidates from {', '.join(deficient)}"
+        sampling_payload["splits"][split] = {
+            "status": status,
+            "reason": reason,
+            "positive_output_images": int(summary["positive_output_images"]),
+            "target_background_images": target,
+            "actual_background_images": actual,
+            "total_output_images": total,
+            "actual_background_fraction": actual / total if total else 0.0,
+            "target_from_empty_source_images": target_empty,
+            "actual_from_empty_source_images": actual_empty,
+            "candidate_empty_source_images": int(summary["candidate_empty_source_images"]),
+            "target_from_populated_image_space": target_populated,
+            "actual_from_populated_image_space": actual_populated,
+            "candidate_populated_source_images": int(summary["candidate_populated_source_images"]),
+        }
+    (root / "background_sampling.json").write_text(
+        json.dumps(sampling_payload, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _write_tiling_class_counts(
+    builder: Any,
+    before_samples: list[Sample],
+    names: dict[int, str],
+    *,
+    visualize: bool,
+) -> None:
+    before_counts = Counter(
+        annotation.class_id
+        for sample in before_samples
+        for annotation in sample.annotations
+    )
+    after_counts = Counter(
+        annotation.class_id
+        for sample in builder.output_samples
+        for annotation in sample.annotations
+    )
+    before_background = sum(not sample.annotations for sample in before_samples)
+    after_background = sum(not sample.annotations for sample in builder.output_samples)
+    before_annotated = len(before_samples) - before_background
+    after_annotated = len(builder.output_samples) - after_background
+    named = {str(class_id): class_name for class_id, class_name in sorted(names.items())}
+    payload = {
+        "definition": (
+            "annotation_counts count annotation instances; image_composition counts images. "
+            "Only image_composition is used to calculate a tiling background fraction"
+        ),
+        "operation": builder.operation,
+        "annotation_counts": {
+            "before": {
+                str(class_id): before_counts.get(class_id, 0)
+                for class_id in sorted(names)
+            },
+            "after": {
+                str(class_id): after_counts.get(class_id, 0)
+                for class_id in sorted(names)
+            },
+            "names": named,
+        },
+        "image_composition": {
+            "before": {
+                "annotated": before_annotated,
+                "background": before_background,
+                "total": len(before_samples),
+                "background_fraction": (
+                    before_background / len(before_samples) if before_samples else 0.0
+                ),
+            },
+            "after": {
+                "annotated": after_annotated,
+                "background": after_background,
+                "total": len(builder.output_samples),
+                "background_fraction": (
+                    after_background / len(builder.output_samples)
+                    if builder.output_samples
+                    else 0.0
+                ),
+            },
+        },
+        # Kept for report compatibility. These mixed-unit fields are deprecated;
+        # new consumers should use the two explicitly named sections above.
+        "before": {
+            **{str(class_id): before_counts.get(class_id, 0) for class_id in sorted(names)},
+            "background": before_background,
+        },
+        "after": {
+            **{str(class_id): after_counts.get(class_id, 0) for class_id in sorted(names)},
+            "background": after_background,
+        },
+        "names_before": {**named, "background": "background"},
+        "names_after": {**named, "background": "background"},
+    }
+    (builder.reports_dir / "class_counts.json").write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+    )
+    if visualize:
+        before_named = {
+            class_name: before_counts.get(class_id, 0)
+            for class_id, class_name in sorted(names.items())
+        }
+        after_named = {
+            class_name: after_counts.get(class_id, 0)
+            for class_id, class_name in sorted(names.items())
+        }
+        output = save_tiling_count_summary(
+            before_named,
+            after_named,
+            {
+                "before": {
+                    "annotated": before_annotated,
+                    "background": before_background,
+                },
+                "after": {
+                    "annotated": after_annotated,
+                    "background": after_background,
+                },
+            },
+            builder.reports_dir / "class_counts.jpg",
+        )
+        builder.visuals.append(str(output.relative_to(builder.staging)))
+
+
+def _select_tiling_preview_items(
+    samples: list[Sample],
+    boxes_by_source: dict[str, list[tuple[int, int, int, int]]],
+    kept_parent_paths: set[str],
+    *,
+    small_limit: int,
+) -> list[tuple[Sample, list[tuple[int, int, int, int]], str]]:
+    """Select one pass-through source and three genuinely cropped sources."""
+
+    available = [
+        sample
+        for sample in samples
+        if str(sample.image_path) in kept_parent_paths
+    ]
+    small = sorted(
+        (
+            sample
+            for sample in available
+            if max(sample.width, sample.height) <= small_limit
+            and not boxes_by_source.get(str(sample.image_path))
+        ),
+        key=lambda sample: (
+            -bool(sample.annotations),
+            -(sample.width * sample.height),
+            str(sample.relative_path),
+        ),
+    )
+    tiled = sorted(
+        (
+            sample
+            for sample in available
+            if boxes_by_source.get(str(sample.image_path))
+            and not (
+                len(boxes_by_source[str(sample.image_path)]) == 1
+                and boxes_by_source[str(sample.image_path)][0]
+                == (0, 0, sample.width, sample.height)
+            )
+        ),
+        key=lambda sample: (
+            -bool(sample.annotations),
+            -len(boxes_by_source[str(sample.image_path)]),
+            -(sample.width * sample.height),
+            str(sample.relative_path),
+        ),
+    )
+    output: list[tuple[Sample, list[tuple[int, int, int, int]], str]] = []
+    if small:
+        output.append((small[0], [], "Small image copied unchanged"))
+    tiled_limit = 3 if output else 4
+    for sample in tiled[:tiled_limit]:
+        boxes = boxes_by_source[str(sample.image_path)]
+        output.append((sample, boxes, f"Tiled source · {len(boxes)} crop windows"))
+    return output
+
+
+def _clear_inherited_tiling_reports(builder: Any) -> None:
+    """Hide class counts from an earlier operation until tiling replaces them."""
+
+    for filename in ("class_counts.json", "class_counts.jpg"):
+        inherited = builder.reports_dir / filename
+        if inherited.exists():
+            inherited.unlink()
 
 
 def _validate_coverage_settings(cfg: dict[str, Any]) -> None:
@@ -883,8 +1477,8 @@ def _validate_coverage_settings(cfg: dict[str, Any]) -> None:
         raise ValueError("large_image_threshold must be non-negative or None")
     if cfg["max_tiles_per_source_image"] is not None and int(cfg["max_tiles_per_source_image"]) <= 0:
         raise ValueError("max_tiles_per_source_image must be positive or None")
-    if not 0 <= float(cfg["background_ratio"]) <= 1:
-        raise ValueError("background_ratio must be in [0, 1]")
+    if not 0 <= float(cfg["background_ratio"]) < 1:
+        raise ValueError("background_ratio must be in [0, 1)")
     if not 0 <= float(cfg["min_area_ratio"]) <= 1:
         raise ValueError("min_area_ratio must be in [0, 1]")
     if not 1 <= int(cfg["jpeg_quality"]) <= 100:

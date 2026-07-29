@@ -12,6 +12,13 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from .models import Annotation, DatasetMetadata, Sample, Task
 
 SPLIT_COLORS = {"train": "#2ca02c", "val": "#ff7f0e", "test": "#1f77b4"}
+ANNOTATION_COLORS = (
+    "#ff00ff",  # magenta
+    "#7fff00",  # chartreuse
+    "#ff5f00",  # vivid orange
+    "#ffff00",  # yellow
+    "#ff1493",  # deep pink
+)
 
 
 def visualize_samples(
@@ -51,16 +58,65 @@ def _draw_sample(ax, sample: Sample, task: Task, metadata: DatasetMetadata) -> N
     with Image.open(sample.image_path) as opened:
         image = ImageOps.exif_transpose(opened).convert("RGB")
         ax.imshow(image)
-    colors = plt.cm.tab20.colors
     for annotation in sample.annotations:
-        color = colors[annotation.class_id % len(colors)]
+        color = ANNOTATION_COLORS[annotation.class_id % len(ANNOTATION_COLORS)]
         name = metadata.names.get(annotation.class_id, str(annotation.class_id))
         if annotation.bbox is not None and task in {Task.DETECT, Task.POSE}:
             x1, y1, x2, y2 = annotation.bbox
-            ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False, edgecolor=color, linewidth=1.5))
+            ax.add_patch(
+                patches.Rectangle(
+                    (x1, y1),
+                    x2 - x1,
+                    y2 - y1,
+                    fill=False,
+                    edgecolor="white",
+                    linewidth=3.5,
+                )
+            )
+            ax.add_patch(
+                patches.Rectangle(
+                    (x1, y1),
+                    x2 - x1,
+                    y2 - y1,
+                    fill=False,
+                    edgecolor=color,
+                    linewidth=1.8,
+                )
+            )
             ax.text(x1, max(0, y1 - 3), name, color="white", fontsize=7, bbox={"facecolor": color, "alpha": 0.8, "pad": 2})
         if annotation.polygon:
-            ax.add_patch(patches.Polygon(annotation.polygon, closed=True, fill=False, edgecolor=color, linewidth=1.5))
+            ax.add_patch(
+                patches.Polygon(
+                    annotation.polygon,
+                    closed=True,
+                    fill=False,
+                    edgecolor="white",
+                    linewidth=3.5,
+                )
+            )
+            ax.add_patch(
+                patches.Polygon(
+                    annotation.polygon,
+                    closed=True,
+                    fill=False,
+                    edgecolor=color,
+                    linewidth=1.8,
+                )
+            )
+            xs, ys = zip(*annotation.polygon)
+            left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+            for outline, line_width in (("white", 3.2), (color, 1.6)):
+                ax.add_patch(
+                    patches.Rectangle(
+                        (left, top),
+                        right - left,
+                        bottom - top,
+                        fill=False,
+                        edgecolor=outline,
+                        linewidth=line_width,
+                        linestyle="--",
+                    )
+                )
         if annotation.keypoints:
             names = metadata.kpt_names.get(annotation.class_id, [])
             skeleton_value = metadata.extra.get("skeleton", [])
@@ -95,20 +151,67 @@ def _draw_sample(ax, sample: Sample, task: Task, metadata: DatasetMetadata) -> N
     ax.axis("off")
 
 
-def save_split_preview(samples: list[Sample], assignments: dict[str, str], output: Path) -> Path:
-    chosen: list[Sample] = []
-    for split in ("train", "val", "test"):
-        match = next((s for s in samples if assignments.get(str(s.image_path)) == split), None)
-        if match:
-            chosen.append(match)
-    columns = max(1, len(chosen))
-    fig, axes = plt.subplots(1, columns, figsize=(6 * columns, 5), squeeze=False)
-    for ax, sample in zip(axes.flatten(), chosen):
-        with Image.open(sample.image_path) as opened:
-            ax.imshow(ImageOps.exif_transpose(opened))
-        target = assignments[str(sample.image_path)]
-        ax.set_title(f"{sample.relative_path}\n→ {target}", color=SPLIT_COLORS[target])
+def save_split_preview(
+    samples: list[Sample],
+    assignments: dict[str, str],
+    group_lookup: dict[str, str],
+    task: Task,
+    metadata: DatasetMetadata,
+    output: Path,
+) -> Path:
+    splits = [split for split in ("train", "val", "test") if split in assignments.values()]
+    chosen: list[tuple[str, Sample]] = []
+    for split in splits:
+        candidates = sorted(
+            (
+                sample
+                for sample in samples
+                if assignments.get(str(sample.image_path)) == split
+            ),
+            key=lambda sample: (
+                -bool(sample.annotations),
+                group_lookup.get(str(sample.image_path), ""),
+                str(sample.relative_path),
+            ),
+        )
+        seen_groups: set[str] = set()
+        selected: list[Sample] = []
+        for sample in candidates:
+            group = group_lookup.get(str(sample.image_path), str(sample.image_path))
+            if group in seen_groups:
+                continue
+            selected.append(sample)
+            seen_groups.add(group)
+            if len(selected) == 2:
+                break
+        if len(selected) < 2:
+            remaining = [sample for sample in candidates if sample not in selected]
+            selected.extend(remaining[: 2 - len(selected)])
+        chosen.extend((split, sample) for sample in selected)
+
+    columns = 2
+    rows = max(1, len(splits))
+    fig, axes = plt.subplots(rows, columns, figsize=(12, 5 * rows), squeeze=False)
+    flat = axes.flatten()
+    for ax, (target, sample) in zip(flat, chosen):
+        _draw_sample(ax, sample, task, metadata)
+        group = group_lookup.get(str(sample.image_path), "ungrouped")
+        if len(group) > 70:
+            group = f"…{group[-69:]}"
+        ax.set_title(
+            f"{target.upper()} · group {group}\n"
+            f"{sample.relative_path} · {len(sample.annotations)} annotations",
+            color=SPLIT_COLORS[target],
+            fontsize=8,
+        )
+    for ax in flat[len(chosen) :]:
         ax.axis("off")
+    details = []
+    for split in splits:
+        paths = [path for path, target in assignments.items() if target == split]
+        groups = {group_lookup.get(path, path) for path in paths}
+        details.append(f"{split}: {len(paths)} images / {len(groups)} groups")
+    fig.suptitle("Split assignment audit — " + " · ".join(details), fontsize=13)
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(output, bbox_inches="tight", dpi=140)
@@ -170,23 +273,57 @@ def save_class_count_summary(
     return output
 
 
-def save_class_rename_summary(renamed: dict[int, dict[str, str]], output: Path) -> Path:
-    """Render a compact class-ID/name audit table."""
+def save_tiling_count_summary(
+    before_annotations: dict[str, int],
+    after_annotations: dict[str, int],
+    image_composition: dict[str, dict[str, int]],
+    output: Path,
+) -> Path:
+    """Plot annotation counts and image composition without mixing their units."""
 
-    rows = [[str(class_id), values["from"], values["to"]] for class_id, values in sorted(renamed.items())]
-    fig, ax = plt.subplots(figsize=(8, max(2.4, 0.55 * len(rows) + 1.4)))
-    ax.axis("off")
-    table = ax.table(
-        cellText=rows,
-        colLabels=["class ID", "old name", "new name"],
-        cellLoc="left",
-        colLoc="left",
-        loc="center",
+    labels = sorted(set(before_annotations) | set(after_annotations))
+    x = list(range(len(labels)))
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(max(11, len(labels) * 0.8 + 6), 4.5),
     )
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1, 1.35)
-    ax.set_title("Class renames (IDs and annotations unchanged)", pad=14)
+
+    axes[0].bar(
+        [value - 0.2 for value in x],
+        [before_annotations.get(label, 0) for label in labels],
+        width=0.4,
+        label="before",
+    )
+    axes[0].bar(
+        [value + 0.2 for value in x],
+        [after_annotations.get(label, 0) for label in labels],
+        width=0.4,
+        label="after",
+    )
+    axes[0].set_xticks(x, labels, rotation=30, ha="right")
+    axes[0].set_ylabel("annotation instances")
+    axes[0].set_title("Annotations by class")
+    axes[0].legend()
+
+    phases = ["before", "after"]
+    categories = ["annotated", "background"]
+    colors = {"annotated": "#4477AA", "background": "#CC6677"}
+    phase_x = list(range(len(phases)))
+    width = 0.36
+    for offset, category in zip((-width / 2, width / 2), categories):
+        axes[1].bar(
+            [value + offset for value in phase_x],
+            [image_composition[phase][category] for phase in phases],
+            width=width,
+            label=category,
+            color=colors[category],
+        )
+    axes[1].set_xticks(phase_x, phases)
+    axes[1].set_ylabel("images")
+    axes[1].set_title("Image composition used for background ratio")
+    axes[1].legend()
+
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(output, bbox_inches="tight", dpi=140)
@@ -251,19 +388,67 @@ def save_class_removal_preview(
     return output
 
 
-def save_grid_preview(sample: Sample, boxes: list[tuple[int, int, int, int]], output: Path) -> Path:
-    fig, ax = plt.subplots(figsize=(10, 8))
-    with Image.open(sample.image_path) as opened:
-        ax.imshow(ImageOps.exif_transpose(opened))
-    for idx, (left, top, right, bottom) in enumerate(boxes):
-        ax.add_patch(
-            patches.Rectangle(
-                (left, top), right - left, bottom - top, fill=False, edgecolor="#00d4ff", linewidth=1.2
+def save_tiling_preview(
+    items: list[tuple[Sample, list[tuple[int, int, int, int]], str]],
+    task: Task,
+    metadata: DatasetMetadata,
+    output: Path,
+    *,
+    mode: str,
+) -> Path:
+    """Show one small pass-through source and up to three tiled sources."""
+
+    columns = 2
+    rows = max(1, math.ceil(len(items) / columns))
+    fig, axes = plt.subplots(rows, columns, figsize=(14, 6 * rows), squeeze=False)
+    flat = axes.flatten()
+    for ax, (sample, boxes, status) in zip(flat, items):
+        _draw_sample(ax, sample, task, metadata)
+        for index, (left, top, right, bottom) in enumerate(boxes):
+            ax.add_patch(
+                patches.Rectangle(
+                    (left, top),
+                    right - left,
+                    bottom - top,
+                    fill=False,
+                    edgecolor="#00d4ff",
+                    linewidth=1.4,
+                )
             )
+            if len(boxes) <= 20:
+                ax.text(
+                    left + 3,
+                    top + 12,
+                    str(index),
+                    color="white",
+                    fontsize=7,
+                    bbox={"facecolor": "black", "alpha": 0.65, "pad": 1},
+                )
+        if not boxes:
+            ax.text(
+                0.02,
+                0.04,
+                "PASS-THROUGH · NO CROP",
+                transform=ax.transAxes,
+                color="white",
+                fontsize=9,
+                bbox={"facecolor": "#167c3a", "alpha": 0.9, "pad": 4},
+            )
+        ax.set_title(
+            f"{status} · {sample.split} · {sample.width}×{sample.height}\n"
+            f"{sample.relative_path} · {len(sample.annotations)} annotations",
+            fontsize=8,
         )
-        ax.text(left + 3, top + 12, str(idx), color="white", fontsize=7, bbox={"facecolor": "black", "alpha": 0.6})
-    ax.set_title(f"Grid tiling preview — {sample.relative_path} ({len(boxes)} tiles)")
-    ax.axis("off")
+    for ax in flat[len(items) :]:
+        ax.axis("off")
+    pass_through = sum(not boxes for _, boxes, _ in items)
+    tiled = len(items) - pass_through
+    fig.suptitle(
+        f"{mode.capitalize()} tiling preview — "
+        f"{pass_through} small pass-through source(s), {tiled} tiled source(s)\n"
+        "cyan rectangles = output crop windows",
+        fontsize=13,
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(output, bbox_inches="tight", dpi=140)
@@ -316,7 +501,23 @@ def _wrap_legend_lines(
 ) -> list[str]:
     wrapped: list[str] = []
     for line in lines:
-        words = line.split()
+        words: list[str] = []
+        for word in line.split():
+            bounds = draw.textbbox((0, 0), word, font=font)
+            if bounds[2] - bounds[0] <= max_width:
+                words.append(word)
+                continue
+            chunk = ""
+            for character in word:
+                candidate = f"{chunk}{character}"
+                chunk_bounds = draw.textbbox((0, 0), candidate, font=font)
+                if chunk and chunk_bounds[2] - chunk_bounds[0] > max_width:
+                    words.append(chunk)
+                    chunk = character
+                else:
+                    chunk = candidate
+            if chunk:
+                words.append(chunk)
         current = ""
         for word in words:
             candidate = f"{current} {word}".strip()
@@ -334,31 +535,48 @@ def save_coverage_annotated_original(
     sample: Sample,
     coverage_counts: dict[int, int],
     coverage_targets: dict[int, int],
+    coverage_types: dict[int, str],
     background_boxes: list[tuple[int, int, int, int]],
     output: Path,
     settings: dict[str, Any],
 ) -> Path:
     with Image.open(sample.image_path) as opened:
         annotated = ImageOps.exif_transpose(opened).convert("RGBA")
+    source_width, source_height = annotated.size
+    preview_scale = max(
+        1.0,
+        900.0 / max(1, source_width, source_height),
+    )
+    if preview_scale > 1:
+        annotated = annotated.resize(
+            (
+                int(round(source_width * preview_scale)),
+                int(round(source_height * preview_scale)),
+            ),
+            Image.Resampling.BILINEAR,
+        )
     overlay = Image.new("RGBA", annotated.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     width, height = annotated.size
     min_dim = min(width, height)
-    marker_radius = max(14, int(min_dim * 0.014))
+    marker_radius = max(12, min(40, int(min_dim * 0.022)))
     center_radius = max(4, int(marker_radius * 0.28))
-    line_width = max(4, int(min_dim * 0.0035))
+    line_width = max(3, min(10, int(min_dim * 0.005)))
     underlay = line_width + 4
-    font_size = max(18, int(min_dim * 0.015))
-    legend_size = max(18, int(min_dim * 0.016))
-    bg_size = max(16, int(min_dim * 0.012))
-    font, legend_font, bg_font = _font(font_size), _font(legend_size), _font(bg_size)
+    font_size = max(15, min(30, int(min_dim * 0.026)))
+    bg_size = max(14, min(26, int(min_dim * 0.022)))
+    font, bg_font = _font(font_size), _font(bg_size)
 
     cyan = (0, 190, 255)
     for index, box in enumerate(background_boxes):
-        left, top, right, bottom = box
-        draw.rectangle(box, fill=cyan + (35,))
-        draw.rectangle(box, outline=(255, 255, 255, 235), width=underlay)
-        draw.rectangle(box, outline=cyan + (230,), width=line_width)
+        left, top, right, bottom = (
+            int(round(value * preview_scale))
+            for value in box
+        )
+        display_box = (left, top, right, bottom)
+        draw.rectangle(display_box, fill=cyan + (35,))
+        draw.rectangle(display_box, outline=(255, 255, 255, 235), width=underlay)
+        draw.rectangle(display_box, outline=cyan + (230,), width=line_width)
         text = f"bg {index}"
         tx, ty = left + max(6, line_width * 2), top + max(6, line_width * 2)
         bounds = draw.textbbox((0, 0), text, font=bg_font)
@@ -367,6 +585,65 @@ def save_coverage_annotated_original(
         _text_box(draw, (tx, ty), text, bg_font, cyan + (230,), box_fill=(0, 0, 0, 135), pad=max(5, bg_size // 4))
 
     for label_idx, annotation in enumerate(sample.annotations):
+        geometry_color = (
+            (255, 0, 255),
+            (127, 255, 0),
+            (255, 95, 0),
+            (255, 255, 0),
+            (255, 20, 147),
+        )[annotation.class_id % len(ANNOTATION_COLORS)]
+        geometry_rgba = geometry_color + (235,)
+        if annotation.polygon:
+            polygon = [
+                (
+                    int(round(x * preview_scale)),
+                    int(round(y * preview_scale)),
+                )
+                for x, y in annotation.polygon
+            ]
+            if len(polygon) >= 3:
+                closed = [*polygon, polygon[0]]
+                draw.polygon(polygon, fill=geometry_color + (38,))
+                draw.line(
+                    closed,
+                    fill=(255, 255, 255, 245),
+                    width=underlay,
+                    joint="curve",
+                )
+                draw.line(
+                    closed,
+                    fill=geometry_rgba,
+                    width=line_width,
+                    joint="curve",
+                )
+                xs, ys = zip(*polygon)
+                bounds = (min(xs), min(ys), max(xs), max(ys))
+                draw.rectangle(
+                    bounds,
+                    outline=(255, 255, 255, 245),
+                    width=underlay,
+                )
+                draw.rectangle(
+                    bounds,
+                    outline=geometry_rgba,
+                    width=line_width,
+                )
+        elif annotation.bbox is not None:
+            bounds = tuple(
+                int(round(value * preview_scale))
+                for value in annotation.bbox
+            )
+            draw.rectangle(
+                bounds,
+                outline=(255, 255, 255, 245),
+                width=underlay,
+            )
+            draw.rectangle(
+                bounds,
+                outline=geometry_rgba,
+                width=line_width,
+            )
+
         if annotation.point is not None:
             anchor = annotation.point
         elif annotation.bbox is not None:
@@ -377,10 +654,14 @@ def save_coverage_annotated_original(
             anchor = (sum(xs) / len(xs), sum(ys) / len(ys))
         else:
             continue
-        x, y = map(lambda v: int(round(v)), anchor)
+        x, y = (
+            int(round(anchor[0] * preview_scale)),
+            int(round(anchor[1] * preview_scale)),
+        )
         x, y = min(max(x, 0), width - 1), min(max(y, 0), height - 1)
         count = coverage_counts.get(label_idx, 0)
         target = coverage_targets.get(label_idx, settings["target_appearances_per_object"])
+        coverage_type = coverage_types.get(label_idx, "sparse")
         color = coverage_color(100 * count / target if target else 0)
         rgba = color + (200,)
         marker = (x - marker_radius, y - marker_radius, x + marker_radius, y + marker_radius)
@@ -394,10 +675,20 @@ def save_coverage_annotated_original(
         inner = max(1, center_radius // 2)
         draw.ellipse((x - inner, y - inner, x + inner, y + inner), fill=rgba)
         configured_radius = settings["polo_radius_px"]
-        radius = int(configured_radius if configured_radius is not None else annotation.radius or 0)
+        radius = int(
+            round(
+                (configured_radius if configured_radius is not None else annotation.radius or 0)
+                * preview_scale
+            )
+        )
         if annotation.point is not None and radius >= 3:
             draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=color + (130,), width=max(2, line_width // 2))
-        text = f"{count}/{target}"
+        type_label = {
+            "dense": "D",
+            "sparse": "S",
+            "override": "O",
+        }.get(coverage_type, "?")
+        text = f"{type_label} {count}/{target}"
         bounds = draw.textbbox((0, 0), text, font=font)
         tw, th = bounds[2] - bounds[0], bounds[3] - bounds[1]
         tx, ty = x + marker_radius + 12, y - marker_radius - 6
@@ -409,49 +700,94 @@ def save_coverage_annotated_original(
         ty = min(max(ty, 8), max(8, height - th - 20))
         _text_box(draw, (tx, ty), text, font, rgba, box_fill=(0, 0, 0, 125), pad=max(6, font_size // 4))
 
-    dense = sum(
-        coverage_targets.get(i) == settings["target_appearances_per_object"]
+    dense = sum(value == "dense" for value in coverage_types.values())
+    sparse = sum(value == "sparse" for value in coverage_types.values())
+    overrides = sum(value == "override" for value in coverage_types.values())
+    hit = sum(coverage_counts.get(i, 0) >= 1 for i in range(len(sample.annotations)))
+    complete = sum(
+        coverage_counts.get(i, 0) >= coverage_targets.get(i, 1)
         for i in range(len(sample.annotations))
     )
-    sparse = len(sample.annotations) - dense
-    hit = sum(coverage_counts.get(i, 0) >= 1 for i in range(len(sample.annotations)))
     percent_hit = 100 * hit / len(sample.annotations) if sample.annotations else 0
     cap = settings["max_tiles_per_source_image"]
-    lines = [
-        f"{sample.split.upper()} coverage: {sample.image_path.stem}",
-        f"dense target: {settings['target_appearances_per_object']}, sparse target: {settings['sparse_appearances_per_object']}",
-        f"dense objects: {dense}, sparse objects: {sparse}",
-        f"objects hit at least once: {hit}/{len(sample.annotations)} ({percent_hit:.1f}%)",
-        f"background tiles: {len(background_boxes)}",
-        f"background ratio: {settings['background_ratio']}",
-        f"POLO radius override: {settings['polo_radius_px']}px",
-        f"dense radius: {settings['dense_neighbor_radius_px']}px, min neighbors: {settings['min_nearby_objects_for_full_coverage']}",
-        f"max total tiles/source: {cap if cap is not None else 'disabled'}",
-        "green=complete, yellow/orange=partial, red=low",
-        "cyan rectangles=background tiles",
-        "circle=train, square=val/test",
+    filename = sample.image_path.name
+    if len(filename) > 72:
+        filename = f"{filename[:35]}…{filename[-36:]}"
+    lines = [f"{sample.split.upper()} coverage | {filename}"]
+    if sample.annotations:
+        lines.extend(
+            [
+                (
+                    f"Objects: {len(sample.annotations)} | dense: {dense} × "
+                    f"{settings['target_appearances_per_object']} | sparse: {sparse} × "
+                    f"{settings['sparse_appearances_per_object']} | overrides: {overrides}"
+                ),
+                (
+                    f"Coverage: hit at least once {hit}/{len(sample.annotations)} "
+                    f"({percent_hit:.1f}%) | completed target {complete}/{len(sample.annotations)}"
+                ),
+                (
+                    f"Dense rule: at least {settings['min_nearby_objects_for_full_coverage']} "
+                    f"other objects within {settings['dense_neighbor_radius_px']:.0f}px"
+                ),
+            ]
+        )
+    else:
+        lines.append(
+            "No source annotations; this image is useful only as background imagery."
+        )
+    lines.extend(
+        [
+            (
+                f"Background crops from this source: {len(background_boxes)} | "
+                f"dataset target: {float(settings['background_ratio']):.1%} | "
+                f"max tiles/source: {cap if cap is not None else 'disabled'}"
+            ),
+            (
+                "Markers: D=dense, S=sparse, O=override, followed by actual/target; "
+                "green=complete, yellow/orange=partial, red=low"
+            ),
+            (
+                "Magenta/lime/orange geometry with white under-stroke = annotations; "
+                "segmentation rectangles = mask bounds; cyan = background crop"
+            ),
+        ]
+    )
+
+    # Put explanatory text below the raster so it cannot hide annotations on
+    # small source images.
+    composited = Image.alpha_composite(annotated, overlay).convert("RGB")
+    panel_font_size = max(15, min(24, int(min_dim * 0.028)))
+    panel_font = _font(panel_font_size)
+    measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    fitted_lines = _wrap_legend_lines(
+        measure,
+        lines,
+        panel_font,
+        max(120, width - 32),
+    )
+    gap = max(5, panel_font_size // 3)
+    line_heights = [
+        measure.textbbox((0, 0), line, font=panel_font)[3]
+        - measure.textbbox((0, 0), line, font=panel_font)[1]
+        for line in fitted_lines
     ]
-    # Shrink and wrap the legend as needed so it never leaves the raster,
-    # including unusually wide-but-short orchard imagery.
-    fitted_lines = lines
-    for candidate_size in range(legend_size, 6, -1):
-        candidate_font = _font(candidate_size)
-        candidate_lines = _wrap_legend_lines(draw, lines, candidate_font, max(40, width - 40))
-        heights = [draw.textbbox((0, 0), line, font=candidate_font)[3] for line in candidate_lines]
-        candidate_gap = max(2, candidate_size // 4)
-        if sum(heights) + len(heights) * (candidate_gap + 8) <= height - 24:
-            legend_font = candidate_font
-            legend_size = candidate_size
-            fitted_lines = candidate_lines
-            break
-    y_cursor = 12
-    gap = max(2, legend_size // 4)
-    for line in fitted_lines:
-        _text_box(draw, (12, y_cursor), line, legend_font, (255, 255, 255, 255), pad=max(6, legend_size // 4))
-        bounds = draw.textbbox((12, y_cursor), line, font=legend_font)
-        y_cursor += bounds[3] - bounds[1] + gap + 8
+    panel_height = 28 + sum(line_heights) + gap * max(0, len(fitted_lines) - 1)
+    canvas = Image.new("RGB", (width, height + panel_height), (12, 12, 16))
+    canvas.paste(composited, (0, 0))
+    panel_draw = ImageDraw.Draw(canvas)
+    panel_draw.rectangle(
+        (0, height, width, height + max(3, line_width)),
+        fill=(255, 0, 255),
+    )
+    y_cursor = height + 16
+    for line_index, line in enumerate(fitted_lines):
+        color = (255, 255, 255) if line_index == 0 else (225, 225, 232)
+        panel_draw.text((16, y_cursor), line, fill=color, font=panel_font)
+        bounds = panel_draw.textbbox((16, y_cursor), line, font=panel_font)
+        y_cursor += bounds[3] - bounds[1] + gap
     output.parent.mkdir(parents=True, exist_ok=True)
-    Image.alpha_composite(annotated, overlay).convert("RGB").save(output, quality=int(settings["jpeg_quality"]))
+    canvas.save(output, quality=int(settings["jpeg_quality"]))
     return output
 
 

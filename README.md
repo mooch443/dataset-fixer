@@ -76,7 +76,7 @@ resplit = dataset.split(
 )
 
 clean = resplit.remove_classes(["damaged"], visualize=True)
-renamed = resplit.rename_classes({"damaged": "blemished"}, visualize=True)
+renamed = resplit.rename_classes({"damaged": "blemished"})
 grid = clean.tile(mode="grid", tile_size=480, overlap=0.2)
 balanced = grid.rebalance_empty(0.20, splits=("train",), seed=42)
 canonical = balanced.export(
@@ -127,9 +127,10 @@ but `location` still identifies the immutable source, `data_yaml` is `None`, and
 Grid tiling uses deterministic, fixed-size source windows; it does not randomly
 crop, resize, or zoom. It clips boxes, polygons, and pose instances and requires
 POLO circles to fit fully inside a crop. `negative_tiles` accepts `"all"`,
-`"none"`, or a ratio relative to positive tiles. Coverage tiling supports
-detection, segmentation, pose, and POLO and provides notebook-derived random
-crop/zoom with per-object appearance targets:
+`"none"`, or a final output background fraction in `[0, 1)`, including
+uncropped small images. Coverage tiling supports detection, segmentation, pose,
+and POLO and provides notebook-derived random crop/zoom with per-object
+appearance targets:
 
 ```python
 coverage = dataset.tile(
@@ -145,14 +146,30 @@ coverage = dataset.tile(
 
 Set both appearance parameters to the same value to request a uniform count for
 every object. `object_appearance_overrides={source_id: count}` overrides
-individual annotations. IDEs can autocomplete the literal choices for `mode`,
-`negative_tiles`, `errors`, tasks, splits, comparison protocols, and inference
-backends; all coverage controls are explicit `tile()` parameters.
+individual annotations. `background_ratio=0.10` targets 10% annotation-free
+images across the complete coverage output of each split, including copied
+small images and newly generated crops. Half of the target is sampled from
+wholly empty source images and half from object-free regions of populated
+images where possible. If either source cannot supply its half, the other
+cross-fills the target and the exact counts and reason are written to
+`coverage_summary/background_sampling.json`. IDEs can autocomplete the literal
+choices for `mode`, `negative_tiles`, `errors`, tasks, splits, comparison
+protocols, and inference backends; all coverage controls are explicit `tile()`
+parameters.
 
 `rebalance_empty(max_empty_fraction=...)` deterministically downsamples empty
 images without duplicating data. The cap is applied independently to each
 selected split; non-selected splits are preserved. If the requested ratio would
 require more empty images, the existing images are retained rather than copied.
+
+Composition parameters always refer to the complete output of their operation:
+coverage `background_ratio`, numeric grid `negative_tiles`, and
+`rebalance_empty(max_empty_fraction=...)` all count pass-through images as well
+as generated images. Geometric fractions such as `overlap`, `min_area_ratio`,
+augmentation `min_visibility`, and SAHI overlap apply to windows or individual
+annotations rather than dataset composition. Split weights accept either
+fractions (`0.8/0.2`) or percentages (`80/20`) and are normalized; grouping and
+explicit assignments can make the achieved split counts approximate.
 
 Visualization preferences are recorded on virtual operations and rendered
 during export. Intermediate plan steps reuse their in-memory sample index and
