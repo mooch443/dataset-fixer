@@ -27,11 +27,46 @@ def test_invalid_label_fails_at_open(detect_dataset: Path) -> None:
         Dataset.open(detect_dataset, task="detect", progress=False)
 
 
+def test_malformed_label_can_be_skipped_at_open(detect_dataset: Path) -> None:
+    label = next(path for path in detect_dataset.rglob("*.txt") if "labels" in path.parts)
+    labels = [path for path in detect_dataset.rglob("*.txt") if "labels" in path.parts]
+    original_count = sum(len(path.read_text(encoding="utf-8").splitlines()) for path in labels)
+    replaced_count = len(label.read_text(encoding="utf-8").splitlines())
+    label.write_text("0 0.5 0.5 0.2 0.2\n0 nan 0.5 0.2 0.2\n", encoding="utf-8")
+
+    dataset = Dataset.open(
+        detect_dataset,
+        task="detect",
+        errors="skip",
+        progress=False,
+    )
+
+    assert any("non-finite" in warning for warning in dataset.warnings)
+    assert sum(len(sample.annotations) for sample in dataset._samples) == original_count - replaced_count + 1
+
+
 def test_orphan_label_fails_at_open(detect_dataset: Path) -> None:
     orphan = detect_dataset / "train" / "labels" / "orphan.txt"
     orphan.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
     with pytest.raises(DatasetValidationError, match="no image"):
         Dataset.open(detect_dataset, task="detect", progress=False)
+
+
+def test_errors_skip_applies_across_recoverable_load_errors(detect_dataset: Path) -> None:
+    orphan = detect_dataset / "train" / "labels" / "orphan.txt"
+    orphan.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+    broken_image = next((detect_dataset / "train" / "images").rglob("*.jpg"))
+    broken_image.write_bytes(b"not an image")
+    data = yaml.safe_load((detect_dataset / "data.yaml").read_text(encoding="utf-8"))
+    data["test"] = "missing/images"
+    (detect_dataset / "data.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    dataset = Dataset.open(detect_dataset, task="detect", errors="skip", progress=False)
+
+    assert len(dataset._samples) == 5
+    assert any("Skipped invalid split entry" in warning for warning in dataset.warnings)
+    assert any("Skipped invalid image" in warning for warning in dataset.warnings)
+    assert any("Ignored orphan label" in warning for warning in dataset.warnings)
 
 
 def test_split_grouping_manifest_and_provenance(detect_dataset: Path, tmp_path: Path) -> None:
@@ -92,6 +127,54 @@ def test_remove_classes_compacts_and_chains_original(detect_dataset: Path, tmp_p
     assert counts["names_before"]["background"] == "background"
     assert counts["names_after"]["background"] == "background"
     assert (clean.location / "reports" / "class_counts.jpg").is_file()
+
+
+def test_rename_classes_is_virtual_validated_and_exported(
+    detect_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+    original_ids = [
+        annotation.class_id
+        for sample in dataset._samples
+        for annotation in sample.annotations
+    ]
+
+    planned = dataset.rename_classes(
+        {0: "apple", "damaged": "blemished"},
+        visualize=True,
+        progress=False,
+    )
+
+    assert dataset.classes == {0: "fruit", 1: "damaged"}
+    assert planned.classes == {0: "apple", 1: "blemished"}
+    assert planned.history[-1]["operation"] == "rename-classes"
+    assert [
+        annotation.class_id
+        for sample in planned._samples
+        for annotation in sample.annotations
+    ] == original_ids
+    assert planned.remove_classes(["blemished"], visualize=False).classes == {0: "apple"}
+    with pytest.raises(ValueError, match="duplicate class names"):
+        dataset.rename_classes({"fruit": "damaged"})
+
+    exported = planned.export(
+        destination=tmp_path / "renamed",
+        visualize=True,
+        progress=False,
+    )
+
+    assert exported.classes == {0: "apple", 1: "blemished"}
+    assert [
+        annotation.class_id
+        for sample in exported._samples
+        for annotation in sample.annotations
+    ] == original_ids
+    assert (exported.location / "reports" / "class_renames.json").is_file()
+    assert (exported.location / "reports" / "rename_classes_summary.jpg").is_file()
+    assert all("class_renames" in record for record in exported.provenance.values())
+    data = yaml.safe_load(exported.data_yaml.read_text(encoding="utf-8"))
+    assert data["names"] == {0: "apple", 1: "blemished"}
 
 
 def test_virtual_pipeline_repr_and_empty_image_rebalancing(

@@ -1,12 +1,71 @@
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
+from dataset_fixer import ComparisonResult, Dataset, DatasetValidationError, Task
 from dataset_fixer.public_examples import SAWIT_COMMIT, SAWIT_LICENSE, SAWIT_REPOSITORY
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_public_api_inventory_is_typed_and_documented() -> None:
+    expected = {
+        "open",
+        "name",
+        "location",
+        "data_yaml",
+        "task",
+        "splits",
+        "classes",
+        "warnings",
+        "settings",
+        "history",
+        "provenance",
+        "training_ready",
+        "split",
+        "remove_classes",
+        "rename_classes",
+        "rebalance_empty",
+        "tile",
+        "augment",
+        "export",
+        "compare_models",
+        "visualize",
+        "assert_trainable",
+    }
+    public = {name: value for name, value in Dataset.__dict__.items() if not name.startswith("_")}
+    assert set(public) == expected
+    for name, raw in public.items():
+        if isinstance(raw, property):
+            target = raw.fget
+        elif isinstance(raw, classmethod):
+            target = raw.__func__
+        else:
+            target = raw
+        assert inspect.getdoc(target), f"Dataset.{name} has no public documentation"
+        assert getattr(target, "__annotations__", {}).get("return") is not None
+        if callable(target) and not isinstance(raw, property):
+            assert "parameters:" in inspect.getdoc(target).lower()
+            if name != "augment":
+                assert all(
+                    parameter.kind is not inspect.Parameter.VAR_KEYWORD
+                    for parameter in inspect.signature(target).parameters.values()
+                )
+
+    tile_signature = str(inspect.signature(Dataset.tile))
+    open_signature = str(inspect.signature(Dataset.open))
+    comparison_signature = str(inspect.signature(Dataset.compare_models))
+    assert "Literal['grid', 'coverage']" in tile_signature
+    assert "Literal['all', 'none']" in tile_signature
+    assert "**settings" not in tile_signature
+    assert "Literal['raise', 'skip']" in open_signature
+    assert "Literal['auto', 'native', 'sahi']" in comparison_signature
+    assert inspect.getdoc(ComparisonResult)
+    assert inspect.getdoc(DatasetValidationError)
+    assert inspect.getdoc(Task)
 
 
 def test_public_example_source_is_pinned_and_explicitly_licensed() -> None:

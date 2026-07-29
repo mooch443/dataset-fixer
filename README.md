@@ -47,7 +47,23 @@ dataset.visualize(split="train", n=12, seed=42, columns=3)
 ```
 
 Validation errors identify the file, label row or COCO annotation, bad value,
-expected schema, and suggested correction. Loading never changes the source.
+expected schema, and suggested correction. To keep loading while omitting
+recoverably bad records from the in-memory dataset, opt in explicitly:
+
+```python
+dataset = Dataset.open(
+    "/datasets/orchard/data.yaml",
+    task="segment",
+    errors="skip",
+)
+print(*dataset.warnings, sep="\n")
+```
+
+The default is `errors="raise"`. With `errors="skip"`, recoverable bad images,
+label rows, annotations, duplicate records, incompatible COCO split files,
+missing split entries, orphan labels, and incomplete provenance are omitted
+virtually and listed in `dataset.warnings`. An unusable class schema or a dataset
+with no valid images still raises. Loading never changes the source.
 
 ## Transformations
 
@@ -60,6 +76,7 @@ resplit = dataset.split(
 )
 
 clean = resplit.remove_classes(["damaged"], visualize=True)
+renamed = resplit.rename_classes({"damaged": "blemished"}, visualize=True)
 grid = clean.tile(mode="grid", tile_size=480, overlap=0.2)
 balanced = grid.rebalance_empty(0.20, splits=("train",), seed=42)
 canonical = balanced.export(
@@ -67,6 +84,10 @@ canonical = balanced.export(
     splits=("train", "val"),
 )
 ```
+
+`rename_classes()` changes only class metadata; class IDs, annotation rows,
+geometry, POLO radii, and pose metadata remain unchanged until the renamed
+metadata is written by `export()`.
 
 Albumentations is optional. Install it with
 `pip install "dataset-fixer[augment]"`, then pass either a transform sequence,
@@ -103,22 +124,30 @@ its projected classes, splits, settings, history, and pending operation names,
 but `location` still identifies the immutable source, `data_yaml` is `None`, and
 `training_ready` is false until export.
 
-Grid tiling clips boxes, polygons, and pose instances and requires POLO circles
-to fit fully inside a crop. `negative_tiles` accepts `"all"`, `"none"`, or a
-ratio relative to positive tiles. Coverage tiling is POLO-specific:
+Grid tiling uses deterministic, fixed-size source windows; it does not randomly
+crop, resize, or zoom. It clips boxes, polygons, and pose instances and requires
+POLO circles to fit fully inside a crop. `negative_tiles` accepts `"all"`,
+`"none"`, or a ratio relative to positive tiles. Coverage tiling supports
+detection, segmentation, pose, and POLO and provides notebook-derived random
+crop/zoom with per-object appearance targets:
 
 ```python
 coverage = dataset.tile(
     mode="coverage",
     tile_size=480,
-    # Any notebook-derived advanced default can be overridden by keyword.
-    fixed_polo_radius_px=15,
-    target_coverage_per_label=5,
-    sparse_coverage_per_label=1,
-    max_bg_ratio=0.10,
+    scale_range=(0.75, 1.25),
+    target_appearances_per_object=5,
+    sparse_appearances_per_object=1,
+    background_ratio=0.10,
     seed=42,
 )
 ```
+
+Set both appearance parameters to the same value to request a uniform count for
+every object. `object_appearance_overrides={source_id: count}` overrides
+individual annotations. IDEs can autocomplete the literal choices for `mode`,
+`negative_tiles`, `errors`, tasks, splits, comparison protocols, and inference
+backends; all coverage controls are explicit `tile()` parameters.
 
 `rebalance_empty(max_empty_fraction=...)` deterministically downsamples empty
 images without duplicating data. The cap is applied independently to each
@@ -216,7 +245,7 @@ data and JSON metadata sidecars.
 
 ## Output and reproduction
 
-Derived datasets contain `images/{split}`, `labels/{split}`, `data.yaml`,
+Derived datasets contain `{split}/images`, `{split}/labels`, `data.yaml`,
 `dataset-fixer.json`, `provenance.jsonl`, and operation reports. Coverage mode
 also writes its four CSV reports and annotated originals under
 `coverage_summary/`. Publication is atomic and happens only after the private
@@ -234,7 +263,10 @@ The intentionally small public API is:
 - `Dataset.open`
 - `Dataset.split`
 - `Dataset.remove_classes`
+- `Dataset.rename_classes`
+- `Dataset.rebalance_empty`
 - `Dataset.tile`
+- `Dataset.augment`
 - `Dataset.export`
 - `Dataset.compare_models`
 - `Dataset.visualize`

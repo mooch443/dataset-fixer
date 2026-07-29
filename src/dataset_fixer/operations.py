@@ -8,16 +8,17 @@ import tempfile
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Hashable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Hashable, Iterable, Mapping
 
 from tqdm.auto import tqdm
 
 from .errors import DatasetValidationError, ValidationIssue
 from .models import Annotation, DatasetMetadata, Sample, Task
-from .planning import select_empty_images
+from .planning import resolve_renamed_classes, select_empty_images
 from .utils import ensure_safe_destination, normalize_split, settings_fingerprint, slugify, to_jsonable
 from .visualization import (
     save_class_count_summary,
+    save_class_rename_summary,
     save_class_removal_preview,
     save_empty_image_balance_summary,
     save_split_preview,
@@ -290,6 +291,51 @@ def export_dataset(
         raise
 
 
+def rename_classes(
+    dataset: "Dataset",
+    renames: Mapping[str | int, str],
+    *,
+    destination: str | Path | None,
+    name: str | None,
+    visualize: bool,
+    progress: bool,
+    dry_run: bool,
+    validate_output: bool = True,
+) -> "Dataset":
+    renamed, metadata = resolve_renamed_classes(dataset._metadata, renames)
+    settings = {
+        "renamed_classes": renamed,
+        "class_ids_changed": False,
+        "visualize": visualize,
+    }
+    builder = _builder(dataset, destination, name, "rename-classes", settings, metadata=metadata)
+    try:
+        if visualize:
+            preview = save_class_rename_summary(renamed, builder.reports_dir / "rename_classes_summary.jpg")
+            builder.visuals.append(str(preview.relative_to(builder.staging)))
+            print(f"Class-rename audit: {preview}")
+        _print_start(builder, dataset._samples, settings)
+        if dry_run:
+            print("Dry run complete; no dataset was published.")
+            builder.cleanup()
+            return dataset
+        iterator = tqdm(dataset._samples, desc="Renaming classes", unit="image", disable=not progress)
+        for sample in iterator:
+            builder.add_copy(
+                sample,
+                split=sample.split,
+                provenance={"class_renames": renamed},
+            )
+        (builder.reports_dir / "class_renames.json").write_text(
+            json.dumps(to_jsonable(renamed), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return _publish(builder, progress=progress, validate_output=validate_output)
+    except Exception:
+        builder.cleanup()
+        raise
+
+
 def rebalance_empty_dataset(
     dataset: "Dataset",
     max_empty_fraction: float,
@@ -418,7 +464,7 @@ def _builder(
     dest = dest.resolve()
     dest.parent.mkdir(parents=True, exist_ok=True)
     ensure_safe_destination(dataset.location, dest)
-    return OutputBuilder(
+    builder = OutputBuilder(
         source_root=dataset.location,
         source_name=dataset.name,
         destination=dest,
@@ -429,6 +475,8 @@ def _builder(
         settings=settings,
         parent_manifest=dataset._manifest,
     )
+    builder.warnings.extend(dataset._warnings)
+    return builder
 
 
 def _operation_detail(operation: str, settings: dict[str, Any]) -> str:
@@ -437,6 +485,9 @@ def _operation_detail(operation: str, settings: dict[str, Any]) -> str:
     if operation == "remove-classes":
         values = list(settings["removed_classes"].values())
         return "remove-" + "-".join(map(slugify, values[:3]))
+    if operation == "rename-classes":
+        values = [item["to"] for item in settings["renamed_classes"].values()]
+        return "rename-" + "-".join(map(slugify, values[:3]))
     if operation == "export":
         return "yolo"
     if operation == "tile-grid":

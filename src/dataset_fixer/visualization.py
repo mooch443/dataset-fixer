@@ -170,6 +170,30 @@ def save_class_count_summary(
     return output
 
 
+def save_class_rename_summary(renamed: dict[int, dict[str, str]], output: Path) -> Path:
+    """Render a compact class-ID/name audit table."""
+
+    rows = [[str(class_id), values["from"], values["to"]] for class_id, values in sorted(renamed.items())]
+    fig, ax = plt.subplots(figsize=(8, max(2.4, 0.55 * len(rows) + 1.4)))
+    ax.axis("off")
+    table = ax.table(
+        cellText=rows,
+        colLabels=["class ID", "old name", "new name"],
+        cellLoc="left",
+        colLoc="left",
+        loc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 1.35)
+    ax.set_title("Class renames (IDs and annotations unchanged)", pad=14)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output, bbox_inches="tight", dpi=140)
+    plt.close(fig)
+    return output
+
+
 def save_empty_image_balance_summary(summary: dict[str, dict[str, Any]], output: Path) -> Path:
     """Plot annotated/background image distributions before and after balancing."""
 
@@ -343,12 +367,20 @@ def save_coverage_annotated_original(
         _text_box(draw, (tx, ty), text, bg_font, cyan + (230,), box_fill=(0, 0, 0, 135), pad=max(5, bg_size // 4))
 
     for label_idx, annotation in enumerate(sample.annotations):
-        if annotation.point is None:
+        if annotation.point is not None:
+            anchor = annotation.point
+        elif annotation.bbox is not None:
+            x1, y1, x2, y2 = annotation.bbox
+            anchor = ((x1 + x2) / 2, (y1 + y2) / 2)
+        elif annotation.polygon:
+            xs, ys = zip(*annotation.polygon)
+            anchor = (sum(xs) / len(xs), sum(ys) / len(ys))
+        else:
             continue
-        x, y = map(lambda v: int(round(v)), annotation.point)
+        x, y = map(lambda v: int(round(v)), anchor)
         x, y = min(max(x, 0), width - 1), min(max(y, 0), height - 1)
         count = coverage_counts.get(label_idx, 0)
-        target = coverage_targets.get(label_idx, settings["target_coverage_per_label"])
+        target = coverage_targets.get(label_idx, settings["target_appearances_per_object"])
         color = coverage_color(100 * count / target if target else 0)
         rgba = color + (200,)
         marker = (x - marker_radius, y - marker_radius, x + marker_radius, y + marker_radius)
@@ -361,8 +393,9 @@ def save_coverage_annotated_original(
         draw.ellipse((x - center_radius, y - center_radius, x + center_radius, y + center_radius), fill=(255, 255, 255, 255))
         inner = max(1, center_radius // 2)
         draw.ellipse((x - inner, y - inner, x + inner, y + inner), fill=rgba)
-        radius = int(settings["fixed_polo_radius_px"])
-        if radius >= 3:
+        configured_radius = settings["polo_radius_px"]
+        radius = int(configured_radius if configured_radius is not None else annotation.radius or 0)
+        if annotation.point is not None and radius >= 3:
             draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=color + (130,), width=max(2, line_width // 2))
         text = f"{count}/{target}"
         bounds = draw.textbbox((0, 0), text, font=font)
@@ -376,20 +409,23 @@ def save_coverage_annotated_original(
         ty = min(max(ty, 8), max(8, height - th - 20))
         _text_box(draw, (tx, ty), text, font, rgba, box_fill=(0, 0, 0, 125), pad=max(6, font_size // 4))
 
-    dense = sum(coverage_targets.get(i) == settings["target_coverage_per_label"] for i in range(len(sample.annotations)))
+    dense = sum(
+        coverage_targets.get(i) == settings["target_appearances_per_object"]
+        for i in range(len(sample.annotations))
+    )
     sparse = len(sample.annotations) - dense
     hit = sum(coverage_counts.get(i, 0) >= 1 for i in range(len(sample.annotations)))
     percent_hit = 100 * hit / len(sample.annotations) if sample.annotations else 0
-    cap = settings["max_total_tiles_per_source_image"]
+    cap = settings["max_tiles_per_source_image"]
     lines = [
         f"{sample.split.upper()} coverage: {sample.image_path.stem}",
-        f"dense target: {settings['target_coverage_per_label']}, sparse target: {settings['sparse_coverage_per_label']}",
-        f"dense labels: {dense}, sparse labels: {sparse}",
-        f"labels hit at least once: {hit}/{len(sample.annotations)} ({percent_hit:.1f}%)",
+        f"dense target: {settings['target_appearances_per_object']}, sparse target: {settings['sparse_appearances_per_object']}",
+        f"dense objects: {dense}, sparse objects: {sparse}",
+        f"objects hit at least once: {hit}/{len(sample.annotations)} ({percent_hit:.1f}%)",
         f"background tiles: {len(background_boxes)}",
-        f"background ratio: {settings['max_bg_ratio']}",
-        f"fixed label radius: {settings['fixed_polo_radius_px']}px",
-        f"dense radius: {settings['dense_neighbor_radius_px']}px, min neighbors: {settings['min_nearby_labels_for_full_coverage']}",
+        f"background ratio: {settings['background_ratio']}",
+        f"POLO radius override: {settings['polo_radius_px']}px",
+        f"dense radius: {settings['dense_neighbor_radius_px']}px, min neighbors: {settings['min_nearby_objects_for_full_coverage']}",
         f"max total tiles/source: {cap if cap is not None else 'disabled'}",
         "green=complete, yellow/orange=partial, red=low",
         "cyan rectangles=background tiles",

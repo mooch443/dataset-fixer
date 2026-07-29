@@ -158,6 +158,52 @@ def resolve_removed_classes(
     return removed, mapping, projected
 
 
+def resolve_renamed_classes(
+    metadata: DatasetMetadata,
+    renames: Mapping[str | int, str],
+) -> tuple[dict[int, dict[str, str]], DatasetMetadata]:
+    """Resolve class selectors and validate the final name schema."""
+
+    if not renames:
+        raise ValueError("At least one class must be renamed")
+    reverse: dict[str, list[int]] = defaultdict(list)
+    for class_id, class_name in metadata.names.items():
+        reverse[class_name].append(class_id)
+    resolved: dict[int, str] = {}
+    for selector, new_name in renames.items():
+        if not isinstance(new_name, str) or not new_name.strip():
+            raise ValueError(f"New class name for {selector!r} must be a non-empty string")
+        if isinstance(selector, int):
+            if selector not in metadata.names:
+                raise ValueError(f"Unknown class ID {selector}; available IDs are {sorted(metadata.names)}")
+            class_id = selector
+        else:
+            matches = reverse.get(selector, [])
+            if len(matches) != 1:
+                raise ValueError(
+                    f"Class name {selector!r} matched {len(matches)} classes; available names are {list(reverse)}"
+                )
+            class_id = matches[0]
+        if class_id in resolved and resolved[class_id] != new_name:
+            raise ValueError(f"Class {class_id} was assigned conflicting new names")
+        resolved[class_id] = new_name
+
+    final_names = {class_id: resolved.get(class_id, class_name) for class_id, class_name in metadata.names.items()}
+    duplicates = sorted({name for name in final_names.values() if list(final_names.values()).count(name) > 1})
+    if duplicates:
+        raise ValueError(f"Renaming would create duplicate class names: {duplicates}")
+    renamed = {
+        class_id: {"from": metadata.names[class_id], "to": final_names[class_id]}
+        for class_id in sorted(resolved)
+        if metadata.names[class_id] != final_names[class_id]
+    }
+    if not renamed:
+        raise ValueError("The requested class renames do not change any names")
+    projected = metadata.copy()
+    projected.names = final_names
+    return renamed, projected
+
+
 def project_remove_classes(
     samples: list[Sample],
     *,
@@ -224,6 +270,10 @@ def derived_name(current: str, operation: str, settings: dict[str, Any]) -> str:
     elif operation == "remove-classes":
         detail = "remove-" + "-".join(
             slugify(value) for value in list(settings["removed_classes"].values())[:3]
+        )
+    elif operation == "rename-classes":
+        detail = "rename-" + "-".join(
+            slugify(value["to"]) for value in list(settings["renamed_classes"].values())[:3]
         )
     elif operation == "rebalance-empty":
         detail = f"empty-max{int(float(settings['max_empty_fraction']) * 100)}"

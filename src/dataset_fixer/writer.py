@@ -134,6 +134,7 @@ class OutputBuilder:
                 "tile_index",
                 "tile_mode",
                 "class_mapping",
+                "class_renames",
                 "split_group",
                 "empty_image",
                 "augmentation_index",

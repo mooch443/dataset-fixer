@@ -4,10 +4,11 @@ import csv
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 from PIL import Image
 
-from dataset_fixer import Dataset, Task
+from dataset_fixer import Dataset, DatasetValidationError, Task
 from conftest import make_image, make_yolo_dataset
 
 
@@ -38,6 +39,45 @@ def test_segment_pose_and_polo_load(tmp_path: Path) -> None:
     assert Dataset.open(segment, task="segment", progress=False).task is Task.SEGMENT
     assert Dataset.open(pose, task="pose", progress=False).task is Task.POSE
     assert Dataset.open(polo, task="polo", progress=False).task is Task.POLO
+
+
+def test_invalid_segmentation_can_be_skipped_virtually(tmp_path: Path) -> None:
+    invalid_row = "0 0.2 0.2 0.8 0.8 0.8 0.2 0.2 0.8"
+    valid_row = "0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"
+    source = make_yolo_dataset(
+        tmp_path / "segment_with_invalid_polygon",
+        task="segment",
+        names=["fruit"],
+        train_rows=[f"{invalid_row}\n{valid_row}"],
+        val_rows=[valid_row],
+    )
+    source_label = next((source / "train" / "labels").rglob("*.txt"))
+    original_label = source_label.read_text(encoding="utf-8")
+
+    with pytest.raises(DatasetValidationError, match="Invalid or self-intersecting polygon"):
+        Dataset.open(source, task="segment", progress=False)
+
+    dataset = Dataset.open(
+        source,
+        task="segment",
+        errors="skip",
+        progress=False,
+    )
+
+    assert sum(len(sample.annotations) for sample in dataset._samples) == 2
+    assert any("Skipped invalid annotation" in warning for warning in dataset.warnings)
+    assert any("Invalid or self-intersecting polygon" in warning for warning in dataset.warnings)
+    assert source_label.read_text(encoding="utf-8") == original_label
+
+    exported = dataset.export(
+        destination=tmp_path / "segment_without_invalid_polygon",
+        visualize=False,
+        progress=False,
+    )
+    exported_train_label = next((exported.location / "train" / "labels").rglob("*.txt"))
+    assert len(exported_train_label.read_text(encoding="utf-8").splitlines()) == 1
+    manifest = json.loads((exported.location / "dataset-fixer.json").read_text(encoding="utf-8"))
+    assert any("Skipped invalid annotation" in warning for warning in manifest["warnings"])
 
 
 def test_grid_tiling_transforms_segment_and_pose(tmp_path: Path) -> None:
@@ -96,11 +136,11 @@ def test_polo_coverage_reports_and_visual_audit(tmp_path: Path) -> None:
         tile_size=100,
         large_image_threshold=200,
         scale_range=(1.0, 1.0),
-        fixed_polo_radius_px=10,
-        target_coverage_per_label=1,
-        sparse_coverage_per_label=1,
-        max_total_tiles_per_source_image=5,
-        max_bg_ratio=0.5,
+        polo_radius_px=10,
+        target_appearances_per_object=1,
+        sparse_appearances_per_object=1,
+        max_tiles_per_source_image=5,
+        background_ratio=0.5,
         seed=3,
         visualize=True,
         progress=False,
@@ -112,6 +152,95 @@ def test_polo_coverage_reports_and_visual_audit(tmp_path: Path) -> None:
     rows = list(csv.DictReader((summary / "label_coverage.csv").open(encoding="utf-8")))
     assert rows and all(float(row["actual_coverages"]) >= 1 for row in rows)
     assert all(annotation.radius == 10 for sample in tiled._samples for annotation in sample.annotations)
+
+
+@pytest.mark.parametrize("task", ["detect", "segment", "pose", "polo"])
+def test_coverage_tiling_supports_every_task(task: str, tmp_path: Path) -> None:
+    rows = {
+        "detect": "0 0.5 0.5 0.2 0.2",
+        "segment": "0 0.4 0.4 0.6 0.4 0.6 0.6 0.4 0.6",
+        "pose": "0 0.5 0.5 0.2 0.2 0.47 0.47 2 0.53 0.53 2",
+        "polo": "0 10 0.5 0.5",
+    }
+    extra = {
+        "pose": {"kpt_shape": [2, 3], "flip_idx": [1, 0], "kpt_names": {0: ["left", "right"]}},
+        "polo": {"radii": {0: 10}},
+    }.get(task, {})
+    source = make_yolo_dataset(
+        tmp_path / f"{task}_coverage_source",
+        task=task,
+        names=["fruit"],
+        train_rows=[rows[task]],
+        val_rows=[rows[task]],
+        size=(300, 260),
+        extra=extra,
+    )
+
+    tiled = (
+        Dataset.open(source, task=task, progress=False)
+        .tile(
+            mode="coverage",
+            tile_size=100,
+            large_image_threshold=200,
+            scale_range=(1.0, 1.0),
+            target_appearances_per_object=2,
+            sparse_appearances_per_object=2,
+            background_ratio=0,
+            max_tiles_per_source_image=10,
+            seed=7,
+            visualize=False,
+            progress=False,
+        )
+        .export(
+            destination=tmp_path / f"{task}_coverage",
+            visualize=False,
+            progress=False,
+        )
+    )
+
+    rows_out = list(csv.DictReader((tiled.location / "coverage_summary" / "label_coverage.csv").open()))
+    assert rows_out
+    assert all(int(row["requested_coverages"]) == 2 for row in rows_out)
+    assert all(int(row["actual_coverages"]) == 2 for row in rows_out)
+    assert all(sample.width == 100 and sample.height == 100 for sample in tiled._samples)
+    assert tiled.task.value == task
+
+
+def test_coverage_object_appearance_override_uses_source_id(tmp_path: Path) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "coverage_override_source",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.5 0.5 0.2 0.2"],
+        val_rows=["0 0.5 0.5 0.2 0.2"],
+        size=(300, 260),
+    )
+    dataset = Dataset.open(source, task="detect", progress=False)
+    source_id = dataset._samples[0].annotations[0].source_id
+
+    tiled = dataset.tile(
+        mode="coverage",
+        tile_size=100,
+        large_image_threshold=200,
+        scale_range=(1.0, 1.0),
+        target_appearances_per_object=1,
+        sparse_appearances_per_object=1,
+        object_appearance_overrides={str(source_id): 3},
+        background_ratio=0,
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "coverage_override",
+        visualize=False,
+        progress=False,
+    )
+
+    rows = list(csv.DictReader((tiled.location / "coverage_summary" / "label_coverage.csv").open()))
+    overridden = next(row for row in rows if row["source_id"] == str(source_id))
+    assert int(overridden["requested_coverages"]) == 3
+    assert int(overridden["actual_coverages"]) == 3
+    with pytest.raises(ValueError, match="Unknown object_appearance_overrides"):
+        dataset.tile(mode="coverage", object_appearance_overrides={"missing": 2})
 
 
 def test_coco_detection_export_compacts_categories(tmp_path: Path) -> None:
@@ -140,3 +269,32 @@ def test_coco_detection_export_compacts_categories(tmp_path: Path) -> None:
     assert data["train"] == "train/images" and data["val"] == "val/images"
     labels = "\n".join(path.read_text(encoding="utf-8") for path in exported.location.rglob("*.txt") if "labels" in path.parts)
     assert labels.startswith(("0 ", "1 "))
+
+
+def test_coco_errors_skip_filters_bad_records_across_loading_stages(tmp_path: Path) -> None:
+    root = tmp_path / "coco_with_bad_records"
+    make_image(root / "images" / "one.jpg", size=(100, 80))
+    data = {
+        "images": [
+            {"id": 1, "file_name": "one.jpg", "width": 100, "height": 80},
+            {"id": 2, "file_name": "missing.jpg", "width": 100, "height": 80},
+        ],
+        "categories": [{"id": 4, "name": "apple"}],
+        "annotations": [
+            {"id": 11, "image_id": 1, "category_id": 4, "bbox": [10, 10, 20, 30]},
+            {"id": 12, "image_id": 1, "category_id": 4, "bbox": ["bad", 10, 20, 30]},
+            {"id": 13, "image_id": 99, "category_id": 4, "bbox": [10, 10, 20, 30]},
+            {"id": 11, "image_id": 1, "category_id": 4, "bbox": [10, 10, 20, 30]},
+        ],
+    }
+    (root / "annotations.json").parent.mkdir(parents=True, exist_ok=True)
+    (root / "annotations.json").write_text(json.dumps(data), encoding="utf-8")
+
+    dataset = Dataset.open(root, task="detect", errors="skip", progress=False)
+
+    assert len(dataset._samples) == 1
+    assert len(dataset._samples[0].annotations) == 1
+    assert any("unknown image" in warning for warning in dataset.warnings)
+    assert any("IDs must be unique" in warning for warning in dataset.warnings)
+    assert any("Malformed COCO annotation" in warning for warning in dataset.warnings)
+    assert any("COCO image file not found" in warning for warning in dataset.warnings)

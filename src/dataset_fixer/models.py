@@ -3,17 +3,29 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 
 class Task(str, Enum):
+    """Supported annotation geometries.
+
+    Values are accepted anywhere a public API requests a task and serialize
+    directly to the corresponding lowercase string.
+    """
+
     DETECT = "detect"
     SEGMENT = "segment"
     POSE = "pose"
     POLO = "polo"
 
     @classmethod
-    def parse(cls, value: str | "Task" | None) -> "Task | None":
+    def parse(
+        cls,
+        value: Literal["detect", "segment", "pose", "polo", "bbox", "boxes", "keypoints", "locate", "point"]
+        | "Task"
+        | None,
+    ) -> "Task | None":
+        """Normalize a task value or supported convenience alias."""
         if value is None or isinstance(value, cls):
             return value
         aliases = {"bbox": "detect", "boxes": "detect", "keypoints": "pose", "locate": "polo", "point": "polo"}
@@ -80,4 +92,3 @@ class DatasetMetadata:
             kpt_oks_sigmas=list(self.kpt_oks_sigmas) if self.kpt_oks_sigmas else None,
             extra=dict(self.extra),
         )
-

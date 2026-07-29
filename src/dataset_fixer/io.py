@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from PIL import Image, ImageOps
@@ -22,25 +22,60 @@ def load_source(
     names: dict[int, str] | list[str] | None,
     radii: dict[int, float] | None,
     progress: bool,
+    errors: Literal["raise", "skip"] = "raise",
+    warnings: list[str] | None = None,
 ) -> tuple[Path, str, Task, DatasetMetadata, list[Sample], dict[str, Any]]:
+    warnings = warnings if warnings is not None else []
     location = location.expanduser().resolve()
     if not location.exists():
         raise FileNotFoundError(f"Dataset does not exist: {location}")
 
     if location.suffix.lower() == ".json":
-        return _load_coco(location, task=task, name=name, progress=progress)
+        return _load_coco(
+            location,
+            task=task,
+            name=name,
+            progress=progress,
+            errors=errors,
+            warnings=warnings,
+        )
 
     root = location.parent if location.suffix.lower() in {".yaml", ".yml"} else location
     yaml_path = location if location.suffix.lower() in {".yaml", ".yml"} else _find_yaml(root)
     if yaml_path is not None:
-        return _load_yolo(yaml_path, task=task, name=name, names_override=names, radii_override=radii, progress=progress)
+        return _load_yolo(
+            yaml_path,
+            task=task,
+            name=name,
+            names_override=names,
+            radii_override=radii,
+            progress=progress,
+            errors=errors,
+            warnings=warnings,
+        )
 
     coco_files = sorted(root.rglob("*.json"))
     coco_files = [p for p in coco_files if p.name not in {"dataset-fixer.json"}]
     if coco_files:
-        return _load_coco(root, task=task, name=name, progress=progress)
+        return _load_coco(
+            root,
+            task=task,
+            name=name,
+            progress=progress,
+            errors=errors,
+            warnings=warnings,
+        )
 
-    return _load_flat_yolo(root, task=task, name=name, names_override=names, radii_override=radii, progress=progress)
+    return _load_flat_yolo(
+        root,
+        task=task,
+        name=name,
+        names_override=names,
+        radii_override=radii,
+        progress=progress,
+        errors=errors,
+        warnings=warnings,
+    )
 
 
 def _find_yaml(root: Path) -> Path | None:
@@ -68,6 +103,8 @@ def _load_yolo(
     names_override: dict[int, str] | list[str] | None,
     radii_override: dict[int, float] | None,
     progress: bool,
+    errors: Literal["raise", "skip"],
+    warnings: list[str],
 ) -> tuple[Path, str, Task, DatasetMetadata, list[Sample], dict[str, Any]]:
     raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
     yaml_dir = yaml_path.parent.resolve()
@@ -97,7 +134,13 @@ def _load_yolo(
         if key not in {"train", "val", "valid", "validation", "test"} or value is None or value == "":
             continue
         split = normalize_split(key)
-        for image_path, rel in _expand_yolo_split(value, root=root, yaml_dir=yaml_dir):
+        for image_path, rel in _expand_yolo_split(
+            value,
+            root=root,
+            yaml_dir=yaml_dir,
+            errors=errors,
+            warnings=warnings,
+        ):
             split_images.append((split, image_path, rel))
 
     if not split_images:
@@ -110,19 +153,38 @@ def _load_yolo(
             )
         )
 
-    resolved_task = task or _infer_yolo_task([p for _, p, _ in split_images], metadata)
+    resolved_task = task or _infer_yolo_task(
+        [p for _, p, _ in split_images],
+        metadata,
+        errors=errors,
+        warnings=warnings,
+    )
     if resolved_task is None:
         raise DatasetValidationError("Could not infer task from empty labels; pass task='detect', 'segment', 'pose', or 'polo'")
-    samples = _parse_yolo_images(split_images, resolved_task, metadata, progress=progress)
+    samples = _parse_yolo_images(
+        split_images,
+        resolved_task,
+        metadata,
+        progress=progress,
+        errors=errors,
+        warnings=warnings,
+    )
     if not metadata.names:
         max_id = max((a.class_id for s in samples for a in s.annotations), default=-1)
         metadata.names = {i: f"class_{i}" for i in range(max_id + 1)}
-    manifest = _load_manifest(yaml_dir)
+    manifest = _load_manifest(yaml_dir, errors=errors, warnings=warnings)
     dataset_name = name or manifest.get("name") or raw.get("name") or root.name
     return root, dataset_name, resolved_task, metadata, samples, manifest
 
 
-def _expand_yolo_split(value: Any, *, root: Path, yaml_dir: Path) -> list[tuple[Path, Path]]:
+def _expand_yolo_split(
+    value: Any,
+    *,
+    root: Path,
+    yaml_dir: Path,
+    errors: Literal["raise", "skip"],
+    warnings: list[str],
+) -> list[tuple[Path, Path]]:
     values = value if isinstance(value, list) else [value]
     result: list[tuple[Path, Path]] = []
     for item in values:
@@ -132,7 +194,15 @@ def _expand_yolo_split(value: Any, *, root: Path, yaml_dir: Path) -> list[tuple[
             path = yaml_dir / str(item)[2:]
         path = path.resolve()
         if path.suffix.lower() == ".txt" and path.is_file():
-            for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError as exc:
+                issue = ValidationIssue(f"Unreadable image-list file: {exc}", source=str(path))
+                if errors == "raise":
+                    raise DatasetValidationError(issue) from exc
+                warnings.append(f"Skipped invalid split entry: {issue.format()}")
+                continue
+            for line in lines:
                 if not line.strip():
                     continue
                 image = Path(line.strip())
@@ -146,9 +216,10 @@ def _expand_yolo_split(value: Any, *, root: Path, yaml_dir: Path) -> list[tuple[
         elif path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES:
             result.append((path, Path(path.name)))
         else:
-            raise DatasetValidationError(
-                ValidationIssue("Split path does not exist or contains no supported images", source=str(path))
-            )
+            issue = ValidationIssue("Split path does not exist or contains no supported images", source=str(path))
+            if errors == "raise":
+                raise DatasetValidationError(issue)
+            warnings.append(f"Skipped invalid split entry: {issue.format()}")
     return result
 
 
@@ -177,14 +248,28 @@ def _label_path_for_image(image: Path) -> Path:
     return image.parent.parent / "labels" / f"{image.stem}.txt"
 
 
-def _infer_yolo_task(images: list[Path], metadata: DatasetMetadata) -> Task | None:
+def _infer_yolo_task(
+    images: list[Path],
+    metadata: DatasetMetadata,
+    *,
+    errors: Literal["raise", "skip"],
+    warnings: list[str],
+) -> Task | None:
     if metadata.kpt_shape:
         return Task.POSE
     for image in images:
         label = _label_path_for_image(image)
         if not label.is_file():
             continue
-        for line in label.read_text(encoding="utf-8").splitlines():
+        try:
+            lines = label.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            issue = ValidationIssue(f"Unreadable label file during task inference: {exc}", source=str(label))
+            if errors == "raise":
+                raise DatasetValidationError(issue) from exc
+            warnings.append(f"Skipped invalid label file: {issue.format()}")
+            continue
+        for line in lines:
             cols = line.split()
             if not cols:
                 continue
@@ -198,26 +283,50 @@ def _infer_yolo_task(images: list[Path], metadata: DatasetMetadata) -> Task | No
 
 
 def _parse_yolo_images(
-    split_images: list[tuple[str, Path, Path]], task: Task, metadata: DatasetMetadata, *, progress: bool
+    split_images: list[tuple[str, Path, Path]],
+    task: Task,
+    metadata: DatasetMetadata,
+    *,
+    progress: bool,
+    errors: Literal["raise", "skip"],
+    warnings: list[str],
 ) -> list[Sample]:
     samples: list[Sample] = []
     iterator = tqdm(split_images, desc="Loading YOLO dataset", unit="image", disable=not progress)
     issues: list[ValidationIssue] = []
     for split, image_path, relative_path in iterator:
         if not image_path.is_file():
-            issues.append(ValidationIssue("Image referenced by dataset does not exist", source=str(image_path)))
+            issue = ValidationIssue("Image referenced by dataset does not exist", source=str(image_path))
+            if errors == "skip":
+                warnings.append(f"Skipped invalid image: {issue.format()}")
+            else:
+                issues.append(issue)
             continue
         try:
             with Image.open(image_path) as opened:
                 image = ImageOps.exif_transpose(opened)
                 width, height = image.size
         except Exception as exc:
-            issues.append(ValidationIssue(f"Unreadable image: {exc}", source=str(image_path)))
+            issue = ValidationIssue(f"Unreadable image: {exc}", source=str(image_path))
+            if errors == "skip":
+                warnings.append(f"Skipped invalid image: {issue.format()}")
+            else:
+                issues.append(issue)
             continue
         annotations: list[Annotation] = []
         label_path = _label_path_for_image(image_path)
         if label_path.is_file():
-            for line_no, line in enumerate(label_path.read_text(encoding="utf-8").splitlines(), 1):
+            try:
+                label_lines = label_path.read_text(encoding="utf-8").splitlines()
+            except OSError as exc:
+                issue = ValidationIssue(f"Unreadable label file: {exc}", source=str(label_path))
+                if errors == "skip":
+                    warnings.append(f"Skipped invalid label file: {issue.format()}")
+                    label_lines = []
+                else:
+                    issues.append(issue)
+                    label_lines = []
+            for line_no, line in enumerate(label_lines, 1):
                 if not line.strip():
                     continue
                 try:
@@ -225,11 +334,17 @@ def _parse_yolo_images(
                     annotation.source_id = f"{relative_path}:{line_no}"
                     annotations.append(annotation)
                 except Exception as exc:
-                    issues.append(
-                        ValidationIssue(
-                            str(exc), source=str(label_path), line=line_no, value=line, suggestion="fix or remove this label row"
-                        )
+                    issue = ValidationIssue(
+                        str(exc),
+                        source=str(label_path),
+                        line=line_no,
+                        value=line,
+                        suggestion="fix or remove this label row",
                     )
+                    if errors == "skip":
+                        warnings.append(f"Skipped invalid annotation: {issue.format()}")
+                    else:
+                        issues.append(issue)
         samples.append(Sample(image_path, relative_path, split, width, height, annotations))
     if issues:
         raise DatasetValidationError(issues)
@@ -288,6 +403,8 @@ def _load_flat_yolo(
     names_override: dict[int, str] | list[str] | None,
     radii_override: dict[int, float] | None,
     progress: bool,
+    errors: Literal["raise", "skip"],
+    warnings: list[str],
 ) -> tuple[Path, str, Task, DatasetMetadata, list[Sample], dict[str, Any]]:
     images_dir = root / "images" if (root / "images").is_dir() else root
     images = image_files(images_dir)
@@ -296,19 +413,41 @@ def _load_flat_yolo(
     metadata = DatasetMetadata(
         names=_parse_names(names_override), radii={int(k): float(v) for k, v in (radii_override or {}).items()}
     )
-    resolved_task = task or _infer_yolo_task(images, metadata)
+    resolved_task = task or _infer_yolo_task(
+        images,
+        metadata,
+        errors=errors,
+        warnings=warnings,
+    )
     if resolved_task is None:
         raise DatasetValidationError("Could not infer task from flat dataset; pass task explicitly")
     split_images = [("train", p, p.relative_to(images_dir)) for p in images]
-    samples = _parse_yolo_images(split_images, resolved_task, metadata, progress=progress)
+    samples = _parse_yolo_images(
+        split_images,
+        resolved_task,
+        metadata,
+        progress=progress,
+        errors=errors,
+        warnings=warnings,
+    )
     if not metadata.names:
         max_id = max((a.class_id for s in samples for a in s.annotations), default=-1)
         metadata.names = {i: f"class_{i}" for i in range(max_id + 1)}
-    return root, name or root.name, resolved_task, metadata, samples, _load_manifest(root)
+    return root, name or root.name, resolved_task, metadata, samples, _load_manifest(
+        root,
+        errors=errors,
+        warnings=warnings,
+    )
 
 
 def _load_coco(
-    source: Path, *, task: Task | None, name: str | None, progress: bool
+    source: Path,
+    *,
+    task: Task | None,
+    name: str | None,
+    progress: bool,
+    errors: Literal["raise", "skip"],
+    warnings: list[str],
 ) -> tuple[Path, str, Task, DatasetMetadata, list[Sample], dict[str, Any]]:
     root = source.parent if source.is_file() else source
     json_files = [source] if source.is_file() else sorted(
@@ -317,7 +456,23 @@ def _load_coco(
     if not json_files:
         raise DatasetValidationError(f"No COCO JSON annotations found in {source}")
 
-    loaded = [(path, json.loads(path.read_text(encoding="utf-8"))) for path in json_files]
+    loaded: list[tuple[Path, dict[str, Any]]] = []
+    load_issues: list[ValidationIssue] = []
+    for path in json_files:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("top-level JSON value must be an object")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            issue = ValidationIssue(f"Unreadable annotation JSON: {exc}", source=str(path))
+            if errors == "skip":
+                warnings.append(f"Skipped invalid annotation file: {issue.format()}")
+            else:
+                load_issues.append(issue)
+            continue
+        loaded.append((path, data))
+    if load_issues:
+        raise DatasetValidationError(load_issues)
     valid = [(p, d) for p, d in loaded if all(k in d for k in ("images", "annotations", "categories"))]
     if not valid:
         raise DatasetValidationError("JSON files do not contain COCO images, annotations, and categories arrays")
@@ -329,9 +484,21 @@ def _load_coco(
     category_names: dict[int, str] = {}
     category_map: dict[int, int] = {}
     categories = valid[0][1]["categories"]
-    for new_id, category in enumerate(sorted(categories, key=lambda c: int(c["id"]))):
-        category_map[int(category["id"])] = new_id
-        category_names[new_id] = str(category["name"])
+    try:
+        sorted_categories = sorted(categories, key=lambda category: int(category["id"]))
+        source_category_ids = [int(category["id"]) for category in sorted_categories]
+        if len(source_category_ids) != len(set(source_category_ids)):
+            raise ValueError("category IDs must be unique")
+        for new_id, category in enumerate(sorted_categories):
+            category_map[int(category["id"])] = new_id
+            category_names[new_id] = str(category["name"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DatasetValidationError(
+            ValidationIssue(
+                f"COCO reference category schema is unusable: {exc}",
+                source=str(valid[0][0]),
+            )
+        ) from exc
 
     reference_categories = {(int(category["id"]), str(category["name"])) for category in categories}
     reference_keypoints = {
@@ -341,40 +508,28 @@ def _load_coco(
         int(category["id"]): tuple(tuple(edge) for edge in category.get("skeleton") or []) for category in categories
     }
     schema_issues: list[ValidationIssue] = []
+    sanitized_valid: list[tuple[Path, dict[str, Any]]] = []
     for json_path, data in valid:
-        actual_categories = {(int(category["id"]), str(category["name"])) for category in data["categories"]}
+        try:
+            actual_categories = {(int(category["id"]), str(category["name"])) for category in data["categories"]}
+        except (KeyError, TypeError, ValueError) as exc:
+            issue = ValidationIssue(f"Invalid COCO category schema: {exc}", source=str(json_path))
+            if errors == "skip":
+                warnings.append(f"Skipped incompatible annotation file: {issue.format()}")
+                continue
+            schema_issues.append(issue)
+            continue
         if actual_categories != reference_categories:
-            schema_issues.append(
-                ValidationIssue(
-                    "COCO category schemas differ between split files",
-                    source=str(json_path),
-                    value=sorted(actual_categories),
-                    expected=str(sorted(reference_categories)),
-                )
+            issue = ValidationIssue(
+                "COCO category schemas differ between split files",
+                source=str(json_path),
+                value=sorted(actual_categories),
+                expected=str(sorted(reference_categories)),
             )
-        image_ids = [int(image["id"]) for image in data["images"]]
-        if len(image_ids) != len(set(image_ids)):
-            schema_issues.append(ValidationIssue("COCO image IDs must be unique", source=str(json_path)))
-        annotation_ids = [annotation.get("id") for annotation in data["annotations"]]
-        if len(annotation_ids) != len(set(annotation_ids)):
-            schema_issues.append(ValidationIssue("COCO annotation IDs must be unique", source=str(json_path)))
-        for annotation in data["annotations"]:
-            if int(annotation.get("image_id", -1)) not in set(image_ids):
-                schema_issues.append(
-                    ValidationIssue(
-                        "COCO annotation references an unknown image",
-                        source=str(json_path),
-                        value={"annotation_id": annotation.get("id"), "image_id": annotation.get("image_id")},
-                    )
-                )
-            if int(annotation.get("category_id", -1)) not in category_map:
-                schema_issues.append(
-                    ValidationIssue(
-                        "COCO annotation references an unknown category",
-                        source=str(json_path),
-                        value={"annotation_id": annotation.get("id"), "category_id": annotation.get("category_id")},
-                    )
-                )
+            if errors == "skip":
+                warnings.append(f"Skipped incompatible annotation file: {issue.format()}")
+                continue
+            schema_issues.append(issue)
         if resolved_task is Task.POSE:
             actual_keypoints = {
                 int(category["id"]): tuple(category.get("keypoints") or []) for category in data["categories"]
@@ -384,11 +539,88 @@ def _load_coco(
                 for category in data["categories"]
             }
             if actual_keypoints != reference_keypoints or actual_skeletons != reference_skeletons:
-                schema_issues.append(
-                    ValidationIssue("COCO pose keypoint or skeleton schemas differ between splits", source=str(json_path))
+                issue = ValidationIssue(
+                    "COCO pose keypoint or skeleton schemas differ between splits",
+                    source=str(json_path),
                 )
+                if errors == "skip":
+                    warnings.append(f"Skipped incompatible annotation file: {issue.format()}")
+                    continue
+                schema_issues.append(issue)
+
+        clean_images: list[dict[str, Any]] = []
+        image_ids: set[int] = set()
+        for image in data["images"]:
+            try:
+                image_id = int(image["id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                issue = ValidationIssue(f"Invalid COCO image record: {exc}", source=str(json_path), value=image)
+            else:
+                issue = (
+                    ValidationIssue("COCO image IDs must be unique", source=str(json_path), value=image_id)
+                    if image_id in image_ids
+                    else None
+                )
+            if issue is not None:
+                if errors == "skip":
+                    warnings.append(f"Skipped invalid image record: {issue.format()}")
+                    continue
+                schema_issues.append(issue)
+                continue
+            image_ids.add(image_id)
+            clean_images.append(image)
+
+        clean_annotations: list[dict[str, Any]] = []
+        annotation_ids: set[Any] = set()
+        for annotation in data["annotations"]:
+            annotation_id = annotation.get("id")
+            issue = None
+            if annotation_id in annotation_ids:
+                issue = ValidationIssue(
+                    "COCO annotation IDs must be unique",
+                    source=str(json_path),
+                    value=annotation_id,
+                )
+            else:
+                try:
+                    image_id = int(annotation.get("image_id", -1))
+                    category_id = int(annotation.get("category_id", -1))
+                except (TypeError, ValueError) as exc:
+                    issue = ValidationIssue(
+                        f"Invalid COCO annotation reference: {exc}",
+                        source=str(json_path),
+                        value={"annotation_id": annotation_id},
+                    )
+                else:
+                    if image_id not in image_ids:
+                        issue = ValidationIssue(
+                            "COCO annotation references an unknown image",
+                            source=str(json_path),
+                            value={"annotation_id": annotation_id, "image_id": image_id},
+                        )
+                    elif category_id not in category_map:
+                        issue = ValidationIssue(
+                            "COCO annotation references an unknown category",
+                            source=str(json_path),
+                            value={"annotation_id": annotation_id, "category_id": category_id},
+                        )
+            if issue is not None:
+                if errors == "skip":
+                    warnings.append(f"Skipped invalid annotation: {issue.format()}")
+                    continue
+                schema_issues.append(issue)
+                continue
+            annotation_ids.add(annotation_id)
+            clean_annotations.append(annotation)
+        clean_data = dict(data)
+        clean_data["images"] = clean_images
+        clean_data["annotations"] = clean_annotations
+        sanitized_valid.append((json_path, clean_data))
     if schema_issues:
         raise DatasetValidationError(schema_issues)
+    valid = sanitized_valid
+    if not valid or not any(data["images"] for _, data in valid):
+        raise DatasetValidationError("COCO contains no valid images after skipping recoverable errors")
 
     metadata = DatasetMetadata(names=category_names)
     if resolved_task is Task.POSE:
@@ -416,27 +648,54 @@ def _load_coco(
             by_image.setdefault(int(ann["image_id"]), []).append(ann)
         iterator = tqdm(data["images"], desc=f"Loading COCO {split}", unit="image", disable=not progress)
         for image_record in iterator:
-            image_id = int(image_record["id"])
-            image_path = _resolve_coco_image(root, json_path, str(image_record["file_name"]), split)
-            if image_path is None:
-                issues.append(ValidationIssue("COCO image file not found", source=str(json_path), value=image_record["file_name"]))
+            try:
+                image_id = int(image_record["id"])
+                file_name = str(image_record["file_name"])
+                width, height = int(image_record["width"]), int(image_record["height"])
+            except (KeyError, TypeError, ValueError) as exc:
+                issue = ValidationIssue(
+                    f"Invalid COCO image record: {exc}",
+                    source=str(json_path),
+                    value=image_record,
+                )
+                if errors == "skip":
+                    warnings.append(f"Skipped invalid image record: {issue.format()}")
+                else:
+                    issues.append(issue)
                 continue
-            width, height = int(image_record["width"]), int(image_record["height"])
+            image_path = _resolve_coco_image(root, json_path, file_name, split)
+            if image_path is None:
+                issue = ValidationIssue(
+                    "COCO image file not found",
+                    source=str(json_path),
+                    value=file_name,
+                )
+                if errors == "skip":
+                    warnings.append(f"Skipped invalid image: {issue.format()}")
+                else:
+                    issues.append(issue)
+                continue
             try:
                 with Image.open(image_path) as opened:
                     actual_width, actual_height = ImageOps.exif_transpose(opened).size
             except Exception as exc:
-                issues.append(ValidationIssue(f"Unreadable COCO image: {exc}", source=str(image_path)))
+                issue = ValidationIssue(f"Unreadable COCO image: {exc}", source=str(image_path))
+                if errors == "skip":
+                    warnings.append(f"Skipped invalid image: {issue.format()}")
+                else:
+                    issues.append(issue)
                 continue
             if (width, height) != (actual_width, actual_height):
-                issues.append(
-                    ValidationIssue(
-                        "COCO image dimensions do not match the image file after EXIF orientation",
-                        source=str(image_path),
-                        value={"coco": [width, height], "actual": [actual_width, actual_height]},
-                        suggestion="correct the COCO image width and height",
-                    )
+                issue = ValidationIssue(
+                    "COCO image dimensions do not match the image file after EXIF orientation",
+                    source=str(image_path),
+                    value={"coco": [width, height], "actual": [actual_width, actual_height]},
+                    suggestion="correct the COCO image width and height",
                 )
+                if errors == "skip":
+                    warnings.append(f"Skipped invalid image: {issue.format()}")
+                else:
+                    issues.append(issue)
                 continue
             annotations: list[Annotation] = []
             for ann in by_image.get(image_id, []):
@@ -445,36 +704,57 @@ def _load_coco(
                 except KeyError:
                     issues.append(ValidationIssue("Annotation references unknown category", source=str(json_path), value=ann))
                     continue
-                bbox_raw = ann.get("bbox")
-                bbox = None
-                if bbox_raw:
-                    x, y, w, h = map(float, bbox_raw)
-                    bbox = (x, y, x + w, y + h)
-                annotation = Annotation(class_id, bbox=bbox, source_id=ann.get("id"))
-                if resolved_task is Task.SEGMENT:
-                    segmentation = ann.get("segmentation")
-                    if isinstance(segmentation, dict):
-                        annotation.rle = segmentation
-                    elif isinstance(segmentation, list):
-                        if len(segmentation) != 1:
-                            annotation.rle = {"multipart": segmentation}
-                        elif segmentation:
-                            flat = segmentation[0]
-                            annotation.polygon = [(float(flat[i]), float(flat[i + 1])) for i in range(0, len(flat), 2)]
-                elif resolved_task is Task.POSE:
-                    flat = ann.get("keypoints") or []
-                    annotation.keypoints = [
-                        (float(flat[i]), float(flat[i + 1]), float(flat[i + 2])) for i in range(0, len(flat), 3)
-                    ]
+                try:
+                    bbox_raw = ann.get("bbox")
+                    bbox = None
+                    if bbox_raw:
+                        x, y, w, h = map(float, bbox_raw)
+                        bbox = (x, y, x + w, y + h)
+                    annotation = Annotation(class_id, bbox=bbox, source_id=ann.get("id"))
+                    if resolved_task is Task.SEGMENT:
+                        segmentation = ann.get("segmentation")
+                        if isinstance(segmentation, dict):
+                            annotation.rle = segmentation
+                        elif isinstance(segmentation, list):
+                            if len(segmentation) != 1:
+                                annotation.rle = {"multipart": segmentation}
+                            elif segmentation:
+                                flat = segmentation[0]
+                                annotation.polygon = [
+                                    (float(flat[i]), float(flat[i + 1])) for i in range(0, len(flat), 2)
+                                ]
+                    elif resolved_task is Task.POSE:
+                        flat = ann.get("keypoints") or []
+                        annotation.keypoints = [
+                            (float(flat[i]), float(flat[i + 1]), float(flat[i + 2]))
+                            for i in range(0, len(flat), 3)
+                        ]
+                except (IndexError, TypeError, ValueError) as exc:
+                    source_id = ann.get("id")
+                    source = f"{json_path} [annotation {source_id}]" if source_id is not None else str(json_path)
+                    issue = ValidationIssue(
+                        f"Malformed COCO annotation: {exc}",
+                        source=source,
+                        suggestion="fix or remove this annotation",
+                    )
+                    if errors == "skip":
+                        warnings.append(f"Skipped invalid annotation: {issue.format()}")
+                    else:
+                        issues.append(issue)
+                    continue
                 annotations.append(annotation)
             samples.append(
-                Sample(image_path, Path(str(image_record["file_name"])), split, width, height, annotations)
+                Sample(image_path, Path(file_name), split, width, height, annotations)
             )
     if issues:
         raise DatasetValidationError(issues)
     info = valid[0][1].get("info") or {}
     dataset_name = name or info.get("name") or info.get("description") or root.name
-    return root, dataset_name, resolved_task, metadata, samples, _load_manifest(root)
+    return root, dataset_name, resolved_task, metadata, samples, _load_manifest(
+        root,
+        errors=errors,
+        warnings=warnings,
+    )
 
 
 def _infer_coco_task(data_sets: list[dict[str, Any]]) -> Task | None:
@@ -518,13 +798,22 @@ def _resolve_coco_image(root: Path, json_path: Path, file_name: str, split: str)
     return matches[0].resolve() if len(matches) == 1 else None
 
 
-def _load_manifest(root: Path) -> dict[str, Any]:
+def _load_manifest(
+    root: Path,
+    *,
+    errors: Literal["raise", "skip"],
+    warnings: list[str],
+) -> dict[str, Any]:
     path = root / "dataset-fixer.json"
     if not path.is_file():
         return {}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        issue = ValidationIssue(f"Unreadable dataset-fixer manifest: {exc}", source=str(path))
+        if errors == "raise":
+            raise DatasetValidationError(issue) from exc
+        warnings.append(f"Ignored invalid manifest: {issue.format()}")
         return {}
 
 

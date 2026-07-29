@@ -57,6 +57,14 @@ class Cohort:
 
 @dataclass(frozen=True)
 class ComparisonResult:
+    """Verified model-comparison outcome and artifact location.
+
+    ``ranking`` contains ordered metric summaries. The verification booleans
+    report cohort integrity, training-data overlap/provenance, and cache trust.
+    ``settings`` records the exact protocol and inference configuration, while
+    ``limitations`` lists caveats that should accompany interpretation.
+    """
+
     location: Path
     ranking: tuple[dict[str, Any], ...]
     cohort_fingerprint: str

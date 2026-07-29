@@ -63,6 +63,8 @@ def tile_dataset(
             name=name,
             splits=splits,
             tile_size=tile_size,
+            min_area_ratio=min_area_ratio,
+            allow_lossy=allow_lossy,
             visualize=visualize,
             progress=progress,
             dry_run=dry_run,
@@ -200,77 +202,109 @@ def _transform_annotations(
     allow_lossy: bool,
     warnings: list[str],
 ) -> list[Annotation]:
-    left, top, right, bottom = crop
     result: list[Annotation] = []
-    crop_shape = shapely_box(left, top, right, bottom)
     for annotation in sample.annotations:
-        if task is Task.POLO:
-            assert annotation.point is not None and annotation.radius is not None
-            x, y = annotation.point
-            r = annotation.radius
-            if left <= x - r and x + r <= right and top <= y - r and y + r <= bottom:
-                result.append(annotation.clone(point=(x - left, y - top)))
-            continue
-        if annotation.bbox is None:
-            continue
-        x1, y1, x2, y2 = annotation.bbox
-        ix1, iy1, ix2, iy2 = max(x1, left), max(y1, top), min(x2, right), min(y2, bottom)
-        original_area = max(0, x2 - x1) * max(0, y2 - y1)
-        intersection_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-        if original_area <= 0 or intersection_area / original_area < min_area_ratio:
-            continue
-        new_bbox = (ix1 - left, iy1 - top, ix2 - left, iy2 - top)
-        if task is Task.DETECT:
-            result.append(annotation.clone(bbox=new_bbox))
-        elif task is Task.POSE:
-            keypoints = []
-            for x, y, visibility in annotation.keypoints or []:
-                if left <= x < right and top <= y < bottom and visibility != 0:
-                    keypoints.append((x - left, y - top, visibility))
-                else:
-                    keypoints.append((0.0, 0.0, 0.0 if visibility is not None else None))
-            if any(x != 0 or y != 0 for x, y, _ in keypoints):
-                result.append(annotation.clone(bbox=new_bbox, keypoints=keypoints))
-        elif task is Task.SEGMENT:
-            if not annotation.polygon:
-                if allow_lossy:
-                    warnings.append(f"Dropped non-polygon segmentation {annotation.source_id} during tiling")
-                    continue
-                raise DatasetValidationError("RLE/multipart segmentation requires allow_lossy=True before grid tiling")
-            intersection = Polygon(annotation.polygon).intersection(crop_shape)
-            if intersection.is_empty or intersection.area / Polygon(annotation.polygon).area < min_area_ratio:
-                continue
-            if intersection.geom_type == "MultiPolygon":
-                if not allow_lossy:
-                    raise DatasetValidationError("Crop split one segmentation into disconnected components; pass allow_lossy=True")
-                intersection = max(intersection.geoms, key=lambda geom: geom.area)
-                warnings.append(f"Kept largest segment fragment for annotation {annotation.source_id}")
-            if intersection.geom_type != "Polygon" or intersection.interiors:
-                if not allow_lossy:
-                    raise DatasetValidationError("Cropped segmentation has holes or unsupported geometry")
-                warnings.append(f"Simplified cropped segmentation {annotation.source_id}")
-            polygon = [(float(x - left), float(y - top)) for x, y in list(intersection.exterior.coords)[:-1]]
-            xs, ys = zip(*polygon)
-            result.append(annotation.clone(polygon=polygon, bbox=(min(xs), min(ys), max(xs), max(ys))))
+        transformed = _transform_annotation(
+            annotation,
+            crop,
+            task,
+            min_area_ratio,
+            allow_lossy,
+            warnings,
+        )
+        if transformed is not None:
+            result.append(transformed)
     return result
 
 
-COVERAGE_DEFAULTS: dict[str, Any] = {
-    "large_image_threshold": 1000,
-    "scale_range": (0.75, 1.25),
-    "fixed_polo_radius_px": 15.0,
-    "radius_multiplier": 1.0,
-    "target_coverage_per_label": 5,
-    "sparse_coverage_per_label": 1,
-    "min_nearby_labels_for_full_coverage": 5,
-    "dense_neighbor_radius_px": None,
-    "max_bg_ratio": 0.1,
-    "max_attempts_per_needed_crop": 15,
-    "max_bg_attempts_per_tile": 15,
-    "max_total_tiles_per_source_image": 100,
-    "jpeg_quality": 95,
-    "seed": 42,
-}
+def _transform_annotation(
+    annotation: Annotation,
+    crop: tuple[int, int, int, int],
+    task: Task,
+    min_area_ratio: float,
+    allow_lossy: bool,
+    warnings: list[str],
+) -> Annotation | None:
+    left, top, right, bottom = crop
+    crop_shape = shapely_box(left, top, right, bottom)
+    if task is Task.POLO:
+        assert annotation.point is not None and annotation.radius is not None
+        x, y = annotation.point
+        radius = annotation.radius
+        if left <= x - radius and x + radius <= right and top <= y - radius and y + radius <= bottom:
+            return annotation.clone(point=(x - left, y - top))
+        return None
+    if annotation.bbox is None:
+        return None
+    x1, y1, x2, y2 = annotation.bbox
+    ix1, iy1, ix2, iy2 = max(x1, left), max(y1, top), min(x2, right), min(y2, bottom)
+    original_area = max(0, x2 - x1) * max(0, y2 - y1)
+    intersection_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if original_area <= 0 or intersection_area / original_area < min_area_ratio:
+        return None
+    new_bbox = (ix1 - left, iy1 - top, ix2 - left, iy2 - top)
+    if task is Task.DETECT:
+        return annotation.clone(bbox=new_bbox)
+    if task is Task.POSE:
+        keypoints = []
+        for x, y, visibility in annotation.keypoints or []:
+            if left <= x < right and top <= y < bottom and visibility != 0:
+                keypoints.append((x - left, y - top, visibility))
+            else:
+                keypoints.append((0.0, 0.0, 0.0 if visibility is not None else None))
+        if any(x != 0 or y != 0 for x, y, _ in keypoints):
+            return annotation.clone(bbox=new_bbox, keypoints=keypoints)
+        return None
+    if task is Task.SEGMENT:
+        if not annotation.polygon:
+            if allow_lossy:
+                warnings.append(f"Dropped non-polygon segmentation {annotation.source_id} during tiling")
+                return None
+            raise DatasetValidationError("RLE/multipart segmentation requires allow_lossy=True before tiling")
+        source_polygon = Polygon(annotation.polygon)
+        intersection = source_polygon.intersection(crop_shape)
+        if intersection.is_empty or intersection.area / source_polygon.area < min_area_ratio:
+            return None
+        if intersection.geom_type == "MultiPolygon":
+            if not allow_lossy:
+                raise DatasetValidationError(
+                    "Crop split one segmentation into disconnected components; pass allow_lossy=True"
+                )
+            intersection = max(intersection.geoms, key=lambda geom: geom.area)
+            warnings.append(f"Kept largest segment fragment for annotation {annotation.source_id}")
+        if intersection.geom_type != "Polygon":
+            if not allow_lossy:
+                raise DatasetValidationError("Cropped segmentation has unsupported geometry")
+            polygon_parts = [geom for geom in getattr(intersection, "geoms", ()) if geom.geom_type == "Polygon"]
+            if not polygon_parts:
+                warnings.append(f"Dropped unsupported cropped segmentation {annotation.source_id}")
+                return None
+            intersection = max(polygon_parts, key=lambda geom: geom.area)
+        if intersection.interiors:
+            if not allow_lossy:
+                raise DatasetValidationError("Cropped segmentation has holes; pass allow_lossy=True")
+            warnings.append(f"Removed holes from cropped segmentation {annotation.source_id}")
+        polygon = [(float(x - left), float(y - top)) for x, y in list(intersection.exterior.coords)[:-1]]
+        if len(polygon) < 3:
+            return None
+        xs, ys = zip(*polygon)
+        return annotation.clone(polygon=polygon, bbox=(min(xs), min(ys), max(xs), max(ys)))
+    return None
+
+
+def _scale_annotation(annotation: Annotation, scale: float, task: Task, radius_multiplier: float) -> Annotation:
+    updates: dict[str, Any] = {}
+    if annotation.bbox is not None:
+        updates["bbox"] = tuple(value * scale for value in annotation.bbox)
+    if annotation.polygon is not None:
+        updates["polygon"] = [(x * scale, y * scale) for x, y in annotation.polygon]
+    if annotation.keypoints is not None:
+        updates["keypoints"] = [(x * scale, y * scale, visibility) for x, y, visibility in annotation.keypoints]
+    if annotation.point is not None:
+        updates["point"] = (annotation.point[0] * scale, annotation.point[1] * scale)
+    if task is Task.POLO and annotation.radius is not None:
+        updates["radius"] = annotation.radius * scale * radius_multiplier
+    return annotation.clone(**updates)
 
 
 def _tile_coverage(
@@ -280,30 +314,36 @@ def _tile_coverage(
     name: str | None,
     splits: Iterable[str] | None,
     tile_size: int,
+    min_area_ratio: float,
+    allow_lossy: bool,
     visualize: bool,
     progress: bool,
     dry_run: bool,
     overrides: dict[str, Any],
     validate_output: bool,
 ) -> "Dataset":
-    if dataset.task is not Task.POLO:
-        raise ValueError("coverage tiling is POLO-specific; use mode='grid' for other tasks")
     selected = {normalize_split(s) for s in splits} if splits else set(dataset.splits)
     samples = [s for s in dataset._samples if s.split in selected]
-    cfg = dict(COVERAGE_DEFAULTS)
-    cfg.update(overrides)
+    cfg = dict(overrides)
     cfg["tile_size"] = int(tile_size)
+    cfg["min_area_ratio"] = float(min_area_ratio)
+    cfg["allow_lossy"] = bool(allow_lossy)
+    if cfg["large_image_threshold"] is None:
+        cfg["large_image_threshold"] = int(tile_size)
     _validate_coverage_settings(cfg)
     if cfg["dense_neighbor_radius_px"] is None:
         cfg["dense_neighbor_radius_px"] = tile_size * 0.5
     cfg["mode"] = "coverage"
     cfg["splits"] = sorted(selected)
     cfg["visualize"] = visualize
-    dense_target = max(int(cfg["target_coverage_per_label"]), int(cfg["sparse_coverage_per_label"]))
-    cap = cfg["max_total_tiles_per_source_image"]
+    dense_target = max(
+        int(cfg["target_appearances_per_object"]),
+        int(cfg["sparse_appearances_per_object"]),
+    )
+    cap = cfg["max_tiles_per_source_image"]
     cfg["estimated_tiles"] = sum(
         1
-        if sample.width <= int(cfg["large_image_threshold"])
+        if max(sample.width, sample.height) <= int(cfg["large_image_threshold"])
         else min(int(cap) if cap is not None else len(sample.annotations) * dense_target, len(sample.annotations) * dense_target)
         for sample in samples
     )
@@ -315,7 +355,14 @@ def _tile_coverage(
             preview_boxes = []
             if preview_sample.annotations:
                 first = preview_sample.annotations[0]
-                candidate = _make_crop_containing(first, preview_sample.width, preview_sample.height, cfg, rng)
+                candidate = _make_crop_containing(
+                    first,
+                    preview_sample.width,
+                    preview_sample.height,
+                    dataset.task,
+                    cfg,
+                    rng,
+                )
                 if candidate:
                     preview_boxes.append(candidate)
             preview = save_grid_preview(preview_sample, preview_boxes, builder.reports_dir / "coverage_preview.jpg")
@@ -333,8 +380,11 @@ def _tile_coverage(
         records: list[dict[str, Any]] = []
         iterator = tqdm(samples, desc="Coverage tiling", unit="image", disable=not progress)
         for sample in iterator:
-            if sample.width <= int(cfg["large_image_threshold"]):
-                annotations = [a.clone(radius=float(cfg["fixed_polo_radius_px"])) for a in sample.annotations]
+            if max(sample.width, sample.height) <= int(cfg["large_image_threshold"]):
+                annotations = [
+                    _coverage_small_annotation(annotation, dataset.task, cfg)
+                    for annotation in sample.annotations
+                ]
                 with Image.open(sample.image_path) as opened:
                     image = ImageOps.exif_transpose(opened).convert("RGB")
                     rel = sample.relative_path.with_suffix(".jpg")
@@ -350,28 +400,53 @@ def _tile_coverage(
             targets = _coverage_targets(sample, cfg)
             generated: list[dict[str, Any]] = []
             attempts = 0
-            max_attempts = max(1, sum(targets.values()) * int(cfg["max_attempts_per_needed_crop"]))
+            max_attempts = max(1, sum(targets.values()) * int(cfg["max_attempts_per_target"]))
             provisional = Counter()
             while attempts < max_attempts and any(provisional[i] < targets[i] for i in targets):
                 needed = [i for i in targets if provisional[i] < targets[i]]
                 focus_idx = rng.choice(needed)
-                crop = _make_crop_containing(sample.annotations[focus_idx], sample.width, sample.height, cfg, rng)
+                crop = _make_crop_containing(
+                    sample.annotations[focus_idx],
+                    sample.width,
+                    sample.height,
+                    dataset.task,
+                    cfg,
+                    rng,
+                )
                 attempts += 1
                 if crop is None:
                     continue
                 adjusted: list[Annotation] = []
                 indices: list[int] = []
+                scale = tile_size / (crop[2] - crop[0])
                 for idx, annotation in enumerate(sample.annotations):
-                    transformed = _adjust_polo(annotation, crop, cfg)
+                    source_annotation = _coverage_source_annotation(annotation, dataset.task, cfg)
+                    transformed = _transform_annotation(
+                        source_annotation,
+                        crop,
+                        dataset.task,
+                        min_area_ratio,
+                        allow_lossy,
+                        builder.warnings,
+                    )
                     if transformed is not None:
-                        adjusted.append(transformed)
+                        adjusted.append(
+                            _scale_annotation(
+                                transformed,
+                                scale,
+                                dataset.task,
+                                float(cfg["radius_multiplier"]),
+                            )
+                        )
                         indices.append(idx)
                 if not indices:
+                    continue
+                if any(provisional[idx] >= targets[idx] for idx in indices):
                     continue
                 generated.append({"box": crop, "annotations": adjusted, "indices": indices})
                 provisional.update(indices)
             generated_before_cap = len(generated)
-            cap = cfg["max_total_tiles_per_source_image"]
+            cap = cfg["max_tiles_per_source_image"]
             if cap is not None and len(generated) > int(cap):
                 generated = rng.sample(generated, int(cap))
                 split_summary[sample.split]["positive_tiles_dropped_by_source_cap"] += generated_before_cap - len(generated)
@@ -421,18 +496,18 @@ def _tile_coverage(
             missed = sum(max(0, targets[i] - counts[i]) for i in targets)
             if missed:
                 builder.warnings.append(
-                    f"{sample.split}/{sample.relative_path}: missed {missed} requested label coverages"
+                    f"{sample.split}/{sample.relative_path}: missed {missed} requested object appearances"
                 )
 
         for split in selected:
             split_records = [r for r in records if r["sample"].split == split]
-            desired = int(round(split_summary[split]["positive_output_images"] * float(cfg["max_bg_ratio"])))
-            allocated = _allocate_backgrounds(split_records, desired, cfg, rng)
+            desired = int(round(split_summary[split]["positive_output_images"] * float(cfg["background_ratio"])))
+            allocated = _allocate_backgrounds(split_records, desired, dataset.task, cfg, rng)
             split_summary[split]["target_empty_images_from_file_ratio"] = desired
             split_summary[split]["missed_empty_images_from_file_ratio"] = max(0, desired - allocated)
             if allocated < desired:
                 builder.warnings.append(
-                    f"{split}: allocated {allocated}/{desired} requested background tiles without touching point circles"
+                    f"{split}: allocated {allocated}/{desired} requested object-free background tiles"
                 )
             for record in split_records:
                 sample = record["sample"]
@@ -480,81 +555,142 @@ def _tile_coverage(
 def _coverage_targets(sample: Sample, cfg: dict[str, Any]) -> dict[int, int]:
     targets: dict[int, int] = {}
     radius = float(cfg["dense_neighbor_radius_px"])
+    overrides = cfg["object_appearance_overrides"]
     for i, annotation in enumerate(sample.annotations):
-        assert annotation.point is not None
+        override = overrides.get(annotation.source_id)
+        if override is None and annotation.source_id is not None:
+            override = overrides.get(str(annotation.source_id))
+        if override is not None:
+            targets[i] = int(override)
+            continue
+        anchor = _annotation_anchor(annotation)
         nearby = sum(
             j != i
-            and other.point is not None
-            and math.hypot(annotation.point[0] - other.point[0], annotation.point[1] - other.point[1]) <= radius
+            and math.hypot(
+                anchor[0] - _annotation_anchor(other)[0],
+                anchor[1] - _annotation_anchor(other)[1],
+            )
+            <= radius
             for j, other in enumerate(sample.annotations)
         )
         targets[i] = int(
-            cfg["target_coverage_per_label"]
-            if nearby >= int(cfg["min_nearby_labels_for_full_coverage"])
-            else cfg["sparse_coverage_per_label"]
+            cfg["target_appearances_per_object"]
+            if nearby >= int(cfg["min_nearby_objects_for_full_coverage"])
+            else cfg["sparse_appearances_per_object"]
         )
     return targets
 
 
+def _annotation_anchor(annotation: Annotation) -> tuple[float, float]:
+    if annotation.point is not None:
+        return annotation.point
+    if annotation.bbox is not None:
+        x1, y1, x2, y2 = annotation.bbox
+        return (x1 + x2) / 2, (y1 + y2) / 2
+    if annotation.polygon:
+        xs, ys = zip(*annotation.polygon)
+        return sum(xs) / len(xs), sum(ys) / len(ys)
+    raise DatasetValidationError(f"Annotation {annotation.source_id} has no crop anchor")
+
+
+def _polo_radius(annotation: Annotation, cfg: dict[str, Any]) -> float:
+    configured = cfg["polo_radius_px"]
+    if configured is not None:
+        return float(configured)
+    if annotation.radius is None:
+        raise DatasetValidationError(f"POLO annotation {annotation.source_id} has no radius")
+    return float(annotation.radius)
+
+
+def _coverage_source_annotation(annotation: Annotation, task: Task, cfg: dict[str, Any]) -> Annotation:
+    return annotation.clone(radius=_polo_radius(annotation, cfg)) if task is Task.POLO else annotation.clone()
+
+
+def _coverage_small_annotation(annotation: Annotation, task: Task, cfg: dict[str, Any]) -> Annotation:
+    if task is not Task.POLO:
+        return annotation.clone()
+    return annotation.clone(
+        radius=_polo_radius(annotation, cfg) * float(cfg["radius_multiplier"])
+    )
+
+
+def _annotation_bounds(annotation: Annotation, task: Task, cfg: dict[str, Any]) -> tuple[float, float, float, float]:
+    if task is Task.POLO:
+        assert annotation.point is not None
+        radius = _polo_radius(annotation, cfg)
+        x, y = annotation.point
+        return x - radius, y - radius, x + radius, y + radius
+    if annotation.bbox is not None:
+        return annotation.bbox
+    if annotation.polygon:
+        xs, ys = zip(*annotation.polygon)
+        return min(xs), min(ys), max(xs), max(ys)
+    raise DatasetValidationError(f"Annotation {annotation.source_id} has no crop bounds")
+
+
 def _make_crop_containing(
-    annotation: Annotation, width: int, height: int, cfg: dict[str, Any], rng: random.Random
+    annotation: Annotation,
+    width: int,
+    height: int,
+    task: Task,
+    cfg: dict[str, Any],
+    rng: random.Random,
 ) -> tuple[int, int, int, int] | None:
-    assert annotation.point is not None
     scale = rng.uniform(*cfg["scale_range"])
-    crop_dim = int(cfg["tile_size"] / scale)
-    crop_w, crop_h = min(crop_dim, width), min(crop_dim, height)
-    x, y = annotation.point
-    radius = float(cfg["fixed_polo_radius_px"])
-    max_left, max_top = width - crop_w, height - crop_h
-    left_min = max(0, int(math.ceil(x + radius - crop_w)))
-    left_max = min(max_left, int(math.floor(x - radius)))
-    top_min = max(0, int(math.ceil(y + radius - crop_h)))
-    top_max = min(max_top, int(math.floor(y - radius)))
+    crop_dim = min(max(1, int(cfg["tile_size"] / scale)), width, height)
+    x1, y1, x2, y2 = _annotation_bounds(annotation, task, cfg)
+    if x2 - x1 > crop_dim or y2 - y1 > crop_dim:
+        return None
+    max_left, max_top = width - crop_dim, height - crop_dim
+    left_min = max(0, int(math.ceil(x2 - crop_dim)))
+    left_max = min(max_left, int(math.floor(x1)))
+    top_min = max(0, int(math.ceil(y2 - crop_dim)))
+    top_max = min(max_top, int(math.floor(y1)))
     if left_min > left_max or top_min > top_max:
         return None
     left, top = rng.randint(left_min, left_max), rng.randint(top_min, top_max)
-    return left, top, left + crop_w, top + crop_h
-
-
-def _adjust_polo(annotation: Annotation, crop: tuple[int, int, int, int], cfg: dict[str, Any]) -> Annotation | None:
-    assert annotation.point is not None
-    left, top, right, bottom = crop
-    x, y = annotation.point
-    radius = float(cfg["fixed_polo_radius_px"])
-    if not (left <= x - radius and x + radius < right and top <= y - radius and y + radius < bottom):
-        return None
-    scale = cfg["tile_size"] / (right - left)
-    return annotation.clone(
-        point=((x - left) * scale, (y - top) * scale),
-        radius=radius * scale * float(cfg["radius_multiplier"]),
-    )
+    return left, top, left + crop_dim, top + crop_dim
 
 
 def _random_crop(width: int, height: int, cfg: dict[str, Any], rng: random.Random) -> tuple[int, int, int, int]:
     scale = rng.uniform(*cfg["scale_range"])
-    dim = int(cfg["tile_size"] / scale)
-    crop_w, crop_h = min(dim, width), min(dim, height)
-    left = rng.randint(0, width - crop_w) if width > crop_w else 0
-    top = rng.randint(0, height - crop_h) if height > crop_h else 0
-    return left, top, left + crop_w, top + crop_h
+    dim = min(max(1, int(cfg["tile_size"] / scale)), width, height)
+    left = rng.randint(0, width - dim) if width > dim else 0
+    top = rng.randint(0, height - dim) if height > dim else 0
+    return left, top, left + dim, top + dim
 
 
-def _circle_intersects(annotation: Annotation, crop: tuple[int, int, int, int], radius: float) -> bool:
-    assert annotation.point is not None
-    x, y = annotation.point
+def _annotation_intersects_crop(
+    annotation: Annotation,
+    crop: tuple[int, int, int, int],
+    task: Task,
+    cfg: dict[str, Any],
+) -> bool:
     left, top, right, bottom = crop
-    closest_x, closest_y = min(max(x, left), right), min(max(y, top), bottom)
-    return (x - closest_x) ** 2 + (y - closest_y) ** 2 <= radius**2
+    if task is Task.POLO:
+        assert annotation.point is not None
+        x, y = annotation.point
+        radius = _polo_radius(annotation, cfg)
+        closest_x, closest_y = min(max(x, left), right), min(max(y, top), bottom)
+        return (x - closest_x) ** 2 + (y - closest_y) ** 2 <= radius**2
+    x1, y1, x2, y2 = _annotation_bounds(annotation, task, cfg)
+    return not (x2 <= left or right <= x1 or y2 <= top or bottom <= y1)
 
 
 def _boxes_intersect(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
     return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
 
 
-def _allocate_backgrounds(records: list[dict[str, Any]], desired: int, cfg: dict[str, Any], rng: random.Random) -> int:
+def _allocate_backgrounds(
+    records: list[dict[str, Any]],
+    desired: int,
+    task: Task,
+    cfg: dict[str, Any],
+    rng: random.Random,
+) -> int:
     allocated = 0
-    cap = cfg["max_total_tiles_per_source_image"]
-    for _ in range(desired * int(cfg["max_bg_attempts_per_tile"])):
+    cap = cfg["max_tiles_per_source_image"]
+    for _ in range(desired * int(cfg["max_background_attempts_per_tile"])):
         if allocated >= desired:
             break
         eligible = [r for r in records if cap is None or r["next_tile_idx"] + len(r["background_boxes"]) < int(cap)]
@@ -563,7 +699,7 @@ def _allocate_backgrounds(records: list[dict[str, Any]], desired: int, cfg: dict
         record = rng.choice(eligible)
         sample = record["sample"]
         crop = _random_crop(sample.width, sample.height, cfg, rng)
-        if any(_circle_intersects(a, crop, float(cfg["fixed_polo_radius_px"])) for a in sample.annotations):
+        if any(_annotation_intersects_crop(annotation, crop, task, cfg) for annotation in sample.annotations):
             continue
         if any(_boxes_intersect(crop, existing) for existing in record["background_boxes"]):
             continue
@@ -584,14 +720,19 @@ def _append_coverage_rows(
 ) -> None:
     for idx, annotation in enumerate(sample.annotations):
         count, target = int(counts.get(idx, 0)), targets[idx]
+        anchor = _annotation_anchor(annotation)
+        override = cfg["object_appearance_overrides"].get(annotation.source_id)
+        if override is None and annotation.source_id is not None:
+            override = cfg["object_appearance_overrides"].get(str(annotation.source_id))
         coverage_rows.append(
             {
                 "split": sample.split,
                 "image": sample.image_path.name,
                 "label_idx": idx,
+                "source_id": annotation.source_id,
                 "class_id": annotation.class_id,
-                "x_norm": annotation.point[0] / sample.width if annotation.point else "",
-                "y_norm": annotation.point[1] / sample.height if annotation.point else "",
+                "x_norm": anchor[0] / sample.width,
+                "y_norm": anchor[1] / sample.height,
                 "actual_coverages": count,
                 "requested_coverages": target,
                 "covered_at_least_once": count >= 1,
@@ -599,7 +740,13 @@ def _append_coverage_rows(
                 "source_image_width": sample.width,
                 "source_image_height": sample.height,
                 "is_large_image": is_large,
-                "coverage_type": "dense" if target == cfg["target_coverage_per_label"] else "sparse",
+                "coverage_type": (
+                    "override"
+                    if override is not None
+                    else "dense"
+                    if target == cfg["target_appearances_per_object"]
+                    else "sparse"
+                ),
             }
         )
         totals = class_totals[(sample.split, annotation.class_id)]
@@ -607,7 +754,7 @@ def _append_coverage_rows(
     total = len(sample.annotations)
     hit = sum(counts.get(i, 0) >= 1 for i in range(total))
     requested, actual = sum(targets.values()), sum(counts.get(i, 0) for i in range(total))
-    dense = sum(v == cfg["target_coverage_per_label"] for v in targets.values())
+    dense = sum(v == cfg["target_appearances_per_object"] for v in targets.values())
     image_rows.append(
         {
             "split": sample.split,
@@ -712,17 +859,39 @@ def _write_coverage_reports(
 def _validate_coverage_settings(cfg: dict[str, Any]) -> None:
     if int(cfg["tile_size"]) <= 0:
         raise ValueError("tile_size must be positive")
-    low, high = map(float, cfg["scale_range"])
+    try:
+        low, high = map(float, cfg["scale_range"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("scale_range must contain exactly two numeric values") from exc
     if low <= 0 or high < low:
         raise ValueError("scale_range must contain two positive ascending values")
-    for key in ("fixed_polo_radius_px", "radius_multiplier"):
-        if float(cfg[key]) <= 0:
-            raise ValueError(f"{key} must be positive")
-    for key in ("target_coverage_per_label", "sparse_coverage_per_label", "max_attempts_per_needed_crop"):
+    if cfg["polo_radius_px"] is not None and float(cfg["polo_radius_px"]) <= 0:
+        raise ValueError("polo_radius_px must be positive or None")
+    if float(cfg["radius_multiplier"]) <= 0:
+        raise ValueError("radius_multiplier must be positive")
+    for key in (
+        "target_appearances_per_object",
+        "sparse_appearances_per_object",
+        "max_attempts_per_target",
+        "max_background_attempts_per_tile",
+    ):
         if int(cfg[key]) <= 0:
             raise ValueError(f"{key} must be positive")
-    if not 0 <= float(cfg["max_bg_ratio"]) <= 1:
-        raise ValueError("max_bg_ratio must be in [0, 1]")
+    if int(cfg["min_nearby_objects_for_full_coverage"]) < 0:
+        raise ValueError("min_nearby_objects_for_full_coverage must be non-negative")
+    if int(cfg["large_image_threshold"]) < 0:
+        raise ValueError("large_image_threshold must be non-negative or None")
+    if cfg["max_tiles_per_source_image"] is not None and int(cfg["max_tiles_per_source_image"]) <= 0:
+        raise ValueError("max_tiles_per_source_image must be positive or None")
+    if not 0 <= float(cfg["background_ratio"]) <= 1:
+        raise ValueError("background_ratio must be in [0, 1]")
+    if not 0 <= float(cfg["min_area_ratio"]) <= 1:
+        raise ValueError("min_area_ratio must be in [0, 1]")
+    if not 1 <= int(cfg["jpeg_quality"]) <= 100:
+        raise ValueError("jpeg_quality must be in [1, 100]")
+    for source_id, target in cfg["object_appearance_overrides"].items():
+        if int(target) <= 0:
+            raise ValueError(f"object_appearance_overrides[{source_id!r}] must be positive")
 
 
 def _save_staging_contact_sheet(builder, task: Task, relative_output: str) -> None:
