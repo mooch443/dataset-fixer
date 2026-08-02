@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,7 @@ from tqdm.auto import tqdm
 
 from .comparison.reporting import write_csv, write_json
 from .errors import DatasetValidationError, ValidationIssue
+from .model import ImagePrediction, Model, ModelCollection, ModelInput
 from .models import SemanticComparisonResult, SemanticMaskExport
 from .utils import (
     IMAGE_SUFFIXES,
@@ -26,22 +27,8 @@ from .utils import (
     normalize_split,
     settings_fingerprint,
     sha256_file,
-    slugify,
     to_jsonable,
 )
-
-
-@dataclass(frozen=True)
-class _NNUNetModelSpec:
-    name: str
-    slug: str
-    model_folder: Path
-    folds: tuple[str, ...]
-    checkpoint: str
-    checkpoint_files: tuple[Path, ...]
-    checkpoint_sha256: str
-    model_sha256: str
-    upscale_factor: int
 
 
 @dataclass(frozen=True)
@@ -54,6 +41,31 @@ class _SemanticCase:
     height: int
     image_sha256: str
     mask_sha256: str
+
+
+SemanticModelCohort = ModelCollection
+
+
+def load_nnunet_models(
+    export: SemanticMaskExport,
+    models: Any,
+    *,
+    folds: tuple[int | str, ...],
+    checkpoint: str,
+    device: str,
+    workers: int,
+) -> ModelCollection:
+    """Resolve official nnU-Net model folders for repeated operations."""
+
+    return Model.load_many(
+        models,
+        source=export,
+        kind="nnunet",
+        folds=folds,
+        checkpoint=checkpoint,
+        device=device,
+        workers=workers,
+    )
 
 
 def compare_nnunet_models(
@@ -90,11 +102,16 @@ def compare_nnunet_models(
         baseline = specs[0].name
     if baseline not in {spec.name for spec in specs}:
         raise ValueError(f"Unknown baseline {baseline!r}")
-    _require_official_commands()
+    _require_official_commands(
+        "nnUNetv2_predict_from_modelfolder",
+        "nnUNetv2_evaluate_folder",
+    )
     cases, cohort_fingerprint = _freeze_cohort(export, split)
 
     resolved_settings = {
         "backend": "nnunetv2-official",
+        "report_schema": 3,
+        "canonical_projection": "probability-area-pool-argmax",
         "split": split,
         "baseline": baseline,
         "device": device,
@@ -112,6 +129,8 @@ def compare_nnunet_models(
                 "checkpoint_sha256": spec.checkpoint_sha256,
                 "model_sha256": spec.model_sha256,
                 "upscale_factor": spec.upscale_factor,
+                "device": spec.device or device,
+                "workers": spec.workers,
             }
             for spec in specs
         ],
@@ -132,11 +151,13 @@ def compare_nnunet_models(
         "Metrics are produced by the official nnU-Net v2 folder evaluator on binary foreground masks.",
         "Training/evaluation overlap cannot be independently verified from an nnU-Net model folder alone.",
         "Paired uncertainty treats exported cases as independent; tiled cases from one source image may be correlated.",
+        "Dice is undefined when both reference and prediction are empty; finite support is reported separately "
+        "from total cohort size.",
     ]
     if any(spec.upscale_factor != 1 for spec in specs):
         limitations.append(
-            "Each model received inputs at its configured training-adapter scale; predicted masks were "
-            "nearest-neighbor resized back to the canonical exported resolution before evaluation."
+            "Each model received inputs at its configured training-adapter scale; predicted class probabilities "
+            "were area-averaged back to the canonical exported resolution before argmax and evaluation."
         )
 
     try:
@@ -147,59 +168,54 @@ def compare_nnunet_models(
         model_rows: dict[str, list[dict[str, Any]]] = {}
         ranking: list[dict[str, Any]] = []
         official_summaries: dict[str, str] = {}
+        native_official_summaries: dict[str, str] = {}
         prediction_dirs: dict[str, Path] = {}
+        model_inputs = _model_inputs_from_cases(cases)
         for model_index, spec in enumerate(specs):
-            prepared_images = temporary / "cohort" / "models" / spec.slug / "images"
-            _prepare_images(
-                cases,
-                prepared_images,
-                upscale_factor=spec.upscale_factor,
-                progress=progress,
-                model_name=spec.name,
-            )
+            native_labels = temporary / "cohort" / "models" / spec.slug / "labels"
+            _prepare_labels(cases, native_labels, upscale_factor=spec.upscale_factor)
             native_prediction_dir = temporary / "native-predictions" / spec.slug
             native_prediction_dir.mkdir(parents=True, exist_ok=True)
             prediction_dir = temporary / "predictions" / spec.slug
             prediction_dir.mkdir(parents=True, exist_ok=True)
             prediction_dirs[spec.name] = prediction_dir
-            summary_path = temporary / "reports" / "official" / f"{spec.slug}.json"
-            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path = temporary / f"{spec.slug}-metrics.json"
+            native_summary_path = temporary / f"{spec.slug}-native-metrics.json"
             print(
                 f"Evaluating {spec.name!r} with official nnU-Net v2 "
                 f"(folds={spec.folds}, checkpoint={spec.checkpoint}, "
                 f"input_scale={spec.upscale_factor}x)"
             )
-            inference_started = time.perf_counter()
+            prediction_result = spec.predict(
+                model_inputs,
+                device=spec.device or device,
+                progress=progress,
+                _keep_native=True,
+            )
+            inference_seconds = prediction_result.inference_seconds
+            _write_semantic_prediction_masks(
+                prediction_result.records,
+                prediction_dir,
+                native_prediction_dir,
+            )
+            _assert_exact_predictions(native_prediction_dir, cases, spec.name)
             _run_command(
                 [
-                    "nnUNetv2_predict_from_modelfolder",
-                    "-i",
-                    str(prepared_images),
-                    "-o",
+                    "nnUNetv2_evaluate_folder",
+                    str(native_labels),
                     str(native_prediction_dir),
-                    "-m",
-                    str(spec.model_folder),
-                    "-f",
-                    *spec.folds,
-                    "-chk",
-                    spec.checkpoint,
-                    "-device",
-                    device,
-                    "-npp",
-                    str(workers),
-                    "-nps",
-                    str(workers),
+                    "-djfile",
+                    str(spec.model_folder / "dataset.json"),
+                    "-pfile",
+                    str(spec.model_folder / "plans.json"),
+                    "-o",
+                    str(native_summary_path),
+                    "-np",
+                    str(spec.workers),
                 ]
             )
-            inference_seconds = time.perf_counter() - inference_started
-            _assert_exact_predictions(native_prediction_dir, cases, spec.name)
-            _canonicalize_predictions(
-                native_prediction_dir,
-                prediction_dir,
-                cases,
-                model_name=spec.name,
-                upscale_factor=spec.upscale_factor,
-            )
+            native_summary = _load_official_summary(native_summary_path, spec.name)
+            native_rows = _per_case_rows(native_summary, cases, spec.name)
             _assert_exact_predictions(prediction_dir, cases, spec.name)
             shutil.rmtree(native_prediction_dir)
             _run_command(
@@ -214,7 +230,7 @@ def compare_nnunet_models(
                     "-o",
                     str(summary_path),
                     "-np",
-                    str(workers),
+                    str(spec.workers),
                 ]
             )
             summary = _load_official_summary(summary_path, spec.name)
@@ -223,6 +239,13 @@ def compare_nnunet_models(
             aggregate = summary["foreground_mean"]
             dice = _metric(aggregate, "Dice")
             iou = _metric(aggregate, "IoU")
+            native_aggregate = native_summary["foreground_mean"]
+            native_dice = _metric(native_aggregate, "Dice")
+            native_iou = _metric(native_aggregate, "IoU")
+            finite_support = sum(math.isfinite(row["dice"]) for row in rows)
+            native_finite_support = sum(
+                math.isfinite(row["dice"]) for row in native_rows
+            )
             ci_low, ci_high = _bootstrap_interval(
                 [row["dice"] for row in rows],
                 resamples=bootstrap_resamples,
@@ -232,13 +255,19 @@ def compare_nnunet_models(
                 {
                     "model": spec.name,
                     "backend": "nnunetv2-official",
-                    "metric": "foreground_mean.Dice",
+                    "metric": "canonical.foreground_mean.Dice",
                     "score": dice,
                     "dice": dice,
                     "iou": iou,
+                    "native_dice": native_dice,
+                    "native_iou": native_iou,
                     "ci_low": ci_low,
                     "ci_high": ci_high,
-                    "support_cases": len(cases),
+                    "support_cases": finite_support,
+                    "native_support_cases": native_finite_support,
+                    "cohort_cases": len(cases),
+                    "undefined_cases": len(cases) - finite_support,
+                    "native_undefined_cases": len(cases) - native_finite_support,
                     "folds": ",".join(spec.folds),
                     "checkpoint": spec.checkpoint,
                     "checkpoint_sha256": spec.checkpoint_sha256,
@@ -246,6 +275,8 @@ def compare_nnunet_models(
                     "model_folder": str(spec.model_folder),
                     "upscale_factor": spec.upscale_factor,
                     "evaluation_resolution": "canonical-export",
+                    "projection": "probability-area-pool-argmax",
+                    "native_evaluation_resolution": f"model-input-{spec.upscale_factor}x",
                     "cohort_fingerprint": cohort_fingerprint,
                     "inference_seconds": inference_seconds,
                     "throughput_cases_per_second": (
@@ -260,8 +291,23 @@ def compare_nnunet_models(
                 model_slug=spec.slug,
                 keep_predictions=keep_predictions,
             )
+            sanitized["evaluation_resolution"] = "canonical-export"
+            sanitized["projection"] = "probability-area-pool-argmax"
             write_json(summary_path, sanitized)
             official_summaries[spec.name] = str(summary_path.relative_to(temporary))
+            sanitized_native = _sanitize_official_summary(
+                native_summary,
+                cases,
+                split=split,
+                model_slug=spec.slug,
+                keep_predictions=False,
+            )
+            sanitized_native["evaluation_resolution"] = f"model-input-{spec.upscale_factor}x"
+            sanitized_native["projection"] = "none"
+            write_json(native_summary_path, sanitized_native)
+            native_official_summaries[spec.name] = str(
+                native_summary_path.relative_to(temporary)
+            )
 
         ranking.sort(key=lambda row: (-_sortable_score(row["score"]), row["model"]))
         for rank, row in enumerate(ranking, start=1):
@@ -273,15 +319,14 @@ def compare_nnunet_models(
             seed=seed,
         )
         per_case = [row for name in [spec.name for spec in specs] for row in model_rows[name]]
-        write_csv(temporary / "metrics" / "ranking.csv", ranking)
-        write_csv(temporary / "metrics" / "per_case.csv", per_case)
-        write_csv(temporary / "metrics" / "paired_statistics.csv", paired)
-        write_json(temporary / "reports" / "limitations.json", {"limitations": limitations})
+        write_csv(temporary / "ranking.csv", ranking)
+        write_csv(temporary / "per-case.csv", per_case)
+        write_csv(temporary / "paired-statistics.csv", paired)
 
         figure_paths: list[str] = []
         qualitative_paths: list[str] = []
         if visualize:
-            figure_paths = _render_ranking(temporary, ranking, cohort_fingerprint)
+            figure_paths = _render_ranking(temporary, ranking)
             qualitative_paths = _render_qualitative(
                 temporary,
                 cases,
@@ -296,7 +341,7 @@ def compare_nnunet_models(
         shutil.rmtree(temporary / "cohort", ignore_errors=True)
 
         manifest = {
-            "schema": 1,
+            "schema": 3,
             "kind": "semantic-mask-model-comparison",
             "backend": "nnunetv2-official",
             "dataset": {
@@ -315,6 +360,7 @@ def compare_nnunet_models(
             "ranking": ranking,
             "paired_statistics": paired,
             "official_summaries": official_summaries,
+            "native_official_summaries": native_official_summaries,
             "limitations": limitations,
             "figures": figure_paths,
             "qualitative": qualitative_paths,
@@ -344,235 +390,223 @@ def compare_nnunet_models(
     )
 
 
+def predict_nnunet_model(
+    model: Model,
+    inputs: tuple[ModelInput, ...],
+    *,
+    device: str,
+    progress: bool,
+    keep_native: bool,
+) -> tuple[ImagePrediction, ...]:
+    """Run the official nnU-Net adapter for :meth:`Model.predict`."""
+
+    if model.kind != "nnunet":
+        raise TypeError("predict_nnunet_model requires Model(kind='nnunet')")
+    if device not in {"cpu", "cuda", "mps"}:
+        raise ValueError("nnU-Net device must be 'cpu', 'cuda', or 'mps'")
+    _require_official_commands("nnUNetv2_predict_from_modelfolder")
+    with tempfile.TemporaryDirectory(prefix="dataset-fixer-nnunet-predict-") as temporary:
+        root = Path(temporary)
+        prepared_images = root / "cohort" / "models" / model.slug / "images"
+        native_predictions = root / "native-predictions" / model.slug
+        native_predictions.mkdir(parents=True, exist_ok=True)
+        _prepare_model_inputs(
+            inputs,
+            prepared_images,
+            upscale_factor=model.upscale_factor,
+            progress=progress,
+            model_name=model.name,
+        )
+        if all(value.mask_path is not None for value in inputs):
+            _prepare_model_input_labels(
+                inputs,
+                root / "cohort" / "canonical" / "labels",
+            )
+        _run_command(
+            [
+                "nnUNetv2_predict_from_modelfolder",
+                "-i",
+                str(prepared_images),
+                "-o",
+                str(native_predictions),
+                "-m",
+                str(model.model_folder),
+                "-f",
+                *model.folds,
+                "-chk",
+                model.checkpoint,
+                "-device",
+                device,
+                "-npp",
+                str(model.workers),
+                "-nps",
+                str(model.workers),
+                "--save_probabilities",
+            ]
+        )
+        _assert_exact_model_predictions(native_predictions, inputs, model.name)
+        records: list[ImagePrediction] = []
+        for value in inputs:
+            native_path = native_predictions / f"{value.image_id}.png"
+            with Image.open(native_path) as opened:
+                native_mask = np.asarray(opened.convert("L")) > 0
+            expected_native = (
+                value.height * model.upscale_factor,
+                value.width * model.upscale_factor,
+            )
+            if native_mask.shape != expected_native:
+                raise DatasetValidationError(
+                    ValidationIssue(
+                        "nnU-Net native prediction dimensions do not match its input adapter",
+                        source=f"{model.name}/{value.image_id}",
+                        value=native_mask.shape,
+                        expected=str(expected_native),
+                    )
+                )
+            mask = _canonical_mask_from_probabilities(
+                native_predictions / f"{value.image_id}.npz",
+                image_id=value.image_id,
+                width=value.width,
+                height=value.height,
+                model_name=model.name,
+                upscale_factor=model.upscale_factor,
+            )
+            records.append(
+                ImagePrediction(
+                    image_id=value.image_id,
+                    image_path=value.image_path,
+                    relative_path=value.relative_path,
+                    width=value.width,
+                    height=value.height,
+                    mask=mask,
+                    native_mask=native_mask if keep_native else None,
+                    metadata={
+                        "backend": "nnunetv2-official",
+                        "upscale_factor": model.upscale_factor,
+                        "projection": "probability-area-pool-argmax",
+                    },
+                )
+            )
+        return tuple(records)
+
+
+def visualize_nnunet_models(
+    cohort: ModelCollection,
+    *,
+    split: str,
+    samples: int,
+    examples_per_row: int,
+    include_empty: bool,
+    seed: int,
+    panel_size: float,
+    model_title_length: int,
+    image_title_length: int,
+    progress: bool,
+    destination: str | Path | None,
+) -> Any:
+    """Run sampled official nnU-Net inference and render model masks."""
+
+    export = cohort.source
+    if not isinstance(export, SemanticMaskExport):
+        raise TypeError("Semantic visualization requires a bound SemanticMaskExport")
+    split = normalize_split(split)
+    if split not in export.splits:
+        raise ValueError(
+            f"Unknown semantic-mask split {split!r}; "
+            f"available splits are {export.splits}"
+        )
+    if samples <= 0:
+        raise ValueError("samples must be positive")
+    if examples_per_row <= 0:
+        raise ValueError("examples_per_row must be positive")
+    if not math.isfinite(panel_size) or panel_size <= 0:
+        raise ValueError("panel_size must be a positive finite number")
+    if model_title_length < 5:
+        raise ValueError("model_title_length must be at least 5")
+    if image_title_length < 5:
+        raise ValueError("image_title_length must be at least 5")
+    _require_official_commands("nnUNetv2_predict_from_modelfolder")
+
+    cases, _ = _freeze_cohort(export, split)
+    selected = _select_visual_cases(
+        cases,
+        samples=samples,
+        include_empty=include_empty,
+        seed=seed,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="dataset-fixer-semantic-visualize-") as temporary:
+        temporary_root = Path(temporary)
+        prediction_dirs: dict[str, Path] = {}
+        rows_by_model: dict[str, list[dict[str, Any]]] = {}
+        model_inputs = _model_inputs_from_cases(selected)
+        for spec in cohort.models:
+            predictions = temporary_root / "predictions" / spec.slug
+            predictions.mkdir(parents=True, exist_ok=True)
+            result = spec.predict(
+                model_inputs,
+                device=spec.device or "cuda",
+                progress=progress,
+            )
+            _write_semantic_prediction_masks(
+                result.records,
+                predictions,
+            )
+            prediction_dirs[spec.name] = predictions
+            rows_by_model[spec.name] = _sample_metric_rows(
+                selected,
+                predictions,
+                spec.name,
+            )
+
+        figure = _render_semantic_grid(
+            selected,
+            prediction_dirs,
+            rows_by_model,
+            examples_per_row=examples_per_row,
+            panel_size=panel_size,
+            model_title_length=model_title_length,
+            image_title_length=image_title_length,
+        )
+        if destination is not None:
+            output = _visualization_destination(destination)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            figure.savefig(
+                output,
+                dpi=180,
+                bbox_inches="tight",
+                facecolor="white",
+            )
+        return figure
+
+
 def _parse_models(
     models: Any,
     *,
     default_folds: tuple[int | str, ...],
     default_checkpoint: str,
-) -> list[_NNUNetModelSpec]:
-    if isinstance(models, (str, Path)):
-        items = [(Path(models).name, models)]
-    elif isinstance(models, Mapping):
-        items = list(models.items())
-    elif isinstance(models, Sequence):
-        items = [(Path(value).name, value) for value in models]
-    else:
-        raise TypeError(
-            "models must be an nnU-Net model folder, a sequence of folders, or a name-to-model mapping"
-        )
-    if not items:
-        raise ValueError("At least one nnU-Net model is required")
-
-    issues: list[ValidationIssue] = []
-    specs: list[_NNUNetModelSpec] = []
-    seen_names: set[str] = set()
-    seen_slugs: set[str] = set()
-    for raw_name, value in items:
-        name = str(raw_name).strip()
-        if not name or name in seen_names:
-            issues.append(ValidationIssue("Model names must be non-empty and unique", value=name))
-            continue
-        seen_names.add(name)
-        slug = slugify(name)
-        if slug in seen_slugs:
-            issues.append(
-                ValidationIssue(
-                    "Model names must remain unique after filename normalization",
-                    value=name,
-                    expected="distinct filesystem-safe names",
-                )
-            )
-            continue
-        seen_slugs.add(slug)
-        settings = dict(value) if isinstance(value, Mapping) else {"model_folder": value}
-        selected_upscale_factor = settings.get("upscale_factor", 1)
-        if (
-            not isinstance(selected_upscale_factor, int)
-            or isinstance(selected_upscale_factor, bool)
-            or selected_upscale_factor <= 0
-        ):
-            issues.append(
-                ValidationIssue(
-                    "Model upscale_factor must be a positive integer",
-                    source=name,
-                    value=selected_upscale_factor,
-                )
-            )
-            continue
-        raw_folder = settings.get("model_folder", settings.get("path"))
-        if raw_folder is None:
-            issues.append(ValidationIssue("nnU-Net model specification is missing model_folder", source=name))
-            continue
-        model_folder = Path(raw_folder).expanduser().resolve()
-        explicit_folds = "folds" in settings
-        selected_folds = _normalize_folds(settings.get("folds", default_folds), name, issues)
-        if model_folder.name.startswith("fold_") and not (model_folder / "plans.json").is_file():
-            inferred_fold = model_folder.name.removeprefix("fold_")
-            model_folder = model_folder.parent
-            if not explicit_folds:
-                selected_folds = (inferred_fold,)
-        selected_checkpoint = str(settings.get("checkpoint", default_checkpoint)).strip()
-        if not selected_checkpoint or Path(selected_checkpoint).name != selected_checkpoint:
-            issues.append(
-                ValidationIssue(
-                    "checkpoint must be a filename within each selected fold",
-                    source=name,
-                    value=selected_checkpoint,
-                )
-            )
-            continue
-        if not model_folder.is_dir():
-            issues.append(
-                ValidationIssue("nnU-Net model folder does not exist", source=name, value=str(model_folder))
-            )
-            continue
-        if not selected_folds:
-            continue
-        dataset_json = model_folder / "dataset.json"
-        plans_json = model_folder / "plans.json"
-        for required in (dataset_json, plans_json):
-            if not required.is_file():
-                issues.append(
-                    ValidationIssue(
-                        "Incomplete nnU-Net model folder",
-                        source=name,
-                        value=str(required),
-                        expected="dataset.json, plans.json, and selected fold checkpoints",
-                    )
-                )
-        if not dataset_json.is_file() or not plans_json.is_file():
-            continue
-        if not _validate_model_dataset_json(dataset_json, name, issues):
-            continue
-        checkpoint_files = tuple(
-            model_folder / f"fold_{fold}" / selected_checkpoint for fold in selected_folds
-        )
-        missing = [str(path) for path in checkpoint_files if not path.is_file()]
-        if missing:
-            issues.append(
-                ValidationIssue(
-                    "nnU-Net checkpoint is missing",
-                    source=name,
-                    value=missing,
-                    expected=f"{selected_checkpoint} in every selected fold",
-                )
-            )
-            continue
-        checkpoint_sha256 = _combined_sha256(checkpoint_files, relative_to=model_folder)
-        model_sha256 = _combined_sha256(
-            (dataset_json, plans_json, *checkpoint_files),
-            relative_to=model_folder,
-        )
-        specs.append(
-            _NNUNetModelSpec(
-                name=name,
-                slug=slug,
-                model_folder=model_folder,
-                folds=selected_folds,
-                checkpoint=selected_checkpoint,
-                checkpoint_files=checkpoint_files,
-                checkpoint_sha256=checkpoint_sha256,
-                model_sha256=model_sha256,
-                upscale_factor=selected_upscale_factor,
-            )
-        )
-    if issues:
-        raise DatasetValidationError(issues)
-    return specs
-
-
-def _normalize_folds(
-    value: Any,
-    name: str,
-    issues: list[ValidationIssue],
-) -> tuple[str, ...]:
-    if isinstance(value, (str, int)):
-        raw_folds = (value,)
-    else:
-        try:
-            raw_folds = tuple(value)
-        except TypeError:
-            issues.append(ValidationIssue("Invalid nnU-Net folds", source=name, value=value))
-            return ()
-    folds: list[str] = []
-    for raw in raw_folds:
-        fold = str(raw).strip()
-        if fold != "all":
-            try:
-                if int(fold) < 0 or str(int(fold)) != fold:
-                    raise ValueError
-            except ValueError:
-                issues.append(
-                    ValidationIssue(
-                        "Invalid nnU-Net fold",
-                        source=name,
-                        value=raw,
-                        expected="a non-negative integer or 'all'",
-                    )
-                )
-                continue
-        if fold not in folds:
-            folds.append(fold)
-    if not folds:
-        issues.append(ValidationIssue("At least one nnU-Net fold is required", source=name))
-    return tuple(folds)
-
-
-def _validate_model_dataset_json(
-    path: Path,
-    name: str,
-    issues: list[ValidationIssue],
-) -> bool:
-    try:
-        dataset = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        issues.append(ValidationIssue(f"Unreadable nnU-Net dataset.json: {exc}", source=name))
-        return False
-    if dataset.get("file_ending") != ".png":
-        issues.append(
+) -> list[Model]:
+    collection = Model.load_many(
+        models,
+        kind="nnunet",
+        folds=default_folds,
+        checkpoint=default_checkpoint,
+    )
+    incompatible = [model.name for model in collection if model.kind != "nnunet"]
+    if incompatible:
+        raise DatasetValidationError(
             ValidationIssue(
-                "SemanticMaskExport comparison requires an nnU-Net PNG model",
-                source=name,
-                value=dataset.get("file_ending"),
-                expected="file_ending='.png'",
+                "Semantic-mask comparison requires official nnU-Net models",
+                value=incompatible,
             )
         )
-        return False
-    labels = dataset.get("labels") or {}
-    values: set[int] = set()
-    try:
-        for value in labels.values():
-            if isinstance(value, list):
-                values.update(int(item) for item in value)
-            else:
-                values.add(int(value))
-    except (TypeError, ValueError):
-        values = set()
-    if values != {0, 1}:
-        issues.append(
-            ValidationIssue(
-                "SemanticMaskExport comparison requires binary nnU-Net labels",
-                source=name,
-                value=labels,
-                expected="background=0 and one foreground label=1",
-            )
-        )
-        return False
-    return True
+    return list(collection.models)
 
 
-def _combined_sha256(paths: tuple[Path, ...], *, relative_to: Path) -> str:
-    digest = hashlib.sha256()
-    for path in paths:
-        digest.update(path.relative_to(relative_to).as_posix().encode("utf-8"))
-        digest.update(sha256_file(path).encode("ascii"))
-    return digest.hexdigest()
-
-
-def _require_official_commands() -> None:
+def _require_official_commands(*commands: str) -> None:
     missing = [
         command
-        for command in ("nnUNetv2_predict_from_modelfolder", "nnUNetv2_evaluate_folder")
+        for command in commands
         if shutil.which(command) is None
     ]
     if missing:
@@ -667,14 +701,131 @@ def _freeze_cohort(
     return cases, digest.hexdigest()
 
 
+def _model_inputs_from_cases(
+    cases: list[_SemanticCase],
+) -> tuple[ModelInput, ...]:
+    return tuple(
+        ModelInput(
+            image_id=case.case_id,
+            image_path=case.image_path,
+            width=case.width,
+            height=case.height,
+            relative_path=case.relative_path.as_posix(),
+            mask_path=case.mask_path,
+        )
+        for case in cases
+    )
+
+
+def _prepare_model_input_labels(
+    inputs: tuple[ModelInput, ...],
+    label_dir: Path,
+) -> None:
+    label_dir.mkdir(parents=True, exist_ok=True)
+    for value in inputs:
+        if value.mask_path is None:
+            continue
+        with Image.open(value.mask_path) as opened_mask:
+            mask = opened_mask.convert("L").point(lambda pixel: 1 if pixel else 0)
+        mask.save(label_dir / f"{value.image_id}.png", format="PNG", optimize=False)
+
+
+def _prepare_model_inputs(
+    inputs: tuple[ModelInput, ...],
+    image_dir: Path,
+    *,
+    upscale_factor: int,
+    progress: bool,
+    model_name: str,
+) -> None:
+    image_dir.mkdir(parents=True, exist_ok=True)
+    iterator = tqdm(
+        inputs,
+        desc=f"Preparing {model_name} inputs ({upscale_factor}x)",
+        unit="image",
+        disable=not progress,
+    )
+    for value in iterator:
+        with Image.open(value.image_path) as opened_image:
+            image = opened_image.convert("RGB")
+        if image.size != (value.width, value.height):
+            raise DatasetValidationError(
+                f"Prediction input dimensions changed while preparing {value.image_path}"
+            )
+        if upscale_factor != 1:
+            image = image.resize(
+                (value.width * upscale_factor, value.height * upscale_factor),
+                Image.Resampling.BICUBIC,
+            )
+        image.save(image_dir / f"{value.image_id}_0000.png", format="PNG")
+
+
+def _write_semantic_prediction_masks(
+    records: tuple[ImagePrediction, ...],
+    canonical_dir: Path,
+    native_dir: Path | None = None,
+) -> None:
+    canonical_dir.mkdir(parents=True, exist_ok=True)
+    if native_dir is not None:
+        native_dir.mkdir(parents=True, exist_ok=True)
+    for record in records:
+        if record.mask is None:
+            raise DatasetValidationError(
+                f"Semantic prediction {record.image_id!r} has no canonical mask"
+            )
+        Image.fromarray(np.asarray(record.mask, dtype=np.uint8)).save(
+            canonical_dir / f"{record.image_id}.png",
+            format="PNG",
+            optimize=False,
+        )
+        if native_dir is not None:
+            if record.native_mask is None:
+                raise DatasetValidationError(
+                    f"Semantic prediction {record.image_id!r} has no native mask"
+                )
+            Image.fromarray(np.asarray(record.native_mask, dtype=np.uint8)).save(
+                native_dir / f"{record.image_id}.png",
+                format="PNG",
+                optimize=False,
+            )
+
+
+def _assert_exact_model_predictions(
+    prediction_dir: Path,
+    inputs: tuple[ModelInput, ...],
+    model_name: str,
+) -> None:
+    expected = {f"{value.image_id}.png" for value in inputs}
+    actual = {path.name for path in prediction_dir.glob("*.png") if path.is_file()}
+    if actual != expected:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "nnU-Net predictions do not match the requested images",
+                source=model_name,
+                value={
+                    "unexpected": sorted(actual - expected)[:20],
+                    "missing": sorted(expected - actual)[:20],
+                },
+                expected=f"exactly {len(expected)} prediction masks",
+            )
+        )
+
+
 def _prepare_labels(
     cases: list[_SemanticCase],
     label_dir: Path,
+    *,
+    upscale_factor: int = 1,
 ) -> None:
     label_dir.mkdir(parents=True, exist_ok=True)
     for case in cases:
         with Image.open(case.mask_path) as opened_mask:
             mask = opened_mask.convert("L").point(lambda value: 1 if value else 0)
+        if upscale_factor != 1:
+            mask = mask.resize(
+                (case.width * upscale_factor, case.height * upscale_factor),
+                Image.Resampling.NEAREST,
+            )
         mask.save(label_dir / f"{case.case_id}.png", format="PNG", optimize=False)
 
 
@@ -686,27 +837,20 @@ def _prepare_images(
     progress: bool,
     model_name: str,
 ) -> None:
-    image_dir.mkdir(parents=True, exist_ok=True)
-    iterator = tqdm(
-        cases,
-        desc=f"Preparing {model_name} inputs ({upscale_factor}x)",
-        unit="image",
-        disable=not progress,
+    _prepare_model_inputs(
+        _model_inputs_from_cases(cases),
+        image_dir,
+        upscale_factor=upscale_factor,
+        progress=progress,
+        model_name=model_name,
     )
-    for case in iterator:
-        with Image.open(case.image_path) as opened_image:
-            image = opened_image.convert("RGB")
-        if upscale_factor != 1:
-            size = (image.width * upscale_factor, image.height * upscale_factor)
-            image = image.resize(size, Image.Resampling.BICUBIC)
-        image.save(image_dir / f"{case.case_id}_0000.png", format="PNG")
 
 
 def _write_cohort(
     path: Path,
     cases: list[_SemanticCase],
     split: str,
-    specs: list[_NNUNetModelSpec],
+    specs: list[Model],
 ) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for case in cases:
@@ -721,6 +865,7 @@ def _write_cohort(
                         "width": case.width,
                         "height": case.height,
                         "evaluation_resolution": "canonical-export",
+                        "projection": "probability-area-pool-argmax",
                         "model_inputs": {
                             spec.name: {
                                 "upscale_factor": spec.upscale_factor,
@@ -791,46 +936,84 @@ def _canonicalize_predictions(
     model_name: str,
     upscale_factor: int,
 ) -> None:
-    """Project a model's native-scale masks onto the frozen source raster."""
+    """Area-pool native class probabilities onto the frozen source raster."""
 
     canonical_prediction_dir.mkdir(parents=True, exist_ok=True)
     for case in cases:
-        source = native_prediction_dir / f"{case.case_id}.png"
-        with Image.open(source) as opened:
-            prediction = opened.convert("L")
-        expected_native_size = (
-            case.width * upscale_factor,
-            case.height * upscale_factor,
+        source = native_prediction_dir / f"{case.case_id}.npz"
+        prediction = _canonical_mask_from_probabilities(
+            source,
+            image_id=case.case_id,
+            width=case.width,
+            height=case.height,
+            model_name=model_name,
+            upscale_factor=upscale_factor,
         )
-        if prediction.size != expected_native_size:
-            raise DatasetValidationError(
-                ValidationIssue(
-                    "nnU-Net prediction dimensions do not match the model input adapter",
-                    source=f"{model_name}/{case.case_id}",
-                    value=prediction.size,
-                    expected=str(expected_native_size),
-                )
-            )
-        values = set(prediction.getdata())
-        if not values <= {0, 1}:
-            raise DatasetValidationError(
-                ValidationIssue(
-                    "nnU-Net prediction contains labels outside the binary model schema",
-                    source=f"{model_name}/{case.case_id}",
-                    value=sorted(values)[:20],
-                    expected="0 or 1",
-                )
-            )
-        if prediction.size != (case.width, case.height):
-            prediction = prediction.resize(
-                (case.width, case.height),
-                Image.Resampling.NEAREST,
-            )
-        prediction.save(
+        Image.fromarray(prediction).save(
             canonical_prediction_dir / f"{case.case_id}.png",
             format="PNG",
             optimize=False,
         )
+
+
+def _canonical_mask_from_probabilities(
+    source: Path,
+    *,
+    image_id: str,
+    width: int,
+    height: int,
+    model_name: str,
+    upscale_factor: int,
+) -> np.ndarray:
+    if not source.is_file():
+        raise DatasetValidationError(
+            ValidationIssue(
+                "nnU-Net probability export is missing",
+                source=f"{model_name}/{image_id}",
+                value=str(source),
+                expected="an .npz file produced by --save_probabilities",
+            )
+        )
+    try:
+        with np.load(source) as archive:
+            probabilities = np.asarray(archive["probabilities"], dtype=np.float32)
+    except (OSError, KeyError, ValueError) as exc:
+        raise DatasetValidationError(
+            f"Unreadable nnU-Net probability export for {model_name}/{image_id}: {exc}"
+        ) from exc
+    expected_native_size = (width * upscale_factor, height * upscale_factor)
+    expected_spatial_shape = (expected_native_size[1], expected_native_size[0])
+    if (
+        probabilities.ndim < 3
+        or probabilities.shape[0] != 2
+        or probabilities.shape[-2:] != expected_spatial_shape
+        or math.prod(probabilities.shape[1:-2]) != 1
+    ):
+        raise DatasetValidationError(
+            ValidationIssue(
+                "nnU-Net probability dimensions do not match the binary model input adapter",
+                source=f"{model_name}/{image_id}",
+                value=probabilities.shape,
+                expected=f"(2, ..., {expected_native_size[1]}, {expected_native_size[0]})",
+            )
+        )
+    if not np.all(np.isfinite(probabilities)):
+        raise DatasetValidationError(
+            ValidationIssue(
+                "nnU-Net probability export contains non-finite values",
+                source=f"{model_name}/{image_id}",
+                expected="finite class probabilities",
+            )
+        )
+    probabilities = probabilities.reshape(2, *expected_spatial_shape)
+    pooled = probabilities.reshape(
+        2,
+        height,
+        upscale_factor,
+        width,
+        upscale_factor,
+    ).mean(axis=(2, 4))
+    return np.argmax(pooled, axis=0).astype(np.uint8)
 
 
 def _load_official_summary(path: Path, model_name: str) -> dict[str, Any]:
@@ -975,7 +1158,7 @@ def _paired_statistics(
             {
                 "model": name,
                 "baseline": baseline,
-                "metric": "per_case.Dice",
+                "metric": "canonical.per_case.Dice",
                 "difference": float(differences.mean()),
                 "ci_low": float(np.quantile(samples, 0.025)),
                 "ci_high": float(np.quantile(samples, 0.975)),
@@ -1034,11 +1217,7 @@ def _sortable_score(value: Any) -> float:
 def _render_ranking(
     root: Path,
     ranking: list[dict[str, Any]],
-    cohort_fingerprint: str,
 ) -> list[str]:
-    import matplotlib
-
-    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     ordered = list(reversed(ranking))
@@ -1050,29 +1229,16 @@ def _render_ranking(
     ]
     axis.barh(names, scores, color="#0072B2")
     axis.set_xlim(0, 1)
-    axis.set_xlabel("Official foreground mean Dice")
+    axis.set_xlabel("Canonical probability-pooled foreground mean Dice")
     axis.set_title("nnU-Net semantic-mask model comparison")
     for index, (score, row) in enumerate(zip(scores, ordered)):
         label = f"{float(row['dice']):.3f}" if math.isfinite(float(row["dice"])) else "n/a"
         axis.text(min(score + 0.01, 0.98), index, label, va="center")
     figure.tight_layout()
-    paths: list[str] = []
-    for suffix, dpi in (("png", 180), ("pdf", None), ("svg", None)):
-        path = root / "figures" / f"ranking.{suffix}"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        figure.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="white")
-        paths.append(str(path.relative_to(root)))
+    path = root / "ranking.png"
+    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
     plt.close(figure)
-    write_csv(root / "figures" / "data" / "ranking.csv", ranking)
-    write_json(
-        root / "figures" / "metadata" / "ranking.json",
-        {
-            "metric": "foreground_mean.Dice",
-            "cohort_fingerprint": cohort_fingerprint,
-            "models": names,
-        },
-    )
-    return paths
+    return [str(path.relative_to(root))]
 
 
 def _render_qualitative(
@@ -1083,73 +1249,260 @@ def _render_qualitative(
     *,
     seed: int,
 ) -> list[str]:
-    import matplotlib
-
-    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    rng = np.random.default_rng(seed)
-    indices = sorted(
-        rng.choice(len(cases), size=min(8, len(cases)), replace=False).tolist()
+    selected = _select_visual_cases(
+        cases,
+        samples=8,
+        include_empty=False,
+        seed=seed,
     )
-    selected = [cases[index] for index in indices]
-    row_lookup = {
-        name: {row["case_id"]: row for row in rows}
-        for name, rows in rows_by_model.items()
-    }
-    model_names = list(prediction_dirs)
-    figure, axes = plt.subplots(
-        len(selected),
-        2 + len(model_names),
-        figsize=(4 * (2 + len(model_names)), 3.5 * len(selected)),
-        squeeze=False,
+    figure = _render_semantic_grid(
+        selected,
+        prediction_dirs,
+        rows_by_model,
+        examples_per_row=1,
+        panel_size=3.0,
+        model_title_length=30,
+        image_title_length=72,
     )
-    for row_index, case in enumerate(selected):
-        with Image.open(case.image_path) as opened_image:
-            image = np.asarray(opened_image.convert("RGB"))
-        with Image.open(case.mask_path) as opened_mask:
-            truth = np.asarray(opened_mask.convert("L")) > 0
-        axes[row_index, 0].imshow(image)
-        axes[row_index, 0].set_title(case.relative_path.name)
-        axes[row_index, 1].imshow(truth, cmap="gray", vmin=0, vmax=1)
-        axes[row_index, 1].set_title("Ground truth")
-        for model_index, name in enumerate(model_names, start=2):
-            prediction_path = prediction_dirs[name] / f"{case.case_id}.png"
-            with Image.open(prediction_path) as opened_prediction:
-                prediction = np.asarray(opened_prediction.convert("L")) > 0
-            if prediction.shape != truth.shape:
-                prediction = np.asarray(
-                    Image.fromarray(prediction.astype(np.uint8)).resize(
-                        (truth.shape[1], truth.shape[0]),
-                        Image.Resampling.NEAREST,
-                    )
-                ) > 0
-            overlay = image.astype(np.float32) / 255.0
-            true_positive = truth & prediction
-            false_negative = truth & ~prediction
-            false_positive = ~truth & prediction
-            _paint(overlay, true_positive, (1.0, 1.0, 0.0))
-            _paint(overlay, false_negative, (0.0, 1.0, 0.0))
-            _paint(overlay, false_positive, (1.0, 0.0, 1.0))
-            metric = row_lookup[name][case.case_id]
-            axes[row_index, model_index].imshow(np.clip(overlay, 0, 1))
-            axes[row_index, model_index].set_title(
-                f"{name}\nDice={metric['dice']:.3f} · IoU={metric['iou']:.3f}"
-            )
-        for column in range(2 + len(model_names)):
-            axes[row_index, column].axis("off")
-    figure.tight_layout()
-    output = root / "qualitative" / "comparison.png"
-    output.parent.mkdir(parents=True, exist_ok=True)
+    output = root / "comparison.png"
     figure.savefig(output, dpi=160, bbox_inches="tight", facecolor="white")
     plt.close(figure)
     return [str(output.relative_to(root))]
 
 
-def _paint(
-    overlay: np.ndarray,
-    mask: np.ndarray,
-    color: tuple[float, float, float],
-) -> None:
-    color_array = np.asarray(color, dtype=np.float32)
-    overlay[mask] = 0.35 * overlay[mask] + 0.65 * color_array
+def _select_visual_cases(
+    cases: list[_SemanticCase],
+    *,
+    samples: int,
+    include_empty: bool,
+    seed: int,
+) -> list[_SemanticCase]:
+    eligible: list[_SemanticCase] = []
+    for case in cases:
+        if include_empty:
+            eligible.append(case)
+            continue
+        with Image.open(case.mask_path) as opened_mask:
+            if opened_mask.convert("L").getbbox() is not None:
+                eligible.append(case)
+    if not eligible:
+        eligible = list(cases)
+    count = min(samples, len(eligible))
+    if count == len(eligible):
+        return eligible
+    rng = np.random.default_rng(seed)
+    indices = sorted(rng.choice(len(eligible), size=count, replace=False).tolist())
+    return [eligible[index] for index in indices]
+
+
+def _sample_metric_rows(
+    cases: list[_SemanticCase],
+    prediction_dir: Path,
+    model_name: str,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for case in cases:
+        with Image.open(case.mask_path) as opened_mask:
+            truth = np.asarray(opened_mask.convert("L")) > 0
+        prediction_path = prediction_dir / f"{case.case_id}.png"
+        with Image.open(prediction_path) as opened_prediction:
+            prediction = np.asarray(opened_prediction.convert("L")) > 0
+        if prediction.shape != truth.shape:
+            raise DatasetValidationError(
+                f"Prediction dimensions {prediction.shape} do not match "
+                f"ground truth {truth.shape}: {prediction_path}"
+            )
+        metrics = _binary_mask_metrics(truth, prediction)
+        rows.append(
+            {
+                "model": model_name,
+                "case_id": case.case_id,
+                "relative_path": case.relative_path.as_posix(),
+                "dice": metrics["dice"],
+                "iou": metrics["iou"],
+                "n_ref": metrics["n_ref"],
+                "n_pred": metrics["n_pred"],
+            }
+        )
+    return rows
+
+
+def _binary_mask_metrics(
+    truth: np.ndarray,
+    prediction: np.ndarray,
+) -> dict[str, float]:
+    tp = int(np.sum(truth & prediction))
+    fp = int(np.sum(~truth & prediction))
+    fn = int(np.sum(truth & ~prediction))
+    dice_denominator = 2 * tp + fp + fn
+    iou_denominator = tp + fp + fn
+    return {
+        "dice": 2 * tp / dice_denominator if dice_denominator else math.nan,
+        "iou": tp / iou_denominator if iou_denominator else math.nan,
+        "n_ref": int(np.sum(truth)),
+        "n_pred": int(np.sum(prediction)),
+    }
+
+
+def _render_semantic_grid(
+    cases: list[_SemanticCase],
+    prediction_dirs: dict[str, Path],
+    rows_by_model: dict[str, list[dict[str, Any]]],
+    *,
+    examples_per_row: int,
+    panel_size: float,
+    model_title_length: int,
+    image_title_length: int,
+) -> Any:
+    import matplotlib.pyplot as plt
+
+    if not cases:
+        raise ValueError("At least one semantic-mask case is required for visualization")
+    model_names = list(prediction_dirs)
+    if not model_names:
+        raise ValueError("At least one model prediction is required for visualization")
+    row_lookup = {
+        name: {row["case_id"]: row for row in rows}
+        for name, rows in rows_by_model.items()
+    }
+    panel_count = 2 + len(model_names)
+    grid_rows = math.ceil(len(cases) / examples_per_row)
+    group_width = panel_size * panel_count
+    group_height = panel_size + 0.48
+    figure = plt.figure(
+        figsize=(
+            group_width * examples_per_row,
+            group_height * grid_rows,
+        ),
+    )
+    figure.subplots_adjust(
+        left=0.015,
+        right=0.985,
+        top=0.985,
+        bottom=0.015,
+    )
+    outer = figure.add_gridspec(
+        grid_rows,
+        examples_per_row,
+        wspace=0.08,
+        hspace=0.18,
+    )
+    column_titles = [
+        "Original",
+        "GT",
+        *[
+            _shorten_middle(name, model_title_length)
+            for name in model_names
+        ],
+    ]
+
+    for index, case in enumerate(cases):
+        grid_row = index // examples_per_row
+        grid_column = index % examples_per_row
+        cell = outer[grid_row, grid_column].subgridspec(
+            3,
+            panel_count,
+            height_ratios=(0.07, 0.07, 0.86),
+            hspace=0.01,
+            wspace=0.07,
+        )
+        title_slot = cell[0, :] if grid_row == 0 else cell[0:2, :]
+        title_axis = figure.add_subplot(title_slot)
+        title_axis.set_axis_off()
+        title_axis.text(
+            0.5,
+            0.5,
+            _shorten_middle(case.relative_path.name, image_title_length),
+            ha="center",
+            va="center",
+            fontsize=9,
+            fontweight="semibold",
+        )
+        if grid_row == 0:
+            heading_axis = figure.add_subplot(cell[1, :])
+            heading_axis.set_axis_off()
+            for panel_index, heading in enumerate(column_titles):
+                heading_axis.text(
+                    (panel_index + 0.5) / panel_count,
+                    0.45,
+                    heading,
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                )
+
+        with Image.open(case.image_path) as opened_image:
+            image = np.asarray(opened_image.convert("RGB"))
+        with Image.open(case.mask_path) as opened_mask:
+            truth = np.asarray(opened_mask.convert("L")) > 0
+        panels: list[np.ndarray] = [image, truth]
+        metrics: list[dict[str, Any] | None] = [None, None]
+        for name in model_names:
+            prediction_path = prediction_dirs[name] / f"{case.case_id}.png"
+            with Image.open(prediction_path) as opened_prediction:
+                prediction = np.asarray(opened_prediction.convert("L")) > 0
+            if prediction.shape != truth.shape:
+                raise DatasetValidationError(
+                    f"Prediction dimensions {prediction.shape} do not match "
+                    f"ground truth {truth.shape}: {prediction_path}"
+                )
+            panels.append(prediction)
+            try:
+                metrics.append(row_lookup[name][case.case_id])
+            except KeyError as exc:
+                raise DatasetValidationError(
+                    f"Missing visualization metrics for {name}/{case.case_id}"
+                ) from exc
+
+        for panel_index, panel in enumerate(panels):
+            axis = figure.add_subplot(cell[2, panel_index])
+            if panel_index == 0:
+                axis.imshow(panel)
+            else:
+                axis.imshow(
+                    panel,
+                    cmap="gray",
+                    vmin=0,
+                    vmax=1,
+                    interpolation="nearest",
+                )
+            axis.set_xticks([])
+            axis.set_yticks([])
+            for spine in axis.spines.values():
+                spine.set_visible(False)
+            metric = metrics[panel_index]
+            if metric is not None:
+                axis.set_xlabel(
+                    f"Dice={_format_metric(metric['dice'])} · "
+                    f"IoU={_format_metric(metric['iou'])}",
+                    fontsize=7.5,
+                    labelpad=2,
+                )
+    return figure
+
+
+def _shorten_middle(value: str, maximum: int) -> str:
+    if len(value) <= maximum:
+        return value
+    left = (maximum - 1) // 2
+    right = maximum - 1 - left
+    return f"{value[:left]}…{value[-right:]}"
+
+
+def _format_metric(value: Any) -> str:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    return f"{parsed:.3f}" if math.isfinite(parsed) else "n/a"
+
+
+def _visualization_destination(destination: str | Path) -> Path:
+    path = Path(destination).expanduser().resolve()
+    if path.suffix:
+        if path.suffix.lower() != ".png":
+            raise ValueError("visualization destination must be a PNG file or directory")
+        return path
+    return path / "comparison.png"

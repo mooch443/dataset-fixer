@@ -198,6 +198,34 @@ class SemanticMaskExport:
             mask_dirs=mask_dirs,
         )
 
+    def load_models(
+        self,
+        models: Any,
+        *,
+        folds: tuple[int | str, ...] = (0,),
+        checkpoint: str = "checkpoint_final.pth",
+        device: Literal["cpu", "cuda", "mps"] = "cuda",
+        workers: int = 2,
+    ) -> "ModelCollection":
+        """Load official nnU-Net models and bind them to this export.
+
+        The generic returned collection validates model folders and
+        checkpoints once. Its ``predict`` method uses the same model interface
+        as other supported model types; ``visualize`` predicts only a sampled
+        image set, while ``compare`` evaluates an entire semantic-mask split.
+        """
+
+        from .semantic_comparison import load_nnunet_models
+
+        return load_nnunet_models(
+            self,
+            models,
+            folds=folds,
+            checkpoint=checkpoint,
+            device=device,
+            workers=workers,
+        )
+
     def compare_models(
         self,
         models: Any,
@@ -244,22 +272,22 @@ class SemanticMaskExport:
                 overwritten.
 
         Returns:
-            A :class:`SemanticComparisonResult` with the official Dice/IoU
-            ranking, frozen cohort identity, settings, limitations, and report
-            location.
+            A :class:`SemanticComparisonResult` ranked by canonical Dice/IoU
+            after area-pooling nnU-Net class probabilities to the exported
+            resolution. The report also includes native-resolution official
+            metrics, finite support, frozen cohort identity, settings,
+            limitations, and its location.
         """
 
-        from .semantic_comparison import compare_nnunet_models
-
-        return compare_nnunet_models(
-            self,
+        return self.load_models(
             models,
-            split=split,
-            baseline=baseline,
             folds=folds,
             checkpoint=checkpoint,
             device=device,
             workers=workers,
+        ).compare(
+            split=split,
+            baseline=baseline,
             bootstrap_resamples=bootstrap_resamples,
             seed=seed,
             keep_predictions=keep_predictions,

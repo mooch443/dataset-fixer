@@ -272,13 +272,15 @@ relative path and stem. Mask values are `0` for background and `255` for the
 union of all polygons, intentionally discarding class and instance identity.
 Semantic-mask exports contain no YOLO labels or `data.yaml`.
 
-The returned artifact can compare official nnU-Net v2 models directly on one
-frozen exported split. Pass the trained-model directory that contains
-`dataset.json`, `plans.json`, and `fold_*` subdirectories—not a standalone
-checkpoint file:
+Official nnU-Net v2 models use the same model-first API for sampled
+visualization or a complete comparison. Pass the trained-model directory that
+contains `dataset.json`, `plans.json`, and `fold_*` subdirectories—not a
+standalone checkpoint file:
 
 ```python
-comparison = masks.compare_models(
+from dataset_fixer import Model
+
+models = Model.load_many(
     {
         "resenc-capped": {
             "model_folder": capped_fold_output.parent,
@@ -293,22 +295,50 @@ comparison = masks.compare_models(
             "upscale_factor": 1,
         },
     },
-    split="val",
-    baseline="resenc-capped",
     device="cuda",
 )
+
+# Predict only eight sampled validation images and return a Matplotlib figure.
+figure = models.visualize(
+    masks,
+    split="val",
+    samples=8,
+    examples_per_row=1,
+    destination="quick-comparison.png",
+)
+
+# Or predict and evaluate the complete validation split.
+comparison = models.compare(
+    masks,
+    split="val",
+    baseline="resenc-capped",
+)
 ```
+
+The sampled figure and the full comparison use the same renderer: each example
+has one filename title and columns for Original, GT, and each shortened model
+name. Model panels show masks only, with Dice and IoU beneath them. The
+`examples_per_row` and `panel_size` arguments control the grid. The existing
+`masks.load_models(...)` and `masks.compare_models(...)` remain compatibility
+shortcuts, but model loading itself is dataset-independent.
 
 Install the optional official backend with
 `pip install 'dataset-fixer[nnunet]'`. Comparison calls
 `nnUNetv2_predict_from_modelfolder` and `nnUNetv2_evaluate_folder`, verifies
 that every model predicted the exact same image set, and ranks the official
 foreground Dice/IoU results. Each model receives inputs at its own configured
-training-adapter scale; predictions are projected back to the original export
-resolution before all models are evaluated against the same canonical masks.
-The report includes per-case metrics, paired Dice
-deltas with bootstrap intervals, model/checkpoint hashes, official summaries,
-retained prediction masks, a ranking figure, and a qualitative error grid.
+training-adapter scale. nnU-Net class probabilities are area-averaged back to
+the original export resolution before `argmax`, so comparison does not depend
+on an arbitrary nearest-neighbor sample from each high-resolution block. All
+models are ranked against the same canonical masks; the report also retains
+the official native-resolution score for each model. It includes per-case
+metrics, finite and total cohort support, paired Dice deltas with bootstrap
+intervals, model/checkpoint hashes, canonical and native official summaries,
+retained canonical prediction masks, a ranking figure, and a qualitative error
+grid drawn from cases with foreground annotations. The report is intentionally
+shallow: its main files are `ranking.png`, `comparison.png`, `ranking.csv`,
+`per-case.csv`, `paired-statistics.csv`, and one canonical/native metric JSON
+pair per model; retained masks live under `predictions/`.
 For the attached official-training notebook, `model_folder` is
 `FOLD_OUTPUT.parent`, `folds=(FOLD,)`, `checkpoint=PREDICTION_CHECKPOINT`, and
 the model configuration's `upscale_factor` is `UPSCALE_FACTOR`.
@@ -331,6 +361,50 @@ licensing notes, expected runtime, validation checks, and source provenance.
 See the [notebook guide](notebooks/README.md) and the
 [public-data downloader](examples/README.md).
 
+## Unified model API
+
+`Model` is the single loading and prediction interface. It detects official
+nnU-Net trained-model folders from `dataset.json` and `plans.json`; model files
+use the Ultralytics adapter. Resolution, nnU-Net folds/checkpoint/upscale, the
+default device, and other adapter choices belong to the model and are reused by
+prediction, visualization, and comparison:
+
+```python
+from dataset_fixer import Model
+
+detector = Model(
+    "/models/best.pt",
+    name="detector",
+    resolution=640,
+)
+predictions = detector.predict(
+    "/data/example.jpg",
+    confidence=0.25,
+)
+print(predictions.summary())
+predictions.save("detector-predictions")
+
+segmenter = Model(
+    "/models/nnUNetTrainer_100epochs__nnUNetResEncUNetMPlans__2d",
+    name="resenc-m",
+    folds=(0,),
+    checkpoint="checkpoint_best_mean_fg_dice.pth",
+    upscale_factor=4,
+    device="mps",
+)
+mask_predictions = segmenter.predict(masks, split="val")
+```
+
+`PredictionResult` preserves input ordering and stable image IDs. Object-style
+models populate each record's `objects`; semantic models populate `mask`.
+`by_id`, `masks`, `summary()`, and `save()` provide common inspection/export
+utilities. Direct `Model.predict` defaults to native prediction. A dataset
+collection may opt into automatic SAHI selection explicitly.
+
+Use `Model.load_many(...)` to normalize an ordered model collection once. The
+collection accepts a dataset/export at operation time and exposes `predict`,
+`compare`, and—for semantic-mask exports—the shared sampled `visualize` grid.
+
 ## Cached model comparison
 
 `compare_models()` freezes one ordered evaluation cohort and requires every
@@ -338,7 +412,7 @@ model to predict exactly those images. It never takes a validation split from a
 checkpoint or training configuration.
 
 ```python
-comparison = dataset.compare_models(
+models = Model.load_many(
     {
         "baseline": {
             "path": "/models/baseline.pt",
@@ -351,10 +425,14 @@ comparison = dataset.compare_models(
             "resolution": 480,
         },
     },
+    inference="auto",
+)
+
+comparison = models.compare(
+    dataset,
     split="val",
     baseline="baseline",
     protocol="validation",
-    inference="auto",
 )
 ```
 
@@ -413,6 +491,11 @@ The intentionally small public API is:
 - `Dataset.compare_models`
 - `Dataset.visualize`
 - `Dataset.assert_trainable`
+- `Model`
+- `Model.predict`
+- `Model.compare`
+- `ModelCollection.predict`
+- `ModelCollection.compare`
 
 Operation-specific previews and audits are controlled with each method's
 `visualize=` parameter. Consistency checks run automatically during loading.

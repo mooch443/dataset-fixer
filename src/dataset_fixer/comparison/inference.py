@@ -4,12 +4,15 @@ import importlib.util
 import math
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from tqdm.auto import tqdm
 
 from ..errors import DatasetValidationError, ValidationIssue
 from .types import Cohort, ModelSpec, Prediction
+
+if TYPE_CHECKING:
+    from ..model import Model, ModelInput, PredictionTask
 
 
 def sahi_available() -> bool:
@@ -57,14 +60,20 @@ def run_inference(
         if threshold in predictions:
             continue
         start = time.perf_counter()
-        if backend == "sahi":
-            by_image = _run_sahi(
-                spec, cohort, threshold, confidence_floor, device, progress, settings
-            )
-        else:
-            by_image = _run_native(
-                spec, cohort, threshold, confidence_floor, device, progress, settings
-            )
+        result = spec.resolved_model.predict(
+            cohort,
+            inference=backend,
+            resolution=spec.resolution,
+            confidence=confidence_floor,
+            postprocess=threshold,
+            device=device,
+            progress=progress,
+            settings=settings,
+        )
+        by_image = {
+            record.image_id: list(record.objects)
+            for record in result.records
+        }
         _assert_exact_predictions(cohort, by_image, spec.name)
         predictions[threshold] = by_image
         timings[f"postprocess_{threshold:g}"] = time.perf_counter() - start
@@ -82,13 +91,103 @@ def _run_native(
     progress: bool,
     settings: dict[str, Any],
 ) -> dict[str, list[Prediction]]:
+    result = spec.resolved_model.predict(
+        cohort,
+        inference="native",
+        resolution=spec.resolution,
+        confidence=confidence_floor,
+        postprocess=threshold,
+        device=device,
+        progress=progress,
+        settings=settings,
+    )
+    return {record.image_id: list(record.objects) for record in result.records}
+
+
+def predict_model_inputs(
+    model: "Model",
+    inputs: tuple["ModelInput", ...],
+    *,
+    task: str | None,
+    backend: str,
+    resolution: int,
+    confidence: float,
+    postprocess: float,
+    device: str | None,
+    progress: bool,
+    settings: dict[str, Any],
+) -> tuple[dict[str, list[Prediction]], "PredictionTask"]:
+    """Adapter entry point used by the public :class:`Model` API."""
+
+    if backend == "sahi":
+        if task is None:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "SAHI prediction requires a known model task",
+                    source=model.name,
+                    expected="task metadata in args.yaml or Model(..., task=...)",
+                )
+            )
+        values = _predict_sahi_inputs(
+            model,
+            inputs,
+            task=task,
+            threshold=postprocess,
+            confidence_floor=confidence,
+            resolution=resolution,
+            device=device,
+            progress=progress,
+            settings=settings,
+        )
+        return values, task  # type: ignore[return-value]
+    return _predict_native_inputs(
+        model,
+        inputs,
+        task=task,
+        threshold=postprocess,
+        confidence_floor=confidence,
+        resolution=resolution,
+        device=device,
+        progress=progress,
+        settings=settings,
+    )
+
+
+def _predict_native_inputs(
+    model: "Model",
+    inputs: tuple["ModelInput", ...],
+    *,
+    task: str | None,
+    threshold: float,
+    confidence_floor: float,
+    resolution: int,
+    device: str | None,
+    progress: bool,
+    settings: dict[str, Any],
+) -> tuple[dict[str, list[Prediction]], "PredictionTask"]:
     try:
         from ultralytics import YOLO
     except ImportError as exc:
         raise ImportError("Native inference requires Ultralytics; install dataset-fixer[comparison]") from exc
-    model = YOLO(str(spec.path))
+    loaded = model._runtime_model(
+        ("ultralytics-native",),
+        lambda: YOLO(str(model.path)),
+    )
+    detected_task = task or model.task or getattr(loaded, "task", None)
+    if detected_task is None:
+        detected_task = getattr(getattr(loaded, "model", None), "task", None)
+    if detected_task not in {"detect", "segment", "pose", "polo"}:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Could not determine the Ultralytics model task",
+                source=model.name,
+                value=detected_task,
+                expected="detect, segment, pose, or polo",
+                suggestion="pass task=... when constructing Model",
+            )
+        )
     kwargs: dict[str, Any] = {
-        "imgsz": spec.resolution,
+        "imgsz": resolution,
         "conf": confidence_floor,
         "iou": threshold,
         "verbose": False,
@@ -101,9 +200,9 @@ def _run_native(
         kwargs["half"] = True
     output: dict[str, list[Prediction]] = {}
     iterator = tqdm(
-        cohort.records,
-        total=len(cohort.records),
-        desc=f"{spec.name} native {threshold:g}",
+        inputs,
+        total=len(inputs),
+        desc=f"{model.name} native {threshold:g}",
         disable=not progress,
     )
     for record in iterator:
@@ -111,12 +210,12 @@ def _run_native(
         # then reports synthetic paths such as ``image0.jpg``. Inference one image
         # at a time so result identity remains independently verifiable instead of
         # trusting positional ordering from a batched loader.
-        results = model.predict(source=str(record.image_path), **kwargs)
+        results = loaded.predict(source=str(record.image_path), **kwargs)
         if len(results) != 1:
             raise DatasetValidationError(
                 ValidationIssue(
                     "Native inference did not return exactly one result for a cohort image",
-                    source=f"{spec.name}: {record.image_path}",
+                    source=f"{model.name}: {record.image_path}",
                     value=len(results),
                     expected="exactly one result",
                 )
@@ -130,13 +229,13 @@ def _run_native(
                 raise DatasetValidationError(
                     ValidationIssue(
                         "Native inference reordered or substituted a cohort image",
-                        source=spec.name,
+                        source=model.name,
                         value=str(result_path),
                         expected=str(record.image_path),
                     )
                 )
-        output[record.image_id] = _parse_native_result(result, cohort.task)
-    return output
+        output[record.image_id] = _parse_native_result(result, detected_task)
+    return output, detected_task  # type: ignore[return-value]
 
 
 def _parse_native_result(result: Any, task: str) -> list[Prediction]:
@@ -192,17 +291,52 @@ def _run_sahi(
     progress: bool,
     settings: dict[str, Any],
 ) -> dict[str, list[Prediction]]:
+    result = spec.resolved_model.predict(
+        cohort,
+        inference="sahi",
+        resolution=spec.resolution,
+        confidence=confidence_floor,
+        postprocess=threshold,
+        device=device,
+        progress=progress,
+        settings=settings,
+    )
+    return {record.image_id: list(record.objects) for record in result.records}
+
+
+def _predict_sahi_inputs(
+    source_model: "Model",
+    inputs: tuple["ModelInput", ...],
+    *,
+    task: str,
+    threshold: float,
+    confidence_floor: float,
+    resolution: int,
+    device: str | None,
+    progress: bool,
+    settings: dict[str, Any],
+) -> dict[str, list[Prediction]]:
     try:
         from sahi import AutoDetectionModel
         from sahi.predict import get_prediction, get_sliced_prediction
     except ImportError as exc:
         raise ImportError("SAHI inference requires the optional dataset-fixer[sahi] extra") from exc
-    model = AutoDetectionModel.from_pretrained(
-        model_type=str(settings.get("model_type", "ultralytics")),
-        model_path=str(spec.path),
-        confidence_threshold=confidence_floor,
-        device=device or "cpu",
-        image_size=spec.resolution,
+    model_type = str(settings.get("model_type", "ultralytics"))
+    model = source_model._runtime_model(
+        (
+            "sahi",
+            model_type,
+            float(confidence_floor),
+            device or "cpu",
+            int(resolution),
+        ),
+        lambda: AutoDetectionModel.from_pretrained(
+            model_type=model_type,
+            model_path=str(source_model.path),
+            confidence_threshold=confidence_floor,
+            device=device or "cpu",
+            image_size=resolution,
+        ),
     )
     mode = str(settings.get("sahi_mode", "sliced"))
     if mode not in {"standard", "sliced", "combined"}:
@@ -212,7 +346,11 @@ def _run_sahi(
     post_type = str(settings.get("postprocess_type", "GREEDYNMM")).upper()
     post_metric = str(settings.get("postprocess_match_metric", "IOS")).upper()
     output: dict[str, list[Prediction]] = {}
-    iterator = tqdm(cohort.records, desc=f"{spec.name} SAHI {threshold:g}", disable=not progress)
+    iterator = tqdm(
+        inputs,
+        desc=f"{source_model.name} SAHI {threshold:g}",
+        disable=not progress,
+    )
     for record in iterator:
         common = {
             "detection_model": model,
@@ -232,15 +370,15 @@ def _run_sahi(
         else:
             result = get_sliced_prediction(
                 str(record.image_path),
-                slice_height=int(settings.get("slice_height", spec.resolution)),
-                slice_width=int(settings.get("slice_width", spec.resolution)),
+                slice_height=int(settings.get("slice_height", resolution)),
+                slice_width=int(settings.get("slice_width", resolution)),
                 overlap_height_ratio=overlap_h,
                 overlap_width_ratio=overlap_w,
                 perform_standard_pred=mode == "combined",
                 **common,
             )
         output[record.image_id] = [
-            _sahi_prediction(value, cohort.task, post_type, post_metric, threshold)
+            _sahi_prediction(value, task, post_type, post_metric, threshold)
             for value in result.object_prediction_list
         ]
     return output

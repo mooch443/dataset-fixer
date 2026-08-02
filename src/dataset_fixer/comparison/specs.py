@@ -4,9 +4,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from ..errors import DatasetValidationError, ValidationIssue
+from ..model import Model, ModelCollection
 from .types import ModelSpec
 
 
@@ -17,12 +16,19 @@ def parse_models(
     confidence_thresholds: tuple[float, ...],
     postprocess_thresholds: tuple[float, ...],
 ) -> list[ModelSpec]:
-    if isinstance(models, (str, Path)):
+    if isinstance(models, ModelCollection):
+        items = [(model.name, model) for model in models]
+    elif isinstance(models, Model):
+        items = [(models.name, models)]
+    elif isinstance(models, (str, Path)):
         items = [(Path(models).stem, models)]
     elif isinstance(models, Mapping):
         items = list(models.items())
     elif isinstance(models, Sequence):
-        items = [(Path(value).stem, value) for value in models]
+        items = [
+            (value.name, value) if isinstance(value, Model) else (Path(value).stem, value)
+            for value in models
+        ]
     else:
         raise TypeError("models must be a checkpoint path, a sequence of paths, or a name-to-model mapping")
 
@@ -36,10 +42,20 @@ def parse_models(
             continue
         seen.add(name)
         settings = dict(value) if isinstance(value, Mapping) else {"path": value}
-        if "path" not in settings:
+        loaded = value if isinstance(value, Model) else None
+        if loaded is not None:
+            settings = {
+                "path": loaded.path,
+                "training_dataset": loaded.training_dataset,
+                "resolution": loaded.resolution or default_resolution,
+                "inference": loaded.inference,
+                **loaded.settings,
+            }
+        if "path" not in settings and "model_folder" not in settings:
             issues.append(ValidationIssue("Model specification is missing path", source=name))
             continue
-        path = Path(settings["path"]).expanduser().resolve()
+        raw_path = settings.get("path", settings.get("model_folder"))
+        path = Path(raw_path).expanduser().resolve()
         if not path.is_file():
             issues.append(
                 ValidationIssue(
@@ -56,7 +72,31 @@ def parse_models(
             continue
         conf = _thresholds(settings.get("confidence_thresholds", confidence_thresholds), "confidence", name, issues)
         post = _thresholds(settings.get("postprocess_thresholds", postprocess_thresholds), "postprocess", name, issues)
-        training = settings.get("training_dataset") or _training_dataset_from_args(path)
+        adapter_settings = {
+            key: value
+            for key, value in settings.items()
+            if key
+            not in {
+                "path",
+                "model_folder",
+                "training_dataset",
+                "resolution",
+                "confidence_thresholds",
+                "postprocess_thresholds",
+                "locked_confidence",
+                "locked_postprocess",
+                "inference",
+            }
+        }
+        resolved_model = loaded or Model(
+            path,
+            name=name,
+            resolution=resolution,
+            training_dataset=settings.get("training_dataset"),
+            inference=str(settings.get("inference", "auto")),
+            settings=adapter_settings,
+        )
+        training = settings.get("training_dataset") or resolved_model.training_dataset
         result.append(
             ModelSpec(
                 name=name,
@@ -72,10 +112,11 @@ def parse_models(
                     for key, value in settings.items()
                     if key
                     not in {
-                        "path", "training_dataset", "resolution", "confidence_thresholds",
+                        "path", "model_folder", "training_dataset", "resolution", "confidence_thresholds",
                         "postprocess_thresholds", "locked_confidence", "locked_postprocess",
                     }
                 },
+                model=resolved_model,
             )
         )
     if issues:
@@ -114,24 +155,3 @@ def _optional_probability(value: Any, name: str, issues: list[ValidationIssue]) 
     if not 0 <= result <= 1:
         issues.append(ValidationIssue("Locked threshold must be in [0, 1]", source=name, value=result))
     return result
-
-
-def _training_dataset_from_args(checkpoint: Path) -> str | None:
-    for directory in (checkpoint.parent, checkpoint.parent.parent):
-        args = directory / "args.yaml"
-        if not args.is_file():
-            continue
-        try:
-            payload = yaml.safe_load(args.read_text(encoding="utf-8")) or {}
-            data = payload.get("data")
-            if not data:
-                continue
-            path = Path(str(data)).expanduser()
-            if not path.is_absolute():
-                path = (args.parent / path).resolve()
-            if path.suffix.lower() in {".yaml", ".yml"}:
-                return str(path)
-            return str(path.resolve())
-        except (OSError, TypeError, yaml.YAMLError):
-            continue
-    return None

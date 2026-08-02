@@ -10,7 +10,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dataset_fixer import ComparisonResult, Dataset
+from dataset_fixer import (
+    ComparisonResult,
+    Dataset,
+    Model,
+    ModelCollection,
+    PredictionResult,
+)
 from dataset_fixer.comparison.cache import (
     import_notebook_cache,
     load_package_cache,
@@ -168,6 +174,90 @@ def test_native_inference_verifies_each_image_identity(
     assert list(predictions) == [record.image_id for record in cohort.records]
 
 
+def test_generic_model_auto_detects_and_predicts_supported_images(
+    detect_dataset: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "detect-model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    (tmp_path / "args.yaml").write_text(
+        "task: detect\ndata: training/data.yaml\n",
+        encoding="utf-8",
+    )
+    image = detect_dataset / "val" / "images" / "val_0.jpg"
+
+    class FakeYOLO:
+        task = "detect"
+
+        def __init__(self, path: str) -> None:
+            assert path == str(checkpoint)
+
+        def predict(self, *, source, **kwargs):
+            assert source == str(image.resolve())
+            assert kwargs["imgsz"] == 320
+            boxes = types.SimpleNamespace(
+                xyxy=[[1, 2, 20, 30]],
+                conf=[0.9],
+                cls=[0],
+            )
+            return [
+                types.SimpleNamespace(
+                    path=source,
+                    boxes=boxes,
+                    masks=None,
+                    keypoints=None,
+                )
+            ]
+
+    monkeypatch.setitem(sys.modules, "ultralytics", types.SimpleNamespace(YOLO=FakeYOLO))
+    model = Model(checkpoint, name="detector", resolution=320)
+
+    assert model.kind == "ultralytics"
+    assert model.task == "detect"
+    assert not model.loaded
+    assert model.describe()["digest"] == model.digest
+    result = model.predict(image, confidence=0.2, progress=False)
+
+    assert isinstance(result, PredictionResult)
+    assert result.task == "detect"
+    assert model.loaded
+    assert result.backend == "native"
+    assert result["image_000000"].objects[0].bbox == pytest.approx((1, 2, 20, 30))
+    assert result.summary()["predictions"] == 1
+    saved = result.save(tmp_path / "saved-predictions")
+    assert (saved / "prediction-manifest.json").is_file()
+    assert (saved / "predictions.json").is_file()
+    model.unload()
+    assert not model.loaded
+
+
+def test_model_load_many_returns_reusable_unbound_collection(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+
+    models = Model.load_many(
+        {
+            "baseline": {
+                "path": checkpoint,
+                "resolution": 384,
+                "confidence_thresholds": (0.5,),
+            }
+        },
+        inference="native",
+        device="mps",
+    )
+
+    assert isinstance(models, ModelCollection)
+    assert models.source is None
+    assert models.names == ("baseline",)
+    assert models["baseline"].resolution == 384
+    assert models["baseline"].device == "mps"
+    assert models["baseline"].settings["confidence_thresholds"] == (0.5,)
+
+
 def test_compare_models_facade_atomic_result(
     detect_dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -209,6 +299,22 @@ def test_compare_models_facade_atomic_result(
     assert (destination / "model-comparison.json").is_file()
     assert (destination / "metrics" / "ranking.csv").is_file()
     assert not list(tmp_path.glob(".comparison.building-*"))
+
+    direct = Model(checkpoint, name="direct", task="detect")
+    direct_result = direct.compare(
+        dataset,
+        split="val",
+        training_provenance="ignore",
+        confidence_thresholds=(0.5,),
+        postprocess_thresholds=(0.5,),
+        cache=False,
+        visualize=False,
+        progress=False,
+        destination=tmp_path / "direct-comparison",
+        bootstrap_resamples=20,
+    )
+    assert direct_result.ranking[0]["model"] == "direct"
+    assert direct_result.settings["inference_requested"] == "native"
 
 
 def test_comparison_visuals_have_data_and_metadata_sidecars(

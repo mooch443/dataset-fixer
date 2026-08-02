@@ -1009,8 +1009,16 @@ class Dataset:
         if overlap_width_ratio is not None:
             inference_settings["overlap_width_ratio"] = overlap_width_ratio
 
+        from .model import Model
+
+        loaded_models = Model.load_many(
+            models,
+            resolution=resolution,
+            inference=inference,
+            device=device,
+        )
         return compare_models(
-            self, models, split=split, baseline=baseline, inference=inference,
+            self, loaded_models, split=split, baseline=baseline, inference=inference,
             protocol=protocol, calibration_split=calibration_split,
             training_provenance=training_provenance,
             confidence_thresholds=confidence_thresholds,

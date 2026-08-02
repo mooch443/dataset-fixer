@@ -1,0 +1,1359 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
+
+import numpy as np
+import yaml
+from PIL import Image
+
+from .errors import DatasetValidationError, ValidationIssue
+from .utils import IMAGE_SUFFIXES, sha256_file, slugify, to_jsonable
+
+ModelKind = Literal["ultralytics", "nnunet"]
+PredictionTask = Literal["detect", "segment", "pose", "polo", "semantic_segment"]
+
+
+@dataclass(frozen=True)
+class ModelInput:
+    """One image supplied to :meth:`Model.predict`.
+
+    ``image_id`` is stable within a prediction request. ``mask_path`` is
+    optional and is used only by evaluation code; prediction never reads it.
+    """
+
+    image_id: str
+    image_path: Path
+    width: int
+    height: int
+    relative_path: str
+    mask_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class ImagePrediction:
+    """Predictions associated with one input image.
+
+    Instance-style tasks populate ``objects`` with the package's existing
+    ``Prediction`` values. Semantic models populate ``mask`` and, when
+    requested internally, ``native_mask``.
+    """
+
+    image_id: str
+    image_path: Path
+    relative_path: str
+    width: int
+    height: int
+    objects: tuple[Any, ...] = ()
+    mask: np.ndarray | None = field(default=None, repr=False, compare=False)
+    native_mask: np.ndarray | None = field(default=None, repr=False, compare=False)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def count(self) -> int:
+        """Number of object predictions, or foreground pixels for a mask."""
+
+        if self.mask is not None:
+            return int(np.count_nonzero(self.mask))
+        return len(self.objects)
+
+
+@dataclass(frozen=True)
+class PredictionResult:
+    """Ordered, model-independent output returned by :meth:`Model.predict`."""
+
+    model_name: str
+    model_kind: ModelKind
+    task: PredictionTask
+    backend: str
+    records: tuple[ImagePrediction, ...]
+    inference_seconds: float
+    settings: dict[str, Any] = field(default_factory=dict)
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __iter__(self) -> Iterator[ImagePrediction]:
+        return iter(self.records)
+
+    def __getitem__(self, value: int | str) -> ImagePrediction:
+        if isinstance(value, int):
+            return self.records[value]
+        try:
+            return self.by_id[value]
+        except KeyError as exc:
+            raise KeyError(f"Unknown prediction image_id {value!r}") from exc
+
+    @property
+    def by_id(self) -> dict[str, ImagePrediction]:
+        """Predictions keyed by stable input image identifier."""
+
+        return {record.image_id: record for record in self.records}
+
+    @property
+    def masks(self) -> dict[str, np.ndarray]:
+        """Semantic masks keyed by image identifier."""
+
+        return {
+            record.image_id: record.mask
+            for record in self.records
+            if record.mask is not None
+        }
+
+    def save(self, destination: str | Path) -> Path:
+        """Save predictions in a compact task-appropriate representation.
+
+        Semantic masks are written to ``masks/*.png`` and object-style output
+        to ``predictions.json``. Existing output files are never overwritten.
+
+        Parameters:
+            destination: New or empty prediction directory.
+
+        Returns:
+            The resolved output directory.
+        """
+
+        root = Path(destination).expanduser().resolve()
+        if root.exists():
+            if not root.is_dir() or any(root.iterdir()):
+                raise FileExistsError(f"Prediction destination is not empty: {root}")
+        root.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "schema": 1,
+            "kind": "model-predictions",
+            "model": self.model_name,
+            "model_kind": self.model_kind,
+            "task": self.task,
+            "backend": self.backend,
+            "images": len(self.records),
+            "inference_seconds": self.inference_seconds,
+            "settings": to_jsonable(self.settings),
+        }
+        (root / "prediction-manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        if self.task == "semantic_segment":
+            mask_root = root / "masks"
+            mask_root.mkdir(parents=True, exist_ok=True)
+            for record in self.records:
+                if record.mask is None:
+                    raise DatasetValidationError(
+                        f"Semantic prediction {record.image_id!r} has no mask"
+                    )
+                Image.fromarray(
+                    (np.asarray(record.mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+                ).save(mask_root / f"{record.image_id}.png", format="PNG")
+        else:
+            rows = []
+            for record in self.records:
+                rows.append(
+                    {
+                        "image_id": record.image_id,
+                        "image_path": str(record.image_path),
+                        "relative_path": record.relative_path,
+                        "width": record.width,
+                        "height": record.height,
+                        "predictions": [
+                            {
+                                "class_id": value.class_id,
+                                "score": value.score,
+                                "bbox": value.bbox,
+                                "point": value.point,
+                                "radius": value.radius,
+                                "polygon": value.polygon,
+                                "keypoints": value.keypoints,
+                                "metadata": value.metadata,
+                            }
+                            for value in record.objects
+                        ],
+                    }
+                )
+            (root / "predictions.json").write_text(
+                json.dumps(to_jsonable(rows), indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        return root
+
+    def summary(self) -> dict[str, Any]:
+        """Return a JSON-safe prediction summary."""
+
+        return {
+            "model": self.model_name,
+            "model_kind": self.model_kind,
+            "task": self.task,
+            "backend": self.backend,
+            "images": len(self.records),
+            "predictions": sum(record.count for record in self.records),
+            "inference_seconds": self.inference_seconds,
+            "images_per_second": (
+                len(self.records) / self.inference_seconds
+                if self.inference_seconds > 0
+                else None
+            ),
+        }
+
+    def visualize(
+        self,
+        *,
+        samples: int = 8,
+        columns: int = 2,
+        seed: int = 42,
+        panel_size: float = 3.0,
+        destination: str | Path | None = None,
+    ) -> Any:
+        """Render sampled original/prediction pairs.
+
+        Parameters:
+            samples: Maximum number of images to render.
+            columns: Number of independent image pairs per figure row.
+            seed: Deterministic sampling seed.
+            panel_size: Approximate width/height of each image panel in inches.
+            destination: Optional PNG output path.
+
+        Returns:
+            A Matplotlib figure.
+        """
+
+        if samples <= 0 or columns <= 0:
+            raise ValueError("samples and columns must be positive")
+        if not math.isfinite(panel_size) or panel_size <= 0:
+            raise ValueError("panel_size must be a positive finite number")
+        if not self.records:
+            raise ValueError("PredictionResult contains no images")
+        import matplotlib.pyplot as plt
+
+        count = min(samples, len(self.records))
+        if count == len(self.records):
+            selected = list(self.records)
+        else:
+            rng = np.random.default_rng(seed)
+            indices = sorted(
+                rng.choice(len(self.records), size=count, replace=False).tolist()
+            )
+            selected = [self.records[index] for index in indices]
+        rows = math.ceil(len(selected) / columns)
+        figure = plt.figure(
+            figsize=(panel_size * 2 * columns, (panel_size + 0.38) * rows)
+        )
+        figure.subplots_adjust(left=0.02, right=0.98, top=0.98, bottom=0.02)
+        outer = figure.add_gridspec(rows, columns, wspace=0.10, hspace=0.18)
+        for index, record in enumerate(selected):
+            row = index // columns
+            column = index % columns
+            cell = outer[row, column].subgridspec(
+                2,
+                2,
+                height_ratios=(0.10, 0.90),
+                hspace=0.02,
+                wspace=0.07,
+            )
+            title = figure.add_subplot(cell[0, :])
+            title.set_axis_off()
+            title.text(
+                0.5,
+                0.5,
+                _shorten_middle(record.relative_path, 72),
+                ha="center",
+                va="center",
+                fontsize=9,
+                fontweight="semibold",
+            )
+            with Image.open(record.image_path) as opened:
+                image = np.asarray(opened.convert("RGB"))
+            original = figure.add_subplot(cell[1, 0])
+            original.imshow(image)
+            prediction = figure.add_subplot(cell[1, 1])
+            if record.mask is not None:
+                prediction.imshow(
+                    record.mask,
+                    cmap="gray",
+                    vmin=0,
+                    vmax=1,
+                    interpolation="nearest",
+                )
+            else:
+                prediction.imshow(image)
+                _draw_object_predictions(prediction, record.objects)
+            for axis in (original, prediction):
+                axis.set_xticks([])
+                axis.set_yticks([])
+                for spine in axis.spines.values():
+                    spine.set_visible(False)
+            if row == 0:
+                original.set_title("Original", fontsize=9, pad=4)
+                prediction.set_title(
+                    _shorten_middle(self.model_name, 28),
+                    fontsize=9,
+                    pad=4,
+                )
+        if destination is not None:
+            path = Path(destination).expanduser().resolve()
+            if path.suffix.lower() != ".png":
+                raise ValueError("visualization destination must be a PNG file")
+            if path.exists():
+                raise FileExistsError(f"Visualization already exists: {path}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
+        return figure
+
+
+class Model:
+    """Auto-detected model with a common prediction and comparison API.
+
+    A path to an official nnU-Net trained-model folder is detected from its
+    ``dataset.json``/``plans.json`` files. File checkpoints are treated as
+    Ultralytics-compatible models. Model-specific adapter settings live on the
+    model instead of being repeated at each evaluation call.
+
+    Parameters:
+        source: Ultralytics-compatible checkpoint or official nnU-Net model
+            folder. Passing ``fold_N`` for nnU-Net is normalized to its parent.
+        name: Display name; defaults to the file stem or folder name.
+        kind: Explicit adapter, or ``"auto"`` to inspect ``source``.
+        task: Optional task override. nnU-Net is always semantic segmentation;
+            Ultralytics task metadata is read from adjacent ``args.yaml`` when
+            available and otherwise resolved lazily by Ultralytics.
+        resolution: Default Ultralytics image size.
+        training_dataset: Optional training-data provenance path.
+        inference: Default Ultralytics inference mode.
+        device: Default inference device.
+        folds: nnU-Net folds selected for prediction.
+        checkpoint: nnU-Net checkpoint filename within each fold.
+        upscale_factor: nnU-Net input adapter scale used during training.
+        workers: nnU-Net preprocessing/export worker count.
+        settings: Additional adapter defaults such as SAHI slicing options.
+    """
+
+    def __init__(
+        self,
+        source: str | Path,
+        *,
+        name: str | None = None,
+        kind: Literal["auto", "ultralytics", "nnunet"] = "auto",
+        task: PredictionTask | Literal["auto"] | None = None,
+        resolution: int | None = None,
+        training_dataset: str | Path | None = None,
+        inference: Literal["auto", "native", "sahi"] = "native",
+        device: str | None = None,
+        folds: tuple[int | str, ...] = (0,),
+        checkpoint: str = "checkpoint_final.pth",
+        upscale_factor: int = 1,
+        workers: int = 2,
+        settings: Mapping[str, Any] | None = None,
+    ) -> None:
+        path = Path(source).expanduser().resolve()
+        if path.name.startswith("fold_") and not (path / "plans.json").is_file():
+            candidate = path.parent
+            if (candidate / "dataset.json").is_file() and (candidate / "plans.json").is_file():
+                if folds == (0,):
+                    folds = (path.name.removeprefix("fold_"),)
+                path = candidate
+        resolved_kind = self._detect_kind(path) if kind == "auto" else kind
+        if resolved_kind not in {"ultralytics", "nnunet"}:
+            raise ValueError("kind must be 'auto', 'ultralytics', or 'nnunet'")
+        parsed_name = str(name or (path.stem if path.is_file() else path.name)).strip()
+        if not parsed_name:
+            raise ValueError("Model name must be non-empty")
+        if inference not in {"auto", "native", "sahi"}:
+            raise ValueError("inference must be 'auto', 'native', or 'sahi'")
+        if resolution is not None and (
+            isinstance(resolution, bool) or int(resolution) <= 0
+        ):
+            raise ValueError("resolution must be a positive integer")
+        if (
+            isinstance(upscale_factor, bool)
+            or not isinstance(upscale_factor, int)
+            or upscale_factor <= 0
+        ):
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Model upscale_factor must be a positive integer",
+                    source=parsed_name,
+                    value=upscale_factor,
+                )
+            )
+        if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
+            raise ValueError("workers must be a positive integer")
+
+        self._path = path
+        self._name = parsed_name
+        self._slug = slugify(parsed_name)
+        self._kind: ModelKind = resolved_kind
+        self._resolution = int(resolution) if resolution is not None else None
+        self._inference = inference
+        self._device = device
+        self._settings = dict(settings or {})
+        self._upscale_factor = upscale_factor
+        self._workers = workers
+        self._folds: tuple[str, ...] = ()
+        self._checkpoint = checkpoint
+        self._checkpoint_files: tuple[Path, ...] = ()
+        self._checkpoint_sha256 = ""
+        self._digest = ""
+        self._runtime: dict[Any, Any] = {}
+        self._resolved_task: PredictionTask | None = (
+            None if task in {None, "auto"} else task
+        )
+
+        if resolved_kind == "nnunet":
+            self._initialize_nnunet(folds, checkpoint)
+            if self._resolved_task not in {None, "semantic_segment"}:
+                raise ValueError("Official nnU-Net models use task='semantic_segment'")
+            self._resolved_task = "semantic_segment"
+            if inference not in {"auto", "native"}:
+                raise ValueError("Official nnU-Net prediction does not support SAHI")
+            if device is not None and device not in {"cpu", "cuda", "mps"}:
+                raise ValueError("nnU-Net device must be 'cpu', 'cuda', or 'mps'")
+        else:
+            if not path.is_file():
+                raise DatasetValidationError(
+                    ValidationIssue(
+                        "Ultralytics model source is not a file",
+                        value=str(path),
+                        expected="a model checkpoint or exported model file",
+                    )
+                )
+            self._digest = sha256_file(path)
+            if self._resolved_task is None:
+                self._resolved_task = _task_from_args(path)
+
+        inferred_training = training_dataset or (
+            _training_dataset_from_args(path) if resolved_kind == "ultralytics" else None
+        )
+        self._training_dataset = (
+            Path(inferred_training).expanduser().resolve() if inferred_training else None
+        )
+
+    @staticmethod
+    def _detect_kind(path: Path) -> ModelKind:
+        if path.is_dir() and (path / "dataset.json").is_file() and (path / "plans.json").is_file():
+            return "nnunet"
+        if path.is_file():
+            return "ultralytics"
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Could not detect a supported model",
+                value=str(path),
+                expected=(
+                    "an Ultralytics-compatible model file or an official nnU-Net "
+                    "folder containing dataset.json and plans.json"
+                ),
+            )
+        )
+
+    def _initialize_nnunet(
+        self,
+        folds: tuple[int | str, ...],
+        checkpoint: str,
+    ) -> None:
+        dataset_json = self._path / "dataset.json"
+        plans_json = self._path / "plans.json"
+        selected_folds = _normalize_folds(folds)
+        if not checkpoint or Path(checkpoint).name != checkpoint:
+            raise ValueError("checkpoint must be a filename within each selected fold")
+        _validate_nnunet_dataset(dataset_json, self._name)
+        if not plans_json.is_file():
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Incomplete nnU-Net model folder",
+                    source=self._name,
+                    value=str(plans_json),
+                    expected="plans.json",
+                )
+            )
+        checkpoint_files = tuple(
+            self._path / f"fold_{fold}" / checkpoint for fold in selected_folds
+        )
+        missing = [str(path) for path in checkpoint_files if not path.is_file()]
+        if missing:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "nnU-Net checkpoint is missing",
+                    source=self._name,
+                    value=missing,
+                    expected=f"{checkpoint} in every selected fold",
+                )
+            )
+        self._folds = selected_folds
+        self._checkpoint_files = checkpoint_files
+        self._checkpoint_sha256 = _combined_sha256(
+            checkpoint_files,
+            relative_to=self._path,
+        )
+        self._digest = _combined_sha256(
+            (dataset_json, plans_json, *checkpoint_files),
+            relative_to=self._path,
+        )
+
+    @property
+    def name(self) -> str:
+        """Human-readable model name."""
+
+        return self._name
+
+    @property
+    def slug(self) -> str:
+        """Filesystem-safe model name."""
+
+        return self._slug
+
+    @property
+    def path(self) -> Path:
+        """Resolved checkpoint or trained-model folder."""
+
+        return self._path
+
+    @property
+    def model_folder(self) -> Path:
+        """Official nnU-Net model folder.
+
+        Raises for non-nnU-Net models so adapter mistakes fail early.
+        """
+
+        if self.kind != "nnunet":
+            raise AttributeError("model_folder is only available for nnU-Net models")
+        return self._path
+
+    @property
+    def kind(self) -> ModelKind:
+        """Detected model adapter."""
+
+        return self._kind
+
+    @property
+    def task(self) -> PredictionTask | None:
+        """Detected/configured task, or ``None`` until lazy model loading."""
+
+        return self._resolved_task
+
+    @property
+    def resolution(self) -> int | None:
+        """Default Ultralytics inference resolution."""
+
+        return self._resolution
+
+    @property
+    def inference(self) -> str:
+        """Default inference mode."""
+
+        return self._inference
+
+    @property
+    def device(self) -> str | None:
+        """Default inference device."""
+
+        return self._device
+
+    @property
+    def training_dataset(self) -> Path | None:
+        """Training-data provenance path when known."""
+
+        return self._training_dataset
+
+    @property
+    def folds(self) -> tuple[str, ...]:
+        """Selected nnU-Net folds."""
+
+        return self._folds
+
+    @property
+    def checkpoint(self) -> str:
+        """Selected nnU-Net checkpoint filename."""
+
+        return self._checkpoint
+
+    @property
+    def checkpoint_files(self) -> tuple[Path, ...]:
+        """Resolved nnU-Net checkpoint files."""
+
+        return self._checkpoint_files
+
+    @property
+    def checkpoint_sha256(self) -> str:
+        """Combined selected-checkpoint hash for nnU-Net models."""
+
+        return self._checkpoint_sha256
+
+    @property
+    def digest(self) -> str:
+        """Content digest used for cache and comparison identity."""
+
+        return self._digest
+
+    @property
+    def model_sha256(self) -> str:
+        """Compatibility alias for :attr:`digest`."""
+
+        return self._digest
+
+    @property
+    def upscale_factor(self) -> int:
+        """nnU-Net input adapter scale."""
+
+        return self._upscale_factor
+
+    @property
+    def workers(self) -> int:
+        """Default nnU-Net worker count."""
+
+        return self._workers
+
+    @property
+    def settings(self) -> dict[str, Any]:
+        """Copy of additional adapter defaults."""
+
+        return dict(self._settings)
+
+    @property
+    def loaded(self) -> bool:
+        """Whether a heavyweight runtime has been initialized lazily."""
+
+        return bool(self._runtime)
+
+    def unload(self) -> None:
+        """Release cached inference runtimes while preserving model metadata."""
+
+        self._runtime.clear()
+
+    def _runtime_model(self, key: Any, factory: Callable[[], Any]) -> Any:
+        if key not in self._runtime:
+            self._runtime[key] = factory()
+        return self._runtime[key]
+
+    def describe(self) -> dict[str, Any]:
+        """Return a JSON-safe model identity and adapter summary."""
+
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "task": self.task,
+            "path": str(self.path),
+            "digest": self.digest,
+            "resolution": self.resolution,
+            "training_dataset": (
+                str(self.training_dataset) if self.training_dataset else None
+            ),
+            "inference": self.inference,
+            "device": self.device,
+            "folds": self.folds,
+            "checkpoint": self.checkpoint if self.kind == "nnunet" else None,
+            "checkpoint_sha256": (
+                self.checkpoint_sha256 if self.kind == "nnunet" else None
+            ),
+            "upscale_factor": self.upscale_factor if self.kind == "nnunet" else None,
+            "workers": self.workers if self.kind == "nnunet" else None,
+            "settings": to_jsonable(self.settings),
+        }
+
+    def predict(
+        self,
+        source: Any,
+        *,
+        split: Literal["train", "val", "test"] | None = None,
+        inference: Literal["auto", "native", "sahi"] | None = None,
+        resolution: int | None = None,
+        confidence: float = 0.25,
+        postprocess: float = 0.7,
+        device: str | None = None,
+        progress: bool = True,
+        destination: str | Path | None = None,
+        settings: Mapping[str, Any] | None = None,
+        _keep_native: bool = False,
+    ) -> PredictionResult:
+        """Predict images, directories, datasets, exports, or frozen inputs.
+
+        Parameters:
+            source: Image path, image directory, sequence of paths or
+                :class:`ModelInput` values, :class:`Dataset`,
+                :class:`SemanticMaskExport`, or an internal frozen cohort.
+            split: Dataset/export split. Defaults to ``"val"`` for dataset-like
+                sources and is ignored for direct image inputs.
+            inference: Native or SAHI inference for Ultralytics models. nnU-Net
+                uses its official predictor.
+            resolution: Ultralytics input size override.
+            confidence: Prediction confidence floor.
+            postprocess: Native IoU or SAHI postprocessing threshold.
+            device: Device override.
+            progress: Show package-managed progress bars.
+            destination: Optional new/empty directory receiving saved output.
+            settings: Additional per-call adapter overrides.
+
+        Returns:
+            Ordered :class:`PredictionResult` values with stable image IDs.
+        """
+
+        if not math.isfinite(float(confidence)) or not 0 <= float(confidence) <= 1:
+            raise ValueError("confidence must be finite and in [0, 1]")
+        if not math.isfinite(float(postprocess)) or not 0 <= float(postprocess) <= 1:
+            raise ValueError("postprocess must be finite and in [0, 1]")
+        inputs, source_task = normalize_model_inputs(source, split=split)
+        if not inputs:
+            raise ValueError("Prediction source contains no supported images")
+        selected_device = device if device is not None else self.device
+        combined_settings = {**self.settings, **dict(settings or {})}
+        started = time.perf_counter()
+        if self.kind == "nnunet":
+            from .semantic_comparison import predict_nnunet_model
+
+            records = predict_nnunet_model(
+                self,
+                inputs,
+                device=selected_device or "cuda",
+                progress=progress,
+                keep_native=_keep_native,
+            )
+            backend = "nnunetv2-official"
+            task: PredictionTask = "semantic_segment"
+            resolved_settings = {
+                "device": selected_device or "cuda",
+                "folds": self.folds,
+                "checkpoint": self.checkpoint,
+                "upscale_factor": self.upscale_factor,
+                "workers": self.workers,
+            }
+        else:
+            from .comparison.inference import predict_model_inputs, resolve_backend
+
+            requested = inference or self.inference
+            known_task = source_task or self.task
+            selected_backend = (
+                "native"
+                if requested == "auto" and known_task is None
+                else resolve_backend(requested, known_task or "detect")
+            )
+            by_id, resolved_task = predict_model_inputs(
+                self,
+                inputs,
+                task=known_task,
+                backend=selected_backend,
+                resolution=resolution or self.resolution or 480,
+                confidence=float(confidence),
+                postprocess=float(postprocess),
+                device=selected_device,
+                progress=progress,
+                settings=combined_settings,
+            )
+            self._resolved_task = resolved_task
+            task = resolved_task
+            backend = selected_backend
+            records = tuple(
+                ImagePrediction(
+                    image_id=value.image_id,
+                    image_path=value.image_path,
+                    relative_path=value.relative_path,
+                    width=value.width,
+                    height=value.height,
+                    objects=tuple(by_id[value.image_id]),
+                    metadata={"backend": backend},
+                )
+                for value in inputs
+            )
+            resolved_settings = {
+                "device": selected_device,
+                "resolution": resolution or self.resolution or 480,
+                "confidence": confidence,
+                "postprocess": postprocess,
+                **combined_settings,
+            }
+        result = PredictionResult(
+            model_name=self.name,
+            model_kind=self.kind,
+            task=task,
+            backend=backend,
+            records=tuple(records),
+            inference_seconds=time.perf_counter() - started,
+            settings=resolved_settings,
+        )
+        if destination is not None:
+            result.save(destination)
+        return result
+
+    def compare(self, source: Any, **options: Any) -> Any:
+        """Compare this model on a dataset or semantic-mask export."""
+
+        return ModelCollection((self,), source=source).compare(**options)
+
+    def visualize(
+        self,
+        source: Any,
+        *,
+        split: Literal["train", "val", "test"] | None = None,
+        samples: int = 8,
+        columns: int = 2,
+        seed: int = 42,
+        panel_size: float = 3.0,
+        destination: str | Path | None = None,
+        progress: bool = True,
+        prediction_options: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Predict a source and render sampled original/prediction pairs."""
+
+        options = dict(prediction_options or {})
+        options.setdefault("split", split)
+        options.setdefault("progress", progress)
+        result = self.predict(source, **options)
+        return result.visualize(
+            samples=samples,
+            columns=columns,
+            seed=seed,
+            panel_size=panel_size,
+            destination=destination,
+        )
+
+    @classmethod
+    def load_many(
+        cls,
+        models: Any,
+        *,
+        source: Any | None = None,
+        kind: Literal["auto", "ultralytics", "nnunet"] | None = None,
+        task: PredictionTask | Literal["auto"] | None = None,
+        resolution: int | None = None,
+        training_dataset: str | Path | None = None,
+        inference: Literal["auto", "native", "sahi"] | None = None,
+        device: str | None = None,
+        folds: tuple[int | str, ...] | None = None,
+        checkpoint: str | None = None,
+        upscale_factor: int | None = None,
+        workers: int | None = None,
+        settings: Mapping[str, Any] | None = None,
+        defaults: Mapping[str, Any] | None = None,
+    ) -> "ModelCollection":
+        """Normalize paths/configurations into an ordered model collection.
+
+        Common keyword values are collection defaults; a model's own mapping
+        overrides them. ``defaults`` remains available for programmatic
+        forwarding, but user code should prefer the explicit keywords.
+        """
+
+        if isinstance(models, ModelCollection):
+            if source is None or models.source is source:
+                return models
+            return ModelCollection(models.models, source=source)
+        if isinstance(models, Model):
+            return ModelCollection((models,), source=source)
+        if isinstance(models, (str, Path)):
+            items = [(None, models)]
+        elif isinstance(models, Mapping):
+            items = list(models.items())
+        elif isinstance(models, Sequence):
+            items = [(None, value) for value in models]
+        else:
+            raise TypeError(
+                "models must be Model values, model paths, a sequence, or a name-to-model mapping"
+            )
+        if not items:
+            raise ValueError("At least one model is required")
+        base = dict(defaults or {})
+        explicit_defaults = {
+            "kind": kind,
+            "task": task,
+            "resolution": resolution,
+            "training_dataset": training_dataset,
+            "inference": inference,
+            "device": device,
+            "folds": folds,
+            "checkpoint": checkpoint,
+            "upscale_factor": upscale_factor,
+            "workers": workers,
+        }
+        base.update(
+            {key: value for key, value in explicit_defaults.items() if value is not None}
+        )
+        if settings is not None:
+            base["settings"] = dict(settings)
+        resolved: list[Model] = []
+        seen_names: set[str] = set()
+        seen_slugs: set[str] = set()
+        for raw_name, value in items:
+            if isinstance(value, Model):
+                if raw_name is None or str(raw_name) == value.name:
+                    model = value
+                else:
+                    model = Model(
+                        value.path,
+                        name=str(raw_name),
+                        kind=value.kind,
+                        task=value.task,
+                        resolution=value.resolution,
+                        training_dataset=value.training_dataset,
+                        inference=value.inference,
+                        device=value.device,
+                        folds=value.folds or (0,),
+                        checkpoint=value.checkpoint,
+                        upscale_factor=value.upscale_factor,
+                        workers=value.workers,
+                        settings=value.settings,
+                    )
+            else:
+                configuration = dict(base)
+                if isinstance(value, Mapping):
+                    configuration.update(value)
+                    raw_source = configuration.pop(
+                        "source",
+                        configuration.pop(
+                            "model_folder",
+                            configuration.pop("path", None),
+                        ),
+                    )
+                else:
+                    raw_source = value
+                if raw_source is None:
+                    raise DatasetValidationError(
+                        ValidationIssue(
+                            "Model specification is missing path/model_folder",
+                            source=str(raw_name) if raw_name is not None else None,
+                        )
+                    )
+                known = {
+                    "kind",
+                    "task",
+                    "resolution",
+                    "training_dataset",
+                    "inference",
+                    "device",
+                    "folds",
+                    "checkpoint",
+                    "upscale_factor",
+                    "workers",
+                }
+                adapter_settings = dict(configuration.pop("settings", {}) or {})
+                adapter_settings.update(
+                    {
+                        key: configuration.pop(key)
+                        for key in list(configuration)
+                        if key not in known
+                    }
+                )
+                model = Model(
+                    raw_source,
+                    name=str(raw_name) if raw_name is not None else None,
+                    settings=adapter_settings,
+                    **configuration,
+                )
+            if model.name in seen_names or model.slug in seen_slugs:
+                raise DatasetValidationError(
+                    ValidationIssue(
+                        "Model names must be unique before and after filename normalization",
+                        value=model.name,
+                    )
+                )
+            seen_names.add(model.name)
+            seen_slugs.add(model.slug)
+            resolved.append(model)
+        return ModelCollection(tuple(resolved), source=source)
+
+    def __repr__(self) -> str:
+        return (
+            f"Model(name={self.name!r}, kind={self.kind!r}, task={self.task!r}, "
+            f"path={str(self.path)!r})"
+        )
+
+
+@dataclass(frozen=True)
+class ModelCollection:
+    """Ordered models optionally bound to a dataset or semantic-mask export."""
+
+    models: tuple[Model, ...]
+    source: Any | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not self.models:
+            raise ValueError("At least one model is required")
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """Model names in prediction order."""
+
+        return tuple(model.name for model in self.models)
+
+    def __len__(self) -> int:
+        return len(self.models)
+
+    def __iter__(self) -> Iterator[Model]:
+        return iter(self.models)
+
+    def __getitem__(self, value: int | str) -> Model:
+        if isinstance(value, int):
+            return self.models[value]
+        for model in self.models:
+            if model.name == value:
+                return model
+        raise KeyError(f"Unknown model {value!r}")
+
+    def predict(self, source: Any | None = None, **options: Any) -> dict[str, PredictionResult]:
+        """Run every model through the common prediction interface."""
+
+        active = self.source if source is None else source
+        if active is None:
+            raise ValueError("A prediction source is required for an unbound model collection")
+        return {model.name: model.predict(active, **options) for model in self.models}
+
+    def compare(self, source: Any | None = None, **options: Any) -> Any:
+        """Dispatch comparison to the bound dataset/export implementation."""
+
+        active = self.source if source is None else source
+        if active is None:
+            raise ValueError("A comparison source is required for an unbound model collection")
+        from .models import SemanticMaskExport
+
+        if isinstance(active, SemanticMaskExport):
+            from .semantic_comparison import compare_nnunet_models
+
+            defaults = {
+                "split": "val",
+                "baseline": None,
+                "folds": (0,),
+                "checkpoint": "checkpoint_final.pth",
+                "device": self.models[0].device or "cuda",
+                "workers": self.models[0].workers,
+                "bootstrap_resamples": 10_000,
+                "seed": 42,
+                "keep_predictions": True,
+                "visualize": True,
+                "progress": True,
+                "destination": None,
+            }
+            defaults.update(options)
+            return compare_nnunet_models(active, self, **defaults)
+        from .dataset import Dataset
+
+        if isinstance(active, Dataset):
+            if "inference" not in options:
+                modes = {model.inference for model in self.models}
+                if len(modes) == 1:
+                    options["inference"] = next(iter(modes))
+                else:
+                    options["comparison_unit"] = "system"
+            return active.compare_models(self, **options)
+        raise TypeError("Model comparison requires Dataset or SemanticMaskExport")
+
+    def visualize(self, source: Any | None = None, **options: Any) -> Any:
+        """Render a sampled semantic cohort with the shared comparison grid."""
+
+        active = self.source if source is None else source
+        from .models import SemanticMaskExport
+
+        if not isinstance(active, SemanticMaskExport):
+            raise TypeError(
+                "Collection visualization currently requires SemanticMaskExport; "
+                "use Model.predict for other sources"
+            )
+        from .semantic_comparison import visualize_nnunet_models
+
+        defaults = {
+            "split": "val",
+            "samples": 8,
+            "examples_per_row": 1,
+            "include_empty": False,
+            "seed": 42,
+            "panel_size": 3.0,
+            "model_title_length": 30,
+            "image_title_length": 72,
+            "progress": True,
+            "destination": None,
+        }
+        defaults.update(options)
+        active_collection = (
+            self
+            if self.source is active
+            else ModelCollection(self.models, source=active)
+        )
+        return visualize_nnunet_models(active_collection, **defaults)
+
+    def __repr__(self) -> str:
+        return f"ModelCollection(models={self.names!r}, bound={self.source is not None})"
+
+
+def normalize_model_inputs(
+    source: Any,
+    *,
+    split: str | None,
+) -> tuple[tuple[ModelInput, ...], PredictionTask | None]:
+    """Normalize public prediction sources without reading their annotations."""
+
+    if isinstance(source, ModelInput):
+        return (source,), None
+    if _is_model_input_sequence(source):
+        return tuple(source), None
+
+    from .models import SemanticMaskExport
+
+    if isinstance(source, SemanticMaskExport):
+        selected_split = split or "val"
+        if selected_split not in source.splits:
+            raise ValueError(
+                f"Unknown semantic-mask split {selected_split!r}; "
+                f"available splits are {source.splits}"
+            )
+        from .semantic_comparison import _freeze_cohort
+
+        cases, _ = _freeze_cohort(source, selected_split)
+        return (
+            tuple(
+                ModelInput(
+                    image_id=case.case_id,
+                    image_path=case.image_path,
+                    width=case.width,
+                    height=case.height,
+                    relative_path=case.relative_path.as_posix(),
+                    mask_path=case.mask_path,
+                )
+                for case in cases
+            ),
+            "semantic_segment",
+        )
+
+    from .comparison.types import Cohort
+
+    if isinstance(source, Cohort):
+        return (
+            tuple(
+                ModelInput(
+                    image_id=record.image_id,
+                    image_path=record.image_path,
+                    width=record.width,
+                    height=record.height,
+                    relative_path=record.relative_path,
+                )
+                for record in source.records
+            ),
+            source.task,
+        )
+
+    from .dataset import Dataset
+
+    if isinstance(source, Dataset):
+        if source._plan:
+            raise DatasetValidationError(
+                "Model prediction requires fixed on-disk images; export the plan first"
+            )
+        from .comparison.cohort import freeze_cohort
+
+        cohort = freeze_cohort(source, split or "val")
+        return normalize_model_inputs(cohort, split=None)
+
+    paths: list[Path]
+    if isinstance(source, (str, Path)):
+        path = Path(source).expanduser().resolve()
+        if path.is_dir():
+            paths = sorted(
+                candidate
+                for candidate in path.rglob("*")
+                if candidate.is_file() and candidate.suffix.lower() in IMAGE_SUFFIXES
+            )
+        else:
+            paths = [path]
+    elif isinstance(source, Sequence):
+        paths = [Path(value).expanduser().resolve() for value in source]
+    else:
+        raise TypeError(
+            "source must be an image, directory, image sequence, Dataset, "
+            "SemanticMaskExport, Cohort, or ModelInput sequence"
+        )
+    inputs: list[ModelInput] = []
+    for index, path in enumerate(paths):
+        if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Prediction input is not a supported image",
+                    value=str(path),
+                    expected=f"one of {sorted(IMAGE_SUFFIXES)}",
+                )
+            )
+        with Image.open(path) as opened:
+            width, height = opened.size
+        inputs.append(
+            ModelInput(
+                image_id=f"image_{index:06d}",
+                image_path=path,
+                width=width,
+                height=height,
+                relative_path=path.name,
+            )
+        )
+    return tuple(inputs), None
+
+
+def _is_model_input_sequence(value: Any) -> bool:
+    return (
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes, Path))
+        and bool(value)
+        and all(isinstance(item, ModelInput) for item in value)
+    )
+
+
+def _normalize_folds(value: Any) -> tuple[str, ...]:
+    raw_folds = (value,) if isinstance(value, (str, int)) else tuple(value)
+    folds: list[str] = []
+    for raw in raw_folds:
+        fold = str(raw).strip()
+        if fold != "all":
+            try:
+                if int(fold) < 0 or str(int(fold)) != fold:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid nnU-Net fold {raw!r}; expected a non-negative integer or 'all'"
+                ) from exc
+        if fold not in folds:
+            folds.append(fold)
+    if not folds:
+        raise ValueError("At least one nnU-Net fold is required")
+    return tuple(folds)
+
+
+def _validate_nnunet_dataset(path: Path, name: str) -> None:
+    try:
+        dataset = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Incomplete nnU-Net model folder",
+                source=name,
+                value=str(path),
+                expected="dataset.json",
+            )
+        ) from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DatasetValidationError(
+            f"Unreadable nnU-Net dataset.json for {name}: {exc}"
+        ) from exc
+    if dataset.get("file_ending") != ".png":
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Semantic-mask prediction requires an nnU-Net PNG model",
+                source=name,
+                value=dataset.get("file_ending"),
+                expected="file_ending='.png'",
+            )
+        )
+    labels = dataset.get("labels") or {}
+    values: set[int] = set()
+    try:
+        for value in labels.values():
+            if isinstance(value, list):
+                values.update(int(item) for item in value)
+            else:
+                values.add(int(value))
+    except (TypeError, ValueError):
+        values = set()
+    if values != {0, 1}:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Semantic-mask prediction requires binary nnU-Net labels",
+                source=name,
+                value=labels,
+                expected="background=0 and one foreground label=1",
+            )
+        )
+
+
+def _combined_sha256(paths: tuple[Path, ...], *, relative_to: Path) -> str:
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(path.relative_to(relative_to).as_posix().encode("utf-8"))
+        digest.update(sha256_file(path).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _task_from_args(checkpoint: Path) -> PredictionTask | None:
+    for directory in (checkpoint.parent, checkpoint.parent.parent):
+        path = directory / "args.yaml"
+        if not path.is_file():
+            continue
+        try:
+            payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, TypeError, yaml.YAMLError):
+            continue
+        task = str(payload.get("task", "")).lower()
+        if task in {"detect", "segment", "pose", "polo"}:
+            return task  # type: ignore[return-value]
+    return None
+
+
+def _training_dataset_from_args(checkpoint: Path) -> str | None:
+    for directory in (checkpoint.parent, checkpoint.parent.parent):
+        path = directory / "args.yaml"
+        if not path.is_file():
+            continue
+        try:
+            payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            data = payload.get("data")
+            if not data:
+                continue
+            candidate = Path(str(data)).expanduser()
+            if not candidate.is_absolute():
+                candidate = (path.parent / candidate).resolve()
+            return str(candidate)
+        except (OSError, TypeError, yaml.YAMLError):
+            continue
+    return None
+
+
+def _shorten_middle(value: str, maximum: int) -> str:
+    if len(value) <= maximum:
+        return value
+    left = (maximum - 1) // 2
+    right = maximum - 1 - left
+    return f"{value[:left]}…{value[-right:]}"
+
+
+def _draw_object_predictions(axis: Any, values: tuple[Any, ...]) -> None:
+    import matplotlib.pyplot as plt
+
+    color = "#00D084"
+    for value in values:
+        if value.bbox is not None:
+            x1, y1, x2, y2 = value.bbox
+            axis.add_patch(
+                plt.Rectangle(
+                    (x1, y1),
+                    x2 - x1,
+                    y2 - y1,
+                    fill=False,
+                    color=color,
+                    linewidth=1.5,
+                )
+            )
+        if value.polygon:
+            polygon = np.asarray(value.polygon, dtype=float)
+            axis.plot(
+                np.r_[polygon[:, 0], polygon[0, 0]],
+                np.r_[polygon[:, 1], polygon[0, 1]],
+                color=color,
+                linewidth=1.5,
+            )
+        if value.point is not None:
+            axis.scatter(
+                value.point[0],
+                value.point[1],
+                s=25,
+                color=color,
+                edgecolor="white",
+                linewidth=0.6,
+            )
+        if value.keypoints:
+            keypoints = np.asarray(
+                [
+                    point[:2]
+                    for point in value.keypoints
+                    if len(point) < 3 or point[2] is None or point[2] > 0
+                ],
+                dtype=float,
+            )
+            if len(keypoints):
+                axis.scatter(
+                    keypoints[:, 0],
+                    keypoints[:, 1],
+                    s=14,
+                    color=color,
+                )

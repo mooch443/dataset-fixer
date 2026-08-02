@@ -16,7 +16,6 @@ from .cache import (
     import_notebook_cache,
     load_package_cache,
     model_cache_dir,
-    model_hash,
     notebook_cache_dirs,
     notebook_cache_basename,
     notebook_dataset_hash,
@@ -162,7 +161,7 @@ def compare_models(
         cache_audit: dict[str, Any] = {}
         model_hashes: dict[str, str] = {}
         for spec in specs:
-            sha = model_hash(spec.path)
+            sha = spec.resolved_model.digest
             model_hashes[spec.name] = sha
             spec_backend = str(spec.inference_overrides.get("inference", backend))
             spec_backend = resolve_backend(spec_backend, cohort.task)

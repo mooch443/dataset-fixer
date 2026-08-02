@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,28 @@ class ModelSpec:
     locked_confidence: float | None = None
     locked_postprocess: float | None = None
     inference_overrides: dict[str, Any] = field(default_factory=dict)
+    model: Any | None = field(default=None, repr=False, compare=False)
+
+    @cached_property
+    def resolved_model(self) -> Any:
+        """Generic :class:`dataset_fixer.Model` used for prediction."""
+
+        if self.model is not None:
+            return self.model
+        from ..model import Model
+
+        return Model(
+            self.path,
+            name=self.name,
+            resolution=self.resolution,
+            training_dataset=self.training_dataset,
+            inference=str(self.inference_overrides.get("inference", "auto")),
+            settings={
+                key: value
+                for key, value in self.inference_overrides.items()
+                if key != "inference"
+            },
+        )
 
 
 @dataclass

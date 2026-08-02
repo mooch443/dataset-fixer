@@ -8,6 +8,9 @@ from dataset_fixer import (
     ComparisonResult,
     Dataset,
     DatasetValidationError,
+    Model,
+    ModelCollection,
+    PredictionResult,
     SemanticComparisonResult,
     SemanticMaskExport,
     Task,
@@ -82,6 +85,12 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
     assert inspect.getdoc(SemanticMaskExport.compare_models)
     assert inspect.getdoc(DatasetValidationError)
     assert inspect.getdoc(Task)
+    assert inspect.getdoc(Model)
+    assert inspect.getdoc(Model.predict)
+    assert inspect.getdoc(Model.compare)
+    assert inspect.getdoc(Model.load_many)
+    assert inspect.getdoc(ModelCollection)
+    assert inspect.getdoc(PredictionResult)
 
 
 def test_public_example_source_is_pinned_and_explicitly_licensed() -> None:
