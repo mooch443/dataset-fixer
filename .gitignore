@@ -8,3 +8,4 @@ build/
 dist/
 src/dataset_fixer/_version.py
 .DS_Store
+graphify-out/

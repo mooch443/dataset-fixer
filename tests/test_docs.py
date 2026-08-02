@@ -67,6 +67,8 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
     comparison_signature = str(inspect.signature(Dataset.compare_models))
     assert "Literal['grid', 'coverage']" in tile_signature
     assert "Literal['all', 'none']" in tile_signature
+    assert "Literal['raise', 'skip']" in tile_signature
+    assert "background_filter" in tile_signature
     assert "**settings" not in tile_signature
     assert "Literal['raise', 'skip']" in open_signature
     assert "Literal['auto', 'native', 'sahi']" in comparison_signature

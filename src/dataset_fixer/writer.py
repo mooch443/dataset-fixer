@@ -54,7 +54,11 @@ class OutputBuilder:
             shutil.copytree(source_coverage, self.staging / "coverage_summary", dirs_exist_ok=True)
         self.records: list[dict[str, Any]] = []
         self.output_samples: list[Sample] = []
-        self.visuals: list[str] = []
+        self.visuals = [
+            str(path)
+            for path in parent_manifest.get("visuals") or []
+            if (self.staging / str(path)).is_file()
+        ]
         self.warnings: list[str] = []
 
     def cleanup(self) -> None:
@@ -134,6 +138,8 @@ class OutputBuilder:
                 "tile_index",
                 "tile_mode",
                 "background_source",
+                "background_filter",
+                "background_filter_result",
                 "class_mapping",
                 "class_renames",
                 "split_group",
@@ -142,6 +148,17 @@ class OutputBuilder:
                 "augmentation",
                 "augmentation_seed",
                 "albumentations_applied",
+                "crop_coordinate_space",
+                "source_context",
+                "transformed_view_size",
+                "crop_transform_seed",
+                "crop_transform_attempt",
+                "crop_pipeline",
+                "crop_albumentations_applied",
+                "valid_pixel_fraction",
+                "validity_result",
+                "crop_transform_warnings",
+                "lossy_clipping",
             )
             if key in parent
         }
@@ -199,6 +216,11 @@ class OutputBuilder:
         (self.staging / "data.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
     def write_reports(self, *, class_mapping: dict[int, int] | None = None) -> dict[str, Any]:
+        self.visuals = list(
+            dict.fromkeys(
+                path for path in self.visuals if (self.staging / path).is_file()
+            )
+        )
         for record in self.records:
             record.setdefault("class_mapping", class_mapping)
             record.setdefault("warnings", [])
@@ -316,8 +338,14 @@ class OutputBuilder:
                 width=sample.width,
                 height=sample.height,
                 annotations=list(sample.annotations),
+                source_sha256=record["output_sha256"],
+                provenance={
+                    **record,
+                    "dataset_name": self.name,
+                    "dataset_location": str(self.destination),
+                },
             )
-            for sample in self.output_samples
+            for sample, record in zip(self.output_samples, self.records)
         ]
         return Dataset(
             location=self.destination,

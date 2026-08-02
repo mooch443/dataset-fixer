@@ -6,6 +6,8 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Hashable, Iterable, Literal, Mapping, Sequence
 
+from PIL import Image
+
 from .augmentation import augment_dataset, serialize_pipeline
 from .errors import DatasetValidationError, ValidationIssue
 from .io import _label_path_for_image, load_source
@@ -19,6 +21,7 @@ from .operations import (
 )
 from .planning import (
     PlannedOperation,
+    callback_description,
     derived_name,
     plan_split,
     project_remove_classes,
@@ -469,6 +472,10 @@ class Dataset:
         seed: int = 42,
         jpeg_quality: int = 95,
         allow_lossy: bool = False,
+        crop_transforms: Any | None = None,
+        augment_val: bool = False,
+        background_filter: Callable[[Image.Image], bool] | None = None,
+        errors: Literal["raise", "skip"] = "raise",
         visualize: bool = True,
         progress: bool = True,
     ) -> "Dataset":
@@ -498,7 +505,25 @@ class Dataset:
                 pose annotations in either mode.
             allow_lossy: Permit dropping RLE/multipart masks or keeping the
                 largest polygon fragment when one YOLO polygon cannot represent
-                the crop exactly.
+                the crop exactly. In coverage mode, ``False`` also rejects and
+                resamples crops that cut through any source annotation; export
+                raises rather than returning fewer requested appearances when
+                no lossless replacement can be found.
+            crop_transforms: Optional serializable Albumentations pipeline
+                applied to a virtual full-source view before each coverage
+                crop is selected. This is supported only in coverage mode.
+            augment_val: Apply ``crop_transforms`` to validation crops as well
+                as training crops. Test crops are never augmented.
+            background_filter: Optional predicate called with each annotation-free
+                candidate as an RGB :class:`PIL.Image.Image`. Truthy keeps the
+                candidate and falsey discards it. It applies to copied empty
+                source images, ordinary background crops, and virtual-camera
+                background crops in coverage mode, plus negative grid windows.
+                Positive tiles are never passed to the predicate.
+            errors: ``"raise"`` aborts export when a crop produces geometry
+                that YOLO cannot represent. ``"skip"`` rejects that crop
+                candidate, records the detailed reason, and continues sampling
+                coverage replacements or omits the affected grid window.
             visualize: Generate previews and audit images during export.
             progress: Show materialization progress during export.
 
@@ -557,6 +582,19 @@ class Dataset:
         mode = mode.lower()
         if mode not in {"grid", "coverage"}:
             raise ValueError("mode must be 'grid' or 'coverage'")
+        errors = errors.lower()
+        if errors not in {"raise", "skip"}:
+            raise ValueError("errors must be 'raise' or 'skip'")
+        if not isinstance(augment_val, bool):
+            raise TypeError("augment_val must be a bool")
+        if crop_transforms is not None and mode != "coverage":
+            raise ValueError("crop_transforms is supported only when mode='coverage'")
+        if augment_val and crop_transforms is None:
+            raise ValueError("augment_val=True requires crop_transforms")
+        if background_filter is not None and not callable(background_filter):
+            raise TypeError("background_filter must be callable or None")
+        crop_pipeline = serialize_pipeline(crop_transforms, {}) if crop_transforms is not None else None
+        background_filter_description = callback_description(background_filter)
         if mode == "grid":
             if not (
                 negative_tiles in {"all", "none"}
@@ -607,11 +645,15 @@ class Dataset:
             "radius_multiplier": radius_multiplier,
             "seed": seed,
             "jpeg_quality": jpeg_quality,
+            "crop_pipeline": crop_pipeline,
+            "augment_val": augment_val,
         }
         public_settings = {
             "mode": mode, "tile_size": tile_size, "overlap": overlap,
             "min_area_ratio": min_area_ratio, "negative_tiles": negative_tiles,
             "allow_lossy": allow_lossy,
+            "background_filter": background_filter_description,
+            "errors": errors,
             "splits": sorted({normalize_split(split) for split in split_values} if split_values else set(self.splits)),
             "visualize": visualize,
             **(coverage_settings if mode == "coverage" else {}),
@@ -622,6 +664,9 @@ class Dataset:
                 "mode": mode, "splits": split_values, "tile_size": tile_size,
                 "overlap": overlap, "min_area_ratio": min_area_ratio, "negative_tiles": negative_tiles,
                 "allow_lossy": allow_lossy, "visualize": visualize,
+                "background_filter": background_filter,
+                "background_filter_description": background_filter_description,
+                "errors": errors,
                 "settings": coverage_settings if mode == "coverage" else {},
             },
             public_settings,

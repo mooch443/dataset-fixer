@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import inspect
 import json
@@ -362,6 +363,179 @@ def _apply(
     return image, annotations, applied, warnings
 
 
+def apply_virtual_view(
+    sample: Sample,
+    task: Task,
+    serialized: dict[str, Any],
+    seed: int,
+    *,
+    source_image: np.ndarray,
+    flip_idx: list[int] | None,
+) -> tuple[
+    np.ndarray,
+    list[Annotation],
+    list[int],
+    np.ndarray,
+    Any,
+    list[str],
+    set[int],
+]:
+    """Apply a replayable full-source transform for coverage crop sampling.
+
+    The validity mask is replayed with constant-zero exterior handling, so
+    reflected or filled pixels can never be mistaken for source imagery.
+    Annotation source indices are carried through temporary source IDs.
+    """
+
+    A = _albumentations()
+    tags = [f"__dataset_fixer_source_index_{index}" for index in range(len(sample.annotations))]
+    tagged = Sample(
+        image_path=sample.image_path,
+        relative_path=sample.relative_path,
+        split=sample.split,
+        width=sample.width,
+        height=sample.height,
+        annotations=[
+            annotation.clone(source_id=tags[index])
+            for index, annotation in enumerate(sample.annotations)
+        ],
+    )
+    transform = _target_replay_pipeline(A, serialized, seed)
+    bboxes: list[tuple[float, float, float, float]] = []
+    bbox_ids: list[int] = []
+    keypoints: list[tuple[float, float]] = []
+    keypoint_ids: list[int] = []
+
+    if task in {Task.DETECT, Task.POSE}:
+        for index, annotation in enumerate(tagged.annotations):
+            if annotation.bbox is not None:
+                bboxes.append(annotation.bbox)
+                bbox_ids.append(index)
+    if task is Task.POSE:
+        for annotation_index, annotation in enumerate(tagged.annotations):
+            for keypoint_index, (x, y, _) in enumerate(annotation.keypoints or []):
+                keypoints.append((x, y))
+                keypoint_ids.append(_keypoint_tag(annotation_index, keypoint_index))
+    elif task is Task.POLO:
+        for annotation_index, annotation in enumerate(tagged.annotations):
+            if annotation.point is not None:
+                keypoints.append(annotation.point)
+                keypoint_ids.append(_keypoint_tag(annotation_index, 0))
+
+    instance_masks = [_annotation_mask(tagged, annotation, task) for annotation in tagged.annotations]
+    inputs: dict[str, Any] = {
+        "image": source_image,
+        "bboxes": np.asarray(bboxes, dtype=np.float32).reshape(-1, 4),
+        "bbox_ids": np.asarray(bbox_ids, dtype=np.int64),
+        "keypoints": np.asarray(keypoints, dtype=np.float32).reshape(-1, 2),
+        "keypoint_ids": np.asarray(keypoint_ids, dtype=np.int64),
+    }
+    if instance_masks:
+        inputs["masks"] = np.stack(instance_masks)
+    try:
+        result = transform(**inputs)
+    except Exception as exc:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Albumentations failed while creating a virtual crop view",
+                source=str(sample.image_path),
+                value=str(exc),
+                suggestion="check that every crop transform supports this dataset's annotation targets",
+            )
+        ) from exc
+
+    image = np.asarray(result["image"])
+    if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Crop transforms produced a non-exportable image array",
+                source=str(sample.image_path),
+                value={"shape": list(image.shape), "dtype": str(image.dtype)},
+                expected="an HWC RGB uint8 image",
+                suggestion="remove Normalize, ToTensor, or transforms that change the exported image type",
+            )
+        )
+
+    replay = result.get("replay")
+    if not isinstance(replay, dict):
+        raise DatasetValidationError("Albumentations did not return replay data for a crop transform")
+    validity_replay = _constant_exterior_replay(replay)
+    validity_input = np.ones(source_image.shape[:2], dtype=np.uint8)
+    try:
+        validity_result = A.ReplayCompose.replay(
+            validity_replay,
+            image=np.zeros_like(source_image),
+            mask=validity_input,
+            bboxes=np.empty((0, 4), dtype=np.float32),
+            bbox_ids=np.empty((0,), dtype=np.int64),
+            keypoints=np.empty((0, 2), dtype=np.float32),
+            keypoint_ids=np.empty((0,), dtype=np.int64),
+        )
+    except Exception as exc:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Could not replay crop geometry for source-pixel validation",
+                source=str(sample.image_path),
+                value=str(exc),
+            )
+        ) from exc
+    validity = np.asarray(validity_result["mask"]) > 0
+    if validity.shape != image.shape[:2]:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Crop transform image and validity geometry have different shapes",
+                source=str(sample.image_path),
+                value={"image": list(image.shape[:2]), "validity": list(validity.shape)},
+            )
+        )
+
+    height, width = image.shape[:2]
+    warnings: list[str] = []
+    if task is Task.DETECT:
+        transformed = _boxes_after(tagged, result, width, height)
+    elif task is Task.POSE:
+        transformed = _pose_after(
+            tagged,
+            result,
+            width,
+            height,
+            flip_idx=flip_idx,
+            horizontal_flip=_horizontal_flip_applied(_applied_replay(replay)),
+        )
+    elif task is Task.SEGMENT:
+        transformed, warnings = _segments_after(tagged, result, allow_lossy=True)
+    else:
+        transformed, warnings = _polo_after(tagged, result, width, height, allow_lossy=True)
+
+    tag_to_index = {tag: index for index, tag in enumerate(tags)}
+    output: list[Annotation] = []
+    source_indices: list[int] = []
+    for annotation in transformed:
+        index = tag_to_index.get(str(annotation.source_id))
+        if index is None:
+            continue
+        output.append(annotation.clone(source_id=sample.annotations[index].source_id))
+        source_indices.append(index)
+
+    partial_indices: set[int] = set()
+    transformed_masks = result.get("masks", [])
+    for index, transformed_mask in enumerate(transformed_masks):
+        mask = np.asarray(transformed_mask) > 0
+        if mask.shape != image.shape[:2]:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Crop transform image and annotation mask have different shapes",
+                    source=str(sample.image_path),
+                    value={"image": list(image.shape[:2]), "mask": list(mask.shape)},
+                )
+            )
+        if mask.any() and (mask[0].any() or mask[-1].any() or mask[:, 0].any() or mask[:, -1].any()):
+            partial_indices.add(index)
+    if warnings:
+        partial_indices.update(source_indices)
+    return image, output, source_indices, validity, _applied_replay(replay), warnings, partial_indices
+
+
 def _target_pipeline(A: Any, serialized: dict[str, Any], seed: int, min_area: float, min_visibility: float):
     base = A.from_dict(serialized)
     kwargs: dict[str, Any] = {
@@ -388,6 +562,65 @@ def _target_pipeline(A: Any, serialized: dict[str, Any], seed: int, min_area: fl
     if "telemetry" in signature.parameters:
         kwargs["telemetry"] = False
     return A.Compose(**kwargs)
+
+
+def _target_replay_pipeline(A: Any, serialized: dict[str, Any], seed: int):
+    base = A.from_dict(serialized)
+    kwargs: dict[str, Any] = {
+        "transforms": list(base.transforms),
+        "bbox_params": A.BboxParams(
+            format="pascal_voc",
+            label_fields=["bbox_ids"],
+            min_area=0.0,
+            min_visibility=0.0,
+        ),
+        "keypoint_params": A.KeypointParams(
+            format="xy", label_fields=["keypoint_ids"], remove_invisible=False
+        ),
+        "p": float(getattr(base, "p", 1.0)),
+        "is_check_shapes": bool(getattr(base, "is_check_shapes", True)),
+    }
+    signature = inspect.signature(A.ReplayCompose)
+    if "seed" in signature.parameters:
+        kwargs["seed"] = seed
+    if "strict" in signature.parameters:
+        kwargs["strict"] = bool(getattr(base, "strict", False))
+    if "mask_interpolation" in signature.parameters and getattr(base, "mask_interpolation", None) is not None:
+        kwargs["mask_interpolation"] = base.mask_interpolation
+    replay = A.ReplayCompose(**kwargs)
+    if "seed" not in signature.parameters and hasattr(replay, "set_random_seed"):
+        replay.set_random_seed(seed)
+    return replay
+
+
+def _constant_exterior_replay(replay: dict[str, Any]) -> dict[str, Any]:
+    """Clone replay metadata while forcing generated exterior pixels invalid."""
+
+    result = copy.deepcopy(replay)
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            if "border_mode" in value:
+                value["border_mode"] = 0  # cv2.BORDER_CONSTANT without importing OpenCV here.
+            for key in ("fill", "fill_mask", "value", "mask_value"):
+                if key in value:
+                    value[key] = 0
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(result)
+    return result
+
+
+def _applied_replay(replay: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        transform
+        for transform in replay.get("transforms", [])
+        if isinstance(transform, dict) and transform.get("applied")
+    ]
 
 
 def _boxes_after(sample: Sample, result: dict[str, Any], width: int, height: int) -> list[Annotation]:
@@ -501,7 +734,12 @@ def _polo_after(
         if center is None or not (0 <= center[0] < width and 0 <= center[1] < height):
             continue
         mask = (np.asarray(transformed_mask) > 0).astype(np.uint8)
-        if not mask.any() or mask[0].any() or mask[-1].any() or mask[:, 0].any() or mask[:, -1].any():
+        if not mask.any():
+            continue
+        clipped_at_view = bool(
+            mask[0].any() or mask[-1].any() or mask[:, 0].any() or mask[:, -1].any()
+        )
+        if clipped_at_view and not allow_lossy:
             continue
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         if not contours:
@@ -511,7 +749,12 @@ def _polo_after(
         radius = float(np.median(distances))
         distortion = float(np.percentile(distances, 90) - np.percentile(distances, 10))
         tolerance = max(2.5, radius * 0.15)
-        if distortion > tolerance:
+        if clipped_at_view:
+            radius = float(distances.max())
+            warnings.append(
+                f"Retained a boundary-clipped POLO point {sample.image_path}:{annotation.source_id}"
+            )
+        elif distortion > tolerance:
             if not allow_lossy:
                 raise DatasetValidationError(
                     ValidationIssue(
@@ -536,6 +779,18 @@ def _polygon_mask(sample: Sample, annotation: Annotation) -> np.ndarray:
         raise DatasetValidationError(f"Segmentation annotation {annotation.source_id} has no polygon")
     mask = Image.new("L", (sample.width, sample.height), 0)
     ImageDraw.Draw(mask).polygon(annotation.polygon, fill=1)
+    return np.asarray(mask, dtype=np.uint8)
+
+
+def _annotation_mask(sample: Sample, annotation: Annotation, task: Task) -> np.ndarray:
+    if task is Task.SEGMENT:
+        return _polygon_mask(sample, annotation)
+    if task is Task.POLO:
+        return _polo_mask(sample, annotation)
+    if annotation.bbox is None:
+        raise DatasetValidationError(f"Annotation {annotation.source_id} has no bounding box")
+    mask = Image.new("L", (sample.width, sample.height), 0)
+    ImageDraw.Draw(mask).rectangle(annotation.bbox, fill=1)
     return np.asarray(mask, dtype=np.uint8)
 
 
@@ -624,7 +879,7 @@ def _albumentations():
         import albumentations as A
     except ImportError as exc:
         raise ImportError(
-            "Dataset.augment() requires Albumentations; install it with "
+            "Dataset.augment() and Dataset.tile(crop_transforms=...) require Albumentations; install it with "
             "`pip install 'dataset-fixer[augment]'`"
         ) from exc
     return A

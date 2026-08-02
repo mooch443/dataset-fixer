@@ -10,6 +10,7 @@ import yaml
 from PIL import Image
 
 from dataset_fixer import Dataset, DatasetValidationError, Task
+from dataset_fixer import tiling as tiling_module
 from dataset_fixer.models import Annotation, Sample
 from dataset_fixer.visualization import save_coverage_annotated_original
 from conftest import make_image, make_yolo_dataset
@@ -123,6 +124,93 @@ def test_grid_tiling_transforms_segment_and_pose(tmp_path: Path) -> None:
     )
 
 
+def test_tiling_geometry_errors_are_diagnostic_and_skippable(tmp_path: Path) -> None:
+    # This valid source polygon intersects the [8, 8, 16, 16] grid window as
+    # one Polygon plus one disconnected LineString: a Shapely GeometryCollection
+    # that one YOLO segmentation row cannot represent.
+    coordinates = [
+        (11, 9), (6, 9), (6, 10), (6, 11), (6, 16), (6, 17),
+        (7, 17), (16, 17), (16, 18), (18, 18), (18, 16), (17, 16),
+        (16, 16), (7, 16), (7, 11), (11, 11),
+    ]
+    row = "0 " + " ".join(
+        f"{value / 32:.8f}" for point in coordinates for value in point
+    )
+    source = make_yolo_dataset(
+        tmp_path / "mixed_crop_geometry",
+        task="segment",
+        names=["fruit"],
+        train_rows=[row],
+        val_rows=[row],
+        size=(32, 32),
+    )
+    dataset = Dataset.open(source, task="segment", progress=False)
+    strict_destination = tmp_path / "strict_geometry_tiles"
+
+    with pytest.raises(DatasetValidationError) as caught:
+        dataset.tile(
+            mode="grid",
+            splits=["train"],
+            tile_size=8,
+            overlap=0,
+            min_area_ratio=0,
+            negative_tiles="all",
+            errors="raise",
+            visualize=False,
+            progress=False,
+        ).export(
+            destination=strict_destination,
+            visualize=False,
+            progress=False,
+        )
+
+    message = str(caught.value)
+    assert "unsupported mixed geometry" in message
+    assert "GeometryCollection" in message
+    assert "LineString" in message
+    assert "annotation_index" in message
+    assert "crop_xyxy" in message
+    assert str(next((source / "train" / "images").rglob("*.jpg"))) in message
+    assert not strict_destination.exists()
+
+    skipped = dataset.tile(
+        mode="grid",
+        splits=["train"],
+        tile_size=8,
+        overlap=0,
+        min_area_ratio=0,
+        negative_tiles="all",
+        errors="skip",
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "skipped_geometry_tiles",
+        visualize=False,
+        progress=False,
+    )
+
+    report = json.loads(
+        (skipped.location / "reports" / "tiling_skips.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["errors"] == "skip"
+    assert report["skipped_candidates"] >= 1
+    mixed = next(
+        item
+        for item in report["items"]
+        if item["details"].get("result_geometry", {}).get("type")
+        == "GeometryCollection"
+    )
+    assert "LineString" in mixed["details"]["result_geometry"]["component_types"]
+    assert not list(
+        (skipped.location / "train" / "images").rglob(
+            "train_0__x8_y8_w8_h8.jpg"
+        )
+    )
+    assert any("tiling_skips.json" in warning for warning in skipped.warnings)
+
+
 def test_polo_coverage_reports_and_visual_audit(tmp_path: Path) -> None:
     source = make_yolo_dataset(
         tmp_path / "polo_source",
@@ -158,6 +246,115 @@ def test_polo_coverage_reports_and_visual_audit(tmp_path: Path) -> None:
     assert all(annotation.radius == 10 for sample in tiled._samples for annotation in sample.annotations)
     with Image.open(next((summary / "annotated_originals").rglob("*.jpg"))) as preview:
         assert preview.height > 260
+
+
+def test_coverage_resamples_tiles_that_cut_annotations(tmp_path: Path) -> None:
+    rows = ["0 0.15 0.5 0.1 0.2\n0 0.65 0.5 0.1 0.2"]
+    source = make_yolo_dataset(
+        tmp_path / "boundary_source",
+        task="detect",
+        names=["fruit"],
+        train_rows=rows,
+        val_rows=rows,
+        size=(200, 100),
+    )
+    dataset = Dataset.open(source, task="detect", progress=False)
+    tiled = dataset.tile(
+        mode="coverage",
+        tile_size=100,
+        large_image_threshold=50,
+        scale_range=(1.0, 1.0),
+        target_appearances_per_object=1,
+        sparse_appearances_per_object=1,
+        max_attempts_per_target=100,
+        background_ratio=0,
+        seed=9,
+        visualize=False,
+        progress=False,
+    ).export(destination=tmp_path / "boundary-safe", visualize=False, progress=False)
+
+    sources = {str(sample.image_path): sample for sample in dataset._samples}
+    assert len(tiled._samples) == 4
+    for sample in tiled._samples:
+        crop = sample.provenance["crop"]
+        source_sample = sources[sample.provenance["original_image"]]
+        left, top, right, bottom = crop
+        for annotation in source_sample.annotations:
+            x1, y1, x2, y2 = annotation.bbox
+            intersects = min(x2, right) > max(x1, left) and min(y2, bottom) > max(y1, top)
+            contained = left <= x1 and top <= y1 and x2 <= right and y2 <= bottom
+            assert not intersects or contained
+
+
+def test_coverage_writes_source_pixel_and_label_jpg_audits(tmp_path: Path) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "source_pixel_coverage",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.25 0.5 0.1 0.2"],
+        val_rows=["0 0.25 0.5 0.1 0.2"],
+        size=(200, 100),
+    )
+    tiled = Dataset.open(source, task="detect", progress=False).tile(
+        mode="coverage",
+        tile_size=100,
+        large_image_threshold=20,
+        scale_range=(1.0, 1.0),
+        target_appearances_per_object=1,
+        sparse_appearances_per_object=1,
+        background_ratio=0,
+        allow_lossy=True,
+        seed=8,
+        visualize=True,
+        progress=False,
+    ).export(
+        destination=tmp_path / "source_pixel_coverage_tiles",
+        visualize=True,
+        progress=False,
+    )
+
+    summary = tiled.location / "coverage_summary"
+    assert (summary / "source_pixel_coverage.jpg").is_file()
+    assert (summary / "label_coverage.jpg").is_file()
+    rows = list(csv.DictReader((summary / "source_pixel_coverage.csv").open()))
+    assert {row["split"] for row in rows} == {"train", "val"}
+    assert all(row["coverage_status"] == "exact" for row in rows)
+    assert all(int(row["output_tiles"]) == 1 for row in rows)
+    assert all(float(row["source_pixel_coverage_percent"]) == pytest.approx(50.0) for row in rows)
+    aggregate = json.loads((summary / "source_pixel_coverage.json").read_text())
+    assert aggregate["splits"]["train"]["pixel_weighted_coverage_percent"] == pytest.approx(50.0)
+    assert aggregate["splits"]["val"]["pixel_weighted_coverage_percent"] == pytest.approx(50.0)
+    assert "coverage_summary/source_pixel_coverage.jpg" in tiled._manifest["visuals"]
+    assert "coverage_summary/label_coverage.jpg" in tiled._manifest["visuals"]
+
+
+def test_lossless_coverage_fails_atomically_when_no_complete_crop_exists(tmp_path: Path) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "uncroppable_source",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.5 0.5 0.8 0.2"],
+        val_rows=["0 0.5 0.5 0.8 0.2"],
+        size=(200, 100),
+    )
+    destination = tmp_path / "uncroppable"
+
+    with pytest.raises(DatasetValidationError, match="could not replace boundary-cut candidates"):
+        Dataset.open(source, task="detect", progress=False).tile(
+            mode="coverage",
+            tile_size=100,
+            large_image_threshold=50,
+            scale_range=(1.0, 1.0),
+            target_appearances_per_object=1,
+            sparse_appearances_per_object=1,
+            max_attempts_per_target=3,
+            background_ratio=0,
+            allow_lossy=False,
+            visualize=False,
+            progress=False,
+        ).export(destination=destination, visualize=False, progress=False)
+
+    assert not destination.exists()
 
 
 def test_coverage_visual_keeps_legend_off_image_and_boxes_segmentations(
@@ -335,6 +532,194 @@ def test_coverage_balances_background_source_types(tmp_path: Path) -> None:
         "empty_source_image": 2,
         "populated_image_empty_space": 2,
     }
+
+
+def test_coverage_background_filter_discards_black_crop_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "coverage_background_filter",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.5 0.5 0.1 0.1"],
+        val_rows=["0 0.5 0.5 0.1 0.1"],
+        size=(200, 100),
+    )
+    train_image = next((source / "train" / "images").rglob("*.jpg"))
+    pixels = Image.new("RGB", (200, 100), (0, 0, 0))
+    pixels.paste((80, 120, 160), (100, 0, 200, 100))
+    pixels.save(train_image, format="PNG")
+
+    crops = iter([(0, 0, 50, 50), (150, 0, 200, 50)])
+    monkeypatch.setattr(
+        tiling_module,
+        "_random_crop",
+        lambda width, height, cfg, rng: next(crops),
+    )
+
+    def keep_non_black(candidate: Image.Image) -> bool:
+        return candidate.getbbox() is not None
+
+    tiled = Dataset.open(source, task="detect", progress=False).tile(
+        mode="coverage",
+        splits=["train"],
+        tile_size=50,
+        large_image_threshold=20,
+        scale_range=(1.0, 1.0),
+        target_appearances_per_object=1,
+        sparse_appearances_per_object=1,
+        background_ratio=0.5,
+        max_background_attempts_per_tile=3,
+        background_filter=keep_non_black,
+        seed=5,
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "coverage_filtered_backgrounds",
+        visualize=False,
+        progress=False,
+    )
+
+    backgrounds = [sample for sample in tiled._samples if not sample.annotations]
+    assert len(backgrounds) == 1
+    with Image.open(backgrounds[0].image_path) as candidate:
+        assert candidate.convert("RGB").getbbox() is not None
+    assert backgrounds[0].provenance["background_filter_result"] == "accepted"
+    report = json.loads(
+        (tiled.location / "reports" / "background_filter.json").read_text()
+    )
+    assert report["evaluated_candidates"] == 2
+    assert report["accepted_candidates"] == 1
+    assert report["rejected_candidates"] == 1
+    assert report["accepted_percentage"] == 50.0
+    assert report["rejected_percentage"] == 50.0
+    assert report["by_origin"]["coverage-populated_image_empty_space"] == {
+        "accepted": 1,
+        "accepted_percentage": 50.0,
+        "evaluated": 2,
+        "rejected": 1,
+        "rejected_percentage": 50.0,
+    }
+
+
+def test_coverage_background_filter_applies_to_copied_empty_sources(
+    tmp_path: Path,
+) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "copied_background_filter",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.5 0.5 0.1 0.1", "", "", ""],
+        val_rows=["0 0.5 0.5 0.1 0.1"],
+        size=(100, 100),
+    )
+    empty_images = sorted((source / "train" / "images").rglob("*.jpg"))[1:]
+    for image_path in empty_images[:2]:
+        Image.new("RGB", (100, 100), (0, 0, 0)).save(image_path, format="PNG")
+
+    tiled = Dataset.open(source, task="detect", progress=False).tile(
+        mode="coverage",
+        splits=["train"],
+        tile_size=100,
+        large_image_threshold=200,
+        target_appearances_per_object=1,
+        sparse_appearances_per_object=1,
+        background_ratio=0.5,
+        background_filter=lambda candidate: candidate.getbbox() is not None,
+        seed=4,
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "copied_filtered_backgrounds",
+        visualize=False,
+        progress=False,
+    )
+
+    background = next(sample for sample in tiled._samples if not sample.annotations)
+    with Image.open(background.image_path) as candidate:
+        assert candidate.convert("RGB").getbbox() is not None
+    assert background.provenance["tile_mode"] == "coverage-background-copy"
+    report = json.loads(
+        (tiled.location / "reports" / "background_filter.json").read_text()
+    )
+    assert report["by_origin"]["coverage-background-copy"]["accepted"] == 1
+
+
+def test_grid_background_filter_discards_black_windows(tmp_path: Path) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "grid_background_filter",
+        task="detect",
+        names=["fruit"],
+        train_rows=["", "0 0.5 0.5 0.1 0.1"],
+        val_rows=["0 0.5 0.5 0.1 0.1"],
+        size=(200, 100),
+    )
+    train_image = next((source / "train" / "images").rglob("*.jpg"))
+    pixels = Image.new("RGB", (200, 100), (0, 0, 0))
+    pixels.paste((80, 120, 160), (100, 0, 200, 100))
+    pixels.save(train_image, format="PNG")
+
+    tiled = Dataset.open(source, task="detect", progress=False).tile(
+        mode="grid",
+        splits=["train"],
+        tile_size=100,
+        overlap=0,
+        negative_tiles="all",
+        background_filter=lambda candidate: candidate.getbbox() is not None,
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "grid_filtered_backgrounds",
+        visualize=False,
+        progress=False,
+    )
+
+    backgrounds = [sample for sample in tiled._samples if not sample.annotations]
+    assert len(backgrounds) == 1
+    assert backgrounds[0].relative_path.name.endswith("__x100_y0_w100_h100.jpg")
+    report = json.loads(
+        (tiled.location / "reports" / "background_filter.json").read_text()
+    )
+    assert report["evaluated_candidates"] == 2
+    assert report["accepted_candidates"] == 1
+    assert report["rejected_candidates"] == 1
+
+
+def test_background_filter_exception_is_diagnostic_and_atomic(tmp_path: Path) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "broken_background_filter",
+        task="detect",
+        names=["fruit"],
+        train_rows=["", "0 0.5 0.5 0.1 0.1"],
+        val_rows=["0 0.5 0.5 0.1 0.1"],
+        size=(100, 100),
+    )
+    destination = tmp_path / "broken_background_filter_output"
+
+    def broken_filter(candidate: Image.Image) -> bool:
+        raise RuntimeError(f"cannot inspect {candidate.size}")
+
+    with pytest.raises(DatasetValidationError) as caught:
+        Dataset.open(source, task="detect", progress=False).tile(
+            mode="grid",
+            splits=["train"],
+            tile_size=100,
+            negative_tiles="all",
+            background_filter=broken_filter,
+            visualize=False,
+            progress=False,
+        ).export(
+            destination=destination,
+            visualize=False,
+            progress=False,
+        )
+
+    message = str(caught.value)
+    assert "Background filter raised an exception" in message
+    assert "RuntimeError: cannot inspect (100, 100)" in message
+    assert "crop_xyxy" in message
+    assert not destination.exists()
 
 
 def test_grid_negative_fraction_applies_to_complete_output(tmp_path: Path) -> None:

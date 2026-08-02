@@ -140,9 +140,51 @@ coverage = dataset.tile(
     target_appearances_per_object=5,
     sparse_appearances_per_object=1,
     background_ratio=0.10,
+    # The predicate receives the final RGB background candidate. True keeps it.
+    background_filter=lambda tile: tile.getbbox() is not None,
     seed=42,
 )
 ```
+
+Coverage crops can also sample a fresh Albumentations virtual camera view for
+each output. The complete source image and synchronized annotations are
+transformed first; crop selection happens afterward in transformed coordinates:
+
+```python
+coverage = dataset.tile(
+    mode="coverage",
+    tile_size=480,
+    crop_transforms=A.Compose([
+        A.Affine(scale=(1.0, 1.3), rotate=(-20, 20), p=1.0),
+        A.RandomBrightnessContrast(p=0.3),
+    ]),
+    augment_val=True,   # needed when inspecting/using transformed val crops
+    allow_lossy=True,
+    errors="skip",      # reject rare non-exportable crop geometries and resample
+    seed=42,
+)
+```
+
+Resize, crop, and pad transforms are supported. Generated border pixels are
+tracked separately and never accepted inside an output tile, even when a
+transform requests reflection or fill. With `allow_lossy=False`, transformed
+views or final crops that cut annotations are resampled. With `allow_lossy=True`,
+representable geometry is clipped; disconnected segment results retain their
+largest YOLO-representable polygon with an explicit warning. Small coverage
+pass-through images are unchanged. Tiling defaults to `errors="raise"`, whose
+diagnostic includes the source image, annotation index, crop coordinates, and
+the exact Shapely result and component types. Set `errors="skip"` to reject
+those whole candidates instead: coverage mode resamples replacements, grid
+mode omits the affected windows, and details are written to
+`reports/tiling_skips.json`.
+
+Each produced training crop samples its own independently seeded full-source
+virtual camera. Validation stays in the original orientation unless
+`augment_val=True`; test is never transformed. This matters when previewing
+validation with `visualize(split="val", ...)`. The exact transformed and
+unchanged splits, along with per-candidate sampling statistics, are recorded in
+`reports/crop_augmentation.json`; it also audits the accepted crop count,
+distinct seed count, and `fresh_seed_per_accepted_crop` invariant.
 
 Set both appearance parameters to the same value to request a uniform count for
 every object. `object_appearance_overrides={source_id: count}` overrides
@@ -155,7 +197,25 @@ cross-fills the target and the exact counts and reason are written to
 `coverage_summary/background_sampling.json`. IDEs can autocomplete the literal
 choices for `mode`, `negative_tiles`, `errors`, tasks, splits, comparison
 protocols, and inference backends; all coverage controls are explicit `tile()`
-parameters.
+parameters. `background_filter` also applies to negative grid windows, copied
+empty source images, ordinary background crops, and virtual-camera background
+cropping paths. It runs after any applicable transforms, cropping, and final
+resizing, never sees a positive tile, and receives an isolated RGB PIL image so
+it cannot mutate output pixels. Absolute accepted/rejected counts, percentages,
+per-source-path breakdowns, and the callback description are recorded in
+`reports/background_filter.json`.
+
+Coverage tiling also audits what the output actually represents. It always
+writes per-source unioned spatial coverage to
+`coverage_summary/source_pixel_coverage.csv` and aggregate train/validation
+statistics to `source_pixel_coverage.json`. With visualization enabled (the
+default), `source_pixel_coverage.jpg` compares pixel-weighted, mean, median, and
+per-source coverage, while `label_coverage.jpg` compares labels reached at
+least once with requested appearances produced. Virtual affine/projective crop
+footprints are inverse-mapped into source coordinates before unioning; an
+unsupported non-projective transform is reported explicitly and excluded from
+exact aggregates. Semantic-mask exports preserve the complete
+`coverage_summary/` directory.
 
 `rebalance_empty(max_empty_fraction=...)` deterministically downsamples empty
 images without duplicating data. The cap is applied independently to each

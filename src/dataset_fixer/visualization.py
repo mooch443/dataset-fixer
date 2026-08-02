@@ -331,6 +331,167 @@ def save_tiling_count_summary(
     return output
 
 
+def save_source_pixel_coverage_summary(
+    rows: list[dict[str, Any]],
+    output: Path,
+) -> Path:
+    """Plot exact source-area coverage aggregates and per-image distributions."""
+
+    exact = [row for row in rows if row.get("coverage_status") == "exact"]
+    available = {str(row["split"]) for row in rows}
+    splits = [split for split in ("train", "val", "test") if split in available]
+    splits.extend(sorted(available - set(splits)))
+    fig, axes = plt.subplots(1, 2, figsize=(max(11, len(splits) * 2.6 + 6), 4.8))
+
+    weighted: list[float] = []
+    means: list[float] = []
+    medians: list[float] = []
+    distributions: list[list[float]] = []
+    unsupported_counts: list[int] = []
+    for split in splits:
+        split_exact = [row for row in exact if row["split"] == split]
+        values = sorted(float(row["source_pixel_coverage_percent"]) for row in split_exact)
+        covered = sum(float(row["covered_source_area_px"]) for row in split_exact)
+        total = sum(float(row["source_area_px"]) for row in split_exact)
+        weighted.append(100.0 * covered / total if total else 0.0)
+        means.append(sum(values) / len(values) if values else 0.0)
+        medians.append(
+            values[len(values) // 2]
+            if len(values) % 2 == 1
+            else ((values[len(values) // 2 - 1] + values[len(values) // 2]) / 2 if values else 0.0)
+        )
+        distributions.append(values)
+        unsupported_counts.append(
+            sum(
+                row["split"] == split and row.get("coverage_status") != "exact"
+                for row in rows
+            )
+        )
+
+    x = list(range(len(splits)))
+    width = 0.24
+    for offset, values, label, color in (
+        (-width, weighted, "pixel-weighted", "#4477AA"),
+        (0.0, means, "mean per source", "#66CCEE"),
+        (width, medians, "median per source", "#228833"),
+    ):
+        bars = axes[0].bar(
+            [position + offset for position in x],
+            values,
+            width=width,
+            label=label,
+            color=color,
+        )
+        axes[0].bar_label(bars, fmt="%.1f%%", padding=2, fontsize=8)
+    axes[0].set_xticks(x, splits)
+    axes[0].set_ylim(0, 105)
+    axes[0].set_ylabel("union of original source area (%)")
+    axes[0].set_title("Spatial coverage by split")
+    axes[0].grid(axis="y", alpha=0.2)
+    axes[0].legend(frameon=False, fontsize=8)
+
+    nonempty = [(split, values) for split, values in zip(splits, distributions) if values]
+    if nonempty:
+        labels, values = zip(*nonempty)
+        axes[1].boxplot(values, tick_labels=labels, showfliers=True)
+        axes[1].set_ylim(0, 105)
+        axes[1].set_ylabel("source pixel coverage (%)")
+        axes[1].set_title("Per-source coverage distribution")
+        axes[1].grid(axis="y", alpha=0.2)
+    else:
+        axes[1].axis("off")
+        axes[1].text(0.5, 0.5, "No exact source footprints", ha="center", va="center")
+    if any(unsupported_counts):
+        axes[1].text(
+            0.02,
+            0.02,
+            "Unsupported source(s): "
+            + ", ".join(
+                f"{split}={count}"
+                for split, count in zip(splits, unsupported_counts)
+                if count
+            ),
+            transform=axes[1].transAxes,
+            fontsize=8,
+            color="#AA2222",
+        )
+
+    fig.suptitle("Original source-pixel coverage from unioned tile footprints")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output, bbox_inches="tight", dpi=160)
+    plt.close(fig)
+    return output
+
+
+def save_label_coverage_summary(
+    rows: list[dict[str, Any]],
+    output: Path,
+) -> Path:
+    """Plot label-hit and requested-appearance coverage by split."""
+
+    available = {str(row["split"]) for row in rows}
+    splits = [split for split in ("train", "val", "test") if split in available]
+    splits.extend(sorted(available - set(splits)))
+    label_hit: list[float] = []
+    requested_hit: list[float] = []
+    covered_counts: list[int] = []
+    missed_counts: list[int] = []
+    for split in splits:
+        selected = [row for row in rows if row["split"] == split]
+        total = sum(int(row["total_labels"]) for row in selected)
+        covered = sum(int(row["labels_covered_at_least_once"]) for row in selected)
+        requested = sum(int(row["requested_coverages"]) for row in selected)
+        actual = sum(int(row["actual_coverages"]) for row in selected)
+        label_hit.append(100.0 * covered / total if total else 0.0)
+        requested_hit.append(100.0 * actual / requested if requested else 0.0)
+        covered_counts.append(covered)
+        missed_counts.append(total - covered)
+
+    fig, axes = plt.subplots(1, 2, figsize=(max(10, len(splits) * 2.5 + 5), 4.6))
+    x = list(range(len(splits)))
+    width = 0.36
+    for offset, values, label, color in (
+        (-width / 2, label_hit, "labels hit at least once", "#228833"),
+        (width / 2, requested_hit, "requested appearances produced", "#4477AA"),
+    ):
+        bars = axes[0].bar(
+            [position + offset for position in x],
+            values,
+            width=width,
+            label=label,
+            color=color,
+        )
+        axes[0].bar_label(bars, fmt="%.1f%%", padding=2, fontsize=8)
+    axes[0].set_xticks(x, splits)
+    axes[0].set_ylim(0, 105)
+    axes[0].set_ylabel("coverage (%)")
+    axes[0].set_title("Annotation sampling coverage")
+    axes[0].grid(axis="y", alpha=0.2)
+    axes[0].legend(frameon=False, fontsize=8)
+
+    axes[1].bar(x, covered_counts, label="covered", color="#228833")
+    axes[1].bar(
+        x,
+        missed_counts,
+        bottom=covered_counts,
+        label="never covered",
+        color="#CC6677",
+    )
+    axes[1].set_xticks(x, splits)
+    axes[1].set_ylabel("source annotations")
+    axes[1].set_title("Labels represented at least once")
+    axes[1].grid(axis="y", alpha=0.2)
+    axes[1].legend(frameon=False, fontsize=8)
+
+    fig.suptitle("Coverage-tiling annotation audit")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output, bbox_inches="tight", dpi=160)
+    plt.close(fig)
+    return output
+
+
 def save_empty_image_balance_summary(summary: dict[str, dict[str, Any]], output: Path) -> Path:
     """Plot annotated/background image distributions before and after balancing."""
 
