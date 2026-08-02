@@ -4,7 +4,14 @@ import inspect
 import json
 from pathlib import Path
 
-from dataset_fixer import ComparisonResult, Dataset, DatasetValidationError, Task
+from dataset_fixer import (
+    ComparisonResult,
+    Dataset,
+    DatasetValidationError,
+    SemanticComparisonResult,
+    SemanticMaskExport,
+    Task,
+)
 from dataset_fixer.public_examples import SAWIT_COMMIT, SAWIT_LICENSE, SAWIT_REPOSITORY
 
 
@@ -64,6 +71,13 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
     assert "Literal['raise', 'skip']" in open_signature
     assert "Literal['auto', 'native', 'sahi']" in comparison_signature
     assert inspect.getdoc(ComparisonResult)
+    assert inspect.getdoc(SemanticComparisonResult)
+    assert inspect.getdoc(SemanticMaskExport)
+    assert inspect.getdoc(SemanticMaskExport.open)
+    semantic_comparison_signature = str(inspect.signature(SemanticMaskExport.compare_models))
+    assert "Literal['cpu', 'cuda', 'mps']" in semantic_comparison_signature
+    assert "upscale_factor" not in semantic_comparison_signature
+    assert inspect.getdoc(SemanticMaskExport.compare_models)
     assert inspect.getdoc(DatasetValidationError)
     assert inspect.getdoc(Task)
 

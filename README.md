@@ -188,6 +188,71 @@ val/images/    val/labels/
 test/images/   test/labels/
 ```
 
+For polygon segmentation datasets, `format="semantic_masks"` publishes binary
+foreground-union masks for U-Net-style training and returns a
+`SemanticMaskExport`:
+
+```python
+from dataset_fixer import SemanticMaskExport
+
+masks = dataset.export(
+    destination="/datasets/orchard_masks",
+    format="semantic_masks",
+)
+print(masks.image_dirs["train"])
+print(masks.mask_dirs["train"])
+
+# The same artifact can be reopened in a later process or notebook.
+masks = SemanticMaskExport.open("/datasets/orchard_masks")
+```
+
+Each original image is copied byte-for-byte to `<split>/images/`; its
+single-channel PNG mask is written to `<split>/masks/0/` with matching nested
+relative path and stem. Mask values are `0` for background and `255` for the
+union of all polygons, intentionally discarding class and instance identity.
+Semantic-mask exports contain no YOLO labels or `data.yaml`.
+
+The returned artifact can compare official nnU-Net v2 models directly on one
+frozen exported split. Pass the trained-model directory that contains
+`dataset.json`, `plans.json`, and `fold_*` subdirectories—not a standalone
+checkpoint file:
+
+```python
+comparison = masks.compare_models(
+    {
+        "resenc-capped": {
+            "model_folder": capped_fold_output.parent,
+            "folds": (0,),
+            "checkpoint": "checkpoint_best.pth",
+            "upscale_factor": 2,
+        },
+        "resenc-l": {
+            "model_folder": large_fold_output.parent,
+            "folds": (0,),
+            "checkpoint": "checkpoint_best.pth",
+            "upscale_factor": 1,
+        },
+    },
+    split="val",
+    baseline="resenc-capped",
+    device="cuda",
+)
+```
+
+Install the optional official backend with
+`pip install 'dataset-fixer[nnunet]'`. Comparison calls
+`nnUNetv2_predict_from_modelfolder` and `nnUNetv2_evaluate_folder`, verifies
+that every model predicted the exact same image set, and ranks the official
+foreground Dice/IoU results. Each model receives inputs at its own configured
+training-adapter scale; predictions are projected back to the original export
+resolution before all models are evaluated against the same canonical masks.
+The report includes per-case metrics, paired Dice
+deltas with bootstrap intervals, model/checkpoint hashes, official summaries,
+retained prediction masks, a ranking figure, and a qualitative error grid.
+For the attached official-training notebook, `model_folder` is
+`FOLD_OUTPUT.parent`, `folds=(FOLD,)`, `checkpoint=PREDICTION_CHECKPOINT`, and
+the model configuration's `upscale_factor` is `UPSCALE_FACTOR`.
+
 ## Colab tutorials
 
 Three end-to-end notebooks document the central workflows using official images

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Callable, Hashable, Iterable, Literal, Ma
 from .augmentation import augment_dataset, serialize_pipeline
 from .errors import DatasetValidationError, ValidationIssue
 from .io import _label_path_for_image, load_source
-from .models import DatasetMetadata, Sample, Task
+from .models import DatasetMetadata, Sample, SemanticMaskExport, Task
 from .operations import (
     export_dataset,
     rebalance_empty_dataset,
@@ -26,6 +26,7 @@ from .planning import (
     resolve_renamed_classes,
     select_empty_images,
 )
+from .semantic_export import export_semantic_masks
 from .tiling import tile_dataset
 from .utils import ensure_safe_destination, normalize_split, settings_fingerprint, slugify
 from .validation import validate_dataset
@@ -767,13 +768,14 @@ class Dataset:
         *,
         destination: str | Path | None = None,
         name: str | None = None,
+        format: Literal["yolo", "semantic_masks"] = "yolo",
         splits: Iterable[Literal["train", "val", "test"]] | None = None,
         allow_lossy: bool = False,
         visualize: bool = True,
         progress: bool = True,
         dry_run: bool = False,
-    ) -> "Dataset":
-        """Materialize the current dataset or virtual pipeline as canonical YOLO.
+    ) -> "Dataset | SemanticMaskExport":
+        """Materialize the current dataset or virtual pipeline in a supported format.
 
         Output is built in a private staging directory, completely validated,
         and atomically published. Existing destinations are never overwritten.
@@ -782,6 +784,9 @@ class Dataset:
             destination: Final output root. ``None`` derives a sibling path from
                 the dataset name, operation, and settings fingerprint.
             name: Optional output dataset name stored in metadata.
+            format: ``"yolo"`` preserves the canonical training layout and
+                returns a :class:`Dataset`. ``"semantic_masks"`` writes binary
+                foreground-union masks and returns :class:`SemanticMaskExport`.
             splits: Splits included in the published output; ``None`` publishes
                 every available split. Unselected splits are omitted.
             allow_lossy: Permit explicit lossy conversion of COCO RLE/multipart
@@ -792,16 +797,33 @@ class Dataset:
                 writing a dataset.
 
         Returns:
-            The validated materialized dataset, or the unchanged virtual dataset
-            for a dry run.
+            The validated materialized dataset or semantic-mask artifact. Dry
+            runs return the unchanged virtual dataset.
         """
+
+        format = format.lower()
+        if format not in {"yolo", "semantic_masks"}:
+            raise ValueError("format must be 'yolo' or 'semantic_masks'")
+        if format == "semantic_masks" and allow_lossy:
+            raise ValueError("allow_lossy applies only to YOLO export; semantic masks use polygon unions directly")
 
         if self._plan:
             return self._export_plan(
                 destination=destination,
                 name=name,
+                format=format,
                 splits=splits,
                 allow_lossy=allow_lossy,
+                visualize=visualize,
+                progress=progress,
+                dry_run=dry_run,
+            )
+        if format == "semantic_masks":
+            return export_semantic_masks(
+                self,
+                destination=destination,
+                name=name,
+                splits=splits,
                 visualize=visualize,
                 progress=progress,
                 dry_run=dry_run,
@@ -1170,12 +1192,13 @@ class Dataset:
         *,
         destination: str | Path | None,
         name: str | None,
+        format: str,
         splits: Iterable[str] | None,
         allow_lossy: bool,
         visualize: bool,
         progress: bool,
         dry_run: bool,
-    ) -> "Dataset":
+    ) -> "Dataset | SemanticMaskExport":
         base = self._base
         if base is None:
             raise RuntimeError("Virtual dataset is missing its materialized base")
@@ -1183,6 +1206,7 @@ class Dataset:
             "pipeline": [operation.public_record() for operation in self._plan],
             "splits": sorted(normalize_split(split) for split in splits) if splits else list(self.splits),
             "allow_lossy": allow_lossy,
+            "format": format,
         }
         final_name = slugify(name or self.name)
         final_destination = (
@@ -1227,6 +1251,16 @@ class Dataset:
                     current = augment_dataset(current, **kwargs)
                 else:
                     raise RuntimeError(f"Unknown planned operation {operation.kind!r}")
+            if format == "semantic_masks":
+                return export_semantic_masks(
+                    current,
+                    destination=final_destination,
+                    name=final_name,
+                    splits=splits,
+                    visualize=visualize,
+                    progress=progress,
+                    dry_run=False,
+                )
             return export_dataset(
                 current,
                 destination=final_destination,
