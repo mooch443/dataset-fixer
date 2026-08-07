@@ -4,8 +4,7 @@ from .dataset import Dataset
 from .comparison.types import ComparisonResult
 from .errors import DatasetValidationError
 from .model import ImagePrediction, Model, ModelCollection, ModelInput, PredictionResult
-from .models import SemanticComparisonResult, SemanticMaskExport, Task
-from .semantic_comparison import SemanticModelCohort
+from .models import SemanticComparisonResult, Task
 
 try:
     from ._version import __version__
@@ -22,8 +21,6 @@ __all__ = [
     "ModelInput",
     "PredictionResult",
     "SemanticComparisonResult",
-    "SemanticMaskExport",
-    "SemanticModelCohort",
     "Task",
     "__version__",
 ]

@@ -13,7 +13,12 @@ from PIL import Image, ImageDraw
 from tqdm.auto import tqdm
 
 from .errors import DatasetValidationError, ValidationIssue
-from .models import SemanticMaskExport, Task
+from .models import Task
+from .split_group_audit import (
+    audit_split_groups,
+    print_split_group_audit,
+    write_split_group_audit,
+)
 from .utils import (
     ensure_safe_destination,
     environment_snapshot,
@@ -23,6 +28,7 @@ from .utils import (
     slugify,
     to_jsonable,
 )
+from .validation_audit import stage_load_validation_audit
 
 if TYPE_CHECKING:
     from .dataset import Dataset
@@ -38,7 +44,7 @@ def export_semantic_masks(
     visualize: bool,
     progress: bool,
     dry_run: bool,
-) -> SemanticMaskExport | "Dataset":
+) -> "Dataset":
     """Publish polygon annotations as paired binary foreground masks."""
 
     if dataset.task is not Task.SEGMENT:
@@ -74,6 +80,11 @@ def export_semantic_masks(
             )
         )
     _assert_unique_mask_paths(samples)
+    group_validation, group_report = audit_split_groups(
+        dataset,
+        exported_splits=selected,
+    )
+    print_split_group_audit(group_report)
 
     settings = {
         "format": "semantic_masks",
@@ -114,6 +125,12 @@ def export_semantic_masks(
         source_reports = dataset.location / "reports"
         if source_reports.is_dir():
             shutil.copytree(source_reports, reports, dirs_exist_ok=True)
+        write_split_group_audit(reports, group_report)
+        load_validation, load_visualization = stage_load_validation_audit(
+            dataset._validation_audit,
+            dataset._validation_audit_visualization,
+            reports,
+        )
         source_coverage = dataset.location / "coverage_summary"
         if source_coverage.is_dir():
             shutil.copytree(
@@ -157,10 +174,13 @@ def export_semantic_masks(
             for path in dataset._manifest.get("visuals") or []
             if (staging / str(path)).is_file()
         ]
+        if load_visualization is not None:
+            visuals.append(str(load_visualization.relative_to(staging)))
         if visualize and first_pair is not None:
             preview = reports / "semantic_mask_preview.png"
             _write_preview(*first_pair, preview)
             visuals.append(str(preview.relative_to(staging)))
+        visuals = list(dict.fromkeys(visuals))
         provenance_path = staging / "provenance.jsonl"
         with provenance_path.open("w", encoding="utf-8") as handle:
             for record in records:
@@ -220,6 +240,8 @@ def export_semantic_masks(
                 "images": len(records),
                 "masks": len(records),
                 "allowed_mask_values": [0, 255],
+                "split_group_isolation": group_validation,
+                "load_validation": load_validation,
             },
         }
         (staging / "dataset-fixer.json").write_text(
@@ -231,16 +253,9 @@ def export_semantic_masks(
         shutil.rmtree(staging, ignore_errors=True)
         raise
 
-    split_values = tuple(split for split in ("train", "val", "test") if split in selected)
-    result = SemanticMaskExport(
-        name=final_name,
-        location=final_destination,
-        manifest=manifest,
-        manifest_path=final_destination / "dataset-fixer.json",
-        splits=split_values,
-        image_dirs={split: final_destination / split / "images" for split in split_values},
-        mask_dirs={split: final_destination / split / "masks" / "0" for split in split_values},
-    )
+    from .dataset import Dataset
+
+    result = Dataset.open(final_destination, progress=progress)
     print(f"\nCreated {result.name}")
     print(f"Location: {result.location}")
     print(f"Images/masks: {len(records)}/{len(records)}")
@@ -305,6 +320,7 @@ def _provenance_record(
             "validity_result",
             "crop_transform_warnings",
             "lossy_clipping",
+            "split_group",
         )
         if key in parent
     }

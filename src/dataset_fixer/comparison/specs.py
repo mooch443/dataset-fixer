@@ -93,7 +93,7 @@ def parse_models(
             name=name,
             resolution=resolution,
             training_dataset=settings.get("training_dataset"),
-            inference=str(settings.get("inference", "auto")),
+            inference=str(settings.get("inference", "native")),
             settings=adapter_settings,
         )
         training = settings.get("training_dataset") or resolved_model.training_dataset

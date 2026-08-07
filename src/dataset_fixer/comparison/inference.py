@@ -1,40 +1,34 @@
 from __future__ import annotations
 
-import importlib.util
 import math
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+from PIL import Image
 from tqdm.auto import tqdm
 
 from ..errors import DatasetValidationError, ValidationIssue
+from ..sahi_support import (
+    SahiSettings,
+    SahiTile,
+    build_tile_manifest,
+    class_map_probabilities,
+    resolve_sahi_settings,
+    sahi_available,
+    stitch_probability_tiles,
+)
 from .types import Cohort, ModelSpec, Prediction
 
 if TYPE_CHECKING:
     from ..model import Model, ModelInput, PredictionTask
 
 
-def sahi_available() -> bool:
-    return importlib.util.find_spec("sahi") is not None
-
-
 def resolve_backend(requested: str, task: str) -> str:
     requested = requested.lower()
-    if requested not in {"auto", "native", "sahi"}:
-        raise ValueError("inference must be 'auto', 'native', or 'sahi'")
-    if task == "pose":
-        if requested == "sahi":
-            raise DatasetValidationError(
-                ValidationIssue(
-                    "SAHI cannot preserve the complete pose prediction schema",
-                    expected="native inference for pose",
-                    suggestion="use inference='native' or 'auto'",
-                )
-            )
-        return "native"
-    if requested == "auto":
-        return "sahi" if sahi_available() else "native"
+    if requested not in {"native", "sahi"}:
+        raise ValueError("inference must be 'native' or 'sahi'; 'auto' was removed")
     if requested == "sahi" and not sahi_available():
         raise ImportError("SAHI inference was requested but SAHI is not installed; install dataset-fixer[sahi]")
     return requested
@@ -116,19 +110,11 @@ def predict_model_inputs(
     device: str | None,
     progress: bool,
     settings: dict[str, Any],
-) -> tuple[dict[str, list[Prediction]], "PredictionTask"]:
+) -> tuple[dict[str, list[Prediction] | np.ndarray], "PredictionTask"]:
     """Adapter entry point used by the public :class:`Model` API."""
 
     if backend == "sahi":
-        if task is None:
-            raise DatasetValidationError(
-                ValidationIssue(
-                    "SAHI prediction requires a known model task",
-                    source=model.name,
-                    expected="task metadata in args.yaml or Model(..., task=...)",
-                )
-            )
-        values = _predict_sahi_inputs(
+        values, resolved_task = _predict_sahi_inputs(
             model,
             inputs,
             task=task,
@@ -139,7 +125,7 @@ def predict_model_inputs(
             progress=progress,
             settings=settings,
         )
-        return values, task  # type: ignore[return-value]
+        return values, resolved_task
     return _predict_native_inputs(
         model,
         inputs,
@@ -164,7 +150,7 @@ def _predict_native_inputs(
     device: str | None,
     progress: bool,
     settings: dict[str, Any],
-) -> tuple[dict[str, list[Prediction]], "PredictionTask"]:
+) -> tuple[dict[str, list[Prediction] | np.ndarray], "PredictionTask"]:
     try:
         from ultralytics import YOLO
     except ImportError as exc:
@@ -176,13 +162,14 @@ def _predict_native_inputs(
     detected_task = task or model.task or getattr(loaded, "task", None)
     if detected_task is None:
         detected_task = getattr(getattr(loaded, "model", None), "task", None)
-    if detected_task not in {"detect", "segment", "pose", "polo"}:
+    detected_task = _canonical_task(detected_task)
+    if detected_task not in {"detect", "segment", "pose", "polo", "semantic_segment"}:
         raise DatasetValidationError(
             ValidationIssue(
                 "Could not determine the Ultralytics model task",
                 source=model.name,
                 value=detected_task,
-                expected="detect, segment, pose, or polo",
+                expected="detect, segment, pose, polo/locate, or semantic/semantic_segment",
                 suggestion="pass task=... when constructing Model",
             )
         )
@@ -198,7 +185,7 @@ def _predict_native_inputs(
         kwargs["device"] = device
     if settings.get("precision") == "half":
         kwargs["half"] = True
-    output: dict[str, list[Prediction]] = {}
+    output: dict[str, list[Prediction] | np.ndarray] = {}
     iterator = tqdm(
         inputs,
         total=len(inputs),
@@ -234,7 +221,14 @@ def _predict_native_inputs(
                         expected=str(record.image_path),
                     )
                 )
-        output[record.image_id] = _parse_native_result(result, detected_task)
+        if detected_task == "semantic_segment":
+            output[record.image_id] = _semantic_class_map(
+                result,
+                expected_shape=(record.height, record.width),
+                source=f"{model.name}: {record.relative_path}",
+            )
+        else:
+            output[record.image_id] = _parse_native_result(result, detected_task)
     return output, detected_task  # type: ignore[return-value]
 
 
@@ -275,6 +269,11 @@ def _parse_native_result(result: Any, task: str) -> list[Prediction]:
                 score=float(scores[i]),
                 bbox=tuple(map(float, box[:4])),
                 polygon=[tuple(map(float, point[:2])) for point in polygon] if polygon else None,
+                polygons=(
+                    [[tuple(map(float, point[:2])) for point in polygon]]
+                    if polygon
+                    else None
+                ),
                 keypoints=[tuple(map(float, point[:3])) for point in keypoints] if keypoints else None,
                 metadata={"backend": "native"},
             )
@@ -308,107 +307,689 @@ def _predict_sahi_inputs(
     source_model: "Model",
     inputs: tuple["ModelInput", ...],
     *,
-    task: str,
+    task: str | None,
     threshold: float,
     confidence_floor: float,
     resolution: int,
     device: str | None,
     progress: bool,
     settings: dict[str, Any],
-) -> dict[str, list[Prediction]]:
+) -> tuple[dict[str, list[Prediction] | np.ndarray], "PredictionTask"]:
     try:
-        from sahi import AutoDetectionModel
-        from sahi.predict import get_prediction, get_sliced_prediction
+        from ultralytics import YOLO
     except ImportError as exc:
-        raise ImportError("SAHI inference requires the optional dataset-fixer[sahi] extra") from exc
-    model_type = str(settings.get("model_type", "ultralytics"))
-    model = source_model._runtime_model(
-        (
-            "sahi",
-            model_type,
-            float(confidence_floor),
-            device or "cpu",
-            int(resolution),
-        ),
-        lambda: AutoDetectionModel.from_pretrained(
-            model_type=model_type,
-            model_path=str(source_model.path),
-            confidence_threshold=confidence_floor,
-            device=device or "cpu",
-            image_size=resolution,
-        ),
+        raise ImportError(
+            "SAHI inference for supported models requires dataset-fixer[sahi]"
+        ) from exc
+    resolved = resolve_sahi_settings(settings, resolution=resolution)
+    if resolved.model_type.lower() not in {
+        "ultralytics",
+        "polo",
+        "polo26",
+        "polov8",
+        "locate",
+    }:
+        raise ValueError(
+            "sahi_model_type must identify the Ultralytics adapter "
+            "('ultralytics', 'polo', 'polo26', 'polov8', or 'locate')"
+        )
+    canonical_task = _canonical_task(task)
+    loaded = source_model._runtime_model(
+        ("ultralytics-sahi", device or "cpu", int(resolution)),
+        lambda: YOLO(str(source_model.path)),
     )
-    mode = str(settings.get("sahi_mode", "sliced"))
-    if mode not in {"standard", "sliced", "combined"}:
-        raise ValueError("sahi_mode must be 'standard', 'sliced', or 'combined'")
-    overlap_h = float(settings.get("overlap_height_ratio", settings.get("overlap", 0.2)))
-    overlap_w = float(settings.get("overlap_width_ratio", settings.get("overlap", 0.2)))
-    post_type = str(settings.get("postprocess_type", "GREEDYNMM")).upper()
-    post_metric = str(settings.get("postprocess_match_metric", "IOS")).upper()
-    output: dict[str, list[Prediction]] = {}
+    detected_task = canonical_task or _canonical_task(getattr(loaded, "task", None))
+    if detected_task not in {"detect", "segment", "pose", "polo", "semantic_segment"}:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Could not determine the SAHI model task",
+                source=source_model.name,
+                value=detected_task,
+                expected="detect, segment, pose, polo/locate, or semantic",
+            )
+        )
+    output: dict[str, list[Prediction] | np.ndarray] = {}
     iterator = tqdm(
         inputs,
         desc=f"{source_model.name} SAHI {threshold:g}",
         disable=not progress,
     )
     for record in iterator:
-        common = {
-            "detection_model": model,
-            "postprocess_type": post_type,
-            "postprocess_match_metric": post_metric,
-            "postprocess_match_threshold": threshold,
-            "postprocess_class_agnostic": bool(settings.get("postprocess_class_agnostic", False)),
-            "verbose": 0,
-        }
-        if mode == "standard":
-            # SAHI's standard prediction entry point does not accept sliced
-            # postprocessing parameters. The threshold is still part of the
-            # configuration/cache identity and is reported as inapplicable.
-            result = get_prediction(
-                str(record.image_path), detection_model=model, verbose=0
+        with Image.open(record.image_path) as opened:
+            source_image = opened.convert("RGB")
+        if source_image.size != (record.width, record.height):
+            raise DatasetValidationError(
+                f"Prediction input dimensions changed while slicing {record.image_path}"
+            )
+        manifest = build_tile_manifest(
+            width=record.width,
+            height=record.height,
+            settings=resolved,
+        )
+        raw_objects: list[Prediction] = []
+        semantic_tiles: list[tuple[SahiTile, np.ndarray]] = []
+        for tile in manifest:
+            crop = source_image.crop(tile.box)
+            result = _predict_ultralytics_tile(
+                loaded,
+                crop,
+                resolution=resolution,
+                confidence=confidence_floor,
+                postprocess=threshold,
+                device=device,
+                settings=settings,
+                source=f"{source_model.name}:{record.relative_path}:tile-{tile.index}",
+            )
+            if detected_task == "semantic_segment":
+                semantic_tiles.append(
+                    (
+                        tile,
+                        _semantic_probabilities(
+                            result,
+                            expected_shape=(tile.height, tile.width),
+                            num_classes=_model_class_count(loaded),
+                            source=f"{source_model.name}:{record.relative_path}:tile-{tile.index}",
+                        ),
+                    )
+                )
+                continue
+            tile_objects = _parse_native_result(result, detected_task)
+            raw_objects.extend(
+                _shift_tile_prediction(
+                    value,
+                    tile,
+                    loaded,
+                    full_width=record.width,
+                    full_height=record.height,
+                )
+                for value in tile_objects
+            )
+        if detected_task == "semantic_segment":
+            probabilities = stitch_probability_tiles(
+                width=record.width,
+                height=record.height,
+                tiles=semantic_tiles,
+            )
+            output[record.image_id] = np.argmax(probabilities, axis=0).astype(
+                _class_map_dtype(probabilities.shape[0])
+            )
+        elif detected_task in {"pose", "polo"}:
+            output[record.image_id] = _postprocess_payload_predictions(
+                raw_objects,
+                task=detected_task,
+                threshold=threshold,
+                settings=resolved,
             )
         else:
-            result = get_sliced_prediction(
-                str(record.image_path),
-                slice_height=int(settings.get("slice_height", resolution)),
-                slice_width=int(settings.get("slice_width", resolution)),
-                overlap_height_ratio=overlap_h,
-                overlap_width_ratio=overlap_w,
-                perform_standard_pred=mode == "combined",
-                **common,
+            output[record.image_id] = _postprocess_object_predictions(
+                raw_objects,
+                task=detected_task,
+                width=record.width,
+                height=record.height,
+                threshold=threshold,
+                settings=resolved,
             )
-        output[record.image_id] = [
-            _sahi_prediction(value, task, post_type, post_metric, threshold)
-            for value in result.object_prediction_list
-        ]
-    return output
+    return output, detected_task  # type: ignore[return-value]
 
 
-def _sahi_prediction(value: Any, task: str, post_type: str, post_metric: str, threshold: float) -> Prediction:
+def _sahi_prediction(
+    value: Any,
+    task: str,
+    post_type: str,
+    post_metric: str,
+    threshold: float,
+) -> Prediction:
     bbox = tuple(map(float, value.bbox.to_xyxy()))
     score = float(value.score.value)
     class_id = int(value.category.id)
     polygon = None
+    polygons = None
     if task == "segment" and getattr(value, "mask", None) is not None:
         segmentation = getattr(value.mask, "segmentation", None)
         if segmentation and isinstance(segmentation[0], (list, tuple)):
-            row = segmentation[0]
-            polygon = [(float(row[i]), float(row[i + 1])) for i in range(0, len(row) - 1, 2)]
-    point = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2) if task == "polo" else None
+            polygons = [
+                [
+                    (float(row[i]), float(row[i + 1]))
+                    for i in range(0, len(row) - 1, 2)
+                ]
+                for row in segmentation
+                if len(row) >= 6
+            ]
+            polygon = max(polygons, key=_polygon_area) if polygons else None
     return Prediction(
         class_id=class_id,
         score=score,
         bbox=bbox,
-        point=point,
         polygon=polygon,
+        polygons=polygons,
         metadata={
             "backend": "sahi",
             "source_box": bbox,
-            "postprocess_type": post_type,
-            "postprocess_match_metric": post_metric,
-            "postprocess_threshold": threshold,
+            "sahi_postprocess_type": post_type,
+            "sahi_postprocess_match_metric": post_metric,
+            "sahi_postprocess_threshold": threshold,
         },
     )
+
+
+def _predict_ultralytics_tile(
+    model: Any,
+    image: Image.Image,
+    *,
+    resolution: int,
+    confidence: float,
+    postprocess: float,
+    device: str | None,
+    settings: dict[str, Any],
+    source: str,
+) -> Any:
+    array = np.asarray(image, dtype=np.uint8)
+    kwargs: dict[str, Any] = {
+        "source": np.ascontiguousarray(array[:, :, ::-1]),
+        "imgsz": resolution,
+        "conf": confidence,
+        "iou": postprocess,
+        "verbose": False,
+        "stream": False,
+        "augment": False,
+    }
+    if device is not None:
+        kwargs["device"] = device
+    if settings.get("precision") == "half":
+        kwargs["half"] = True
+    results = model.predict(**kwargs)
+    if len(results) != 1:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "SAHI tile inference did not return exactly one result",
+                source=source,
+                value=len(results),
+                expected="one result for one source tile",
+            )
+        )
+    return results[0]
+
+
+def _shift_tile_prediction(
+    value: Prediction,
+    tile: SahiTile,
+    model: Any,
+    *,
+    full_width: int,
+    full_height: int,
+) -> Prediction:
+    bbox = (
+        (
+            value.bbox[0] + tile.left,
+            value.bbox[1] + tile.top,
+            value.bbox[2] + tile.left,
+            value.bbox[3] + tile.top,
+        )
+        if value.bbox is not None
+        else None
+    )
+    point = (
+        (value.point[0] + tile.left, value.point[1] + tile.top)
+        if value.point is not None
+        else None
+    )
+    polygons = value.polygons or ([value.polygon] if value.polygon else None)
+    shifted_polygons = (
+        [
+            [(x + tile.left, y + tile.top) for x, y in polygon]
+            for polygon in polygons
+        ]
+        if polygons
+        else None
+    )
+    keypoints = (
+        [
+            (point_row[0] + tile.left, point_row[1] + tile.top, point_row[2])
+            for point_row in value.keypoints
+        ]
+        if value.keypoints
+        else None
+    )
+    radius = value.radius
+    if point is not None and bbox is None:
+        radius = radius if radius is not None else _model_polo_radius(model, value.class_id)
+        proxy = max(float(radius) if radius is not None else 1.0, 1e-3)
+        bbox = (
+            max(0.0, point[0] - proxy),
+            max(0.0, point[1] - proxy),
+            min(float(full_width), point[0] + proxy),
+            min(float(full_height), point[1] + proxy),
+        )
+    return Prediction(
+        class_id=value.class_id,
+        score=value.score,
+        bbox=bbox,
+        point=point,
+        radius=radius,
+        polygon=(
+            max(shifted_polygons, key=_polygon_area) if shifted_polygons else None
+        ),
+        polygons=shifted_polygons,
+        keypoints=keypoints,
+        metadata={**value.metadata, "backend": "sahi", "tile": tile.box},
+    )
+
+
+def _postprocess_object_predictions(
+    predictions: list[Prediction],
+    *,
+    task: str,
+    width: int,
+    height: int,
+    threshold: float,
+    settings: SahiSettings,
+) -> list[Prediction]:
+    if not predictions:
+        return []
+    try:
+        from sahi.postprocess.combine import (
+            GreedyNMMPostprocess,
+            LSNMSPostprocess,
+            NMMPostprocess,
+            NMSPostprocess,
+        )
+        from sahi.prediction import ObjectPrediction
+    except ImportError as exc:
+        raise ImportError("SAHI inference requires dataset-fixer[sahi]") from exc
+    classes = {
+        "GREEDYNMM": GreedyNMMPostprocess,
+        "NMM": NMMPostprocess,
+        "NMS": NMSPostprocess,
+        "LSNMS": LSNMSPostprocess,
+    }
+    objects = []
+    for value in predictions:
+        if value.bbox is None:
+            raise DatasetValidationError("SAHI object prediction is missing its proxy box")
+        polygons = value.polygons or ([value.polygon] if value.polygon else None)
+        segmentation = (
+            [[coordinate for point in polygon for coordinate in point] for polygon in polygons]
+            if task == "segment" and polygons
+            else None
+        )
+        objects.append(
+            ObjectPrediction(
+                bbox=list(value.bbox),
+                category_id=value.class_id,
+                category_name=str(value.class_id),
+                score=value.score,
+                segmentation=segmentation,
+                full_shape=[height, width],
+            )
+        )
+    processor = classes[settings.postprocess_type](
+        match_threshold=threshold,
+        match_metric=settings.postprocess_match_metric,
+        class_agnostic=settings.postprocess_class_agnostic,
+    )
+    return [
+        _sahi_prediction(
+            value,
+            task,
+            settings.postprocess_type,
+            settings.postprocess_match_metric,
+            threshold,
+        )
+        for value in processor(objects)
+    ]
+
+
+def _postprocess_payload_predictions(
+    predictions: list[Prediction],
+    *,
+    task: str,
+    threshold: float,
+    settings: SahiSettings,
+) -> list[Prediction]:
+    groups = _prediction_groups(
+        predictions,
+        postprocess_type=settings.postprocess_type,
+        match_metric=settings.postprocess_match_metric,
+        threshold=threshold,
+        class_agnostic=settings.postprocess_class_agnostic,
+    )
+    output: list[Prediction] = []
+    merge_payload = settings.postprocess_type in {"GREEDYNMM", "NMM"}
+    for indices in groups:
+        members = [predictions[index] for index in indices]
+        winner = max(members, key=lambda value: value.score)
+        if not merge_payload:
+            output.append(winner)
+            continue
+        boxes = [value.bbox for value in members if value.bbox is not None]
+        bbox = (
+            (
+                min(value[0] for value in boxes),
+                min(value[1] for value in boxes),
+                max(value[2] for value in boxes),
+                max(value[3] for value in boxes),
+            )
+            if boxes
+            else None
+        )
+        if task == "pose":
+            lengths = {len(value.keypoints or []) for value in members}
+            if len(lengths) != 1 or not lengths or 0 in lengths:
+                raise DatasetValidationError(
+                    ValidationIssue(
+                        "Cannot merge SAHI pose predictions with inconsistent skeletons",
+                        value=sorted(lengths),
+                        expected="one non-zero keypoint count per merge group",
+                    )
+                )
+            keypoints = [
+                _merge_keypoint([value.keypoints[index] for value in members], members)
+                for index in range(next(iter(lengths)))
+            ]
+            output.append(
+                Prediction(
+                    class_id=winner.class_id,
+                    score=winner.score,
+                    bbox=bbox,
+                    keypoints=keypoints,
+                    metadata=_merged_metadata(winner, members, settings, threshold),
+                )
+            )
+        else:
+            point = _weighted_point(members)
+            radii = [(value.radius, value.score) for value in members if value.radius is not None]
+            radius = (
+                sum(float(value) * score for value, score in radii)
+                / sum(score for _, score in radii)
+                if radii and sum(score for _, score in radii) > 0
+                else winner.radius
+            )
+            output.append(
+                Prediction(
+                    class_id=winner.class_id,
+                    score=winner.score,
+                    bbox=bbox,
+                    point=point,
+                    radius=radius,
+                    metadata=_merged_metadata(winner, members, settings, threshold),
+                )
+            )
+    return output
+
+
+def _prediction_groups(
+    predictions: list[Prediction],
+    *,
+    postprocess_type: str,
+    match_metric: str,
+    threshold: float,
+    class_agnostic: bool,
+) -> list[list[int]]:
+    remaining = sorted(range(len(predictions)), key=lambda i: (-predictions[i].score, i))
+    if postprocess_type == "NMM":
+        groups: list[list[int]] = []
+        unseen = set(remaining)
+        for seed in remaining:
+            if seed not in unseen:
+                continue
+            unseen.remove(seed)
+            group = [seed]
+            queue = [seed]
+            while queue:
+                current = queue.pop(0)
+                matches = [
+                    candidate
+                    for candidate in remaining
+                    if candidate in unseen
+                    and _payload_match(
+                        predictions[current],
+                        predictions[candidate],
+                        match_metric,
+                        threshold,
+                        class_agnostic,
+                    )
+                ]
+                for candidate in matches:
+                    unseen.remove(candidate)
+                    group.append(candidate)
+                    queue.append(candidate)
+            groups.append(group)
+        return groups
+    groups = []
+    while remaining:
+        winner = remaining.pop(0)
+        matches = [
+            candidate
+            for candidate in remaining
+            if _payload_match(
+                predictions[winner],
+                predictions[candidate],
+                match_metric,
+                threshold,
+                class_agnostic,
+            )
+        ]
+        remaining = [candidate for candidate in remaining if candidate not in matches]
+        groups.append(
+            [winner, *matches]
+            if postprocess_type == "GREEDYNMM"
+            else [winner]
+        )
+    return groups
+
+
+def _payload_match(
+    left: Prediction,
+    right: Prediction,
+    metric: str,
+    threshold: float,
+    class_agnostic: bool,
+) -> bool:
+    if not class_agnostic and left.class_id != right.class_id:
+        return False
+    if left.bbox is None or right.bbox is None:
+        return False
+    lx1, ly1, lx2, ly2 = left.bbox
+    rx1, ry1, rx2, ry2 = right.bbox
+    intersection = max(0.0, min(lx2, rx2) - max(lx1, rx1)) * max(
+        0.0, min(ly2, ry2) - max(ly1, ry1)
+    )
+    left_area = max(0.0, lx2 - lx1) * max(0.0, ly2 - ly1)
+    right_area = max(0.0, rx2 - rx1) * max(0.0, ry2 - ry1)
+    denominator = (
+        min(left_area, right_area)
+        if metric == "IOS"
+        else left_area + right_area - intersection
+    )
+    return denominator > 0 and intersection / denominator >= threshold
+
+
+def _merge_keypoint(
+    points: list[tuple[float, float, float | None]],
+    members: list[Prediction],
+) -> tuple[float, float, float | None]:
+    rows = []
+    for point, member in zip(points, members):
+        confidence = point[2] if len(point) > 2 else None
+        keypoint_weight = max(float(confidence), 0.0) if confidence is not None else 1.0
+        weight = max(float(member.score), 0.0) * keypoint_weight
+        if weight > 0 and math.isfinite(point[0]) and math.isfinite(point[1]):
+            rows.append((point, weight))
+    if not rows:
+        return points[0]
+    denominator = sum(weight for _, weight in rows)
+    x = sum(point[0] * weight for point, weight in rows) / denominator
+    y = sum(point[1] * weight for point, weight in rows) / denominator
+    confidences = [
+        (float(point[2]), weight)
+        for point, weight in rows
+        if len(point) > 2 and point[2] is not None
+    ]
+    confidence = (
+        sum(value * weight for value, weight in confidences)
+        / sum(weight for _, weight in confidences)
+        if confidences
+        else None
+    )
+    return x, y, confidence
+
+
+def _weighted_point(members: list[Prediction]) -> tuple[float, float]:
+    rows = [(value.point, max(value.score, 0.0)) for value in members if value.point]
+    denominator = sum(weight for _, weight in rows)
+    if not rows:
+        raise DatasetValidationError("SAHI POLO merge group contains no points")
+    if denominator <= 0:
+        return rows[0][0]
+    return (
+        sum(point[0] * weight for point, weight in rows) / denominator,
+        sum(point[1] * weight for point, weight in rows) / denominator,
+    )
+
+
+def _merged_metadata(
+    winner: Prediction,
+    members: list[Prediction],
+    settings: SahiSettings,
+    threshold: float,
+) -> dict[str, Any]:
+    return {
+        **winner.metadata,
+        "backend": "sahi",
+        "merged_predictions": len(members),
+        "sahi_postprocess_type": settings.postprocess_type,
+        "sahi_postprocess_match_metric": settings.postprocess_match_metric,
+        "sahi_postprocess_threshold": threshold,
+    }
+
+
+def _semantic_class_map(
+    result: Any,
+    *,
+    expected_shape: tuple[int, int],
+    source: str,
+) -> np.ndarray:
+    semantic = getattr(result, "semantic_mask", None)
+    raw = getattr(semantic, "data", semantic)
+    if raw is None:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Semantic model result has no semantic_mask",
+                source=source,
+                expected="an Ultralytics task='semantic' result",
+            )
+        )
+    values = np.asarray(_tolist(raw))
+    values = np.squeeze(values)
+    if values.shape != expected_shape:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Semantic model result dimensions do not match its source image",
+                source=source,
+                value=values.shape,
+                expected=str(expected_shape),
+            )
+        )
+    if not np.all(np.isfinite(values)) or np.any(values < 0) or np.any(values != np.floor(values)):
+        raise DatasetValidationError(
+            ValidationIssue("Semantic model result contains invalid class IDs", source=source)
+        )
+    return values.astype(_class_map_dtype(int(values.max(initial=0)) + 1))
+
+
+def _semantic_probabilities(
+    result: Any,
+    *,
+    expected_shape: tuple[int, int],
+    num_classes: int | None,
+    source: str,
+) -> np.ndarray:
+    probabilities = getattr(result, "semantic_probabilities", None)
+    logits = getattr(result, "semantic_logits", None)
+    raw = probabilities if probabilities is not None else logits
+    if raw is None:
+        return class_map_probabilities(
+            _semantic_class_map(result, expected_shape=expected_shape, source=source),
+            num_classes=num_classes,
+        )
+    values = np.asarray(_tolist(raw), dtype=np.float32)
+    while values.ndim > 3 and values.shape[0] == 1:
+        values = values[0]
+    if values.ndim == 2:
+        values = values[None]
+    if values.ndim != 3 or values.shape[-2:] != expected_shape:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Semantic probability/logit dimensions do not match their tile",
+                source=source,
+                value=values.shape,
+                expected=f"(classes, {expected_shape[0]}, {expected_shape[1]})",
+            )
+        )
+    if logits is not None:
+        if values.shape[0] == 1:
+            foreground = 1.0 / (1.0 + np.exp(-values[0]))
+            values = np.stack((1.0 - foreground, foreground))
+        else:
+            values = values - np.max(values, axis=0, keepdims=True)
+            values = np.exp(values)
+            values /= np.sum(values, axis=0, keepdims=True)
+    elif values.shape[0] == 1:
+        values = np.stack((1.0 - values[0], values[0]))
+    if not np.all(np.isfinite(values)):
+        raise DatasetValidationError(
+            ValidationIssue("Semantic probabilities contain non-finite values", source=source)
+        )
+    return values
+
+
+def _model_class_count(model: Any) -> int | None:
+    names = getattr(model, "names", None)
+    if isinstance(names, dict):
+        return len(names)
+    if isinstance(names, (list, tuple)):
+        return len(names)
+    return None
+
+
+def _model_polo_radius(model: Any, class_id: int) -> float | None:
+    radii = getattr(model, "radii", None)
+    if radii is None:
+        radii = getattr(getattr(model, "predictor", None), "radii", None)
+    if isinstance(radii, dict):
+        value = radii.get(class_id, radii.get(str(class_id)))
+        if isinstance(value, dict):
+            value = value.get("radius", value.get("value", value.get("r")))
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _canonical_task(value: Any) -> Any:
+    if value is None:
+        return None
+    normalized = str(value).lower()
+    return {"locate": "polo", "semantic": "semantic_segment"}.get(
+        normalized, normalized
+    )
+
+
+def _class_map_dtype(classes: int) -> Any:
+    return np.uint8 if classes <= 256 else np.uint16
+
+
+def _polygon_area(polygon: list[tuple[float, float]]) -> float:
+    if len(polygon) < 3:
+        return 0.0
+    return abs(
+        sum(
+            polygon[index][0] * polygon[(index + 1) % len(polygon)][1]
+            - polygon[(index + 1) % len(polygon)][0] * polygon[index][1]
+            for index in range(len(polygon))
+        )
+    ) / 2
 
 
 def _assert_exact_predictions(cohort: Cohort, values: dict[str, list[Prediction]], model_name: str) -> None:
@@ -448,6 +1029,7 @@ def _tolist(value: Any) -> list[Any]:
     except AttributeError:
         pass
     try:
-        return value.tolist()
+        converted = value.tolist()
+        return converted if isinstance(converted, list) else [converted]
     except AttributeError:
         return list(value)

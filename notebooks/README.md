@@ -9,7 +9,7 @@ and YOLO annotations from a pinned commit of the public MIT-licensed
 | --- | --- | --- |
 | [01 — Controlled splitting](01_controlled_splitting.ipynb) | `Dataset.split()` | 2–4 minutes |
 | [02 — Task-aware tiling](02_task_aware_tiling.ipynb) | `Dataset.tile()` | 3–6 minutes |
-| [03 — Fixed-cohort model comparison](03_fixed_cohort_model_comparison.ipynb) | `Dataset.compare_models()` | 10–25 minutes |
+| [03 — Fixed-cohort model comparison](03_fixed_cohort_model_comparison.ipynb) | `ModelCollection.compare()` | 10–25 minutes |
 
 The comparison tutorial trains two tiny detection runs. A GPU runtime is
 recommended for that notebook, although it also runs on CPU with longer

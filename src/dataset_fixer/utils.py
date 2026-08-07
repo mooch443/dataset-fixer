@@ -39,8 +39,53 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
 
 
 def settings_fingerprint(settings: dict[str, Any]) -> str:
-    encoded = json.dumps(to_jsonable(settings), sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()[:8]
+    digest = hashlib.sha256()
+    for chunk in _iter_canonical_json(settings):
+        digest.update(chunk.encode())
+    return digest.hexdigest()[:8]
+
+
+def _iter_canonical_json(value: Any):
+    """Yield the canonical JSON used for fingerprints without copying it."""
+
+    if isinstance(value, Path):
+        yield json.dumps(str(value), separators=(",", ":"))
+        return
+    if isinstance(value, Enum):
+        yield from _iter_canonical_json(value.value)
+        return
+    if callable(value):
+        yield from _iter_canonical_json(
+            {
+                "module": getattr(value, "__module__", None),
+                "qualname": getattr(value, "__qualname__", None),
+                "repr": repr(value),
+            }
+        )
+        return
+    if isinstance(value, dict):
+        yield "{"
+        items = sorted(((str(key), item) for key, item in value.items()), key=lambda pair: pair[0])
+        for index, (key, item) in enumerate(items):
+            if index:
+                yield ","
+            yield json.dumps(key, separators=(",", ":"))
+            yield ":"
+            yield from _iter_canonical_json(item)
+        yield "}"
+        return
+    if isinstance(value, (list, tuple, set)):
+        yield "["
+        for index, item in enumerate(value):
+            if index:
+                yield ","
+            yield from _iter_canonical_json(item)
+        yield "]"
+        return
+    try:
+        yield json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except TypeError:
+        yield json.dumps(repr(value), separators=(",", ":"))
 
 
 def to_jsonable(value: Any) -> Any:

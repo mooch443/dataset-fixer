@@ -12,7 +12,7 @@ from PIL import Image
 from dataset_fixer import Dataset, DatasetValidationError, Task
 from dataset_fixer import tiling as tiling_module
 from dataset_fixer.models import Annotation, Sample
-from dataset_fixer.visualization import save_coverage_annotated_original
+from dataset_fixer.visualization import _polygon_invalidity_details, save_coverage_annotated_original
 from conftest import make_image, make_yolo_dataset
 
 
@@ -71,6 +71,9 @@ def test_invalid_segmentation_can_be_skipped_virtually(tmp_path: Path) -> None:
     assert sum(len(sample.annotations) for sample in dataset._samples) == 2
     assert any("Skipped invalid annotation" in warning for warning in dataset.warnings)
     assert any("Invalid or self-intersecting polygon" in warning for warning in dataset.warnings)
+    assert dataset.validation_audit["skipped_count"] == 1
+    assert dataset.validation_audit["visualized_count"] == 1
+    assert Path(dataset.validation_audit["visualization"]).is_file()
     assert source_label.read_text(encoding="utf-8") == original_label
 
     exported = dataset.export(
@@ -82,6 +85,102 @@ def test_invalid_segmentation_can_be_skipped_virtually(tmp_path: Path) -> None:
     assert len(exported_train_label.read_text(encoding="utf-8").splitlines()) == 1
     manifest = json.loads((exported.location / "dataset-fixer.json").read_text(encoding="utf-8"))
     assert any("Skipped invalid annotation" in warning for warning in manifest["warnings"])
+    assert manifest["validation"]["load_validation"]["skipped_count"] == 1
+    assert (exported.location / "reports" / "load_validation_audit.json").is_file()
+    assert (exported.location / "reports" / "load_validation_examples.png").is_file()
+    reopened = Dataset.open(exported.location, task="segment", progress=False)
+    assert reopened.validation_audit["skipped_count"] == 1
+    assert reopened._validation_audit_visualization == (
+        exported.location / "reports" / "load_validation_examples.png"
+    )
+
+    semantic = dataset.export(
+        destination=tmp_path / "semantic_without_invalid_polygon",
+        format="semantic_masks",
+        visualize=False,
+        progress=False,
+    )
+    assert semantic.manifest["validation"]["load_validation"]["skipped_count"] == 1
+    assert (semantic.location / "reports" / "load_validation_audit.json").is_file()
+    assert (semantic.location / "reports" / "load_validation_examples.png").is_file()
+
+
+def test_skip_audit_counts_all_failures_and_visualizes_at_most_four(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from matplotlib import pyplot as plt
+
+    open_figures = set(plt.get_fignums())
+    invalid_row = "0 0.2 0.2 0.8 0.8 0.8 0.2 0.2 0.8"
+    valid_row = "0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"
+    source = make_yolo_dataset(
+        tmp_path / "many_invalid_polygons",
+        task="segment",
+        names=["fruit"],
+        train_rows=["\n".join([invalid_row] * 5 + [valid_row])],
+        val_rows=[valid_row],
+    )
+
+    dataset = Dataset.open(
+        source,
+        task="segment",
+        errors="skip",
+        progress=False,
+    )
+
+    audit = dataset.validation_audit
+    assert audit["status"] == "passed_with_skips"
+    assert audit["skipped_count"] == 5
+    assert audit["visualized_count"] == 4
+    assert audit["max_visualized_examples"] == 4
+    assert audit["counts_by_category"] == {"Skipped invalid annotation": 5}
+    visualization = Path(audit["visualization"])
+    assert visualization.is_file()
+    with Image.open(visualization) as image:
+        assert image.width > 0 and image.height > 0
+    output = capsys.readouterr().out
+    assert "Validation skip audit: 5 failed item(s)" in output
+    assert "showing 4 example(s)" in output
+    assert set(plt.get_fignums()) == open_figures
+
+
+def test_notebook_display_closes_figure_after_immediate_render(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import IPython
+    import IPython.display
+    from matplotlib import pyplot as plt
+
+    from dataset_fixer.visualization import _display_or_print
+
+    figure = plt.figure()
+    displayed: list[object] = []
+    monkeypatch.setattr(IPython, "get_ipython", lambda: object())
+    monkeypatch.setattr(IPython.display, "display", displayed.append)
+
+    _display_or_print(figure, None)
+
+    assert displayed == [figure]
+    assert figure.number not in plt.get_fignums()
+
+
+def test_invalid_polygon_visualization_identifies_exact_defects() -> None:
+    reasons, markers = _polygon_invalidity_details(
+        [(20.0, 20.0), (80.0, 80.0), (80.0, 20.0), (20.0, 80.0)],
+        width=100,
+        height=100,
+    )
+    assert "self-intersection" in reasons
+    assert markers == [(50.0, 50.0, "self-intersection")]
+
+    reasons, markers = _polygon_invalidity_details(
+        [(-5.0, 20.0), (80.0, 20.0), (80.0, 80.0)],
+        width=100,
+        height=100,
+    )
+    assert "vertex 0 lies outside the image" in reasons
+    assert markers[0] == (0.0, 20.0, "vertex 0 outside image\n(-5.0, 20.0)")
 
 
 def test_grid_tiling_transforms_segment_and_pose(tmp_path: Path) -> None:
@@ -879,6 +978,113 @@ def test_coco_detection_export_compacts_categories(tmp_path: Path) -> None:
     assert labels.startswith(("0 ", "1 "))
 
 
+def test_coco_nested_images_path_round_trips_without_annotation_loss(tmp_path: Path) -> None:
+    root = tmp_path / "nested_coco"
+    image_path = root / "train" / "images" / "one.jpg"
+    make_image(image_path, size=(100, 80))
+    source = {
+        "info": {"name": "nested-coco"},
+        "images": [
+            {
+                "id": 1,
+                "file_name": "train/images/one.jpg",
+                "width": 100,
+                "height": 80,
+            }
+        ],
+        "categories": [{"id": 4, "name": "school"}],
+        "annotations": [
+            {
+                "id": 11,
+                "image_id": 1,
+                "category_id": 4,
+                "bbox": [10, 15, 20, 25],
+                "area": 500,
+            }
+        ],
+    }
+    (root / "annotations.json").write_text(json.dumps(source), encoding="utf-8")
+    dataset = Dataset.open(root, task="detect", progress=False)
+    original = dataset._samples[0]
+
+    assert original.relative_path == Path("one.jpg")
+    assert len(original.annotations) == 1
+
+    exported = dataset.export(
+        destination=tmp_path / "nested_yolo",
+        visualize=False,
+        progress=False,
+    )
+
+    expected_image = exported.location / "train" / "images" / original.relative_path
+    expected_label = exported.location / "train" / "labels" / original.relative_path.with_suffix(".txt")
+    assert expected_image.is_file()
+    assert expected_label.is_file()
+    assert len(exported._samples) == 1
+    assert len(exported._samples[0].annotations) == 1
+
+    reopened = Dataset.open(exported.location, progress=False)
+
+    assert reopened.task is Task.DETECT
+    assert reopened._samples[0].relative_path == original.relative_path
+    assert len(reopened._samples) == len(dataset._samples)
+    assert len(reopened._samples[0].annotations) == len(original.annotations)
+    assert reopened._samples[0].annotations[0].class_id == original.annotations[0].class_id
+    assert reopened._samples[0].annotations[0].bbox == pytest.approx(original.annotations[0].bbox)
+
+
+def test_coco_canonical_path_collisions_fail_instead_of_overwriting(tmp_path: Path) -> None:
+    root = tmp_path / "colliding_coco"
+    first = root / "train" / "images" / "one.jpg"
+    second = root / "images" / "train" / "one.jpg"
+    make_image(first, size=(100, 80))
+    make_image(second, size=(100, 80), color=(10, 20, 30))
+    source = {
+        "images": [
+            {"id": 1, "file_name": "train/images/one.jpg", "width": 100, "height": 80},
+            {"id": 2, "file_name": "images/train/one.jpg", "width": 100, "height": 80},
+        ],
+        "categories": [{"id": 4, "name": "school"}],
+        "annotations": [
+            {"id": 11, "image_id": 1, "category_id": 4, "bbox": [10, 15, 20, 25]},
+            {"id": 12, "image_id": 2, "category_id": 4, "bbox": [20, 15, 20, 25]},
+        ],
+    }
+    (root / "annotations.json").write_text(json.dumps(source), encoding="utf-8")
+
+    with pytest.raises(DatasetValidationError, match="same canonical output path"):
+        Dataset.open(root, task="detect", errors="skip", progress=False)
+
+
+def test_yaml_less_split_first_yolo_does_not_duplicate_layout(tmp_path: Path) -> None:
+    root = tmp_path / "flat_split_yolo"
+    image_path = root / "train" / "images" / "nested" / "one.jpg"
+    label_path = root / "train" / "labels" / "nested" / "one.txt"
+    make_image(image_path, size=(100, 80))
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+    label_path.write_text("0 0.5 0.5 0.2 0.25\n", encoding="utf-8")
+
+    dataset = Dataset.open(root, task="detect", progress=False)
+
+    assert dataset.splits == ("train",)
+    assert dataset._samples[0].relative_path == Path("nested/one.jpg")
+    assert len(dataset._samples[0].annotations) == 1
+
+    exported = dataset.export(
+        destination=tmp_path / "canonical_yolo",
+        visualize=False,
+        progress=False,
+    )
+
+    assert (exported.location / "train" / "images" / "nested" / "one.jpg").is_file()
+    assert (exported.location / "train" / "labels" / "nested" / "one.txt").is_file()
+    assert not (exported.location / "train" / "images" / "train" / "images").exists()
+
+    reopened = Dataset.open(exported.location, progress=False)
+    assert reopened._samples[0].relative_path == Path("nested/one.jpg")
+    assert len(reopened._samples[0].annotations) == 1
+
+
 def test_coco_errors_skip_filters_bad_records_across_loading_stages(tmp_path: Path) -> None:
     root = tmp_path / "coco_with_bad_records"
     make_image(root / "images" / "one.jpg", size=(100, 80))
@@ -906,3 +1112,6 @@ def test_coco_errors_skip_filters_bad_records_across_loading_stages(tmp_path: Pa
     assert any("IDs must be unique" in warning for warning in dataset.warnings)
     assert any("Malformed COCO annotation" in warning for warning in dataset.warnings)
     assert any("COCO image file not found" in warning for warning in dataset.warnings)
+    assert dataset.validation_audit["skipped_count"] == 4
+    assert dataset.validation_audit["visualized_count"] == 4
+    assert Path(dataset.validation_audit["visualization"]).is_file()

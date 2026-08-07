@@ -154,7 +154,7 @@ def _load_yolo(
         )
 
     resolved_task = task or _infer_yolo_task(
-        [p for _, p, _ in split_images],
+        [(image, relative) for _, image, relative in split_images],
         metadata,
         errors=errors,
         warnings=warnings,
@@ -239,7 +239,24 @@ def _relative_image_path(image: Path) -> Path:
     return Path(image.name)
 
 
-def _label_path_for_image(image: Path) -> Path:
+def _label_path_for_image(image: Path, relative_path: Path | None = None) -> Path:
+    """Resolve a YOLO label without confusing nested ``images`` directories.
+
+    When the caller knows an image's path relative to its configured image
+    root, use that relationship to locate the sibling label root. This keeps
+    paths such as ``train/images/example.jpg`` intact and pairs them with
+    ``<label-root>/train/images/example.txt``. The heuristic fallback preserves
+    support for standalone and image-list inputs that do not expose a root.
+    """
+
+    if relative_path is not None:
+        relative = Path(relative_path)
+        if relative.parts and not relative.is_absolute() and ".." not in relative.parts:
+            image_root = image
+            for _ in relative.parts:
+                image_root = image_root.parent
+            if image_root.name == "images" and image_root / relative == image:
+                return image_root.with_name("labels") / relative.with_suffix(".txt")
     parts = list(image.parts)
     indices = [i for i, part in enumerate(parts) if part == "images"]
     if indices:
@@ -249,7 +266,7 @@ def _label_path_for_image(image: Path) -> Path:
 
 
 def _infer_yolo_task(
-    images: list[Path],
+    images: list[tuple[Path, Path]],
     metadata: DatasetMetadata,
     *,
     errors: Literal["raise", "skip"],
@@ -257,8 +274,8 @@ def _infer_yolo_task(
 ) -> Task | None:
     if metadata.kpt_shape:
         return Task.POSE
-    for image in images:
-        label = _label_path_for_image(image)
+    for image, relative_path in images:
+        label = _label_path_for_image(image, relative_path)
         if not label.is_file():
             continue
         try:
@@ -314,7 +331,7 @@ def _parse_yolo_images(
                 issues.append(issue)
             continue
         annotations: list[Annotation] = []
-        label_path = _label_path_for_image(image_path)
+        label_path = _label_path_for_image(image_path, relative_path)
         if label_path.is_file():
             try:
                 label_lines = label_path.read_text(encoding="utf-8").splitlines()
@@ -406,22 +423,38 @@ def _load_flat_yolo(
     errors: Literal["raise", "skip"],
     warnings: list[str],
 ) -> tuple[Path, str, Task, DatasetMetadata, list[Sample], dict[str, Any]]:
-    images_dir = root / "images" if (root / "images").is_dir() else root
-    images = image_files(images_dir)
-    if not images:
-        raise DatasetValidationError(f"No supported images found in {images_dir}")
+    split_directories = [
+        (split, root / split / "images")
+        for split in ("train", "val", "test")
+        if (root / split / "images").is_dir()
+    ]
+    if split_directories:
+        split_images = [
+            (split, image, image.relative_to(images_dir))
+            for split, images_dir in split_directories
+            for image in image_files(images_dir)
+        ]
+        searched = root
+    else:
+        images_dir = root / "images" if (root / "images").is_dir() else root
+        split_images = [
+            ("train", image, image.relative_to(images_dir))
+            for image in image_files(images_dir)
+        ]
+        searched = images_dir
+    if not split_images:
+        raise DatasetValidationError(f"No supported images found in {searched}")
     metadata = DatasetMetadata(
         names=_parse_names(names_override), radii={int(k): float(v) for k, v in (radii_override or {}).items()}
     )
     resolved_task = task or _infer_yolo_task(
-        images,
+        [(image, relative) for _, image, relative in split_images],
         metadata,
         errors=errors,
         warnings=warnings,
     )
     if resolved_task is None:
         raise DatasetValidationError("Could not infer task from flat dataset; pass task explicitly")
-    split_images = [("train", p, p.relative_to(images_dir)) for p in images]
     samples = _parse_yolo_images(
         split_images,
         resolved_task,
@@ -641,6 +674,7 @@ def _load_coco(
 
     samples: list[Sample] = []
     issues: list[ValidationIssue] = []
+    output_paths: dict[tuple[str, Path], Path] = {}
     for json_path, data in valid:
         split = _split_from_filename(json_path.name)
         by_image: dict[int, list[dict[str, Any]]] = {}
@@ -675,6 +709,23 @@ def _load_coco(
                 else:
                     issues.append(issue)
                 continue
+            relative_path = _canonical_coco_relative_path(root, image_path, split)
+            output_key = (split, relative_path)
+            if output_key in output_paths:
+                issues.append(
+                    ValidationIssue(
+                        "COCO images would map to the same canonical output path",
+                        source=str(json_path),
+                        value={
+                            "output": str(Path(split) / "images" / relative_path),
+                            "first": str(output_paths[output_key]),
+                            "second": str(image_path),
+                        },
+                        suggestion="make COCO file_name paths unique within each split",
+                    )
+                )
+                continue
+            output_paths[output_key] = image_path
             try:
                 with Image.open(image_path) as opened:
                     actual_width, actual_height = ImageOps.exif_transpose(opened).size
@@ -744,7 +795,7 @@ def _load_coco(
                     continue
                 annotations.append(annotation)
             samples.append(
-                Sample(image_path, Path(file_name), split, width, height, annotations)
+                Sample(image_path, relative_path, split, width, height, annotations)
             )
     if issues:
         raise DatasetValidationError(issues)
@@ -796,6 +847,31 @@ def _resolve_coco_image(root: Path, json_path: Path, file_name: str, split: str)
             return candidate.resolve()
     matches = list(root.rglob(rel.name))
     return matches[0].resolve() if len(matches) == 1 else None
+
+
+def _canonical_coco_relative_path(root: Path, image_path: Path, split: str) -> Path:
+    """Return a lossless path relative to the most specific known image root."""
+
+    candidates = (
+        root / split / "images",
+        root / "images" / split,
+        root / "images",
+        root / split,
+        root,
+    )
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            relative = image_path.relative_to(resolved)
+        except ValueError:
+            continue
+        if relative.parts:
+            return relative
+    return Path(image_path.name)
 
 
 def _load_manifest(

@@ -65,6 +65,14 @@ missing split entries, orphan labels, and incomplete provenance are omitted
 virtually and listed in `dataset.warnings`. An unusable class schema or a dataset
 with no valid images still raises. Loading never changes the source.
 
+Every skipped or ignored load-validation failure is also counted in
+`dataset.validation_audit`. Loading prints the total and renders at most four
+examples in a compact grid, prioritizing readable images and invalid geometry
+such as self-intersecting polygons. The grid is written outside the source
+dataset and is carried into later exports as
+`reports/load_validation_examples.png`, alongside the aggregate audit in
+`reports/load_validation_audit.json`.
+
 ## Transformations
 
 ```python
@@ -76,6 +84,7 @@ resplit = dataset.split(
 )
 
 clean = resplit.remove_classes(["damaged"], visualize=True)
+merged = resplit.remove_classes(["damaged"], merge_into="fruit")
 renamed = resplit.rename_classes({"damaged": "blemished"})
 grid = clean.tile(mode="grid", tile_size=480, overlap=0.2)
 balanced = grid.rebalance_empty(0.20, splits=("train",), seed=42)
@@ -88,6 +97,11 @@ canonical = balanced.export(
 `rename_classes()` changes only class metadata; class IDs, annotation rows,
 geometry, POLO radii, and pose metadata remain unchanged until the renamed
 metadata is written by `export()`.
+
+`remove_classes()` normally discards annotations belonging to the selected
+classes. Pass `merge_into=` with a surviving class name or integer ID to retain
+those annotations under that class; surviving class IDs are still compacted in
+the exported dataset.
 
 Albumentations is optional. Install it with
 `pip install "dataset-fixer[augment]"`, then pass either a transform sequence,
@@ -231,13 +245,23 @@ annotations rather than dataset composition. Split weights accept either
 fractions (`0.8/0.2`) or percentages (`80/20`) and are normalized; grouping and
 explicit assignments can make the achieved split counts approximate.
 
+When the latest split used `group_by`, every later export automatically audits
+that physical group across the complete current dataset, even if `export(splits=...)`
+publishes only a subset. Export fails if a group crosses train/validation/test
+or if any image has lost its group provenance. Successful YOLO and semantic-mask
+exports record per-split distinct-group counts and aggregate group-size
+distributions in `reports/split_group_audit.json`; individual image paths and
+group membership lists are intentionally omitted.
+
 Visualization preferences are recorded on virtual operations and rendered
 during export. Intermediate plan steps reuse their in-memory sample index and
 are not reopened or revalidated. `export(progress=True)` shows progress and ETA
 for copying, tiling, and the single complete staged-output validation performed
-before atomic publication. The validated index is reused after publication, so
-the final dataset is not scanned a second time. Its destination must not exist
-and cannot contain, equal, or be contained by the source.
+before atomic publication. Staged validation streams images, labels, and
+provenance instead of constructing a second complete dataset index. The
+validated index is transferred to the published result, so the final dataset is
+not scanned a second time. Its destination must not exist and cannot contain,
+equal, or be contained by the source.
 
 Canonical exports use split-first layout:
 
@@ -249,12 +273,10 @@ test/images/   test/labels/
 ```
 
 For polygon segmentation datasets, `format="semantic_masks"` publishes binary
-foreground-union masks for U-Net-style training and returns a
-`SemanticMaskExport`:
+foreground-union masks for U-Net-style training and returns the same `Dataset`
+type used for YOLO and COCO:
 
 ```python
-from dataset_fixer import SemanticMaskExport
-
 masks = dataset.export(
     destination="/datasets/orchard_masks",
     format="semantic_masks",
@@ -263,8 +285,26 @@ print(masks.image_dirs["train"])
 print(masks.mask_dirs["train"])
 
 # The same artifact can be reopened in a later process or notebook.
-masks = SemanticMaskExport.open("/datasets/orchard_masks")
+masks = Dataset.open("/datasets/orchard_masks")
 ```
+
+To publish the same segmentation pipeline in both formats, use
+`export_formats`. It validates and writes YOLO first, then builds semantic masks
+from that materialized result:
+
+```python
+exports = dataset.export_formats(
+    {
+        "yolo": "/datasets/orchard_yolo",
+        "semantic_masks": "/datasets/orchard_masks",
+    }
+)
+yolo = exports["yolo"]
+masks = exports["semantic_masks"]
+```
+
+Both destinations are checked before writing starts and must be distinct,
+non-nested paths. The ordinary single-format `export()` API remains unchanged.
 
 Each original image is copied byte-for-byte to `<split>/images/`; its
 single-channel PNG mask is written to `<split>/masks/0/` with matching nested
@@ -315,12 +355,45 @@ comparison = models.compare(
 )
 ```
 
+Mixed YOLO segmentation and semantic-segmentation models use the same API.
+With ``comparison_space="auto"``, YOLO polygons are unioned into binary
+foreground masks at the exported mask resolution, then every model receives
+the same semantic Dice/IoU evaluation:
+
+```python
+models = Model.load_many({
+    "yolo-seg": {
+        "path": "/models/yolo-seg.pt",
+        "task": "segment",
+        "resolution": 640,
+    },
+    "nnunet": {
+        "model_folder": "/models/nnUNetTrainer__Plans__2d",
+        "folds": (0,),
+        "checkpoint": "checkpoint_best.pth",
+    },
+})
+
+comparison = models.compare(
+    masks,
+    split="val",
+    comparison_space="auto",
+    confidence=0.25,
+    postprocess=0.70,
+    baseline="yolo-seg",
+)
+```
+
+The report records each model's native task and applied projection. Same-type
+collections continue through their native evaluator; incompatible mixtures
+without an implemented common denominator fail with a validation error.
+
 The sampled figure and the full comparison use the same renderer: each example
 has one filename title and columns for Original, GT, and each shortened model
 name. Model panels show masks only, with Dice and IoU beneath them. The
-`examples_per_row` and `panel_size` arguments control the grid. The existing
-`masks.load_models(...)` and `masks.compare_models(...)` remain compatibility
-shortcuts, but model loading itself is dataset-independent.
+`examples_per_row` and `panel_size` arguments control the grid. Datasets do
+not expose model-loading or model-comparison methods; load models with
+`Model.load_many(...)` and call `models.compare(masks, ...)`.
 
 Install the optional official backend with
 `pip install 'dataset-fixer[nnunet]'`. Comparison calls
@@ -354,7 +427,7 @@ and YOLO labels downloaded from a pinned commit of the public MIT-licensed
 - [Task-aware tiling](notebooks/02_task_aware_tiling.ipynb) demonstrates regular
   detection grids and negative-tile policies.
 - [Fixed-cohort model comparison](notebooks/03_fixed_cohort_model_comparison.ipynb)
-  trains two small checkpoints and demonstrates cached `Dataset.compare_models()`.
+  trains two small checkpoints and demonstrates cached `ModelCollection.compare()`.
 
 Each notebook includes an “Open in Colab” badge, kernel-safe installation,
 licensing notes, expected runtime, validation checks, and source provenance.
@@ -399,7 +472,8 @@ mask_predictions = segmenter.predict(masks, split="val")
 models populate each record's `objects`; semantic models populate `mask`.
 `by_id`, `masks`, `summary()`, and `save()` provide common inspection/export
 utilities. Direct `Model.predict` defaults to native prediction. A dataset
-collection may opt into automatic SAHI selection explicitly.
+collection opts into tiled inference explicitly with `inference="sahi"`; no
+availability-based selection or fallback is performed.
 
 Use `Model.load_many(...)` to normalize an ordered model collection once. The
 collection accepts a dataset/export at operation time and exposes `predict`,
@@ -407,7 +481,7 @@ collection accepts a dataset/export at operation time and exposes `predict`,
 
 ## Cached model comparison
 
-`compare_models()` freezes one ordered evaluation cohort and requires every
+`ModelCollection.compare()` freezes one ordered evaluation cohort and requires every
 model to predict exactly those images. It never takes a validation split from a
 checkpoint or training configuration.
 
@@ -425,7 +499,7 @@ models = Model.load_many(
             "resolution": 480,
         },
     },
-    inference="auto",
+    inference="native",
 )
 
 comparison = models.compare(
@@ -434,6 +508,16 @@ comparison = models.compare(
     baseline="baseline",
     protocol="validation",
 )
+
+# Use the same explicit source-space tiling for every candidate.
+sliced = models.compare(
+    dataset,
+    split="val",
+    inference="sahi",
+    sahi_slice_height=512,
+    sahi_slice_width=512,
+    sahi_overlap=0.2,
+)
 ```
 
 `protocol="validation"` labels threshold selection as validation/model
@@ -441,10 +525,13 @@ selection. `protocol="locked"` evaluates one predetermined configuration per
 model. `protocol="calibrate_then_test"` selects settings only on
 `calibration_split` and applies them to the distinct requested split.
 
-Native Ultralytics inference is supported for detection, segmentation, pose,
-and POLO. If SAHI is installed, `inference="auto"` uses it for detection,
-segmentation, and POLO; pose always uses native inference. Explicit SAHI use
-never falls back silently. Install optional integrations with:
+Native and sliced SAHI inference are supported for detection, instance
+segmentation, pose, POLO, Ultralytics semantic segmentation, and nnU-Net.
+Pose keypoints and POLO point/radius payloads are retained while duplicates are
+merged, and dense semantic tiles are feather-blended as probabilities before a
+single full-image argmax. All SAHI-only options use the `sahi_` prefix; the
+removed unprefixed names and `inference="auto"` are rejected. Install optional
+integrations with:
 
 ```shell
 pip install 'dataset-fixer[comparison,sahi]'
@@ -452,7 +539,7 @@ pip install 'dataset-fixer[comparison,sahi]'
 
 Predictions are cached independently of metrics and figures in an atomic,
 content-addressed NumPy format. Compatible notebook `.gridcache.pkl` and
-`.gridcache_v2` caches are validated and imported; new pickle caches are never
+`.gridcache_v3` caches are validated and imported; new pickle caches are never
 written. Single-class POLO/SAHI results can be mirrored back to the notebook
 format with `write_notebook_cache=True`.
 
@@ -488,12 +575,12 @@ The intentionally small public API is:
 - `Dataset.tile`
 - `Dataset.augment`
 - `Dataset.export`
-- `Dataset.compare_models`
 - `Dataset.visualize`
 - `Dataset.assert_trainable`
 - `Model`
 - `Model.predict`
 - `Model.compare`
+- `Model.load_many`
 - `ModelCollection.predict`
 - `ModelCollection.compare`
 

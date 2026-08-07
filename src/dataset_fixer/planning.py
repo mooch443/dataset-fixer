@@ -138,7 +138,10 @@ def normalize_split_ratios(ratios: Mapping[str, float]) -> dict[str, float]:
 
 
 def resolve_removed_classes(
-    metadata: DatasetMetadata, selectors: Iterable[str | int]
+    metadata: DatasetMetadata,
+    selectors: Iterable[str | int],
+    *,
+    merge_into: str | int | None = None,
 ) -> tuple[set[int], dict[int, int], DatasetMetadata]:
     reverse: dict[str, list[int]] = defaultdict(list)
     for class_id, class_name in metadata.names.items():
@@ -158,15 +161,39 @@ def resolve_removed_classes(
             removed.add(matches[0])
     if not removed:
         raise ValueError("At least one class must be removed")
+    merge_target: int | None = None
+    if merge_into is not None:
+        if isinstance(merge_into, int):
+            if merge_into not in metadata.names:
+                raise ValueError(
+                    f"Unknown merge target class ID {merge_into}; available IDs are {sorted(metadata.names)}"
+                )
+            merge_target = merge_into
+        else:
+            matches = reverse.get(merge_into, [])
+            if len(matches) != 1:
+                raise ValueError(
+                    f"Merge target class name {merge_into!r} matched {len(matches)} classes; "
+                    f"available names are {list(reverse)}"
+                )
+            merge_target = matches[0]
+        if merge_target in removed:
+            raise ValueError("merge_into must select a class that is not being removed")
     remaining = [class_id for class_id in sorted(metadata.names) if class_id not in removed]
     if not remaining:
         raise DatasetValidationError("Removing these classes would leave the dataset with no classes")
     mapping = {old: new for new, old in enumerate(remaining)}
+    if merge_target is not None:
+        mapping.update({class_id: mapping[merge_target] for class_id in removed})
     projected = metadata.copy()
-    projected.names = {mapping[old]: metadata.names[old] for old in mapping}
-    projected.radii = {mapping[old]: metadata.radii[old] for old in mapping if old in metadata.radii}
+    projected.names = {mapping[old]: metadata.names[old] for old in remaining}
+    projected.radii = {
+        mapping[old]: metadata.radii[old] for old in remaining if old in metadata.radii
+    }
     projected.kpt_names = {
-        mapping[old]: metadata.kpt_names[old] for old in mapping if old in metadata.kpt_names
+        mapping[old]: metadata.kpt_names[old]
+        for old in remaining
+        if old in metadata.kpt_names
     }
     return removed, mapping, projected
 
@@ -281,9 +308,13 @@ def derived_name(current: str, operation: str, settings: dict[str, Any]) -> str:
             f"{key}{int(value * 100)}" for key, value in settings["ratios"].items()
         )
     elif operation == "remove-classes":
-        detail = "remove-" + "-".join(
+        removed = "-".join(
             slugify(value) for value in list(settings["removed_classes"].values())[:3]
         )
+        if settings.get("merge_into"):
+            detail = f"merge-{removed}-into-{slugify(settings['merge_into']['output_class_name'])}"
+        else:
+            detail = f"remove-{removed}"
     elif operation == "rename-classes":
         detail = "rename-" + "-".join(
             slugify(value["to"]) for value in list(settings["renamed_classes"].values())[:3]

@@ -18,9 +18,9 @@ from ..errors import DatasetValidationError, ValidationIssue
 from ..utils import sha256_file, to_jsonable
 from .types import Cohort, Prediction
 
-CACHE_SCHEMA = 3
+CACHE_SCHEMA = 4
 NOTEBOOK_PICKLE_SCHEMA = 1
-NOTEBOOK_NUMPY_SCHEMA = 2
+NOTEBOOK_NUMPY_SCHEMA = 3
 
 
 def token(value: float) -> str:
@@ -64,6 +64,7 @@ def _prediction_arrays(predictions: list[Prediction]) -> dict[str, np.ndarray]:
                 to_jsonable(
                     {
                         "polygon": prediction.polygon,
+                        "polygons": prediction.polygons,
                         "keypoints": prediction.keypoints,
                         "metadata": prediction.metadata,
                     }
@@ -110,6 +111,11 @@ def _predictions_from_arrays(data: Any, source: Path) -> list[Prediction]:
                 point=point,
                 radius=radius,
                 polygon=[tuple(map(float, p)) for p in extra.get("polygon") or []] or None,
+                polygons=[
+                    [tuple(map(float, point)) for point in polygon]
+                    for polygon in extra.get("polygons") or []
+                ]
+                or None,
                 keypoints=[tuple(p) for p in extra.get("keypoints") or []] or None,
                 metadata=extra.get("metadata") or {},
             )
@@ -241,7 +247,7 @@ def import_notebook_cache(
     for directory in directories:
         if not directory.is_dir():
             continue
-        for candidate in sorted(directory.glob("*.gridcache_v2")):
+        for candidate in sorted(directory.glob("*.gridcache_v3")):
             imported = _load_notebook_numpy(
                 candidate,
                 model_sha256=model_sha256,
@@ -320,7 +326,7 @@ def notebook_cache_basename(model_path: Path, key: dict[str, Any], *, numpy: boo
     payload = json.dumps(to_jsonable(key), sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", model_path.stem)[:120]
-    return f"{stem}__{digest}.gridcache_v2" if numpy else f"{stem}__{digest}.gridcache.pkl"
+    return f"{stem}__{digest}.gridcache_v3" if numpy else f"{stem}__{digest}.gridcache.pkl"
 
 
 def _notebook_identity_verified(key: dict[str, Any], image_paths: list[str], cohort: Cohort) -> bool:
@@ -403,9 +409,9 @@ def _load_notebook_numpy(
     try:
         key = json.loads((root / "key.json").read_text(encoding="utf-8"))
         meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
-        if key.get("cache_version") != NOTEBOOK_NUMPY_SCHEMA or key.get("cache_format") != "gridcache_v2_numpy_sharded":
+        if key.get("cache_version") != NOTEBOOK_NUMPY_SCHEMA or key.get("cache_format") != "gridcache_v3_numpy_sharded":
             return None
-        if meta.get("cache_version") != NOTEBOOK_NUMPY_SCHEMA or meta.get("cache_format") != "gridcache_v2_numpy_sharded":
+        if meta.get("cache_version") != NOTEBOOK_NUMPY_SCHEMA or meta.get("cache_format") != "gridcache_v3_numpy_sharded":
             return None
         if not _valid_notebook_key(key, model_sha256, resolution, confidence_floor, thresholds, expected_key):
             return None
@@ -563,7 +569,7 @@ def write_notebook_numpy_cache(
     _write_json_atomic(
         temporary / "meta.json",
         {
-            "cache_format": "gridcache_v2_numpy_sharded",
+            "cache_format": "gridcache_v3_numpy_sharded",
             "cache_version": NOTEBOOK_NUMPY_SCHEMA,
             "created_at_unix": time.time(),
             "skipped": 0,

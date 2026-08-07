@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import pytest
 import yaml
 
 from dataset_fixer import Dataset, DatasetValidationError, Task
+from dataset_fixer.utils import settings_fingerprint, to_jsonable
 
 
 def test_open_identity_and_automatic_validation(detect_dataset: Path) -> None:
@@ -17,7 +19,46 @@ def test_open_identity_and_automatic_validation(detect_dataset: Path) -> None:
     assert dataset.task is Task.DETECT
     assert dataset.splits == ("train", "val")
     assert dataset.classes == {0: "fruit", 1: "damaged"}
+    assert dataset.validation_audit["status"] == "passed"
+    assert dataset.validation_audit["skipped_count"] == 0
+    assert dataset.validation_audit["visualization"] is None
     assert dataset.training_ready
+
+
+def test_dataset_string_reports_file_derived_statistics(detect_dataset: Path) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+
+    summary = str(dataset)
+
+    assert "Dataset 'orchard' [detect; materialized; yolo]" in summary
+    assert "images: 6 | annotations: 7 | empty: 0 (0.0%)" in summary
+    assert "classes: 2 | splits: 2" in summary
+    assert "image size: 160x120" in summary
+    assert "Split statistics" in summary
+    assert "split  images  annotated  empty  annotations" in summary
+    assert "train       4          4      0            5" in summary
+    assert "val         2          2      0            2" in summary
+    assert "total       6          6      0            7" in summary
+    assert "Class statistics (annotation instances and images containing class)" in summary
+    assert "fruit              4       4    66.7%" in summary
+    assert "damaged            3       3    50.0%" in summary
+    assert "validation: passed | warnings: 0" in summary
+
+
+def test_streaming_settings_fingerprint_preserves_canonical_value(tmp_path: Path) -> None:
+    value = {
+        "path": tmp_path / "dataset",
+        "nested": {2: [Task.SEGMENT, (1.25, None, True)]},
+        "text": "reef ü",
+    }
+    reference = hashlib.sha256(
+        json.dumps(
+            to_jsonable(value),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()[:8]
+    assert settings_fingerprint(value) == reference
 
 
 def test_invalid_label_fails_at_open(detect_dataset: Path) -> None:
@@ -99,6 +140,199 @@ def test_split_grouping_manifest_and_provenance(detect_dataset: Path, tmp_path: 
     assert yaml.safe_load(result.data_yaml.read_text(encoding="utf-8"))["path"] == str(result.location)
 
 
+def test_group_aware_export_writes_aggregate_split_audit(
+    detect_dataset: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = Dataset.open(detect_dataset, task="detect", progress=False)
+    result = source.split(
+        {"train": 0.5, "val": 0.5},
+        group_by=lambda path: path.parent.name,
+        seed=7,
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "audited",
+        visualize=False,
+        progress=False,
+    )
+
+    report = json.loads(
+        (result.location / "reports" / "split_group_audit.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["status"] == "passed"
+    assert report["scope"] == "all_current_source_splits"
+    assert report["total"] == {"images": 6, "distinct_groups": 3}
+    assert report["overlap_count"] == 0
+    assert set(report["splits"]) == {"train", "val"}
+    assert "groups" not in report
+    for details in report["splits"].values():
+        histogram = details["group_size"]["histogram"]
+        assert sum(histogram.values()) == details["distinct_groups"]
+        assert sum(int(size) * count for size, count in histogram.items()) == details["images"]
+
+    manifest = json.loads(
+        (result.location / "dataset-fixer.json").read_text(encoding="utf-8")
+    )
+    validation = manifest["validation"]["split_group_isolation"]
+    assert validation["status"] == "passed"
+    assert validation["report"] == "reports/split_group_audit.json"
+    assert validation["distinct_groups"] == 3
+    assert "Split-group audit: passed" in capsys.readouterr().out
+
+
+def test_group_audit_fails_on_cross_split_overlap_even_for_subset_export(
+    detect_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    grouped = Dataset.open(detect_dataset, task="detect", progress=False).split(
+        {"train": 0.5, "val": 0.5},
+        group_by=lambda path: path.parent.name,
+        seed=7,
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "grouped-overlap-source",
+        visualize=False,
+        progress=False,
+    )
+    train = next(sample for sample in grouped._samples if sample.split == "train")
+    val = next(sample for sample in grouped._samples if sample.split == "val")
+    val.provenance["split_group"] = train.provenance["split_group"]
+    destination = tmp_path / "overlap-output"
+
+    with pytest.raises(DatasetValidationError, match="appears in multiple") as exc_info:
+        grouped.export(
+            destination=destination,
+            splits=("train",),
+            visualize=False,
+            progress=False,
+        )
+
+    message = str(exc_info.value)
+    assert "train" in message and "val" in message
+    assert not destination.exists()
+
+
+def test_group_audit_fails_when_group_identity_is_incomplete(
+    detect_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    grouped = Dataset.open(detect_dataset, task="detect", progress=False).split(
+        {"train": 0.5, "val": 0.5},
+        group_by=lambda path: path.parent.name,
+        seed=7,
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "grouped-incomplete-source",
+        visualize=False,
+        progress=False,
+    )
+    grouped._samples[0].provenance.pop("split_group")
+    destination = tmp_path / "incomplete-output"
+
+    with pytest.raises(DatasetValidationError, match="unverifiable"):
+        grouped.export(
+            destination=destination,
+            visualize=False,
+            progress=False,
+        )
+    assert not destination.exists()
+
+
+def test_tiling_preserves_groups_and_audits_current_output_population(
+    detect_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    source = Dataset.open(detect_dataset, task="detect", progress=False)
+    result = source.split(
+        {"train": 0.5, "val": 0.5},
+        group_by=lambda path: path.parent.name,
+        seed=7,
+        visualize=False,
+        progress=False,
+    ).tile(
+        tile_size=80,
+        overlap=0,
+        negative_tiles="all",
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "grouped-tiles",
+        visualize=False,
+        progress=False,
+    )
+
+    report = json.loads(
+        (result.location / "reports" / "split_group_audit.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["total"]["images"] == len(result._samples)
+    assert report["total"]["images"] > len(source._samples)
+    assert report["total"]["distinct_groups"] == 3
+    assert all("split_group" in sample.provenance for sample in result._samples)
+
+
+def test_latest_ungrouped_split_removes_inherited_group_audit(
+    detect_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    grouped = Dataset.open(detect_dataset, task="detect", progress=False).split(
+        {"train": 0.5, "val": 0.5},
+        group_by=lambda path: path.parent.name,
+        seed=7,
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "first-grouped",
+        visualize=False,
+        progress=False,
+    )
+    assert (grouped.location / "reports" / "split_group_audit.json").is_file()
+
+    result = grouped.split(
+        {"train": 0.5, "val": 0.5},
+        seed=11,
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "then-ungrouped",
+        visualize=False,
+        progress=False,
+    )
+
+    assert not (result.location / "reports" / "split_group_audit.json").exists()
+    manifest = json.loads(
+        (result.location / "dataset-fixer.json").read_text(encoding="utf-8")
+    )
+    validation = manifest["validation"]["split_group_isolation"]
+    assert validation["status"] == "not_applicable"
+    assert validation["report"] is None
+    assert "latest split operation did not use group_by" in validation["reason"]
+
+
+def test_export_without_group_aware_history_marks_audit_not_applicable(
+    detect_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    result = Dataset.open(detect_dataset, task="detect", progress=False).export(
+        destination=tmp_path / "ordinary-export",
+        visualize=False,
+        progress=False,
+    )
+
+    assert not (result.location / "reports" / "split_group_audit.json").exists()
+    manifest = json.loads(
+        (result.location / "dataset-fixer.json").read_text(encoding="utf-8")
+    )
+    assert manifest["validation"]["split_group_isolation"]["status"] == "not_applicable"
+
+
 def test_split_ratios_are_normalized_weights(detect_dataset: Path) -> None:
     dataset = Dataset.open(detect_dataset, task="detect", progress=False)
 
@@ -143,6 +377,67 @@ def test_remove_classes_compacts_and_chains_original(detect_dataset: Path, tmp_p
     assert counts["names_before"]["background"] == "background"
     assert counts["names_after"]["background"] == "background"
     assert (clean.location / "reports" / "class_counts.jpg").is_file()
+
+
+@pytest.mark.parametrize(
+    ("removed", "merge_into", "expected_name"),
+    [
+        (["damaged"], "fruit", "fruit"),
+        ([0], 1, "damaged"),
+    ],
+)
+def test_remove_classes_can_merge_annotations_into_surviving_class(
+    detect_dataset: Path,
+    tmp_path: Path,
+    removed: list[str | int],
+    merge_into: str | int,
+    expected_name: str,
+) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+    original_annotation_count = sum(len(sample.annotations) for sample in dataset._samples)
+
+    planned = dataset.remove_classes(
+        removed,
+        merge_into=merge_into,
+        visualize=False,
+        progress=False,
+    )
+
+    assert planned.classes == {0: expected_name}
+    assert sum(len(sample.annotations) for sample in planned._samples) == original_annotation_count
+    assert {annotation.class_id for sample in planned._samples for annotation in sample.annotations} == {0}
+    assert planned.history[-1]["settings"]["merge_into"] == {
+        "selector": merge_into,
+        "output_class_id": 0,
+        "output_class_name": expected_name,
+    }
+
+    exported = planned.export(
+        destination=tmp_path / f"merged-{expected_name}",
+        visualize=False,
+        progress=False,
+    )
+
+    assert exported.classes == {0: expected_name}
+    assert sum(len(sample.annotations) for sample in exported._samples) == original_annotation_count
+    counts = json.loads(
+        (exported.location / "reports" / "class_counts.json").read_text(encoding="utf-8")
+    )
+    assert counts["after"]["0"] == original_annotation_count
+    assert counts["after"]["background"] == 0
+    assert all(
+        record["class_mapping"] == {"0": 0, "1": 0}
+        for record in exported.provenance.values()
+    )
+
+
+def test_remove_classes_rejects_removed_or_unknown_merge_target(detect_dataset: Path) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+
+    with pytest.raises(ValueError, match="not being removed"):
+        dataset.remove_classes(["damaged"], merge_into="damaged", visualize=False)
+    with pytest.raises(ValueError, match="Unknown merge target class ID"):
+        dataset.remove_classes(["damaged"], merge_into=99, visualize=False)
 
 
 def test_rename_classes_is_virtual_validated_and_exported(
@@ -292,23 +587,84 @@ def test_export_announces_prepublication_and_final_validation_progress(
     assert "published dataset is not rescanned" in output
 
 
-def test_multi_step_export_performs_one_complete_dataset_rescan(
+def test_multi_step_export_streams_validation_without_dataset_rescan(
     detect_dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     dataset = Dataset.open(detect_dataset, task="detect", progress=False)
     plan = dataset.remove_classes(["damaged"], visualize=False).rebalance_empty(
         0.5, splits=("train",), visualize=False
     )
-    original_open = Dataset.open.__func__
-    calls: list[Path] = []
+    def unexpected_open(cls, location, **kwargs):
+        raise AssertionError(f"staged validation unexpectedly reopened {location}")
 
-    def counted_open(cls, location, **kwargs):
-        calls.append(Path(location))
-        return original_open(cls, location, **kwargs)
+    monkeypatch.setattr(Dataset, "open", classmethod(unexpected_open))
+    exported = plan.export(
+        destination=tmp_path / "streaming-validation",
+        visualize=False,
+        progress=False,
+    )
+    assert exported.training_ready
 
-    monkeypatch.setattr(Dataset, "open", classmethod(counted_open))
-    plan.export(destination=tmp_path / "single-validation", visualize=False, progress=False)
-    assert len(calls) == 1
+
+def test_streaming_staged_validation_rejects_corrupt_labels_atomically(
+    detect_dataset: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataset_fixer.writer import OutputBuilder
+
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+    destination = tmp_path / "corrupt-staged-label"
+    original_write_reports = OutputBuilder.write_reports
+
+    def write_reports_then_corrupt(self, **kwargs):
+        manifest = original_write_reports(self, **kwargs)
+        label = next(path for path in self.staging.rglob("*.txt") if "labels" in path.parts)
+        label.write_text("0 nan 0.5 0.2 0.2\n", encoding="utf-8")
+        return manifest
+
+    monkeypatch.setattr(OutputBuilder, "write_reports", write_reports_then_corrupt)
+    with pytest.raises(DatasetValidationError, match="non-finite"):
+        dataset.export(destination=destination, visualize=False, progress=False)
+    assert not destination.exists()
+
+
+def test_streaming_staged_validation_rejects_corrupt_provenance_atomically(
+    detect_dataset: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataset_fixer.writer import OutputBuilder
+
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+    destination = tmp_path / "corrupt-staged-provenance"
+    original_write_reports = OutputBuilder.write_reports
+
+    def write_reports_then_corrupt(self, **kwargs):
+        manifest = original_write_reports(self, **kwargs)
+        (self.staging / "provenance.jsonl").write_text("{not-json}\n", encoding="utf-8")
+        return manifest
+
+    monkeypatch.setattr(OutputBuilder, "write_reports", write_reports_then_corrupt)
+    with pytest.raises(DatasetValidationError, match="Invalid provenance record"):
+        dataset.export(destination=destination, visualize=False, progress=False)
+    assert not destination.exists()
+
+
+def test_loaded_samples_share_provenance_records_without_per_sample_copies(
+    detect_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    exported = Dataset.open(detect_dataset, task="detect", progress=False).export(
+        destination=tmp_path / "shared-provenance",
+        visualize=False,
+        progress=False,
+    )
+    reopened = Dataset.open(exported.location, task="detect", progress=False)
+
+    for sample in reopened._samples:
+        key = str(sample.image_path.relative_to(reopened.location))
+        assert sample.provenance is reopened._provenance[key]
 
 
 def test_grid_tile_geometry_and_source_immutability(detect_dataset: Path, tmp_path: Path) -> None:

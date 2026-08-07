@@ -11,17 +11,18 @@ from PIL import Image
 from dataset_fixer import (
     Dataset,
     DatasetValidationError,
+    ImagePrediction,
     Model,
+    ModelCollection,
     PredictionResult,
     SemanticComparisonResult,
-    SemanticMaskExport,
-    SemanticModelCohort,
 )
+from dataset_fixer.comparison.types import Prediction
 from dataset_fixer.semantic_comparison import _SemanticCase, _canonicalize_predictions
 from conftest import make_yolo_dataset
 
 
-def _semantic_export(tmp_path: Path) -> SemanticMaskExport:
+def _semantic_export(tmp_path: Path) -> Dataset:
     source = make_yolo_dataset(
         tmp_path / "segments",
         task="segment",
@@ -39,7 +40,8 @@ def _semantic_export(tmp_path: Path) -> SemanticMaskExport:
         visualize=False,
         progress=False,
     )
-    assert isinstance(exported, SemanticMaskExport)
+    assert isinstance(exported, Dataset)
+    assert exported.format == "semantic_masks"
     return exported
 
 
@@ -203,7 +205,8 @@ def test_semantic_comparison_reports_finite_dice_support(
         visualize=False,
         progress=False,
     )
-    assert isinstance(exported, SemanticMaskExport)
+    assert isinstance(exported, Dataset)
+    assert exported.format == "semantic_masks"
     model = _nnunet_model(tmp_path / "perfect-empty-model")
     monkeypatch.setattr(
         "dataset_fixer.semantic_comparison.shutil.which",
@@ -218,9 +221,9 @@ def test_semantic_comparison_reports_finite_dice_support(
         lambda: {"test": True},
     )
 
-    result = exported.compare_models(
-        {"perfect": model},
-        workers=1,
+    models = Model.load_many({"perfect": model}, workers=1)
+    result = models.compare(
+        exported,
         bootstrap_resamples=10,
         visualize=False,
         progress=False,
@@ -230,6 +233,162 @@ def test_semantic_comparison_reports_finite_dice_support(
     assert result.ranking[0]["cohort_cases"] == 2
     assert result.ranking[0]["support_cases"] == 1
     assert result.ranking[0]["undefined_cases"] == 1
+
+
+def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exported = _semantic_export(tmp_path)
+    yolo_path = tmp_path / "yolo-seg.pt"
+    yolo_path.write_bytes(b"synthetic-yolo-seg")
+    yolo_semantic_path = tmp_path / "yolo-semantic.pt"
+    yolo_semantic_path.write_bytes(b"synthetic-yolo-semantic")
+    nnunet_path = _nnunet_model(tmp_path / "semantic-model")
+    models = Model.load_many(
+        {
+            "yolo-seg": {"path": yolo_path, "task": "segment"},
+            "yolo-semantic": {"path": yolo_semantic_path, "task": "semantic"},
+            "nnunet": {"model_folder": nnunet_path},
+        },
+        source=exported,
+        device="cpu",
+        workers=1,
+    )
+
+    prediction_options: list[dict[str, object]] = []
+
+    def fake_predict(
+        model: Model,
+        source: object,
+        **options: object,
+    ) -> PredictionResult:
+        prediction_options.append(options)
+        records: list[ImagePrediction] = []
+        for value in tuple(source):  # type: ignore[arg-type]
+            assert value.mask_path is not None
+            with Image.open(value.mask_path) as opened_mask:
+                truth = np.asarray(opened_mask.convert("L")) > 0
+            if model.task == "semantic_segment":
+                records.append(
+                    ImagePrediction(
+                        image_id=value.image_id,
+                        image_path=value.image_path,
+                        relative_path=value.relative_path,
+                        width=value.width,
+                        height=value.height,
+                        mask=truth,
+                    )
+                )
+                task = "semantic_segment"
+            else:
+                bounds = Image.fromarray(truth).getbbox()
+                objects: tuple[Prediction, ...] = ()
+                if bounds is not None:
+                    left, top, right, bottom = bounds
+                    objects = (
+                        Prediction(
+                            class_id=0,
+                            score=0.95,
+                            polygon=[
+                                (left, top),
+                                (right - 1, top),
+                                (right - 1, bottom - 1),
+                                (left, bottom - 1),
+                            ],
+                        ),
+                    )
+                records.append(
+                    ImagePrediction(
+                        image_id=value.image_id,
+                        image_path=value.image_path,
+                        relative_path=value.relative_path,
+                        width=value.width,
+                        height=value.height,
+                        objects=objects,
+                    )
+                )
+                task = "segment"
+        return PredictionResult(
+            model_name=model.name,
+            model_kind=model.kind,
+            task=task,
+            backend="synthetic",
+            records=tuple(records),
+            inference_seconds=0.1,
+        )
+
+    monkeypatch.setattr(Model, "predict", fake_predict)
+    monkeypatch.setattr(
+        "dataset_fixer.semantic_comparison.environment_snapshot",
+        lambda: {"test": True},
+    )
+    destination = tmp_path / "mixed-comparison"
+    result = models.compare(
+        comparison_space="auto",
+        split="val",
+        baseline="yolo-seg",
+        inference="sahi",
+        sahi_slice_height=24,
+        sahi_slice_width=20,
+        sahi_overlap=0.25,
+        bootstrap_resamples=10,
+        visualize=False,
+        progress=False,
+        destination=destination,
+    )
+
+    assert isinstance(result, SemanticComparisonResult)
+    assert {row["model"] for row in result.ranking} == {
+        "yolo-seg",
+        "yolo-semantic",
+        "nnunet",
+    }
+    assert all(row["dice"] == pytest.approx(1.0) for row in result.ranking)
+    by_name = {row["model"]: row for row in result.ranking}
+    assert by_name["yolo-seg"]["native_task"] == "segment"
+    assert by_name["yolo-seg"]["projection"] == "polygon-foreground-union"
+    assert by_name["nnunet"]["native_task"] == "semantic_segment"
+    assert by_name["nnunet"]["projection"] == "native-semantic-mask"
+    assert by_name["yolo-semantic"]["native_task"] == "semantic_segment"
+    assert by_name["yolo-semantic"]["projection"] == "native-semantic-mask"
+    assert by_name["yolo-seg"]["micro_dice"] == pytest.approx(1.0)
+    manifest = json.loads((destination / "semantic-model-comparison.json").read_text())
+    assert manifest["backend"] == "common-semantic-mask"
+    assert manifest["negotiated_comparison_space"] == "semantic"
+    assert set(manifest["settings"]["sahi_models"]) == {
+        "yolo-seg",
+        "yolo-semantic",
+        "nnunet",
+    }
+    assert all(options["inference"] == "sahi" for options in prediction_options)
+    assert all(options["sahi_slice_height"] == 24 for options in prediction_options)
+    cohort = json.loads((destination / "evaluation-cohort.jsonl").read_text().splitlines()[0])
+    assert cohort["projection"] == "binary-foreground-union"
+
+
+def test_mixed_comparison_rejects_tasks_without_a_semantic_denominator(
+    tmp_path: Path,
+) -> None:
+    exported = _semantic_export(tmp_path)
+    detector_path = tmp_path / "detector.pt"
+    detector_path.write_bytes(b"synthetic-detector")
+    models = Model.load_many(
+        {
+            "detector": {"path": detector_path, "task": "detect"},
+            "semantic": {"model_folder": _nnunet_model(tmp_path / "semantic-model")},
+        },
+        source=exported,
+    )
+
+    with pytest.raises(DatasetValidationError, match="No common semantic denominator"):
+        models.compare(
+            comparison_space="auto",
+            bootstrap_resamples=10,
+            visualize=False,
+            progress=False,
+            destination=tmp_path / "unsupported-comparison",
+        )
 
 
 def test_loaded_semantic_models_visualize_only_sampled_cases_with_shared_mask_grid(
@@ -271,7 +430,7 @@ def test_loaded_semantic_models_visualize_only_sampled_cases_with_shared_mask_gr
         workers=1,
     )
 
-    assert isinstance(loaded, SemanticModelCohort)
+    assert isinstance(loaded, ModelCollection)
     assert loaded.names == (
         "resenc-m-very-long-model-name-alpha",
         "resenc-m-very-long-model-name-beta",
@@ -344,6 +503,64 @@ def test_generic_model_predicts_semantic_export_and_saves_masks(
     assert len(list((saved / "masks").glob("*.png"))) == 2
 
 
+def test_nnunet_sahi_stitches_tile_probabilities_at_native_and_canonical_scale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("sahi")
+    exported = _semantic_export(tmp_path)
+    folder = _nnunet_model(tmp_path / "semantic-sahi-model")
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        image_dir = Path(command[command.index("-i") + 1])
+        prediction_dir = Path(command[command.index("-o") + 1])
+        prediction_dir.mkdir(parents=True, exist_ok=True)
+        for image_path in sorted(image_dir.glob("*_0000.png")):
+            case_id = image_path.stem.removesuffix("_0000")
+            with Image.open(image_path) as opened:
+                width, height = opened.size
+            mask = np.ones((height, width), dtype=np.uint8)
+            Image.fromarray(mask).save(prediction_dir / f"{case_id}.png")
+            probabilities = np.stack(
+                (
+                    np.zeros((height, width), dtype=np.float32),
+                    np.ones((height, width), dtype=np.float32),
+                )
+            )
+            np.savez_compressed(
+                prediction_dir / f"{case_id}.npz",
+                probabilities=probabilities[:, None],
+            )
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(
+        "dataset_fixer.semantic_comparison.shutil.which",
+        lambda command: f"/fake/{command}",
+    )
+    monkeypatch.setattr("dataset_fixer.semantic_comparison.subprocess.run", fake_run)
+    model = Model(folder, upscale_factor=2, workers=1)
+    result = model.predict(
+        exported,
+        split="val",
+        inference="sahi",
+        sahi_slice_height=16,
+        sahi_slice_width=16,
+        sahi_overlap=0.25,
+        progress=False,
+        _keep_native=True,
+    )
+
+    assert result.backend == "sahi"
+    assert len(commands) == 2
+    assert all("--save_probabilities" in command for command in commands)
+    assert all(record.mask.shape == (30, 40) for record in result.records)
+    assert all(record.native_mask.shape == (60, 80) for record in result.records)
+    assert all(np.all(record.mask == 1) for record in result.records)
+    assert result.settings["sahi_stitching"] == "feathered-probabilities"
+
+
 def test_semantic_export_compares_official_nnunet_model_folders(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -363,7 +580,7 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     monkeypatch.setattr("dataset_fixer.semantic_comparison.subprocess.run", fake_run)
     monkeypatch.setattr("dataset_fixer.semantic_comparison.environment_snapshot", lambda: {"test": True})
     destination = tmp_path / "comparison"
-    result = exported.compare_models(
+    models = Model.load_many(
         {
             # Passing fold_0 mirrors the notebook's FOLD_OUTPUT value. The API
             # normalizes it to the complete trained-model folder automatically.
@@ -376,8 +593,11 @@ def test_semantic_export_compares_official_nnunet_model_folders(
                 "upscale_factor": 1,
             },
         },
-        baseline="perfect",
         workers=1,
+    )
+    result = models.compare(
+        exported,
+        baseline="perfect",
         bootstrap_resamples=20,
         seed=7,
         visualize=True,
@@ -425,8 +645,9 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     assert not (destination / "qualitative").exists()
     assert not (destination / "reports").exists()
     manifest = json.loads((destination / "semantic-model-comparison.json").read_text())
-    assert manifest["backend"] == "nnunetv2-official"
-    assert manifest["schema"] == 3
+    assert manifest["backend"] == "native"
+    assert manifest["adapter"] == "nnunetv2-official"
+    assert manifest["schema"] == 4
     assert manifest["figures"] == ["ranking.png"]
     assert manifest["qualitative"] == ["comparison.png"]
     assert manifest["cases"] == 2
@@ -460,9 +681,9 @@ def test_semantic_comparison_failure_is_atomic(
     monkeypatch.setattr("dataset_fixer.semantic_comparison.subprocess.run", fail)
     destination = tmp_path / "failed-comparison"
     with pytest.raises(RuntimeError, match="synthetic failure"):
-        exported.compare_models(
-            {"broken": model},
-            workers=1,
+        models = Model.load_many({"broken": model}, workers=1)
+        models.compare(
+            exported,
             bootstrap_resamples=10,
             visualize=False,
             progress=False,
@@ -484,9 +705,9 @@ def test_semantic_comparison_requires_binary_png_model_folder(
     monkeypatch.setattr("dataset_fixer.semantic_comparison.shutil.which", lambda command: f"/fake/{command}")
 
     with pytest.raises(DatasetValidationError, match="requires binary nnU-Net labels"):
-        exported.compare_models(
-            {"multiclass": model},
-            workers=1,
+        models = Model.load_many({"multiclass": model}, workers=1)
+        models.compare(
+            exported,
             bootstrap_resamples=10,
             visualize=False,
             progress=False,
@@ -499,9 +720,12 @@ def test_semantic_comparison_validates_model_specific_upscale_factor(tmp_path: P
     model = _nnunet_model(tmp_path / "bad-scale-model")
 
     with pytest.raises(DatasetValidationError, match="upscale_factor must be a positive integer"):
-        exported.compare_models(
+        models = Model.load_many(
             {"bad-scale": {"model_folder": model, "upscale_factor": 0}},
             workers=1,
+        )
+        models.compare(
+            exported,
             bootstrap_resamples=10,
             visualize=False,
             progress=False,

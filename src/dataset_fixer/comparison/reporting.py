@@ -326,8 +326,8 @@ def _draw_panel(ax: Any, image: Image.Image, values: list[Any], task: str, title
         box=get("bbox")
         if box:
             ax.add_patch(plt.Rectangle((box[0],box[1]),box[2]-box[0],box[3]-box[1],fill=False,color=color,lw=1.5))
-        polygon=get("polygon")
-        if polygon:
+        polygons=get("polygons") or ([get("polygon")] if get("polygon") else [])
+        for polygon in polygons:
             xy=np.asarray(polygon); ax.plot(np.r_[xy[:,0],xy[0,0]],np.r_[xy[:,1],xy[0,1]],color=color,lw=1.5)
         point=get("point")
         if point:
@@ -376,8 +376,8 @@ def _draw_value(ax: Any, value: Any, *, truth: bool, color: str, alpha: float, l
             plt.Rectangle((box[0], box[1]), box[2] - box[0], box[3] - box[1], fill=False,
                           color=color, lw=linewidth, alpha=alpha)
         )
-    polygon = get("polygon")
-    if polygon:
+    polygons = get("polygons") or ([get("polygon")] if get("polygon") else [])
+    for polygon in polygons:
         points = np.asarray(polygon)
         ax.plot(np.r_[points[:, 0], points[0, 0]], np.r_[points[:, 1], points[0, 1]], color=color, lw=linewidth, alpha=alpha)
     point = get("point")

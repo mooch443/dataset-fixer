@@ -41,6 +41,7 @@ class OutputBuilder:
         self.metadata = metadata
         self.operation = operation
         self.settings = to_jsonable(settings)
+        self._settings_fingerprint = settings_fingerprint(self.settings)
         self.parent_manifest = parent_manifest
         self.started = time.time()
         self.staging = Path(tempfile.mkdtemp(prefix=f".{self.destination.name}.tmp-", dir=self.destination.parent))
@@ -54,6 +55,7 @@ class OutputBuilder:
             shutil.copytree(source_coverage, self.staging / "coverage_summary", dirs_exist_ok=True)
         self.records: list[dict[str, Any]] = []
         self.output_samples: list[Sample] = []
+        self.validation_details: dict[str, Any] = {}
         self.visuals = [
             str(path)
             for path in parent_manifest.get("visuals") or []
@@ -130,7 +132,7 @@ class OutputBuilder:
         immediate_sha = sample.source_sha256 or sha256_file(sample.image_path)
         parent = sample.provenance or {}
         inherited = {
-            key: parent[key]
+            key: to_jsonable(parent[key])
             for key in (
                 "crop",
                 "zoom",
@@ -162,6 +164,7 @@ class OutputBuilder:
             )
             if key in parent
         }
+        operation_provenance = to_jsonable(provenance or {})
         record = {
             "output_image": str(output.relative_to(self.staging)),
             "output_sha256": sha256_file(output),
@@ -181,12 +184,12 @@ class OutputBuilder:
                 *(parent.get("transformation_chain") or []),
                 {
                     "operation": self.operation,
-                    "settings_fingerprint": settings_fingerprint(self.settings),
+                    "settings_fingerprint": self._settings_fingerprint,
                     "settings": self.settings,
                 },
             ],
             **inherited,
-            **(provenance or {}),
+            **operation_provenance,
         }
         self.records.append(record)
 
@@ -232,7 +235,7 @@ class OutputBuilder:
         operation_record = {
             "operation": self.operation,
             "settings": self.settings,
-            "settings_fingerprint": settings_fingerprint(self.settings),
+            "settings_fingerprint": self._settings_fingerprint,
             "class_mapping": class_mapping,
             "duration_seconds": time.time() - self.started,
             "output_images": len(self.records),
@@ -263,7 +266,7 @@ class OutputBuilder:
             "splits": sorted({r["output_split"] for r in self.records}),
             "classes": self.metadata.names,
             "settings": self.settings,
-            "settings_fingerprint": settings_fingerprint(self.settings),
+            "settings_fingerprint": self._settings_fingerprint,
             "history": history,
             "parent_manifest_fingerprint": settings_fingerprint(self.parent_manifest) if self.parent_manifest else None,
             "source_dataset": {
@@ -281,7 +284,11 @@ class OutputBuilder:
             "warnings": self.warnings,
             "visuals": self.visuals,
             "provenance": "provenance.jsonl",
-            "validation": {"passed": True, "warnings": self.warnings},
+            "validation": {
+                "passed": True,
+                "warnings": self.warnings,
+                **self.validation_details,
+            },
             "training_ready": {"ready": False, "structurally_valid": True, "backend_checked": False},
             "timing": {
                 "started_at": datetime.fromtimestamp(self.started, timezone.utc).isoformat(),
@@ -303,20 +310,30 @@ class OutputBuilder:
     ) -> dict[str, Any]:
         self.write_yaml()
         manifest = self.write_reports(class_mapping=class_mapping)
-        # Load and fully validate the private tree before the atomic rename.
-        from .dataset import Dataset
-
         if validate:
             if progress:
-                print("Validating complete staged output before atomic publication...")
-            candidate = Dataset.open(self.staging, progress=progress)
-            manifest["training_ready"]["ready"] = candidate.training_ready
+                print(
+                    "Validating complete staged output before atomic publication "
+                    "(streaming, bounded memory)..."
+                )
+            from .validation import validate_staged_yolo_output
+
+            manifest["training_ready"]["ready"] = validate_staged_yolo_output(
+                self.staging,
+                self.output_samples,
+                self.records,
+                self.metadata,
+                self.task,
+                manifest,
+                progress=progress,
+            )
             manifest["training_ready"]["backend_checked"] = False
         else:
             manifest["validation"] = {
                 "passed": None,
                 "deferred_to_final_export": True,
                 "warnings": self.warnings,
+                **self.validation_details,
             }
         (self.staging / "dataset-fixer.json").write_text(
             json.dumps(to_jsonable(manifest), indent=2, sort_keys=True), encoding="utf-8"
@@ -330,23 +347,13 @@ class OutputBuilder:
 
         from .dataset import Dataset
 
-        samples = [
-            Sample(
-                image_path=self.destination / sample.image_path.relative_to(self.staging),
-                relative_path=sample.relative_path,
-                split=sample.split,
-                width=sample.width,
-                height=sample.height,
-                annotations=list(sample.annotations),
-                source_sha256=record["output_sha256"],
-                provenance={
-                    **record,
-                    "dataset_name": self.name,
-                    "dataset_location": str(self.destination),
-                },
-            )
-            for sample, record in zip(self.output_samples, self.records)
-        ]
+        samples = self.output_samples
+        for sample, record in zip(samples, self.records):
+            sample.image_path = self.destination / sample.image_path.relative_to(self.staging)
+            sample.source_sha256 = record["output_sha256"]
+        provenance = {str(record["output_image"]): record for record in self.records}
+        self.output_samples = []
+        self.records = []
         return Dataset(
             location=self.destination,
             name=self.name,
@@ -357,4 +364,5 @@ class OutputBuilder:
             data_yaml=self.destination / "data.yaml",
             source_format="yolo",
             warnings=list(self.warnings),
+            provenance=provenance,
         )

@@ -18,6 +18,7 @@ from .utils import IMAGE_SUFFIXES, sha256_file, slugify, to_jsonable
 
 ModelKind = Literal["ultralytics", "nnunet"]
 PredictionTask = Literal["detect", "segment", "pose", "polo", "semantic_segment"]
+ModelTask = PredictionTask | Literal["auto", "locate", "semantic"]
 
 
 @dataclass(frozen=True)
@@ -147,9 +148,19 @@ class PredictionResult:
                     raise DatasetValidationError(
                         f"Semantic prediction {record.image_id!r} has no mask"
                     )
-                Image.fromarray(
-                    (np.asarray(record.mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
-                ).save(mask_root / f"{record.image_id}.png", format="PNG")
+                mask = np.asarray(record.mask)
+                if mask.ndim != 2 or not np.all(np.isfinite(mask)):
+                    raise DatasetValidationError(
+                        f"Semantic prediction {record.image_id!r} is not a finite class map"
+                    )
+                if np.any(mask < 0) or np.any(mask != np.floor(mask)):
+                    raise DatasetValidationError(
+                        f"Semantic prediction {record.image_id!r} contains invalid class IDs"
+                    )
+                dtype = np.uint8 if int(mask.max(initial=0)) <= 255 else np.uint16
+                Image.fromarray(mask.astype(dtype)).save(
+                    mask_root / f"{record.image_id}.png", format="PNG"
+                )
         else:
             rows = []
             for record in self.records:
@@ -168,6 +179,7 @@ class PredictionResult:
                                 "point": value.point,
                                 "radius": value.radius,
                                 "polygon": value.polygon,
+                                "polygons": value.polygons,
                                 "keypoints": value.keypoints,
                                 "metadata": value.metadata,
                             }
@@ -271,11 +283,12 @@ class PredictionResult:
             original.imshow(image)
             prediction = figure.add_subplot(cell[1, 1])
             if record.mask is not None:
+                mask = np.asarray(record.mask)
                 prediction.imshow(
-                    record.mask,
-                    cmap="gray",
+                    mask,
+                    cmap="gray" if int(mask.max(initial=0)) <= 1 else "tab20",
                     vmin=0,
-                    vmax=1,
+                    vmax=max(int(mask.max(initial=0)), 1),
                     interpolation="nearest",
                 )
             else:
@@ -337,10 +350,10 @@ class Model:
         *,
         name: str | None = None,
         kind: Literal["auto", "ultralytics", "nnunet"] = "auto",
-        task: PredictionTask | Literal["auto"] | None = None,
+        task: ModelTask | None = None,
         resolution: int | None = None,
         training_dataset: str | Path | None = None,
-        inference: Literal["auto", "native", "sahi"] = "native",
+        inference: Literal["native", "sahi"] = "native",
         device: str | None = None,
         folds: tuple[int | str, ...] = (0,),
         checkpoint: str = "checkpoint_final.pth",
@@ -361,8 +374,8 @@ class Model:
         parsed_name = str(name or (path.stem if path.is_file() else path.name)).strip()
         if not parsed_name:
             raise ValueError("Model name must be non-empty")
-        if inference not in {"auto", "native", "sahi"}:
-            raise ValueError("inference must be 'auto', 'native', or 'sahi'")
+        if inference not in {"native", "sahi"}:
+            raise ValueError("inference must be 'native' or 'sahi'; 'auto' was removed")
         if resolution is not None and (
             isinstance(resolution, bool) or int(resolution) <= 0
         ):
@@ -390,6 +403,9 @@ class Model:
         self._inference = inference
         self._device = device
         self._settings = dict(settings or {})
+        from .sahi_support import reject_legacy_sahi_settings
+
+        reject_legacy_sahi_settings(self._settings)
         self._upscale_factor = upscale_factor
         self._workers = workers
         self._folds: tuple[str, ...] = ()
@@ -398,17 +414,13 @@ class Model:
         self._checkpoint_sha256 = ""
         self._digest = ""
         self._runtime: dict[Any, Any] = {}
-        self._resolved_task: PredictionTask | None = (
-            None if task in {None, "auto"} else task
-        )
+        self._resolved_task = _normalize_prediction_task(task)
 
         if resolved_kind == "nnunet":
             self._initialize_nnunet(folds, checkpoint)
             if self._resolved_task not in {None, "semantic_segment"}:
                 raise ValueError("Official nnU-Net models use task='semantic_segment'")
             self._resolved_task = "semantic_segment"
-            if inference not in {"auto", "native"}:
-                raise ValueError("Official nnU-Net prediction does not support SAHI")
             if device is not None and device not in {"cpu", "cuda", "mps"}:
                 raise ValueError("nnU-Net device must be 'cpu', 'cuda', or 'mps'")
         else:
@@ -588,12 +600,6 @@ class Model:
         return self._digest
 
     @property
-    def model_sha256(self) -> str:
-        """Compatibility alias for :attr:`digest`."""
-
-        return self._digest
-
-    @property
     def upscale_factor(self) -> int:
         """nnU-Net input adapter scale."""
 
@@ -657,7 +663,7 @@ class Model:
         source: Any,
         *,
         split: Literal["train", "val", "test"] | None = None,
-        inference: Literal["auto", "native", "sahi"] | None = None,
+        inference: Literal["native", "sahi"] | None = None,
         resolution: int | None = None,
         confidence: float = 0.25,
         postprocess: float = 0.7,
@@ -665,18 +671,26 @@ class Model:
         progress: bool = True,
         destination: str | Path | None = None,
         settings: Mapping[str, Any] | None = None,
+        sahi_slice_height: int | None = None,
+        sahi_slice_width: int | None = None,
+        sahi_overlap: float = 0.2,
+        sahi_overlap_height_ratio: float | None = None,
+        sahi_overlap_width_ratio: float | None = None,
+        sahi_postprocess_type: Literal["GREEDYNMM", "NMM", "NMS", "LSNMS"] = "GREEDYNMM",
+        sahi_postprocess_match_metric: Literal["IOU", "IOS"] = "IOS",
+        sahi_postprocess_class_agnostic: bool = False,
+        sahi_model_type: str = "ultralytics",
         _keep_native: bool = False,
     ) -> PredictionResult:
         """Predict images, directories, datasets, exports, or frozen inputs.
 
         Parameters:
             source: Image path, image directory, sequence of paths or
-                :class:`ModelInput` values, :class:`Dataset`,
-                :class:`SemanticMaskExport`, or an internal frozen cohort.
+                :class:`ModelInput` values, a :class:`Dataset`, or an internal
+                frozen cohort.
             split: Dataset/export split. Defaults to ``"val"`` for dataset-like
                 sources and is ignored for direct image inputs.
-            inference: Native or SAHI inference for Ultralytics models. nnU-Net
-                uses its official predictor.
+            inference: Explicit native or sliced SAHI inference.
             resolution: Ultralytics input size override.
             confidence: Prediction confidence floor.
             postprocess: Native IoU or SAHI postprocessing threshold.
@@ -684,6 +698,9 @@ class Model:
             progress: Show package-managed progress bars.
             destination: Optional new/empty directory receiving saved output.
             settings: Additional per-call adapter overrides.
+            sahi_slice_height: Optional SAHI tile height in source pixels.
+            sahi_slice_width: Optional SAHI tile width in source pixels.
+            sahi_overlap: Default overlap ratio for both tile axes.
 
         Returns:
             Ordered :class:`PredictionResult` values with stable image IDs.
@@ -698,18 +715,51 @@ class Model:
             raise ValueError("Prediction source contains no supported images")
         selected_device = device if device is not None else self.device
         combined_settings = {**self.settings, **dict(settings or {})}
+        combined_settings.update(
+            {
+                "sahi_overlap": sahi_overlap,
+                "sahi_postprocess_type": sahi_postprocess_type,
+                "sahi_postprocess_match_metric": sahi_postprocess_match_metric,
+                "sahi_postprocess_class_agnostic": sahi_postprocess_class_agnostic,
+                "sahi_model_type": sahi_model_type,
+            }
+        )
+        if sahi_slice_height is not None:
+            combined_settings["sahi_slice_height"] = sahi_slice_height
+        if sahi_slice_width is not None:
+            combined_settings["sahi_slice_width"] = sahi_slice_width
+        if sahi_overlap_height_ratio is not None:
+            combined_settings["sahi_overlap_height_ratio"] = sahi_overlap_height_ratio
+        if sahi_overlap_width_ratio is not None:
+            combined_settings["sahi_overlap_width_ratio"] = sahi_overlap_width_ratio
+        from .sahi_support import reject_legacy_sahi_settings, resolve_sahi_settings
+
+        reject_legacy_sahi_settings(combined_settings)
+        requested = inference or self.inference
+        if requested not in {"native", "sahi"}:
+            raise ValueError("inference must be 'native' or 'sahi'; 'auto' was removed")
+        effective_resolution = resolution or self.resolution or 480
+        resolved_sahi = resolve_sahi_settings(
+            combined_settings,
+            resolution=effective_resolution,
+        )
         started = time.perf_counter()
         if self.kind == "nnunet":
+            from .comparison.inference import resolve_backend
             from .semantic_comparison import predict_nnunet_model
 
+            selected_backend = resolve_backend(requested, "semantic_segment")
             records = predict_nnunet_model(
                 self,
                 inputs,
                 device=selected_device or "cuda",
                 progress=progress,
                 keep_native=_keep_native,
+                inference=selected_backend,
+                resolution=effective_resolution,
+                settings={**combined_settings, **resolved_sahi.as_dict()},
             )
-            backend = "nnunetv2-official"
+            backend = selected_backend
             task: PredictionTask = "semantic_segment"
             resolved_settings = {
                 "device": selected_device or "cuda",
@@ -717,50 +767,64 @@ class Model:
                 "checkpoint": self.checkpoint,
                 "upscale_factor": self.upscale_factor,
                 "workers": self.workers,
+                "inference": selected_backend,
+                **(resolved_sahi.as_dict() if selected_backend == "sahi" else {}),
             }
         else:
             from .comparison.inference import predict_model_inputs, resolve_backend
 
-            requested = inference or self.inference
-            known_task = source_task or self.task
-            selected_backend = (
-                "native"
-                if requested == "auto" and known_task is None
-                else resolve_backend(requested, known_task or "detect")
+            known_task = self.task or (
+                source_task if source_task != "semantic_segment" else None
             )
+            selected_backend = resolve_backend(requested, known_task or "detect")
             by_id, resolved_task = predict_model_inputs(
                 self,
                 inputs,
                 task=known_task,
                 backend=selected_backend,
-                resolution=resolution or self.resolution or 480,
+                resolution=effective_resolution,
                 confidence=float(confidence),
                 postprocess=float(postprocess),
                 device=selected_device,
                 progress=progress,
-                settings=combined_settings,
+                settings={**combined_settings, **resolved_sahi.as_dict()},
             )
             self._resolved_task = resolved_task
             task = resolved_task
             backend = selected_backend
-            records = tuple(
-                ImagePrediction(
-                    image_id=value.image_id,
-                    image_path=value.image_path,
-                    relative_path=value.relative_path,
-                    width=value.width,
-                    height=value.height,
-                    objects=tuple(by_id[value.image_id]),
-                    metadata={"backend": backend},
+            if task == "semantic_segment":
+                records = tuple(
+                    ImagePrediction(
+                        image_id=value.image_id,
+                        image_path=value.image_path,
+                        relative_path=value.relative_path,
+                        width=value.width,
+                        height=value.height,
+                        mask=np.asarray(by_id[value.image_id]),
+                        metadata={"backend": backend},
+                    )
+                    for value in inputs
                 )
-                for value in inputs
-            )
+            else:
+                records = tuple(
+                    ImagePrediction(
+                        image_id=value.image_id,
+                        image_path=value.image_path,
+                        relative_path=value.relative_path,
+                        width=value.width,
+                        height=value.height,
+                        objects=tuple(by_id[value.image_id]),
+                        metadata={"backend": backend},
+                    )
+                    for value in inputs
+                )
             resolved_settings = {
                 "device": selected_device,
-                "resolution": resolution or self.resolution or 480,
+                "resolution": effective_resolution,
                 "confidence": confidence,
                 "postprocess": postprocess,
                 **combined_settings,
+                **(resolved_sahi.as_dict() if selected_backend == "sahi" else {}),
             }
         result = PredictionResult(
             model_name=self.name,
@@ -814,23 +878,21 @@ class Model:
         *,
         source: Any | None = None,
         kind: Literal["auto", "ultralytics", "nnunet"] | None = None,
-        task: PredictionTask | Literal["auto"] | None = None,
+        task: ModelTask | None = None,
         resolution: int | None = None,
         training_dataset: str | Path | None = None,
-        inference: Literal["auto", "native", "sahi"] | None = None,
+        inference: Literal["native", "sahi"] | None = None,
         device: str | None = None,
         folds: tuple[int | str, ...] | None = None,
         checkpoint: str | None = None,
         upscale_factor: int | None = None,
         workers: int | None = None,
         settings: Mapping[str, Any] | None = None,
-        defaults: Mapping[str, Any] | None = None,
     ) -> "ModelCollection":
         """Normalize paths/configurations into an ordered model collection.
 
         Common keyword values are collection defaults; a model's own mapping
-        overrides them. ``defaults`` remains available for programmatic
-        forwarding, but user code should prefer the explicit keywords.
+        overrides them.
         """
 
         if isinstance(models, ModelCollection):
@@ -851,7 +913,7 @@ class Model:
             )
         if not items:
             raise ValueError("At least one model is required")
-        base = dict(defaults or {})
+        base: dict[str, Any] = {}
         explicit_defaults = {
             "kind": kind,
             "task": task,
@@ -988,62 +1050,300 @@ class ModelCollection:
                 return model
         raise KeyError(f"Unknown model {value!r}")
 
-    def predict(self, source: Any | None = None, **options: Any) -> dict[str, PredictionResult]:
-        """Run every model through the common prediction interface."""
+    def predict(
+        self,
+        source: Any | None = None,
+        *,
+        inference: Literal["native", "sahi"] | None = None,
+        sahi_slice_height: int | None = None,
+        sahi_slice_width: int | None = None,
+        sahi_overlap: float = 0.2,
+        sahi_overlap_height_ratio: float | None = None,
+        sahi_overlap_width_ratio: float | None = None,
+        sahi_postprocess_type: Literal["GREEDYNMM", "NMM", "NMS", "LSNMS"] = "GREEDYNMM",
+        sahi_postprocess_match_metric: Literal["IOU", "IOS"] = "IOS",
+        sahi_postprocess_class_agnostic: bool = False,
+        sahi_model_type: str = "ultralytics",
+        **options: Any,
+    ) -> dict[str, PredictionResult]:
+        """Run every model through the common prediction interface.
+
+        Parameters:
+            source: Prediction source, or the collection's bound source.
+            inference: Explicit backend override for every model.
+            sahi_slice_height: Optional source-space SAHI tile height.
+            sahi_slice_width: Optional source-space SAHI tile width.
+            sahi_overlap: Default overlap ratio for both axes.
+            options: Remaining :meth:`Model.predict` options.
+        """
 
         active = self.source if source is None else source
         if active is None:
             raise ValueError("A prediction source is required for an unbound model collection")
-        return {model.name: model.predict(active, **options) for model in self.models}
+        shared = {
+            **options,
+            "sahi_slice_height": sahi_slice_height,
+            "sahi_slice_width": sahi_slice_width,
+            "sahi_overlap": sahi_overlap,
+            "sahi_overlap_height_ratio": sahi_overlap_height_ratio,
+            "sahi_overlap_width_ratio": sahi_overlap_width_ratio,
+            "sahi_postprocess_type": sahi_postprocess_type,
+            "sahi_postprocess_match_metric": sahi_postprocess_match_metric,
+            "sahi_postprocess_class_agnostic": sahi_postprocess_class_agnostic,
+            "sahi_model_type": sahi_model_type,
+        }
+        if inference is not None:
+            shared["inference"] = inference
+        return {model.name: model.predict(active, **shared) for model in self.models}
 
-    def compare(self, source: Any | None = None, **options: Any) -> Any:
-        """Dispatch comparison to the bound dataset/export implementation."""
+    def compare(
+        self,
+        source: Any | None = None,
+        *,
+        split: Literal["train", "val", "test"] = "val",
+        baseline: str | None = None,
+        comparison_space: Literal["auto", "native", "semantic"] = "auto",
+        inference: Literal["native", "sahi"] | None = None,
+        confidence: float = 0.25,
+        postprocess: float = 0.7,
+        keep_predictions: bool = True,
+        protocol: Literal["validation", "locked", "calibrate_then_test"] = "validation",
+        calibration_split: Literal["train", "val", "test"] | None = None,
+        training_provenance: Literal["required", "warn", "ignore"] = "required",
+        confidence_thresholds: tuple[float, ...] = (0.35, 0.45, 0.55, 0.65, 0.75, 0.85),
+        postprocess_thresholds: tuple[float, ...] = (0.75, 0.85, 0.95),
+        resolution: int = 480,
+        comparison_unit: Literal["model", "system"] = "model",
+        cache: bool | str | Path = True,
+        notebook_cache: str | Path | None = None,
+        write_notebook_cache: bool = False,
+        allow_unverified_cache: bool = False,
+        visualize: bool = True,
+        progress: bool = True,
+        destination: str | Path | None = None,
+        device: str | None = None,
+        seed: int = 42,
+        bootstrap_resamples: int = 10_000,
+        augment_inference: bool = False,
+        precision: Literal["full", "half"] = "full",
+        sahi_slice_height: int | None = None,
+        sahi_slice_width: int | None = None,
+        sahi_overlap: float = 0.2,
+        sahi_overlap_height_ratio: float | None = None,
+        sahi_overlap_width_ratio: float | None = None,
+        sahi_postprocess_type: Literal["GREEDYNMM", "NMM", "NMS", "LSNMS"] = "GREEDYNMM",
+        sahi_postprocess_match_metric: Literal["IOU", "IOS"] = "IOS",
+        sahi_postprocess_class_agnostic: bool = False,
+        sahi_model_type: str = "ultralytics",
+    ) -> Any:
+        """Compare this collection on one frozen dataset cohort.
+
+        ``comparison_space="auto"`` preserves native evaluation for compatible
+        same-task collections. Mixed instance and semantic segmenters negotiate
+        the binary semantic-mask space when the source is a semantic-mask
+        :class:`Dataset`. Use ``"native"`` or ``"semantic"`` to
+        require one behavior explicitly.
+        """
 
         active = self.source if source is None else source
         if active is None:
             raise ValueError("A comparison source is required for an unbound model collection")
-        from .models import SemanticMaskExport
-
-        if isinstance(active, SemanticMaskExport):
-            from .semantic_comparison import compare_nnunet_models
-
-            defaults = {
-                "split": "val",
-                "baseline": None,
-                "folds": (0,),
-                "checkpoint": "checkpoint_final.pth",
-                "device": self.models[0].device or "cuda",
-                "workers": self.models[0].workers,
-                "bootstrap_resamples": 10_000,
-                "seed": 42,
-                "keep_predictions": True,
-                "visualize": True,
-                "progress": True,
-                "destination": None,
-            }
-            defaults.update(options)
-            return compare_nnunet_models(active, self, **defaults)
+        if comparison_space not in {"auto", "native", "semantic"}:
+            raise ValueError("comparison_space must be 'auto', 'native', or 'semantic'")
         from .dataset import Dataset
 
-        if isinstance(active, Dataset):
-            if "inference" not in options:
-                modes = {model.inference for model in self.models}
-                if len(modes) == 1:
-                    options["inference"] = next(iter(modes))
-                else:
-                    options["comparison_unit"] = "system"
-            return active.compare_models(self, **options)
-        raise TypeError("Model comparison requires Dataset or SemanticMaskExport")
+        if not isinstance(active, Dataset):
+            raise TypeError("Model comparison requires a Dataset")
+        if active._plan:
+            raise DatasetValidationError(
+                "Model comparison requires a fixed on-disk cohort; call dataset.export(...) first"
+            )
+
+        if isinstance(active, Dataset) and active.format == "semantic_masks":
+            model_tasks = {model.task for model in self.models}
+            all_nnunet = all(model.kind == "nnunet" for model in self.models)
+            semantic_compatible = model_tasks <= {"segment", "semantic_segment"}
+            if comparison_space == "auto":
+                comparison_space = "native" if all_nnunet else "semantic"
+            if comparison_space == "semantic":
+                if not semantic_compatible:
+                    raise DatasetValidationError(
+                        ValidationIssue(
+                            "No common semantic denominator exists for this model collection",
+                            value=[
+                                {"model": model.name, "kind": model.kind, "task": model.task}
+                                for model in self.models
+                            ],
+                            expected="only segment and semantic_segment tasks",
+                            suggestion=(
+                                "set task='segment' for YOLO segmentation checkpoints, "
+                                "or compare incompatible tasks separately"
+                            ),
+                        )
+                    )
+                from .semantic_comparison import compare_semantic_models
+
+                return compare_semantic_models(
+                    active,
+                    self,
+                    split=split,
+                    baseline=baseline,
+                    device=device,
+                    inference=inference,
+                    confidence=confidence,
+                    postprocess=postprocess,
+                    bootstrap_resamples=bootstrap_resamples,
+                    seed=seed,
+                    keep_predictions=keep_predictions,
+                    visualize=visualize,
+                    progress=progress,
+                    destination=destination,
+                    resolution=resolution,
+                    comparison_unit=comparison_unit,
+                    sahi_slice_height=sahi_slice_height,
+                    sahi_slice_width=sahi_slice_width,
+                    sahi_overlap=sahi_overlap,
+                    sahi_overlap_height_ratio=sahi_overlap_height_ratio,
+                    sahi_overlap_width_ratio=sahi_overlap_width_ratio,
+                    sahi_postprocess_type=sahi_postprocess_type,
+                    sahi_postprocess_match_metric=sahi_postprocess_match_metric,
+                    sahi_postprocess_class_agnostic=sahi_postprocess_class_agnostic,
+                    sahi_model_type=sahi_model_type,
+                )
+            if not all_nnunet:
+                raise DatasetValidationError(
+                    ValidationIssue(
+                        "Native semantic-export comparison requires only semantic models",
+                        value=[
+                            {"model": model.name, "kind": model.kind, "task": model.task}
+                            for model in self.models
+                        ],
+                        expected="all official nnU-Net semantic_segment models",
+                        suggestion="use comparison_space='semantic' for YOLO-seg/semantic mixtures",
+                    )
+                )
+            from .semantic_comparison import compare_nnunet_models
+
+            return compare_nnunet_models(
+                active,
+                self,
+                split=split,
+                baseline=baseline,
+                folds=(0,),
+                checkpoint="checkpoint_final.pth",
+                device=device or self.models[0].device or "cuda",
+                workers=self.models[0].workers,
+                bootstrap_resamples=bootstrap_resamples,
+                seed=seed,
+                keep_predictions=keep_predictions,
+                visualize=visualize,
+                progress=progress,
+                destination=destination,
+                inference=inference,
+                resolution=resolution,
+                comparison_unit=comparison_unit,
+                sahi_slice_height=sahi_slice_height,
+                sahi_slice_width=sahi_slice_width,
+                sahi_overlap=sahi_overlap,
+                sahi_overlap_height_ratio=sahi_overlap_height_ratio,
+                sahi_overlap_width_ratio=sahi_overlap_width_ratio,
+                sahi_postprocess_type=sahi_postprocess_type,
+                sahi_postprocess_match_metric=sahi_postprocess_match_metric,
+                sahi_postprocess_class_agnostic=sahi_postprocess_class_agnostic,
+                sahi_model_type=sahi_model_type,
+            )
+
+        if comparison_space == "semantic":
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Semantic comparison requires canonical mask ground truth",
+                    value=str(active.location),
+                    expected="a semantic-mask Dataset source",
+                    suggestion=(
+                        "export the segmentation dataset with format='semantic_masks' "
+                        "and compare against that returned artifact"
+                    ),
+                )
+            )
+        if any(model.kind != "ultralytics" for model in self.models):
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Dataset-native comparison cannot evaluate semantic model folders",
+                    value=[model.name for model in self.models if model.kind != "ultralytics"],
+                    suggestion="compare nnU-Net folders against a semantic-mask Dataset",
+                )
+            )
+        known_tasks = {model.task for model in self.models if model.task is not None}
+        if len(known_tasks) > 1:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "No implemented native common denominator exists for these model tasks",
+                    value=sorted(known_tasks),
+                    expected="one shared native task",
+                    suggestion="compare same-task models separately",
+                )
+            )
+        if known_tasks and known_tasks != {active.task.value}:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Model task does not match the native evaluation dataset",
+                    value=sorted(known_tasks),
+                    expected=active.task.value,
+                )
+            )
+
+        from .comparison.engine import _compare_models
+
+        inference_settings = {
+            "augment": augment_inference,
+            "precision": precision,
+            "sahi_slice_height": resolution if sahi_slice_height is None else sahi_slice_height,
+            "sahi_slice_width": resolution if sahi_slice_width is None else sahi_slice_width,
+            "sahi_overlap": sahi_overlap,
+            "sahi_postprocess_type": sahi_postprocess_type,
+            "sahi_postprocess_match_metric": sahi_postprocess_match_metric,
+            "sahi_postprocess_class_agnostic": sahi_postprocess_class_agnostic,
+            "sahi_model_type": sahi_model_type,
+        }
+        if sahi_overlap_height_ratio is not None:
+            inference_settings["sahi_overlap_height_ratio"] = sahi_overlap_height_ratio
+        if sahi_overlap_width_ratio is not None:
+            inference_settings["sahi_overlap_width_ratio"] = sahi_overlap_width_ratio
+        return _compare_models(
+            active,
+            self,
+            split=split,
+            baseline=baseline,
+            inference=inference,
+            protocol=protocol,
+            calibration_split=calibration_split,
+            training_provenance=training_provenance,
+            confidence_thresholds=confidence_thresholds,
+            postprocess_thresholds=postprocess_thresholds,
+            resolution=resolution,
+            comparison_unit=comparison_unit,
+            cache=cache,
+            notebook_cache=notebook_cache,
+            write_notebook_cache=write_notebook_cache,
+            allow_unverified_cache=allow_unverified_cache,
+            visualize=visualize,
+            progress=progress,
+            destination=destination,
+            device=device,
+            seed=seed,
+            bootstrap_resamples=bootstrap_resamples,
+            **inference_settings,
+        )
 
     def visualize(self, source: Any | None = None, **options: Any) -> Any:
         """Render a sampled semantic cohort with the shared comparison grid."""
 
         active = self.source if source is None else source
-        from .models import SemanticMaskExport
+        from .dataset import Dataset
 
-        if not isinstance(active, SemanticMaskExport):
+        if not isinstance(active, Dataset) or active.format != "semantic_masks":
             raise TypeError(
-                "Collection visualization currently requires SemanticMaskExport; "
+                "Collection visualization currently requires a semantic-mask Dataset; "
                 "use Model.predict for other sources"
             )
         from .semantic_comparison import visualize_nnunet_models
@@ -1084,9 +1384,9 @@ def normalize_model_inputs(
     if _is_model_input_sequence(source):
         return tuple(source), None
 
-    from .models import SemanticMaskExport
+    from .dataset import Dataset
 
-    if isinstance(source, SemanticMaskExport):
+    if isinstance(source, Dataset) and source.format == "semantic_masks":
         selected_split = split or "val"
         if selected_split not in source.splits:
             raise ValueError(
@@ -1128,8 +1428,6 @@ def normalize_model_inputs(
             source.task,
         )
 
-    from .dataset import Dataset
-
     if isinstance(source, Dataset):
         if source._plan:
             raise DatasetValidationError(
@@ -1156,7 +1454,7 @@ def normalize_model_inputs(
     else:
         raise TypeError(
             "source must be an image, directory, image sequence, Dataset, "
-            "SemanticMaskExport, Cohort, or ModelInput sequence"
+            "Cohort, or ModelInput sequence"
         )
     inputs: list[ModelInput] = []
     for index, path in enumerate(paths):
@@ -1275,9 +1573,31 @@ def _task_from_args(checkpoint: Path) -> PredictionTask | None:
         except (OSError, TypeError, yaml.YAMLError):
             continue
         task = str(payload.get("task", "")).lower()
-        if task in {"detect", "segment", "pose", "polo"}:
-            return task  # type: ignore[return-value]
+        if task in {
+            "detect",
+            "segment",
+            "pose",
+            "polo",
+            "locate",
+            "semantic_segment",
+            "semantic",
+        }:
+            return _normalize_prediction_task(task)
     return None
+
+
+def _normalize_prediction_task(value: Any) -> PredictionTask | None:
+    if value in {None, "auto"}:
+        return None
+    normalized = str(value).strip().lower()
+    aliases = {"locate": "polo", "semantic": "semantic_segment"}
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"detect", "segment", "pose", "polo", "semantic_segment"}:
+        raise ValueError(
+            "task must be 'auto', 'detect', 'segment', 'pose', 'polo'/'locate', "
+            "or 'semantic_segment'/'semantic'"
+        )
+    return normalized  # type: ignore[return-value]
 
 
 def _training_dataset_from_args(checkpoint: Path) -> str | None:
@@ -1324,8 +1644,9 @@ def _draw_object_predictions(axis: Any, values: tuple[Any, ...]) -> None:
                     linewidth=1.5,
                 )
             )
-        if value.polygon:
-            polygon = np.asarray(value.polygon, dtype=float)
+        polygons = value.polygons or ([value.polygon] if value.polygon else [])
+        for raw_polygon in polygons:
+            polygon = np.asarray(raw_polygon, dtype=float)
             axis.plot(
                 np.r_[polygon[:, 0], polygon[0, 0]],
                 np.r_[polygon[:, 1], polygon[0, 1]],

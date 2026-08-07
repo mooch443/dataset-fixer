@@ -32,7 +32,7 @@ class ModelSpec:
             name=self.name,
             resolution=self.resolution,
             training_dataset=self.training_dataset,
-            inference=str(self.inference_overrides.get("inference", "auto")),
+            inference=str(self.inference_overrides.get("inference", "native")),
             settings={
                 key: value
                 for key, value in self.inference_overrides.items()
@@ -49,6 +49,7 @@ class Prediction:
     point: tuple[float, float] | None = None
     radius: float | None = None
     polygon: list[tuple[float, float]] | None = None
+    polygons: list[list[tuple[float, float]]] | None = None
     keypoints: list[tuple[float, float, float | None]] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 

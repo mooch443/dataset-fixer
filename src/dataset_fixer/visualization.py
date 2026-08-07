@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import math
 import random
+import re
+import textwrap
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from shapely.geometry import Polygon
+from shapely.validation import explain_validity
 
 from .models import Annotation, DatasetMetadata, Sample, Task
+
+if TYPE_CHECKING:
+    from .validation_audit import ValidationFailureExample
 
 SPLIT_COLORS = {"train": "#2ca02c", "val": "#ff7f0e", "test": "#1f77b4"}
 ANNOTATION_COLORS = (
@@ -19,6 +26,252 @@ ANNOTATION_COLORS = (
     "#ffff00",  # yellow
     "#ff1493",  # deep pink
 )
+
+
+def visualize_validation_failures(
+    examples: list["ValidationFailureExample"],
+    task: Task,
+    metadata: DatasetMetadata,
+    *,
+    total_count: int,
+    dataset_name: str,
+    save_to: Path,
+    show: bool = True,
+):
+    """Render a bounded grid of load-time validation failures."""
+
+    columns = 1 if len(examples) == 1 else 2
+    rows = max(1, math.ceil(max(1, len(examples)) / columns))
+    fig, axes = plt.subplots(rows, columns, figsize=(7 * columns, 5.6 * rows), squeeze=False)
+    flat = axes.flatten()
+    for ax, example in zip(flat, examples):
+        annotations = (
+            [example.annotation]
+            if example.annotation is not None and example.annotation.polygon is None
+            else []
+        )
+        if (
+            example.image_path is not None
+            and example.image_path.is_file()
+            and example.width is not None
+            and example.height is not None
+        ):
+            sample = Sample(
+                image_path=example.image_path,
+                relative_path=example.relative_path or Path(example.image_path.name),
+                split=example.split or "unknown",
+                width=example.width,
+                height=example.height,
+                annotations=annotations,
+            )
+            try:
+                _draw_sample(ax, sample, task, metadata)
+                if example.annotation is not None:
+                    _highlight_invalid_annotation(
+                        ax,
+                        example.annotation,
+                        width=example.width,
+                        height=example.height,
+                    )
+            except Exception:
+                _draw_failure_placeholder(ax)
+        else:
+            _draw_failure_placeholder(ax)
+        source = (
+            str(example.relative_path)
+            if example.relative_path is not None
+            else "no readable image available"
+        )
+        message = textwrap.fill(
+            example.summary or example.warning,
+            width=58,
+            max_lines=2,
+            placeholder=" …",
+        )
+        ax.set_title(
+            f"SKIPPED · {example.split or 'unknown split'} · {source}\n{message}",
+            color="#b00020",
+            fontsize=9,
+            pad=8,
+        )
+    for ax in flat[len(examples) :]:
+        ax.axis("off")
+    fig.suptitle(
+        f"Load validation skips — {dataset_name} — {total_count} failed item(s); "
+        f"showing {len(examples)}",
+        fontsize=13,
+    )
+    fig.subplots_adjust(top=0.88, hspace=0.38, wspace=0.08)
+    save_to.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_to, bbox_inches="tight", dpi=140)
+    if show:
+        _display_or_print(fig, save_to)
+    return fig
+
+
+def _draw_failure_placeholder(ax) -> None:
+    ax.set_facecolor("#242830")
+    ax.text(
+        0.5,
+        0.5,
+        "No readable image\navailable for this failure",
+        transform=ax.transAxes,
+        ha="center",
+        va="center",
+        color="white",
+        fontsize=11,
+    )
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def _polygon_invalidity_details(
+    points: list[tuple[float, float]],
+    *,
+    width: int,
+    height: int,
+) -> tuple[list[str], list[tuple[float, float, str]]]:
+    """Return human-readable polygon defects and locations worth marking."""
+
+    reasons: list[str] = []
+    markers: list[tuple[float, float, str]] = []
+    if len(points) < 3:
+        reasons.append(f"only {len(points)} point(s); at least 3 required")
+
+    finite_points = [
+        (index, x, y)
+        for index, (x, y) in enumerate(points)
+        if math.isfinite(x) and math.isfinite(y)
+    ]
+    if len(finite_points) != len(points):
+        reasons.append("non-finite vertex coordinate")
+
+    for index, x, y in finite_points:
+        if (
+            x < -0.01 * width
+            or y < -0.01 * height
+            or x > 1.01 * width
+            or y > 1.01 * height
+        ):
+            reasons.append(f"vertex {index} lies outside the image")
+            markers.append(
+                (
+                    min(max(x, 0.0), float(width)),
+                    min(max(y, 0.0), float(height)),
+                    f"vertex {index} outside image\n({x:.1f}, {y:.1f})",
+                )
+            )
+
+    if len(points) >= 3 and len(finite_points) == len(points):
+        try:
+            polygon = Polygon(points)
+            validity = explain_validity(polygon)
+            if polygon.is_empty:
+                reasons.append("empty polygon")
+            if polygon.area <= 0:
+                reasons.append("zero-area polygon")
+            if not polygon.is_valid:
+                reason = validity.split("[", 1)[0].strip() or "invalid polygon"
+                reasons.append(reason.lower())
+                coordinate = re.search(r"\[\s*([^\]]+)\s*\]", validity)
+                if coordinate:
+                    values = coordinate.group(1).replace(",", " ").split()
+                    if len(values) >= 2:
+                        try:
+                            x, y = float(values[0]), float(values[1])
+                        except ValueError:
+                            pass
+                        else:
+                            markers.append((x, y, reason.lower()))
+        except Exception as error:
+            reasons.append(f"geometry could not be constructed ({type(error).__name__})")
+
+    return list(dict.fromkeys(reasons)), list(dict.fromkeys(markers))
+
+
+def _highlight_invalid_annotation(
+    ax,
+    annotation: Annotation,
+    *,
+    width: int,
+    height: int,
+) -> None:
+    """Overlay explicit defect markers on a rejected annotation."""
+
+    if annotation.polygon is None:
+        return
+    reasons, markers = _polygon_invalidity_details(
+        annotation.polygon,
+        width=width,
+        height=height,
+    )
+    if not reasons:
+        return
+
+    finite_polygon = [
+        (x, y)
+        for x, y in annotation.polygon
+        if math.isfinite(x) and math.isfinite(y)
+    ]
+    if len(finite_polygon) >= 2:
+        ax.add_patch(
+            patches.Polygon(
+                finite_polygon,
+                closed=len(finite_polygon) >= 3,
+                fill=False,
+                edgecolor="#ff1744",
+                linewidth=2.5,
+                linestyle="--",
+            )
+        )
+    elif len(finite_polygon) == 1:
+        ax.scatter(
+            [finite_polygon[0][0]],
+            [finite_polygon[0][1]],
+            marker="X",
+            s=150,
+            c="#ffea00",
+            edgecolors="#b00020",
+            linewidths=1.4,
+            zorder=10,
+        )
+    for x, y, label in markers:
+        ax.scatter(
+            [x],
+            [y],
+            marker="X",
+            s=150,
+            c="#ffea00",
+            edgecolors="#b00020",
+            linewidths=1.4,
+            zorder=10,
+            clip_on=False,
+        )
+        ax.annotate(
+            label,
+            xy=(x, y),
+            xytext=(8, 12),
+            textcoords="offset points",
+            color="white",
+            fontsize=7,
+            fontweight="bold",
+            bbox={"facecolor": "#b00020", "alpha": 0.9, "pad": 2, "edgecolor": "white"},
+            arrowprops={"arrowstyle": "->", "color": "#ffea00", "linewidth": 1.2},
+            zorder=11,
+        )
+    ax.text(
+        0.02,
+        0.98,
+        "INVALID: " + "; ".join(reasons),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        color="white",
+        fontsize=7.5,
+        fontweight="bold",
+        bbox={"facecolor": "#b00020", "alpha": 0.88, "pad": 3, "edgecolor": "white"},
+        zorder=12,
+    )
 
 
 def visualize_samples(
@@ -45,6 +298,56 @@ def visualize_samples(
         ax.axis("off")
     title_split = split or "all splits"
     fig.suptitle(f"Annotation check — {title_split} ({len(chosen)} images)", fontsize=13)
+    fig.tight_layout()
+    if save_to:
+        save_to.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_to, bbox_inches="tight", dpi=140)
+    if show:
+        _display_or_print(fig, save_to)
+    return fig
+
+
+def visualize_semantic_masks(
+    samples: list[Sample],
+    mask_paths: dict[Path, Path],
+    *,
+    split: str | None,
+    n: int,
+    seed: int,
+    columns: int,
+    save_to: Path | None = None,
+    show: bool = True,
+):
+    """Render paired source images and binary-mask overlays."""
+
+    candidates = [sample for sample in samples if split is None or sample.split == split]
+    rng = random.Random(seed)
+    chosen = rng.sample(candidates, min(n, len(candidates))) if candidates else []
+    rows = max(1, math.ceil(max(1, len(chosen)) / columns))
+    fig, axes = plt.subplots(rows, columns, figsize=(6 * columns, 5 * rows), squeeze=False)
+    flat = axes.flatten()
+    for ax, sample in zip(flat, chosen):
+        mask_path = mask_paths[sample.image_path.resolve()]
+        with Image.open(sample.image_path) as opened_image, Image.open(mask_path) as opened_mask:
+            image = opened_image.convert("RGB")
+            mask = opened_mask.convert("L")
+        overlay = Image.blend(
+            image,
+            Image.composite(Image.new("RGB", image.size, (255, 32, 32)), image, mask),
+            0.45,
+        )
+        foreground = sum(mask.histogram()[1:])
+        fraction = foreground / (mask.width * mask.height) if mask.width and mask.height else 0.0
+        ax.imshow(overlay)
+        ax.set_title(
+            f"{sample.split} · {sample.relative_path}\nforeground: {fraction:.1%}",
+            fontsize=8,
+        )
+        ax.axis("off")
+    for ax in flat[len(chosen) :]:
+        ax.axis("off")
+    title_split = split or "all splits"
+    fig.suptitle(f"Semantic-mask check — {title_split} ({len(chosen)} images)", fontsize=13)
     fig.tight_layout()
     if save_to:
         save_to.parent.mkdir(parents=True, exist_ok=True)
@@ -527,10 +830,15 @@ def save_empty_image_balance_summary(summary: dict[str, dict[str, Any]], output:
 
 
 def save_class_removal_preview(
-    sample: Sample, removed: set[int], task: Task, metadata: DatasetMetadata, output: Path
+    sample: Sample,
+    class_mapping: dict[int, int],
+    task: Task,
+    before_metadata: DatasetMetadata,
+    after_metadata: DatasetMetadata,
+    output: Path,
 ) -> Path:
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    _draw_sample(axes[0], sample, task, metadata)
+    _draw_sample(axes[0], sample, task, before_metadata)
     axes[0].set_title("Before")
     after = Sample(
         sample.image_path,
@@ -538,9 +846,13 @@ def save_class_removal_preview(
         sample.split,
         sample.width,
         sample.height,
-        [a for a in sample.annotations if a.class_id not in removed],
+        [
+            annotation.clone(class_id=class_mapping[annotation.class_id])
+            for annotation in sample.annotations
+            if annotation.class_id in class_mapping
+        ],
     )
-    _draw_sample(axes[1], after, task, metadata)
+    _draw_sample(axes[1], after, task, after_metadata)
     axes[1].set_title("After")
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
@@ -953,15 +1265,16 @@ def save_coverage_annotated_original(
 
 
 def _display_or_print(fig, save_to: Path | None) -> None:
+    displayed = False
     try:
         from IPython import get_ipython
         from IPython.display import display
 
         if get_ipython() is not None:
             display(fig)
-            return
+            displayed = True
     except Exception:
         pass
-    if save_to:
+    if save_to and not displayed:
         print(f"Visualization: {save_to}")
     plt.close(fig)

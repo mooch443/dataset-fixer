@@ -50,7 +50,18 @@ def test_package_cache_is_pickle_free_and_detects_corruption(detect_dataset: Pat
     cohort = freeze_cohort(Dataset.open(detect_dataset, task="detect", progress=False), "val")
     predictions = {
         0.5: {
-            record.image_id: [Prediction(0, 0.9, bbox=(1, 2, 20, 30))]
+            record.image_id: [
+                Prediction(
+                    0,
+                    0.9,
+                    bbox=(1, 2, 20, 30),
+                    polygon=[(1, 2), (20, 2), (20, 30)],
+                    polygons=[
+                        [(1, 2), (20, 2), (20, 30)],
+                        [(4, 5), (5, 5), (5, 6)],
+                    ],
+                )
+            ]
             for record in cohort.records
         }
     }
@@ -59,6 +70,7 @@ def test_package_cache_is_pickle_free_and_detects_corruption(detect_dataset: Pat
     loaded, shards, complete = load_package_cache(root, cohort, (0.5,))
     assert complete and shards == len(cohort.records)
     assert loaded[0.5][cohort.records[0].image_id][0].bbox == pytest.approx((1, 2, 20, 30))
+    assert len(loaded[0.5][cohort.records[0].image_id][0].polygons) == 2
     shard = next((root / "images").rglob("*.npz"))
     shard.write_bytes(b"broken")
     loaded, _, complete = load_package_cache(root, cohort, (0.5,))
@@ -76,7 +88,7 @@ def test_restricted_pickle_rejects_globals(tmp_path: Path) -> None:
         restricted_pickle_load(path)
 
 
-def test_notebook_v2_round_trip_is_content_verified(tmp_path: Path) -> None:
+def test_notebook_v3_round_trip_is_content_verified(tmp_path: Path) -> None:
     split_root = tmp_path / "val"
     (split_root / "images").mkdir(parents=True)
     (split_root / "labels").mkdir()
@@ -91,8 +103,8 @@ def test_notebook_v2_round_trip_is_content_verified(tmp_path: Path) -> None:
         .75: {cohort.records[0].image_id: [Prediction(0, .9, bbox=(35, 25, 65, 55), point=(50, 40))]}
     }
     key = {
-        "cache_version": 2,
-        "cache_format": "gridcache_v2_numpy_sharded",
+        "cache_version": 3,
+        "cache_format": "gridcache_v3_numpy_sharded",
         "model_path": str(checkpoint.resolve()),
         "model_hash": model_hash(checkpoint),
         "dataset_root": str(split_root.resolve()),
@@ -101,10 +113,14 @@ def test_notebook_v2_round_trip_is_content_verified(tmp_path: Path) -> None:
         "min_conf": .35,
         "iou_list": [.75],
         "device": "None",
-        "overlap_height_ratio": .2,
-        "overlap_width_ratio": .2,
-        "postprocess_class_agnostic": False,
-        "model_type": "ultralytics",
+        "sahi_slice_height": 480,
+        "sahi_slice_width": 480,
+        "sahi_overlap_height_ratio": .2,
+        "sahi_overlap_width_ratio": .2,
+        "sahi_postprocess_type": "GREEDYNMM",
+        "sahi_postprocess_match_metric": "IOS",
+        "sahi_postprocess_class_agnostic": False,
+        "sahi_model_type": "ultralytics",
     }
     cache_dir = tmp_path / "legacy"
     target = cache_dir / notebook_cache_basename(checkpoint, key, numpy=True)
@@ -113,8 +129,10 @@ def test_notebook_v2_round_trip_is_content_verified(tmp_path: Path) -> None:
         [cache_dir], model_sha256=model_hash(checkpoint), resolution=480,
         confidence_floor=.35, thresholds=(.75,), cohort=cohort,
         expected_key={
-            "device": "None", "overlap_height_ratio": .2, "overlap_width_ratio": .2,
-            "postprocess_class_agnostic": False, "model_type": "ultralytics",
+            "device": "None", "sahi_slice_height": 480, "sahi_slice_width": 480,
+            "sahi_overlap_height_ratio": .2, "sahi_overlap_width_ratio": .2,
+            "sahi_postprocess_type": "GREEDYNMM", "sahi_postprocess_match_metric": "IOS",
+            "sahi_postprocess_class_agnostic": False, "sahi_model_type": "ultralytics",
         },
     )
     assert audit and audit["verified"] is True
@@ -141,11 +159,11 @@ def test_class_aware_optimal_matching_and_metrics(detect_dataset: Path) -> None:
     assert metrics["summary"]["f1"] == pytest.approx(1.0)
 
 
-def test_pose_never_resolves_to_sahi(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_inference_is_explicit_and_pose_supports_sahi(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("dataset_fixer.comparison.inference.sahi_available", lambda: True)
-    assert resolve_backend("auto", "pose") == "native"
-    with pytest.raises(ValueError, match="SAHI"):
-        resolve_backend("sahi", "pose")
+    with pytest.raises(ValueError, match="auto.*removed"):
+        resolve_backend("auto", "pose")
+    assert resolve_backend("sahi", "pose") == "sahi"
 
 
 def test_native_inference_verifies_each_image_identity(
@@ -258,7 +276,7 @@ def test_model_load_many_returns_reusable_unbound_collection(
     assert models["baseline"].settings["confidence_thresholds"] == (0.5,)
 
 
-def test_compare_models_facade_atomic_result(
+def test_model_collection_compare_atomic_result(
     detect_dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     dataset = Dataset.open(detect_dataset, task="detect", progress=False)
@@ -279,8 +297,9 @@ def test_compare_models_facade_atomic_result(
 
     monkeypatch.setattr("dataset_fixer.comparison.engine.run_inference", fake_inference)
     destination = tmp_path / "comparison"
-    result = dataset.compare_models(
-        {"baseline": checkpoint},
+    models = Model.load_many({"baseline": checkpoint}, task="detect")
+    result = models.compare(
+        dataset,
         split="val",
         baseline="baseline",
         inference="native",
@@ -338,8 +357,9 @@ def test_comparison_visuals_have_data_and_metadata_sidecars(
 
     monkeypatch.setattr("dataset_fixer.comparison.engine.run_inference", fake_inference)
     destination = tmp_path / "visual-comparison"
-    dataset.compare_models(
-        {"visual": checkpoint}, inference="native", training_provenance="ignore",
+    models = Model.load_many({"visual": checkpoint}, task="detect")
+    models.compare(
+        dataset, inference="native", training_provenance="ignore",
         confidence_thresholds=(.5,), postprocess_thresholds=(.5,), cache=False,
         visualize=True, progress=False, destination=destination, bootstrap_resamples=20,
     )

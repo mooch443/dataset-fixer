@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..errors import DatasetValidationError, ValidationIssue
+from ..sahi_support import reject_legacy_sahi_settings, resolve_sahi_settings
 from ..utils import ensure_safe_destination, environment_snapshot, package_versions, settings_fingerprint, to_jsonable
 from .cache import (
     append_migration_log,
@@ -33,13 +34,13 @@ if TYPE_CHECKING:
     from ..dataset import Dataset
 
 
-def compare_models(
+def _compare_models(
     dataset: "Dataset",
     models: Any,
     *,
     split: str = "val",
     baseline: str | None = None,
-    inference: str = "auto",
+    inference: str | None = None,
     protocol: str = "validation",
     calibration_split: str | None = None,
     training_provenance: str = "required",
@@ -69,6 +70,7 @@ def compare_models(
         raise ValueError("comparison_unit must be 'model' or 'system'")
     if bootstrap_resamples <= 0:
         raise ValueError("bootstrap_resamples must be positive")
+    reject_legacy_sahi_settings(inference_settings)
     if allow_unverified_cache and training_provenance == "required":
         raise ValueError(
             "allow_unverified_cache is exploratory and cannot be combined with training_provenance='required'"
@@ -91,9 +93,38 @@ def compare_models(
         calibration = freeze_cohort(dataset, calibration_split)
         if calibration.fingerprint == cohort.fingerprint or calibration.split == cohort.split:
             raise DatasetValidationError("Calibration and evaluation splits must be distinct frozen cohorts")
-    backend = resolve_backend(inference, cohort.task)
-    if comparison_unit != "system" and any(spec.inference_overrides.get("inference", backend) != backend for spec in specs):
+    model_backends = {
+        str(spec.inference_overrides.get("inference", "native")) for spec in specs
+    }
+    effective_inference = (
+        inference
+        if inference is not None
+        else (next(iter(model_backends)) if len(model_backends) == 1 else "native")
+    )
+    backend = resolve_backend(effective_inference, cohort.task)
+    selected_backends = (
+        {backend}
+        if inference is not None
+        else {resolve_backend(value, cohort.task) for value in model_backends}
+    )
+    if comparison_unit != "system" and len(selected_backends) != 1:
         raise ValueError("Mixed native/SAHI configurations require comparison_unit='system'")
+    if comparison_unit == "model" and selected_backends == {"sahi"}:
+        configurations = {
+            tuple(
+                sorted(
+                    resolve_sahi_settings(
+                        {**spec.inference_overrides, **inference_settings},
+                        resolution=spec.resolution,
+                    ).as_dict().items()
+                )
+            )
+            for spec in specs
+        }
+        if len(configurations) != 1:
+            raise ValueError(
+                "Different SAHI tile configurations require comparison_unit='system'"
+            )
     overlap, provenance_complete, leakage, limitations = check_training_provenance(
         specs, cohort, training_provenance
     )
@@ -104,9 +135,10 @@ def compare_models(
         )
 
     resolved_settings = {
+        "report_schema": 2,
         "split": cohort.split,
         "baseline": baseline,
-        "inference_requested": inference,
+        "inference_requested": effective_inference,
         "inference_resolved": backend,
         "protocol": protocol,
         "calibration_split": calibration.split if calibration else None,
@@ -137,7 +169,7 @@ def compare_models(
     print(
         f"Comparing {len(specs)} models on frozen {cohort.split!r} cohort "
         f"({len(cohort.records)} images, fingerprint {cohort.fingerprint[:12]})\nDestination: {target}\n"
-        f"Backend: requested={inference}, resolved={backend}; protocol={protocol}"
+        f"Backend: requested={effective_inference}, resolved={backend}; protocol={protocol}"
     )
     try:
         write_cohort(cohort, temporary / "evaluation-cohort.jsonl")
@@ -163,7 +195,11 @@ def compare_models(
         for spec in specs:
             sha = spec.resolved_model.digest
             model_hashes[spec.name] = sha
-            spec_backend = str(spec.inference_overrides.get("inference", backend))
+            spec_backend = (
+                backend
+                if inference is not None
+                else str(spec.inference_overrides.get("inference", backend))
+            )
             spec_backend = resolve_backend(spec_backend, cohort.task)
             model_outputs[spec.name] = _evaluate_model(
                 spec,
@@ -177,7 +213,7 @@ def compare_models(
                 model_sha=sha,
                 device=device,
                 progress=progress,
-                settings={**inference_settings, **spec.inference_overrides},
+                settings={**spec.inference_overrides, **inference_settings},
                 allow_unverified_cache=allow_unverified_cache,
             )
             cache_audit[spec.name] = model_outputs[spec.name]["cache"]
@@ -281,7 +317,7 @@ def compare_models(
             "fresh_inference": sum(value.get("source") == "fresh" for value in cache_audit.values()),
         }
         manifest = {
-            "schema": 1,
+            "schema": 2,
             "kind": "model-comparison",
             "dataset": {"name": dataset.name, "location": str(dataset.location), "task": cohort.task},
             "cohort_fingerprint": cohort.fingerprint,
@@ -367,10 +403,14 @@ def _evaluate_model(
                 thresholds=active_posts, cohort=active,
                 expected_key={
                     "device": str(device),
-                    "overlap_height_ratio": float(settings.get("overlap_height_ratio", settings.get("overlap", .2))),
-                    "overlap_width_ratio": float(settings.get("overlap_width_ratio", settings.get("overlap", .2))),
-                    "postprocess_class_agnostic": bool(settings.get("postprocess_class_agnostic", False)),
-                    "model_type": str(settings.get("model_type", "ultralytics")),
+                    "sahi_slice_height": int(settings.get("sahi_slice_height", spec.resolution)),
+                    "sahi_slice_width": int(settings.get("sahi_slice_width", spec.resolution)),
+                    "sahi_overlap_height_ratio": float(settings.get("sahi_overlap_height_ratio", settings.get("sahi_overlap", .2))),
+                    "sahi_overlap_width_ratio": float(settings.get("sahi_overlap_width_ratio", settings.get("sahi_overlap", .2))),
+                    "sahi_postprocess_type": str(settings.get("sahi_postprocess_type", "GREEDYNMM")),
+                    "sahi_postprocess_match_metric": str(settings.get("sahi_postprocess_match_metric", "IOS")),
+                    "sahi_postprocess_class_agnostic": bool(settings.get("sahi_postprocess_class_agnostic", False)),
+                    "sahi_model_type": str(settings.get("sahi_model_type", "ultralytics")),
                 },
                 allow_unverified=allow_unverified_cache,
             )
@@ -382,7 +422,7 @@ def _evaluate_model(
                 candidates = [
                     str(path)
                     for directory in legacy_dirs if directory.is_dir()
-                    for pattern in ("*.gridcache_v2", "*.gridcache.pkl")
+                    for pattern in ("*.gridcache_v3", "*.gridcache.pkl")
                     for path in directory.glob(pattern)
                 ]
                 if candidates:
@@ -437,6 +477,7 @@ def _evaluate_model(
     return {
         "backend": backend, "predictions": evaluation_predictions, "cache": cache_info, "timing": timing,
         "grid": grid, "best": best, "best_confidence": selected["confidence"], "best_postprocess": selected["postprocess"],
+        "settings": settings,
     }
 
 
@@ -476,16 +517,21 @@ def _export_notebook_caches(
         if output["backend"] != "sahi":
             raise ValueError("write_notebook_cache requires POLO predictions produced through SAHI")
         confidence_floor = min(spec.confidence_thresholds or ())
+        settings = output["settings"]
         key = {
-            "cache_version": 2, "cache_format": "gridcache_v2_numpy_sharded",
+            "cache_version": 3, "cache_format": "gridcache_v3_numpy_sharded",
             "model_path": str(spec.path), "model_hash": hashes[spec.name],
             "dataset_root": str(dataset_root.resolve()), "dataset_hash": dataset_sha,
             "resolution": spec.resolution, "min_conf": confidence_floor,
             "iou_list": sorted(output["predictions"]), "device": None,
-            "overlap_height_ratio": spec.inference_overrides.get("overlap_height_ratio", .2),
-            "overlap_width_ratio": spec.inference_overrides.get("overlap_width_ratio", .2),
-            "postprocess_class_agnostic": spec.inference_overrides.get("postprocess_class_agnostic", False),
-            "model_type": spec.inference_overrides.get("model_type", "ultralytics"),
+            "sahi_slice_height": settings.get("sahi_slice_height", spec.resolution),
+            "sahi_slice_width": settings.get("sahi_slice_width", spec.resolution),
+            "sahi_overlap_height_ratio": settings.get("sahi_overlap_height_ratio", settings.get("sahi_overlap", .2)),
+            "sahi_overlap_width_ratio": settings.get("sahi_overlap_width_ratio", settings.get("sahi_overlap", .2)),
+            "sahi_postprocess_type": settings.get("sahi_postprocess_type", "GREEDYNMM"),
+            "sahi_postprocess_match_metric": settings.get("sahi_postprocess_match_metric", "IOS"),
+            "sahi_postprocess_class_agnostic": settings.get("sahi_postprocess_class_agnostic", False),
+            "sahi_model_type": settings.get("sahi_model_type", "ultralytics"),
         }
         target = export_root / notebook_cache_basename(spec.path, key, numpy=True)
         write_notebook_numpy_cache(target, key=key, cohort=cohort, predictions=output["predictions"])
@@ -495,10 +541,14 @@ def _export_notebook_caches(
             cohort=cohort,
             expected_key={
                 "device": "None",
-                "overlap_height_ratio": float(key["overlap_height_ratio"]),
-                "overlap_width_ratio": float(key["overlap_width_ratio"]),
-                "postprocess_class_agnostic": bool(key["postprocess_class_agnostic"]),
-                "model_type": str(key["model_type"]),
+                "sahi_slice_height": int(key["sahi_slice_height"]),
+                "sahi_slice_width": int(key["sahi_slice_width"]),
+                "sahi_overlap_height_ratio": float(key["sahi_overlap_height_ratio"]),
+                "sahi_overlap_width_ratio": float(key["sahi_overlap_width_ratio"]),
+                "sahi_postprocess_type": str(key["sahi_postprocess_type"]),
+                "sahi_postprocess_match_metric": str(key["sahi_postprocess_match_metric"]),
+                "sahi_postprocess_class_agnostic": bool(key["sahi_postprocess_class_agnostic"]),
+                "sahi_model_type": str(key["sahi_model_type"]),
             },
         )
         if imported is None or not imported_meta or not imported_meta.get("verified"):

@@ -278,11 +278,23 @@ def _similarity(annotation: dict[str, Any], prediction: Prediction, task: str, m
         distance = math.dist(annotation["point"], prediction.point)
         radius = float(annotation.get("radius") or metadata.get("radii", {}).get(str(annotation["class_id"])) or metadata.get("radii", {}).get(annotation["class_id"]) or 1)
         return distance / max(radius, 1e-12), {"distance": distance, "normalized_distance": distance / max(radius, 1e-12)}
-    if task == "segment" and annotation.get("polygon") and prediction.polygon:
+    if task == "segment" and annotation.get("polygon") and (
+        prediction.polygons or prediction.polygon
+    ):
         try:
             from shapely.geometry import Polygon
+            from shapely.ops import unary_union
 
-            a, b = Polygon(annotation["polygon"]), Polygon(prediction.polygon)
+            a = Polygon(annotation["polygon"])
+            b = unary_union(
+                [
+                    Polygon(polygon)
+                    for polygon in (
+                        prediction.polygons
+                        or ([prediction.polygon] if prediction.polygon else [])
+                    )
+                ]
+            )
             union = a.union(b).area
             return (a.intersection(b).area / union if union else 0.0), {}
         except Exception:

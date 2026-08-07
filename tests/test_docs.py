@@ -4,6 +4,8 @@ import inspect
 import json
 from pathlib import Path
 
+import dataset_fixer
+import dataset_fixer.comparison as comparison_api
 from dataset_fixer import (
     ComparisonResult,
     Dataset,
@@ -12,7 +14,6 @@ from dataset_fixer import (
     ModelCollection,
     PredictionResult,
     SemanticComparisonResult,
-    SemanticMaskExport,
     Task,
 )
 from dataset_fixer.public_examples import SAWIT_COMMIT, SAWIT_LICENSE, SAWIT_REPOSITORY
@@ -27,10 +28,16 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
         "name",
         "location",
         "data_yaml",
+        "format",
+        "manifest",
+        "manifest_path",
+        "image_dirs",
+        "mask_dirs",
         "task",
         "splits",
         "classes",
         "warnings",
+        "validation_audit",
         "settings",
         "history",
         "provenance",
@@ -42,7 +49,7 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
         "tile",
         "augment",
         "export",
-        "compare_models",
+        "export_formats",
         "visualize",
         "assert_trainable",
     }
@@ -67,29 +74,35 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
 
     tile_signature = str(inspect.signature(Dataset.tile))
     open_signature = str(inspect.signature(Dataset.open))
-    comparison_signature = str(inspect.signature(Dataset.compare_models))
+    comparison_signature = str(inspect.signature(ModelCollection.compare))
     assert "Literal['grid', 'coverage']" in tile_signature
     assert "Literal['all', 'none']" in tile_signature
     assert "Literal['raise', 'skip']" in tile_signature
     assert "background_filter" in tile_signature
     assert "**settings" not in tile_signature
     assert "Literal['raise', 'skip']" in open_signature
-    assert "Literal['auto', 'native', 'sahi']" in comparison_signature
+    assert "Literal['native', 'sahi']" in comparison_signature
+    assert "sahi_slice_height" in comparison_signature
+    assert "sahi_overlap" in comparison_signature
     assert inspect.getdoc(ComparisonResult)
     assert inspect.getdoc(SemanticComparisonResult)
-    assert inspect.getdoc(SemanticMaskExport)
-    assert inspect.getdoc(SemanticMaskExport.open)
-    semantic_comparison_signature = str(inspect.signature(SemanticMaskExport.compare_models))
-    assert "Literal['cpu', 'cuda', 'mps']" in semantic_comparison_signature
-    assert "upscale_factor" not in semantic_comparison_signature
-    assert inspect.getdoc(SemanticMaskExport.compare_models)
+    assert "comparison_space" in comparison_signature
+    assert "folds" not in comparison_signature
+    assert "upscale_factor" not in comparison_signature
+    assert not hasattr(Dataset, "compare_models")
+    assert not hasattr(Dataset, "load_models")
+    assert not hasattr(dataset_fixer, "SemanticModelCohort")
+    assert not hasattr(comparison_api, "compare_models")
     assert inspect.getdoc(DatasetValidationError)
     assert inspect.getdoc(Task)
     assert inspect.getdoc(Model)
     assert inspect.getdoc(Model.predict)
     assert inspect.getdoc(Model.compare)
     assert inspect.getdoc(Model.load_many)
+    assert "defaults" not in inspect.signature(Model.load_many).parameters
+    assert not hasattr(Model, "model_sha256")
     assert inspect.getdoc(ModelCollection)
+    assert inspect.getdoc(ModelCollection.compare)
     assert inspect.getdoc(PredictionResult)
 
 
@@ -103,7 +116,7 @@ def test_colab_notebooks_have_disclosure_license_and_clean_outputs() -> None:
     expected = {
         "01_controlled_splitting.ipynb": "Dataset.split",
         "02_task_aware_tiling.ipynb": "Dataset.tile",
-        "03_fixed_cohort_model_comparison.ipynb": "compare_models",
+        "03_fixed_cohort_model_comparison.ipynb": "models.compare",
     }
     for filename, api in expected.items():
         path = ROOT / "notebooks" / filename

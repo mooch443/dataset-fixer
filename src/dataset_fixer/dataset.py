@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Hashable, Iterable, Literal, Mapping, Sequence
+from typing import Any, Callable, Hashable, Iterable, Literal, Mapping, Sequence
 
 from PIL import Image
+from tqdm.auto import tqdm
 
 from .augmentation import augment_dataset, serialize_pipeline
 from .errors import DatasetValidationError, ValidationIssue
 from .io import _label_path_for_image, load_source
-from .models import DatasetMetadata, Sample, SemanticMaskExport, Task
+from .models import DatasetMetadata, Sample, Task
 from .operations import (
     export_dataset,
     rebalance_empty_dataset,
@@ -31,13 +33,10 @@ from .planning import (
 )
 from .semantic_export import export_semantic_masks
 from .tiling import tile_dataset
-from .utils import ensure_safe_destination, normalize_split, settings_fingerprint, slugify
+from .utils import IMAGE_SUFFIXES, ensure_safe_destination, normalize_split, settings_fingerprint, slugify
 from .validation import validate_dataset
-from .visualization import visualize_samples
-
-if TYPE_CHECKING:
-    from .comparison.types import ComparisonResult
-
+from .validation_audit import ValidationFailureExample, build_load_validation_audit
+from .visualization import visualize_samples, visualize_semantic_masks
 
 class Dataset:
     """A validated dataset or immutable virtual transformation pipeline."""
@@ -59,6 +58,13 @@ class Dataset:
         projection_exact: bool = True,
         planned_splits: tuple[str, ...] | None = None,
         errors: Literal["raise", "skip"] = "raise",
+        validation_audit: dict[str, Any] | None = None,
+        validation_audit_visualization: Path | None = None,
+        provenance: dict[str, dict[str, Any]] | None = None,
+        image_dirs: Mapping[str, Path] | None = None,
+        mask_dirs: Mapping[str, Path] | None = None,
+        mask_paths: Mapping[Path, Path] | None = None,
+        mask_statistics: Mapping[Path, Mapping[str, int]] | None = None,
     ) -> None:
         self._location = location.resolve()
         self._name = name
@@ -73,7 +79,47 @@ class Dataset:
         self._plan = plan
         self._projection_exact = projection_exact
         self._planned_splits = planned_splits
-        self._provenance = _load_provenance(self._location, samples, errors=errors, warnings=warnings)
+        self._image_dirs = {
+            split: path.resolve() for split, path in (image_dirs or {}).items()
+        }
+        self._mask_dirs = {
+            split: path.resolve() for split, path in (mask_dirs or {}).items()
+        }
+        self._mask_paths = {
+            image.resolve(): mask.resolve() for image, mask in (mask_paths or {}).items()
+        }
+        self._mask_statistics = {
+            image.resolve(): dict(statistics)
+            for image, statistics in (mask_statistics or {}).items()
+        }
+        stored_audit = validation_audit or (
+            (manifest.get("validation") or {}).get("load_validation")
+            if isinstance(manifest.get("validation"), dict)
+            else None
+        )
+        self._validation_audit = dict(
+            stored_audit
+            or {
+                "status": "passed",
+                "skipped_count": 0,
+                "counts_by_category": {},
+                "visualized_count": 0,
+                "max_visualized_examples": 4,
+                "report": None,
+                "visualization": None,
+            }
+        )
+        self._validation_audit_visualization = validation_audit_visualization
+        if self._validation_audit_visualization is None and self._validation_audit.get("visualization"):
+            candidate = Path(str(self._validation_audit["visualization"]))
+            self._validation_audit_visualization = (
+                candidate if candidate.is_absolute() else self._location / candidate
+            )
+        self._provenance = (
+            provenance
+            if provenance is not None
+            else _load_provenance(self._location, samples, errors=errors, warnings=warnings)
+        )
         self._warnings = tuple(warnings)
         for sample in self._samples:
             try:
@@ -81,7 +127,7 @@ class Dataset:
             except ValueError:
                 key = str(Path("images") / sample.split / sample.relative_path)
             if key in self._provenance:
-                sample.provenance = dict(self._provenance[key])
+                sample.provenance = self._provenance[key]
 
     @classmethod
     def open(
@@ -96,10 +142,11 @@ class Dataset:
         errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
     ) -> "Dataset":
-        """Load YOLO or COCO data, infer metadata, and validate it.
+        """Load YOLO, COCO, or semantic-mask data and validate it.
 
         Parameters:
-            location: Dataset root, YOLO YAML file, or COCO JSON file/root.
+            location: Dataset root, YOLO YAML, COCO JSON, or a
+                ``dataset-fixer.json`` semantic-mask manifest.
             task: Annotation task. Pass a :class:`Task` or one of ``"detect"``,
                 ``"segment"``, ``"pose"``, or ``"polo"`` when inference is
                 ambiguous.
@@ -110,9 +157,10 @@ class Dataset:
             errors: ``"raise"`` fails on the first validation batch.
                 ``"skip"`` virtually omits recoverably bad images,
                 annotations, duplicate records, and orphan labels while
-                retaining an audit trail in :attr:`warnings`. Source files are
-                never changed. Errors that make the dataset unusable still
-                raise.
+                retaining an audit trail in :attr:`warnings` and
+                :attr:`validation_audit`. Up to four failures are visualized
+                outside the source tree. Source files are never changed.
+                Errors that make the dataset unusable still raise.
             progress: Show image-loading and validation progress bars.
 
         Returns:
@@ -128,6 +176,18 @@ class Dataset:
         else:
             parsed_names = {int(key): str(value) for key, value in names.items()}
         parsed_radii = {int(key): float(value) for key, value in radii.items()} if radii else None
+        semantic_manifest = _semantic_mask_manifest(requested)
+        if semantic_manifest is not None:
+            return cls._open_semantic_masks(
+                requested,
+                semantic_manifest,
+                task=Task.parse(task),
+                name=name,
+                names=parsed_names,
+                deep=deep,
+                errors=errors,
+                progress=progress,
+            )
         warnings: list[str] = []
         root, resolved_name, resolved_task, metadata, samples, manifest = load_source(
             requested,
@@ -139,6 +199,7 @@ class Dataset:
             errors=errors,
             warnings=warnings,
         )
+        failure_examples: list[ValidationFailureExample] = []
         warnings.extend(
             validate_dataset(
                 samples,
@@ -147,6 +208,7 @@ class Dataset:
                 deep=deep,
                 progress=progress,
                 errors=errors,
+                failure_examples=failure_examples,
             )
         )
         yaml_path = _resolve_data_yaml(requested, root)
@@ -158,7 +220,7 @@ class Dataset:
         )
         if source_format == "yolo":
             _assert_no_orphan_labels(root, samples, errors=errors, warnings=warnings)
-        return cls(
+        dataset = cls(
             location=root,
             name=resolved_name or "dataset",
             task=resolved_task,
@@ -170,6 +232,105 @@ class Dataset:
             warnings=warnings,
             errors=errors,
         )
+        audit, visualization = build_load_validation_audit(
+            dataset._warnings,
+            failure_examples,
+            dataset._samples,
+            resolved_task,
+            metadata,
+            dataset_name=dataset.name,
+        )
+        if int(audit.get("skipped_count", 0)) > 0 or int(
+            dataset._validation_audit.get("skipped_count", 0)
+        ) == 0:
+            dataset._validation_audit = audit
+            dataset._validation_audit_visualization = visualization
+        return dataset
+
+    @classmethod
+    def _open_semantic_masks(
+        cls,
+        requested: Path,
+        manifest: dict[str, Any],
+        *,
+        task: Task | None,
+        name: str | None,
+        names: dict[int, str] | list[str] | None,
+        deep: bool,
+        errors: Literal["raise", "skip"],
+        progress: bool,
+    ) -> "Dataset":
+        root = requested.parent if requested.is_file() else requested
+        if task is not None and task is not Task.SEGMENT:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Semantic-mask datasets require the segmentation task",
+                    value=task.value,
+                    expected="task='segment' or no task override",
+                )
+            )
+        manifest_names = _class_names(manifest.get("classes"))
+        if names is None:
+            resolved_names = manifest_names or {0: "foreground"}
+        elif isinstance(names, list):
+            resolved_names = {index: value for index, value in enumerate(names)}
+        else:
+            resolved_names = dict(names)
+        metadata = DatasetMetadata(names=resolved_names)
+        (
+            samples,
+            image_dirs,
+            mask_dirs,
+            mask_paths,
+            mask_statistics,
+            load_warnings,
+            failure_examples,
+        ) = _load_semantic_mask_samples(
+            root,
+            manifest,
+            progress=progress,
+            errors=errors,
+        )
+        load_warnings.extend(
+            validate_dataset(
+                samples,
+                metadata,
+                Task.SEGMENT,
+                deep=deep,
+                progress=progress,
+                errors=errors,
+                failure_examples=failure_examples,
+            )
+        )
+        inherited_warnings = [str(value) for value in manifest.get("warnings") or []]
+        dataset = cls(
+            location=root,
+            name=name or str(manifest.get("name") or root.name),
+            task=Task.SEGMENT,
+            metadata=metadata,
+            samples=samples,
+            manifest=manifest,
+            data_yaml=None,
+            source_format="semantic_masks",
+            warnings=[*inherited_warnings, *load_warnings],
+            errors=errors,
+            image_dirs=image_dirs,
+            mask_dirs=mask_dirs,
+            mask_paths=mask_paths,
+            mask_statistics=mask_statistics,
+        )
+        if load_warnings:
+            audit, visualization = build_load_validation_audit(
+                load_warnings,
+                failure_examples,
+                samples,
+                Task.SEGMENT,
+                metadata,
+                dataset_name=dataset.name,
+            )
+            dataset._validation_audit = audit
+            dataset._validation_audit_visualization = visualization
+        return dataset
 
     @property
     def name(self) -> str:
@@ -183,8 +344,41 @@ class Dataset:
 
     @property
     def data_yaml(self) -> Path | None:
-        """Canonical training YAML, or ``None`` while transformations are pending."""
+        """Canonical YOLO training YAML, or ``None`` for masks and virtual plans."""
         return None if self._plan else self._data_yaml
+
+    @property
+    def format(self) -> str:
+        """Physical annotation format: YOLO, COCO, or binary semantic masks."""
+        return self._source_format
+
+    @property
+    def manifest(self) -> dict[str, Any]:
+        """Copy of the loaded or generated dataset manifest."""
+        return dict(self._manifest)
+
+    @property
+    def manifest_path(self) -> Path | None:
+        """Dataset-fixer manifest path when one exists on disk."""
+        candidate = self.location / "dataset-fixer.json"
+        return candidate if candidate.is_file() else None
+
+    @property
+    def image_dirs(self) -> dict[str, Path]:
+        """Canonical image directory for each split when known."""
+        if self._image_dirs:
+            return dict(self._image_dirs)
+        directories: dict[str, Path] = {}
+        for split in self.splits:
+            paths = [sample.image_path.resolve() for sample in self._samples if sample.split == split]
+            if paths:
+                directories[split] = Path(_common_parent(paths))
+        return directories
+
+    @property
+    def mask_dirs(self) -> dict[str, Path]:
+        """Binary ground-truth mask directory for each semantic-mask split."""
+        return dict(self._mask_dirs)
 
     @property
     def task(self) -> Task:
@@ -208,6 +402,11 @@ class Dataset:
     def warnings(self) -> tuple[str, ...]:
         """Non-fatal validation and transformation warnings."""
         return self._warnings
+
+    @property
+    def validation_audit(self) -> dict[str, Any]:
+        """Load-time skip totals, categories, and bounded visualization metadata."""
+        return dict(self._validation_audit)
 
     @property
     def settings(self) -> dict[str, Any]:
@@ -237,6 +436,20 @@ class Dataset:
         except DatasetValidationError:
             return False
         return True
+
+    def _require_vector_annotations(self, operation: str) -> None:
+        if self.format == "semantic_masks":
+            raise DatasetValidationError(
+                ValidationIssue(
+                    f"{operation} requires vector annotations",
+                    value=self.format,
+                    expected="a YOLO or COCO Dataset with polygon labels",
+                    suggestion=(
+                        "load the corresponding YOLO/COCO source; binary foreground-union "
+                        "masks cannot reconstruct class or instance polygons"
+                    ),
+                )
+            )
 
     def split(
         self,
@@ -275,6 +488,7 @@ class Dataset:
             A virtual dataset with projected split membership.
         """
 
+        self._require_vector_annotations("Dataset.split")
         source_split_values = tuple(source_splits) if source_splits is not None else None
         projected, settings, _ = plan_split(
             self._samples, ratios, source_splits=source_split_values, group_by=group_by, assign=assign, seed=seed
@@ -297,6 +511,7 @@ class Dataset:
         self,
         classes: Iterable[str | int],
         *,
+        merge_into: str | int | None = None,
         name: str | None = None,
         splits: Iterable[Literal["train", "val", "test"]] | None = None,
         drop_empty_images: bool = False,
@@ -306,7 +521,10 @@ class Dataset:
         """Plan class removal and compact all surviving class IDs.
 
         Parameters:
-            classes: Class names or integer IDs to remove.
+            classes: Class names or integer IDs to remove from the class schema.
+            merge_into: Optional surviving class name or integer ID. When set,
+                annotations belonging to the removed classes are reassigned to
+                this class instead of being discarded.
             name: Optional virtual-derivative name.
             splits: Splits included in the output; ``None`` selects all splits.
                 Unselected splits are omitted because class metadata and IDs
@@ -321,9 +539,14 @@ class Dataset:
             A virtual dataset with projected annotations and class metadata.
         """
 
+        self._require_vector_annotations("Dataset.remove_classes")
         selectors = tuple(classes)
         split_values = tuple(splits) if splits is not None else None
-        removed, mapping, metadata = resolve_removed_classes(self._metadata, selectors)
+        removed, mapping, metadata = resolve_removed_classes(
+            self._metadata,
+            selectors,
+            merge_into=merge_into,
+        )
         selected = {normalize_split(split) for split in split_values} if split_values else set(self.splits)
         projected = project_remove_classes(
             self._samples, selected_splits=selected, mapping=mapping, drop_empty_images=drop_empty_images
@@ -333,10 +556,18 @@ class Dataset:
             "splits": sorted(selected), "drop_empty_images": drop_empty_images,
             "class_mapping": mapping, "visualize": visualize,
         }
+        if merge_into is not None:
+            output_class_id = mapping[next(iter(removed))]
+            settings["merge_into"] = {
+                "selector": merge_into,
+                "output_class_id": output_class_id,
+                "output_class_name": metadata.names[output_class_id],
+            }
         operation = PlannedOperation(
             "remove-classes",
             {
                 "classes": selectors, "splits": split_values,
+                "merge_into": merge_into,
                 "drop_empty_images": drop_empty_images, "visualize": visualize,
             },
             settings,
@@ -370,6 +601,7 @@ class Dataset:
             unchanged.
         """
 
+        self._require_vector_annotations("Dataset.rename_classes")
         requested = dict(renames)
         renamed, metadata = resolve_renamed_classes(self._metadata, requested)
         settings = {
@@ -417,6 +649,7 @@ class Dataset:
             A virtual dataset; positive images are never duplicated or removed.
         """
 
+        self._require_vector_annotations("Dataset.rebalance_empty")
         split_values = tuple(splits) if splits is not None else None
         selected = {normalize_split(split) for split in split_values} if split_values else set(self.splits)
         projected, summary = select_empty_images(
@@ -579,6 +812,7 @@ class Dataset:
             A virtual dataset pipeline with deferred pixel generation.
         """
 
+        self._require_vector_annotations("Dataset.tile")
         mode = mode.lower()
         if mode not in {"grid", "coverage"}:
             raise ValueError("mode must be 'grid' or 'coverage'")
@@ -723,6 +957,7 @@ class Dataset:
             A virtual dataset with deferred augmentation pixels.
         """
 
+        self._require_vector_annotations("Dataset.augment")
         if isinstance(copies, bool) or not isinstance(copies, int) or copies < 1:
             raise ValueError("copies must be at least 1")
         if not isinstance(include_original, bool):
@@ -819,11 +1054,14 @@ class Dataset:
         visualize: bool = True,
         progress: bool = True,
         dry_run: bool = False,
-    ) -> "Dataset | SemanticMaskExport":
+    ) -> "Dataset":
         """Materialize the current dataset or virtual pipeline in a supported format.
 
         Output is built in a private staging directory, completely validated,
         and atomically published. Existing destinations are never overwritten.
+        When the latest split used ``group_by``, export also verifies physical
+        group isolation across every current split and records aggregate group
+        statistics without listing individual image paths.
 
         Parameters:
             destination: Final output root. ``None`` derives a sibling path from
@@ -831,7 +1069,7 @@ class Dataset:
             name: Optional output dataset name stored in metadata.
             format: ``"yolo"`` preserves the canonical training layout and
                 returns a :class:`Dataset`. ``"semantic_masks"`` writes binary
-                foreground-union masks and returns :class:`SemanticMaskExport`.
+                foreground-union masks and also returns a :class:`Dataset`.
             splits: Splits included in the published output; ``None`` publishes
                 every available split. Unselected splits are omitted.
             allow_lossy: Permit explicit lossy conversion of COCO RLE/multipart
@@ -842,10 +1080,11 @@ class Dataset:
                 writing a dataset.
 
         Returns:
-            The validated materialized dataset or semantic-mask artifact. Dry
-            runs return the unchanged virtual dataset.
+            The validated materialized dataset. Dry runs return the unchanged
+            virtual dataset.
         """
 
+        self._require_vector_annotations("Dataset.export")
         format = format.lower()
         if format not in {"yolo", "semantic_masks"}:
             raise ValueError("format must be 'yolo' or 'semantic_masks'")
@@ -884,151 +1123,103 @@ class Dataset:
             dry_run=dry_run,
         )
 
-    def compare_models(
+    def export_formats(
         self,
-        models: Any,
+        destinations: Mapping[Literal["yolo", "semantic_masks"], str | Path],
         *,
-        split: Literal["train", "val", "test"] = "val",
-        baseline: str | None = None,
-        inference: Literal["auto", "native", "sahi"] = "auto",
-        protocol: Literal["validation", "locked", "calibrate_then_test"] = "validation",
-        calibration_split: Literal["train", "val", "test"] | None = None,
-        training_provenance: Literal["required", "warn", "ignore"] = "required",
-        confidence_thresholds: tuple[float, ...] = (0.35, 0.45, 0.55, 0.65, 0.75, 0.85),
-        postprocess_thresholds: tuple[float, ...] = (0.75, 0.85, 0.95),
-        resolution: int = 480,
-        comparison_unit: Literal["model", "system"] = "model",
-        cache: bool | str | Path = True,
-        notebook_cache: str | Path | None = None,
-        write_notebook_cache: bool = False,
-        allow_unverified_cache: bool = False,
+        name: str | None = None,
+        splits: Iterable[Literal["train", "val", "test"]] | None = None,
+        allow_lossy: bool = False,
         visualize: bool = True,
         progress: bool = True,
-        destination: str | Path | None = None,
-        device: str | None = None,
-        seed: int = 42,
-        bootstrap_resamples: int = 10_000,
-        augment_inference: bool = False,
-        precision: Literal["full", "half"] = "full",
-        sahi_mode: Literal["standard", "sliced", "combined"] = "sliced",
-        slice_height: int | None = None,
-        slice_width: int | None = None,
-        overlap: float = 0.2,
-        overlap_height_ratio: float | None = None,
-        overlap_width_ratio: float | None = None,
-        postprocess_type: Literal["GREEDYNMM", "NMM", "NMS", "LSNMS"] = "GREEDYNMM",
-        postprocess_match_metric: Literal["IOU", "IOS"] = "IOS",
-        postprocess_class_agnostic: bool = False,
-        model_type: str = "ultralytics",
-    ) -> "ComparisonResult":
-        """Compare model/inference systems on one frozen, verified cohort.
+        dry_run: bool = False,
+    ) -> "dict[str, Dataset]":
+        """Export one pipeline to multiple training formats in a safe order.
+
+        YOLO is materialized first whenever requested. A requested semantic-mask
+        export is then produced from that validated YOLO result, so a virtual
+        transformation pipeline runs only once. Every format needs an explicit,
+        separate destination and all destinations are preflighted before any
+        output is written.
 
         Parameters:
-            models: Model specs accepted by the comparison parser: paths,
-                name/path mappings, or detailed configuration dictionaries.
-            split: Fixed evaluation split.
-            baseline: Model name used for paired deltas; defaults to the first.
-            inference: ``"native"``, ``"sahi"``, or automatic availability-
-                based selection. Pose supports native inference only.
-            protocol: ``"validation"`` tunes and evaluates on one validation
-                cohort; ``"locked"`` evaluates fixed thresholds; and
-                ``"calibrate_then_test"`` tunes on ``calibration_split`` before
-                evaluation on ``split``.
-            calibration_split: Distinct tuning split required by
-                ``"calibrate_then_test"``.
-            training_provenance: Whether unverifiable training/evaluation
-                overlap raises, warns, or is ignored.
-            confidence_thresholds: Candidate per-prediction score cutoffs in
-                ``[0, 1]``; these do not control a dataset percentage.
-            postprocess_thresholds: Candidate NMS/NMM overlap-match thresholds
-                in ``[0, 1]``; these do not control output composition.
-            resolution: Default model input/slice size.
-            comparison_unit: ``"model"`` requires one inference backend across
-                candidates; ``"system"`` permits backend-specific systems.
-            cache: Enable the verified package cache or provide its path.
-            notebook_cache: Optional compatible external prediction cache.
-            write_notebook_cache: Write predictions to ``notebook_cache``.
-            allow_unverified_cache: Permit exploratory unverified cache input.
-            visualize: Write rankings, plots, and qualitative audits.
-            progress: Show inference and resampling progress.
-            destination: Comparison-report output directory.
-            device: Ultralytics/SAHI device identifier.
-            seed: Deterministic bootstrap and cohort seed.
-            bootstrap_resamples: Paired bootstrap sample count.
-            augment_inference: Enable native Ultralytics test-time augmentation.
-            precision: Native inference precision.
-            sahi_mode: Standard whole-image, sliced-only, or combined SAHI.
-            slice_height: SAHI slice height; defaults to ``resolution``.
-            slice_width: SAHI slice width; defaults to ``resolution``.
-            overlap: Fraction of adjacent SAHI slice edges shared on both axes,
-                in ``[0, 1)``.
-            overlap_height_ratio: Optional vertical slice-overlap override.
-            overlap_width_ratio: Optional horizontal slice-overlap override.
-            postprocess_type: SAHI postprocessor name, such as ``"GREEDYNMM"``.
-            postprocess_match_metric: SAHI ``"IOU"`` or ``"IOS"`` matching.
-            postprocess_class_agnostic: Merge across classes when true.
-            model_type: SAHI detection-model adapter name.
+            destinations: Mapping from ``"yolo"`` and/or ``"semantic_masks"``
+                to their final output roots.
+            name: Optional dataset name stored in each output's metadata.
+            splits: Splits published in every requested format.
+            allow_lossy: Permit lossy conversion for the YOLO output. This is
+                rejected when YOLO is not requested.
+            visualize: Render pending operation audits and final reports.
+            progress: Show export progress and ETA.
+            dry_run: Validate and print every export without writing outputs.
 
         Returns:
-            A :class:`ComparisonResult` containing ranking, verification state,
-            settings, limitations, and report location.
+            A mapping with one validated output object per requested format.
+            Dry runs map each format to the unchanged virtual dataset.
         """
 
-        if self._plan:
+        normalized: dict[str, Path] = {}
+        for raw_format, destination in destinations.items():
+            if not isinstance(raw_format, str):
+                raise TypeError("export format keys must be strings")
+            export_format = raw_format.lower()
+            if export_format not in {"yolo", "semantic_masks"}:
+                raise ValueError("export formats must be 'yolo' and/or 'semantic_masks'")
+            normalized[export_format] = Path(destination).expanduser().resolve()
+        if not normalized:
+            raise ValueError("destinations must request at least one export format")
+        if allow_lossy and "yolo" not in normalized:
+            raise ValueError("allow_lossy applies only when a YOLO export is requested")
+        if "semantic_masks" in normalized and self.task is not Task.SEGMENT:
             raise DatasetValidationError(
-                "Model comparison requires a fixed on-disk cohort; call dataset.export(...) first"
+                ValidationIssue(
+                    "Semantic-mask export requires a segmentation dataset",
+                    value=self.task.value,
+                    expected="task='segment'",
+                )
             )
-        slice_overlaps = {
-            "overlap": overlap,
-            "overlap_height_ratio": overlap_height_ratio,
-            "overlap_width_ratio": overlap_width_ratio,
-        }
-        for parameter, value in slice_overlaps.items():
-            if value is None:
-                continue
-            parsed = float(value)
-            if not math.isfinite(parsed) or not 0 <= parsed < 1:
-                raise ValueError(f"{parameter} must be a finite SAHI slice fraction in [0, 1)")
 
-        from .comparison import compare_models
+        resolved_destinations = list(normalized.values())
+        if len(set(resolved_destinations)) != len(resolved_destinations):
+            raise ValueError("Each export format requires a separate destination")
+        for destination in resolved_destinations:
+            ensure_safe_destination(self.location, destination)
+        for index, first in enumerate(resolved_destinations):
+            for second in resolved_destinations[index + 1 :]:
+                if first in second.parents or second in first.parents:
+                    raise ValueError("Export destinations cannot contain one another")
 
-        inference_settings = {
-            "augment": augment_inference,
-            "precision": precision,
-            "sahi_mode": sahi_mode,
-            "slice_height": resolution if slice_height is None else slice_height,
-            "slice_width": resolution if slice_width is None else slice_width,
-            "overlap": overlap,
-            "postprocess_type": postprocess_type,
-            "postprocess_match_metric": postprocess_match_metric,
-            "postprocess_class_agnostic": postprocess_class_agnostic,
-            "model_type": model_type,
-        }
-        if overlap_height_ratio is not None:
-            inference_settings["overlap_height_ratio"] = overlap_height_ratio
-        if overlap_width_ratio is not None:
-            inference_settings["overlap_width_ratio"] = overlap_width_ratio
-
-        from .model import Model
-
-        loaded_models = Model.load_many(
-            models,
-            resolution=resolution,
-            inference=inference,
-            device=device,
-        )
-        return compare_models(
-            self, loaded_models, split=split, baseline=baseline, inference=inference,
-            protocol=protocol, calibration_split=calibration_split,
-            training_provenance=training_provenance,
-            confidence_thresholds=confidence_thresholds,
-            postprocess_thresholds=postprocess_thresholds, resolution=resolution,
-            comparison_unit=comparison_unit, cache=cache,
-            notebook_cache=notebook_cache, write_notebook_cache=write_notebook_cache,
-            allow_unverified_cache=allow_unverified_cache, visualize=visualize,
-            progress=progress, destination=destination, device=device, seed=seed,
-            bootstrap_resamples=bootstrap_resamples, **inference_settings,
-        )
+        selected_splits = tuple(splits) if splits is not None else None
+        self._require_vector_annotations("Dataset.export_formats")
+        results: dict[str, Dataset] = {}
+        semantic_source: Dataset = self
+        if "yolo" in normalized:
+            yolo = self.export(
+                destination=normalized["yolo"],
+                name=name,
+                format="yolo",
+                splits=selected_splits,
+                allow_lossy=allow_lossy,
+                visualize=visualize,
+                progress=progress,
+                dry_run=dry_run,
+            )
+            if not isinstance(yolo, Dataset):
+                raise RuntimeError("YOLO export unexpectedly returned a non-Dataset result")
+            results["yolo"] = yolo
+            semantic_source = yolo
+        if "semantic_masks" in normalized:
+            semantic = semantic_source.export(
+                destination=normalized["semantic_masks"],
+                name=name,
+                format="semantic_masks",
+                splits=selected_splits,
+                visualize=visualize,
+                progress=progress,
+                dry_run=dry_run,
+            )
+            results["semantic_masks"] = semantic
+        return results
 
     def visualize(
         self,
@@ -1066,6 +1257,17 @@ class Dataset:
         if normalized is not None and normalized not in self.splits:
             raise ValueError(f"Unknown split {split!r}; available splits are {self.splits}")
         destination = Path(save_to).expanduser().resolve() if save_to else None
+        if self.format == "semantic_masks":
+            return visualize_semantic_masks(
+                self._samples,
+                self._mask_paths,
+                split=normalized,
+                n=n,
+                seed=seed,
+                columns=columns,
+                save_to=destination,
+                show=show,
+            )
         return visualize_samples(
             self._samples,
             self.task,
@@ -1108,9 +1310,9 @@ class Dataset:
 
         issues: list[ValidationIssue] = []
         required = tuple(normalize_split(split) for split in required_splits)
-        by_split = {split: [sample for sample in self._samples if sample.split == split] for split in self.splits}
+        available_splits = {sample.split for sample in self._samples}
         for split in required:
-            if not by_split.get(split):
+            if split not in available_splits:
                 issues.append(
                     ValidationIssue(
                         "Required training split is missing or empty",
@@ -1147,6 +1349,10 @@ class Dataset:
                 should_check_backend = self.data_yaml is not None
         if should_check_backend:
             if self.data_yaml is None:
+                if self.format == "semantic_masks":
+                    raise DatasetValidationError(
+                        "Ultralytics backend checks do not apply to binary semantic-mask datasets"
+                    )
                 raise DatasetValidationError("COCO sources must be exported before backend training checks")
             try:
                 from ultralytics.data.utils import check_det_dataset
@@ -1174,42 +1380,273 @@ class Dataset:
 
     def __str__(self) -> str:
         counts = self._summary_counts()
-        classes = ", ".join(f"{class_id}:{name}" for class_id, name in self.classes.items()) or "none"
         empty = counts["empty"]
-        empty_text = "pending export" if empty is None else f"{empty} ({counts['empty_fraction']:.1%})"
+        empty_text = (
+            "pending export"
+            if empty is None
+            else f"{empty} ({counts['empty_fraction']:.1%})"
+        )
         state = "virtual pipeline" if self._plan else "materialized"
-        lines = [
-            f"Dataset {self.name!r} [{self.task.value}; {state}]",
-            f"  classes: {classes}",
-            f"  splits: {counts['splits']}",
-            f"  images: {counts['images']} | annotations: {counts['annotations']} | empty: {empty_text}",
-            f"  location: {self.location}",
-        ]
+        lines = [f"Dataset {self.name!r} [{self.task.value}; {state}; {self._source_format}]"]
+        if self.format == "semantic_masks":
+            lines.extend(
+                [
+                    f"  images: {counts['images']} | masks: {counts['masks']} | "
+                    f"non-empty: {counts['annotated']} | empty: {empty_text}",
+                    f"  source classes: {len(self.classes)} | splits: {len(self.splits)} | "
+                    "class handling: foreground union",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"  images: {counts['images']} | annotations: {counts['annotations']} | "
+                    f"empty: {empty_text}",
+                    f"  classes: {len(self.classes)} | splits: {len(self.splits)}",
+                ]
+            )
+        if counts["image_sizes"] is not None:
+            image_sizes = counts["image_sizes"]
+            if len(image_sizes) == 1:
+                width, height = image_sizes[0]
+                lines.append(f"  image size: {width}x{height}")
+            elif image_sizes:
+                widths = [width for width, _ in image_sizes]
+                heights = [height for _, height in image_sizes]
+                lines.append(
+                    f"  image sizes: {len(image_sizes)} unique | "
+                    f"width {min(widths)}-{max(widths)} | "
+                    f"height {min(heights)}-{max(heights)}"
+                )
+        lines.append(f"  location: {self.location}")
+
+        if counts["mask_statistics"] is not None:
+            mask_rows = [
+                (
+                    split,
+                    statistics["images"],
+                    statistics["nonempty"],
+                    statistics["empty"],
+                    f"{statistics['foreground_pixels']:,}",
+                    f"{statistics['foreground_fraction']:.1%}",
+                )
+                for split, statistics in counts["mask_statistics"].items()
+            ]
+            total_pixels = sum(
+                statistics["total_pixels"]
+                for statistics in counts["mask_statistics"].values()
+            )
+            foreground_pixels = sum(
+                statistics["foreground_pixels"]
+                for statistics in counts["mask_statistics"].values()
+            )
+            mask_rows.append(
+                (
+                    "total",
+                    counts["images"],
+                    counts["annotated"],
+                    counts["empty"],
+                    f"{foreground_pixels:,}",
+                    f"{foreground_pixels / total_pixels if total_pixels else 0.0:.1%}",
+                )
+            )
+            lines.extend(
+                [
+                    "",
+                    "  Mask statistics",
+                    *_format_table(
+                        ("split", "images", "non-empty", "empty", "foreground px", "pixel %"),
+                        mask_rows,
+                        right_aligned={1, 2, 3, 4, 5},
+                    ),
+                ]
+            )
+
+        if counts["split_statistics"] is not None:
+            split_rows = [
+                (
+                    split,
+                    statistics["images"],
+                    statistics["annotated"],
+                    statistics["empty"],
+                    statistics["annotations"],
+                )
+                for split, statistics in counts["split_statistics"].items()
+            ]
+            split_rows.append(
+                (
+                    "total",
+                    counts["images"],
+                    counts["annotated"],
+                    counts["empty"],
+                    counts["annotations"],
+                )
+            )
+            lines.extend(
+                [
+                    "",
+                    "  Split statistics",
+                    *_format_table(
+                        ("split", "images", "annotated", "empty", "annotations"),
+                        split_rows,
+                        right_aligned={1, 2, 3, 4},
+                    ),
+                ]
+            )
+
+        if counts["class_statistics"] is not None:
+            class_rows = [
+                (
+                    class_id,
+                    statistics["name"],
+                    statistics["annotations"],
+                    statistics["images"],
+                    f"{statistics['image_fraction']:.1%}",
+                )
+                for class_id, statistics in counts["class_statistics"].items()
+            ]
+            lines.extend(
+                [
+                    "",
+                    "  Class statistics (annotation instances and images containing class)",
+                    *_format_table(
+                        ("id", "name", "annotations", "images", "image %"),
+                        class_rows,
+                        right_aligned={0, 2, 3, 4},
+                    ),
+                ]
+            )
+        else:
+            classes = ", ".join(
+                f"{class_id}:{name}" for class_id, name in self.classes.items()
+            ) or "none"
+            lines.append(f"  class names: {classes}")
+
         if self._plan:
             lines.append("  pending: " + " → ".join(operation.kind for operation in self._plan))
             lines.append("  export required: data_yaml and training_ready are unavailable until export()")
         elif self.data_yaml is not None:
             lines.append(f"  data_yaml: {self.data_yaml}")
+        skipped = int(self._validation_audit.get("skipped_count", 0))
+        validation_status = str(self._validation_audit.get("status", "unknown"))
+        validation = f"  validation: {validation_status} | warnings: {len(self.warnings)}"
+        if skipped:
+            validation += f" | skipped: {skipped} (see validation_audit)"
+        lines.append(validation)
         return "\n".join(lines)
 
     def _summary_counts(self) -> dict[str, Any]:
-        split_counts = {split: sum(sample.split == split for sample in self._samples) for split in self.splits}
+        split_counts = {
+            split: sum(sample.split == split for sample in self._samples)
+            for split in self.splits
+        }
         if self._plan and not self._projection_exact:
             return {
                 "splits": split_counts,
                 "images": "pending export",
                 "annotations": "pending export",
+                "annotated": None,
                 "empty": None,
                 "empty_fraction": 0.0,
+                "image_sizes": None,
+                "split_statistics": None,
+                "class_statistics": None,
+                "mask_statistics": None,
+            }
+        if self.format == "semantic_masks":
+            mask_statistics = {
+                split: {
+                    "images": 0,
+                    "nonempty": 0,
+                    "empty": 0,
+                    "foreground_pixels": 0,
+                    "total_pixels": 0,
+                    "foreground_fraction": 0.0,
+                }
+                for split in self.splits
+            }
+            masks = 0
+            for sample in self._samples:
+                statistics = self._mask_statistics.get(sample.image_path.resolve())
+                if statistics is None:
+                    continue
+                masks += 1
+                split = mask_statistics[sample.split]
+                split["images"] += 1
+                split["foreground_pixels"] += statistics["foreground_pixels"]
+                split["total_pixels"] += statistics["total_pixels"]
+                if statistics["foreground_pixels"]:
+                    split["nonempty"] += 1
+                else:
+                    split["empty"] += 1
+            for statistics in mask_statistics.values():
+                total_pixels = statistics["total_pixels"]
+                statistics["foreground_fraction"] = (
+                    statistics["foreground_pixels"] / total_pixels if total_pixels else 0.0
+                )
+            images = len(self._samples)
+            empty = sum(statistics["empty"] for statistics in mask_statistics.values())
+            return {
+                "splits": split_counts,
+                "images": images,
+                "masks": masks,
+                "annotations": None,
+                "annotated": images - empty,
+                "empty": empty,
+                "empty_fraction": empty / images if images else 0.0,
+                "image_sizes": sorted({(sample.width, sample.height) for sample in self._samples}),
+                "split_statistics": None,
+                "class_statistics": None,
+                "mask_statistics": mask_statistics,
             }
         images = len(self._samples)
         empty = sum(not sample.annotations for sample in self._samples)
+        annotations = sum(len(sample.annotations) for sample in self._samples)
+        split_statistics = {
+            split: {
+                "images": 0,
+                "annotated": 0,
+                "empty": 0,
+                "annotations": 0,
+            }
+            for split in self.splits
+        }
+        class_statistics = {
+            class_id: {
+                "name": name,
+                "annotations": 0,
+                "images": 0,
+                "image_fraction": 0.0,
+            }
+            for class_id, name in self.classes.items()
+        }
+        for sample in self._samples:
+            split = split_statistics[sample.split]
+            split["images"] += 1
+            split["annotations"] += len(sample.annotations)
+            if sample.annotations:
+                split["annotated"] += 1
+            else:
+                split["empty"] += 1
+            present_class_ids: set[int] = set()
+            for annotation in sample.annotations:
+                class_statistics[annotation.class_id]["annotations"] += 1
+                present_class_ids.add(annotation.class_id)
+            for class_id in present_class_ids:
+                class_statistics[class_id]["images"] += 1
+        for statistics in class_statistics.values():
+            statistics["image_fraction"] = statistics["images"] / images if images else 0.0
         return {
             "splits": split_counts,
             "images": images,
-            "annotations": sum(len(sample.annotations) for sample in self._samples),
+            "annotations": annotations,
+            "annotated": images - empty,
             "empty": empty,
             "empty_fraction": empty / images if images else 0.0,
+            "image_sizes": sorted({(sample.width, sample.height) for sample in self._samples}),
+            "split_statistics": split_statistics,
+            "class_statistics": class_statistics,
+            "mask_statistics": None,
         }
 
     def _with_plan(
@@ -1238,6 +1675,9 @@ class Dataset:
             projection_exact=self._projection_exact if projection_exact is None else projection_exact,
             planned_splits=planned_splits if planned_splits is not None else self._planned_splits,
             errors=self._errors,
+            validation_audit=self._validation_audit,
+            validation_audit_visualization=self._validation_audit_visualization,
+            provenance=self._provenance,
         )
 
     def _export_plan(
@@ -1251,7 +1691,7 @@ class Dataset:
         visualize: bool,
         progress: bool,
         dry_run: bool,
-    ) -> "Dataset | SemanticMaskExport":
+    ) -> "Dataset":
         base = self._base
         if base is None:
             raise RuntimeError("Virtual dataset is missing its materialized base")
@@ -1335,6 +1775,262 @@ def _resolve_data_yaml(requested: Path, root: Path) -> Path | None:
     return None
 
 
+def _semantic_mask_manifest(requested: Path) -> dict[str, Any] | None:
+    manifest_path = (
+        requested
+        if requested.is_file() and requested.name == "dataset-fixer.json"
+        else requested / "dataset-fixer.json"
+    )
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        root = requested.parent if requested.is_file() else requested
+        has_semantic_layout = any(
+            (root / split / "masks" / "0").is_dir()
+            for split in ("train", "val", "test")
+        )
+        if not requested.is_file() and not has_semantic_layout:
+            return None
+        raise DatasetValidationError(
+            ValidationIssue(
+                f"Unreadable dataset manifest: {exc}",
+                source=str(manifest_path),
+            )
+        ) from exc
+    return manifest if manifest.get("format") == "semantic_masks" else None
+
+
+def _class_names(value: Any) -> dict[int, str]:
+    if isinstance(value, list):
+        return {index: str(name) for index, name in enumerate(value)}
+    if isinstance(value, dict):
+        try:
+            return {int(class_id): str(name) for class_id, name in value.items()}
+        except (TypeError, ValueError):
+            return {}
+    return {}
+
+
+def _load_semantic_mask_samples(
+    root: Path,
+    manifest: Mapping[str, Any],
+    *,
+    progress: bool,
+    errors: Literal["raise", "skip"],
+) -> tuple[
+    list[Sample],
+    dict[str, Path],
+    dict[str, Path],
+    dict[Path, Path],
+    dict[Path, dict[str, int]],
+    list[str],
+    list[ValidationFailureExample],
+]:
+    declared_splits = manifest.get("splits")
+    if not isinstance(declared_splits, list) or not declared_splits:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Semantic-mask manifest has no splits",
+                source=str(root / "dataset-fixer.json"),
+                expected="a non-empty splits list",
+            )
+        )
+    declared = {normalize_split(str(split)) for split in declared_splits}
+    splits = tuple(split for split in ("train", "val", "test") if split in declared)
+    image_dirs = {split: root / split / "images" for split in splits}
+    mask_dirs = {split: root / split / "masks" / "0" for split in splits}
+    missing = [
+        str(path)
+        for split in splits
+        for path in (image_dirs[split], mask_dirs[split])
+        if not path.is_dir()
+    ]
+    if missing:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Semantic-mask split directories are missing",
+                source=str(root),
+                value=missing,
+                expected="<split>/images and <split>/masks/0",
+            )
+        )
+
+    candidates = [
+        (split, image_path, image_path.relative_to(image_dirs[split]))
+        for split in splits
+        for image_path in sorted(image_dirs[split].rglob("*"))
+        if image_path.is_file() and image_path.suffix.lower() in IMAGE_SUFFIXES
+    ]
+    samples: list[Sample] = []
+    mask_paths: dict[Path, Path] = {}
+    mask_statistics: dict[Path, dict[str, int]] = {}
+    warnings: list[str] = []
+    failure_examples: list[ValidationFailureExample] = []
+    issues: list[ValidationIssue] = []
+    expected_masks: set[Path] = set()
+    used_masks: dict[Path, Path] = {}
+    iterator = tqdm(
+        candidates,
+        desc="Loading semantic-mask dataset",
+        unit="pair",
+        disable=not progress,
+    )
+    for split, image_path, relative_path in iterator:
+        mask_path = mask_dirs[split] / relative_path.with_suffix(".png")
+        resolved_mask = mask_path.resolve()
+        expected_masks.add(resolved_mask)
+        previous_image = used_masks.get(resolved_mask)
+        issue: ValidationIssue | None = None
+        width: int | None = None
+        height: int | None = None
+        foreground_pixels = 0
+        total_pixels = 0
+        if previous_image is not None:
+            issue = ValidationIssue(
+                "Multiple images resolve to the same semantic mask",
+                source=str(mask_path),
+                value=[str(previous_image), str(image_path)],
+                expected="one unique relative image stem per mask",
+            )
+        elif not mask_path.is_file():
+            issue = ValidationIssue(
+                "Semantic mask is missing for image",
+                source=str(image_path),
+                expected=str(mask_path),
+            )
+        else:
+            try:
+                with Image.open(image_path) as opened_image, Image.open(mask_path) as opened_mask:
+                    opened_image.load()
+                    opened_mask.load()
+                    width, height = opened_image.size
+                    if opened_mask.mode != "L":
+                        raise ValueError(
+                            f"mask mode is {opened_mask.mode!r}; expected single-channel 'L'"
+                        )
+                    if opened_mask.size != (width, height):
+                        raise ValueError(
+                            f"mask dimensions {opened_mask.size} do not match image dimensions "
+                            f"{(width, height)}"
+                        )
+                    histogram = opened_mask.histogram()
+                    values = {value for value, count in enumerate(histogram) if count}
+                    if not values <= {0, 1, 255}:
+                        raise ValueError(
+                            f"mask values must be 0/1/255, found {sorted(values)[:10]}"
+                        )
+                    foreground_pixels = histogram[1] + histogram[255]
+                    total_pixels = width * height
+            except Exception as exc:
+                issue = ValidationIssue(
+                    f"Unreadable or invalid semantic image/mask pair: {exc}",
+                    source=str(image_path),
+                    value=str(mask_path),
+                )
+        if issue is not None:
+            if errors == "raise":
+                issues.append(issue)
+            else:
+                warning = f"Skipped invalid semantic-mask pair: {issue.format()}"
+                warnings.append(warning)
+                failure_examples.append(
+                    ValidationFailureExample(
+                        warning=warning,
+                        summary=str(issue.message),
+                        image_path=image_path if image_path.is_file() else None,
+                        relative_path=relative_path,
+                        split=split,
+                        width=width,
+                        height=height,
+                    )
+                )
+            continue
+        used_masks[resolved_mask] = image_path
+        resolved_image = image_path.resolve()
+        samples.append(
+            Sample(
+                image_path=resolved_image,
+                relative_path=relative_path,
+                split=split,
+                width=int(width),
+                height=int(height),
+            )
+        )
+        mask_paths[resolved_image] = resolved_mask
+        mask_statistics[resolved_image] = {
+            "foreground_pixels": foreground_pixels,
+            "total_pixels": total_pixels,
+        }
+
+    actual_masks = {
+        path.resolve()
+        for split in splits
+        for path in mask_dirs[split].rglob("*.png")
+        if path.is_file()
+    }
+    for orphan in sorted(actual_masks - expected_masks):
+        issue = ValidationIssue(
+            "Semantic mask has no matching image",
+            source=str(orphan),
+        )
+        if errors == "raise":
+            issues.append(issue)
+        else:
+            warnings.append(f"Ignored orphan semantic mask: {issue.format()}")
+    if issues:
+        raise DatasetValidationError(issues)
+    if not samples:
+        raise DatasetValidationError("Semantic-mask dataset contains no valid image/mask pairs")
+    return (
+        samples,
+        image_dirs,
+        mask_dirs,
+        mask_paths,
+        mask_statistics,
+        warnings,
+        failure_examples,
+    )
+
+
+def _common_parent(paths: Sequence[Path]) -> str:
+    common = Path(os.path.commonpath([str(path) for path in paths]))
+    return str(common.parent if common in paths or common.is_file() else common)
+
+
+def _format_table(
+    headers: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    *,
+    right_aligned: set[int] | None = None,
+) -> list[str]:
+    """Render a small dependency-free table for terminal-friendly summaries."""
+
+    aligned = right_aligned or set()
+    rendered_rows = [
+        [str(value).replace("\n", "\\n") for value in row]
+        for row in rows
+    ]
+    widths = [
+        max(len(header), *(len(row[index]) for row in rendered_rows))
+        for index, header in enumerate(headers)
+    ]
+
+    def render(row: Sequence[str]) -> str:
+        cells = [
+            value.rjust(widths[index]) if index in aligned else value.ljust(widths[index])
+            for index, value in enumerate(row)
+        ]
+        return "    " + "  ".join(cells)
+
+    return [
+        render(headers),
+        "    " + "  ".join("-" * width for width in widths),
+        *(render(row) for row in rendered_rows),
+    ]
+
+
 def _load_provenance(
     root: Path,
     samples: list[Sample],
@@ -1347,38 +2043,51 @@ def _load_provenance(
         return {}
     records: dict[str, dict[str, Any]] = {}
     issues: list[ValidationIssue] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-            records[str(Path(record["output_image"]))] = record
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            issues.append(
-                ValidationIssue(
-                    "Invalid provenance record",
-                    source=str(path),
-                    line=line_number,
-                    value=str(exc),
-                )
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                    records[str(Path(record["output_image"]))] = record
+                except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                    issues.append(
+                        ValidationIssue(
+                            "Invalid provenance record",
+                            source=str(path),
+                            line=line_number,
+                            value=str(exc),
+                        )
+                    )
+    except OSError as exc:
+        issues.append(
+            ValidationIssue(
+                f"Unreadable provenance file: {exc}",
+                source=str(path),
             )
+        )
     if issues:
         if errors == "raise":
             raise DatasetValidationError(issues)
         warnings.extend(f"Skipped invalid provenance record: {issue.format()}" for issue in issues)
-    expected: set[str] = set()
+    missing_count = 0
+    missing_examples: list[str] = []
     for sample in samples:
         try:
-            expected.add(str(sample.image_path.resolve().relative_to(root.resolve())))
+            expected = str(sample.image_path.resolve().relative_to(root.resolve()))
         except ValueError:
             # Virtual projections still point to immutable source images.
             continue
-    missing = expected - records.keys()
-    if missing:
+        if expected not in records:
+            missing_count += 1
+            if len(missing_examples) < 10:
+                missing_examples.append(expected)
+    if missing_count:
         issue = ValidationIssue(
             "Derived dataset is missing image provenance records",
             source=str(path),
-            value=sorted(missing)[:10],
+            value={"count": missing_count, "examples": sorted(missing_examples)},
             expected="one record for every output image",
         )
         if errors == "raise":
@@ -1394,7 +2103,10 @@ def _assert_no_orphan_labels(
     errors: Literal["raise", "skip"],
     warnings: list[str],
 ) -> None:
-    expected = {_label_path_for_image(sample.image_path).resolve() for sample in samples}
+    expected = {
+        _label_path_for_image(sample.image_path, sample.relative_path).resolve()
+        for sample in samples
+    }
     actual = {
         path.resolve()
         for path in root.rglob("*.txt")

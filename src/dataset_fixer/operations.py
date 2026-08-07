@@ -13,8 +13,19 @@ from tqdm.auto import tqdm
 
 from .errors import DatasetValidationError, ValidationIssue
 from .models import Annotation, DatasetMetadata, Sample, Task
-from .planning import normalize_split_ratios, resolve_renamed_classes, select_empty_images
+from .planning import (
+    normalize_split_ratios,
+    resolve_removed_classes,
+    resolve_renamed_classes,
+    select_empty_images,
+)
+from .split_group_audit import (
+    audit_split_groups,
+    print_split_group_audit,
+    write_split_group_audit,
+)
 from .utils import ensure_safe_destination, normalize_split, settings_fingerprint, slugify, to_jsonable
+from .validation_audit import stage_load_validation_audit
 from .visualization import (
     save_class_count_summary,
     save_class_removal_preview,
@@ -146,6 +157,7 @@ def remove_classes(
     destination: str | Path | None,
     name: str | None,
     splits: Iterable[str] | None,
+    merge_into: str | int | None = None,
     drop_empty_images: bool,
     visualize: bool,
     progress: bool,
@@ -154,27 +166,11 @@ def remove_classes(
 ) -> "Dataset":
     selected_splits = {normalize_split(s) for s in splits} if splits else set(dataset.splits)
     selected_samples = [s for s in dataset._samples if s.split in selected_splits]
-    reverse: dict[str, list[int]] = defaultdict(list)
-    for class_id, class_name in dataset._metadata.names.items():
-        reverse[class_name].append(class_id)
-    removed: set[int] = set()
-    for selector in classes:
-        if isinstance(selector, int):
-            if selector not in dataset._metadata.names:
-                raise ValueError(f"Unknown class ID {selector}; available IDs are {sorted(dataset._metadata.names)}")
-            removed.add(selector)
-        else:
-            matches = reverse.get(selector, [])
-            if len(matches) != 1:
-                raise ValueError(f"Class name {selector!r} matched {len(matches)} classes; available names are {list(reverse)}")
-            removed.add(matches[0])
-    if not removed:
-        raise ValueError("At least one class must be removed")
-    remaining = [class_id for class_id in sorted(dataset._metadata.names) if class_id not in removed]
-    if not remaining:
-        raise DatasetValidationError("Removing these classes would leave the dataset with no classes")
-    mapping = {old: new for new, old in enumerate(remaining)}
-    metadata = _remap_metadata(dataset._metadata, mapping)
+    removed, mapping, metadata = resolve_removed_classes(
+        dataset._metadata,
+        classes,
+        merge_into=merge_into,
+    )
     settings = {
         "removed_classes": {class_id: dataset._metadata.names[class_id] for class_id in sorted(removed)},
         "splits": sorted(selected_splits),
@@ -182,12 +178,24 @@ def remove_classes(
         "class_mapping": mapping,
         "visualize": visualize,
     }
+    if merge_into is not None:
+        output_class_id = mapping[next(iter(removed))]
+        settings["merge_into"] = {
+            "selector": merge_into,
+            "output_class_id": output_class_id,
+            "output_class_name": metadata.names[output_class_id],
+        }
     builder = _builder(dataset, destination, name, "remove-classes", settings, metadata=metadata)
     try:
         if visualize:
             preview_sample = next((s for s in selected_samples if any(a.class_id in removed for a in s.annotations)), selected_samples[0])
             preview = save_class_removal_preview(
-                preview_sample, removed, dataset.task, dataset._metadata, builder.reports_dir / "remove_classes_preview.jpg"
+                preview_sample,
+                mapping,
+                dataset.task,
+                dataset._metadata,
+                metadata,
+                builder.reports_dir / "remove_classes_preview.jpg",
             )
             builder.visuals.append(str(preview.relative_to(builder.staging)))
             print(f"Class-removal sanity preview: {preview}")
@@ -275,9 +283,16 @@ def export_dataset(
 ) -> "Dataset":
     selected = {normalize_split(s) for s in splits} if splits else set(dataset.splits)
     samples = [s for s in dataset._samples if s.split in selected]
+    group_validation, group_report = audit_split_groups(
+        dataset,
+        exported_splits=selected,
+    )
+    print_split_group_audit(group_report)
     settings = {"splits": sorted(selected), "allow_lossy": allow_lossy, "visualize": visualize}
     builder = _builder(dataset, destination, name, "export", settings)
+    builder.validation_details["split_group_isolation"] = group_validation
     try:
+        write_split_group_audit(builder.reports_dir, group_report)
         if visualize and samples:
             from .visualization import visualize_samples
 
@@ -431,14 +446,6 @@ def _flat_polygon_area(flat: list[float]) -> float:
     return abs(sum(x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in zip(pts, pts[1:] + pts[:1]))) / 2
 
 
-def _remap_metadata(metadata: DatasetMetadata, mapping: dict[int, int]) -> DatasetMetadata:
-    result = metadata.copy()
-    result.names = {mapping[old]: metadata.names[old] for old in mapping}
-    result.radii = {mapping[old]: metadata.radii[old] for old in mapping if old in metadata.radii}
-    result.kpt_names = {mapping[old]: metadata.kpt_names[old] for old in mapping if old in metadata.kpt_names}
-    return result
-
-
 def _callback_description(callback: Callable | None) -> dict[str, Any] | None:
     if callback is None:
         return None
@@ -480,6 +487,14 @@ def _builder(
         settings=settings,
         parent_manifest=dataset._manifest,
     )
+    load_validation, load_visualization = stage_load_validation_audit(
+        dataset._validation_audit,
+        dataset._validation_audit_visualization,
+        builder.reports_dir,
+    )
+    builder.validation_details["load_validation"] = load_validation
+    if load_visualization is not None:
+        builder.visuals.append(str(load_visualization.relative_to(builder.staging)))
     builder.warnings.extend(dataset._warnings)
     return builder
 
