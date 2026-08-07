@@ -1,32 +1,34 @@
 from __future__ import annotations
 
 import json
-import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..errors import DatasetValidationError, ValidationIssue
+from ..artifacts import combine_report_plots
 from ..sahi_support import reject_legacy_sahi_settings, resolve_sahi_settings
-from ..utils import ensure_safe_destination, environment_snapshot, package_versions, settings_fingerprint, to_jsonable
+from ..utils import environment_snapshot, package_versions, settings_fingerprint, to_jsonable
 from .cache import (
-    append_migration_log,
     cache_key,
     default_cache_root,
-    import_notebook_cache,
+    load_evaluation_cache,
     load_package_cache,
     model_cache_dir,
-    notebook_cache_dirs,
-    notebook_cache_basename,
-    notebook_dataset_hash,
     save_package_cache,
-    write_notebook_numpy_cache,
+    save_evaluation_cache,
 )
-from .cohort import check_training_provenance, freeze_cohort, write_cohort
+from .cohort import check_training_provenance, freeze_cohort
 from .inference import resolve_backend, run_inference
 from .metrics import bootstrap_metric, evaluate_configuration, paired_statistics
-from .reporting import render_figures, render_qualitative, write_csv, write_json, write_tables
+from .reporting import (
+    render_figures,
+    render_prediction_grids,
+    render_qualitative,
+    write_json,
+)
 from .specs import parse_models
 from .types import Cohort, ComparisonResult, ModelSpec, Prediction
 
@@ -39,94 +41,47 @@ def _compare_models(
     models: Any,
     *,
     split: str = "val",
-    baseline: str | None = None,
-    inference: str | None = None,
-    protocol: str = "validation",
-    calibration_split: str | None = None,
-    training_provenance: str = "required",
-    confidence_thresholds: tuple[float, ...] = (0.35, 0.45, 0.55, 0.65, 0.75, 0.85),
-    postprocess_thresholds: tuple[float, ...] = (0.75, 0.85, 0.95),
-    resolution: int = 480,
-    comparison_unit: str = "model",
-    cache: bool | str | Path = True,
-    notebook_cache: str | Path | None = None,
-    write_notebook_cache: bool = False,
-    allow_unverified_cache: bool = False,
-    visualize: bool = True,
+    save_prediction_plots: bool = False,
     progress: bool = True,
     destination: str | Path | None = None,
-    device: str | None = None,
-    seed: int = 42,
-    bootstrap_resamples: int = 10_000,
-    **inference_settings: Any,
 ) -> ComparisonResult:
     """Evaluate multiple model configurations on one cryptographically frozen cohort."""
 
     started = time.time()
-    protocol = protocol.lower()
-    if protocol not in {"validation", "locked", "calibrate_then_test"}:
-        raise ValueError("protocol must be 'validation', 'locked', or 'calibrate_then_test'")
-    if comparison_unit not in {"model", "system"}:
-        raise ValueError("comparison_unit must be 'model' or 'system'")
-    if bootstrap_resamples <= 0:
-        raise ValueError("bootstrap_resamples must be positive")
-    reject_legacy_sahi_settings(inference_settings)
-    if allow_unverified_cache and training_provenance == "required":
-        raise ValueError(
-            "allow_unverified_cache is exploratory and cannot be combined with training_provenance='required'"
-        )
-    specs = parse_models(
-        models,
-        default_resolution=resolution,
-        confidence_thresholds=tuple(confidence_thresholds),
-        postprocess_thresholds=tuple(postprocess_thresholds),
-    )
-    if baseline is None:
-        baseline = specs[0].name
-    if baseline not in {spec.name for spec in specs}:
-        raise ValueError(f"Unknown baseline {baseline!r}")
+    protocol = "fixed"
+    seed = 42
+    bootstrap_resamples = 10_000
+    specs = parse_models(models)
+    baseline = specs[0].name
     cohort = freeze_cohort(dataset, split)
-    calibration: Cohort | None = None
-    if protocol == "calibrate_then_test":
-        if not calibration_split:
-            raise ValueError("calibration_split is required for protocol='calibrate_then_test'")
-        calibration = freeze_cohort(dataset, calibration_split)
-        if calibration.fingerprint == cohort.fingerprint or calibration.split == cohort.split:
-            raise DatasetValidationError("Calibration and evaluation splits must be distinct frozen cohorts")
     model_backends = {
-        str(spec.inference_overrides.get("inference", "native")) for spec in specs
+        spec.name: resolve_backend(
+            str(spec.inference_overrides.get("inference", "native")), cohort.task
+        )
+        for spec in specs
     }
-    effective_inference = (
-        inference
-        if inference is not None
-        else (next(iter(model_backends)) if len(model_backends) == 1 else "native")
-    )
-    backend = resolve_backend(effective_inference, cohort.task)
-    selected_backends = (
-        {backend}
-        if inference is not None
-        else {resolve_backend(value, cohort.task) for value in model_backends}
-    )
-    if comparison_unit != "system" and len(selected_backends) != 1:
-        raise ValueError("Mixed native/SAHI configurations require comparison_unit='system'")
-    if comparison_unit == "model" and selected_backends == {"sahi"}:
-        configurations = {
-            tuple(
-                sorted(
-                    resolve_sahi_settings(
-                        {**spec.inference_overrides, **inference_settings},
-                        resolution=spec.resolution,
-                    ).as_dict().items()
-                )
-            )
-            for spec in specs
+    model_systems: dict[str, dict[str, Any]] = {}
+    for spec in specs:
+        settings = dict(spec.inference_overrides)
+        reject_legacy_sahi_settings(settings)
+        system = {
+            "resolution": spec.resolution,
+            "backend": model_backends[spec.name],
+            "confidence": spec.resolved_model.confidence,
+            "postprocess": spec.resolved_model.postprocess,
         }
-        if len(configurations) != 1:
-            raise ValueError(
-                "Different SAHI tile configurations require comparison_unit='system'"
-            )
+        if model_backends[spec.name] == "sahi":
+            system["sahi"] = resolve_sahi_settings(
+                settings, resolution=spec.resolution
+            ).as_dict()
+        model_systems[spec.name] = system
+    comparison_unit = (
+        "model"
+        if len({settings_fingerprint(value) for value in model_systems.values()}) == 1
+        else "system"
+    )
     overlap, provenance_complete, leakage, limitations = check_training_provenance(
-        specs, cohort, training_provenance
+        specs, cohort, "warn"
     )
     independent_clusters = len({record.original_id for record in cohort.records})
     if independent_clusters < 10:
@@ -135,86 +90,80 @@ def _compare_models(
         )
 
     resolved_settings = {
-        "report_schema": 2,
+        "report_schema": 5,
         "split": cohort.split,
         "baseline": baseline,
-        "inference_requested": effective_inference,
-        "inference_resolved": backend,
         "protocol": protocol,
-        "calibration_split": calibration.split if calibration else None,
-        "training_provenance": training_provenance,
-        "confidence_thresholds": confidence_thresholds,
-        "postprocess_thresholds": postprocess_thresholds,
-        "resolution": resolution,
+        "training_provenance": "verify-when-configured",
         "comparison_unit": comparison_unit,
-        "cache": bool(cache),
-        "visualize": visualize,
-        "device": device,
         "seed": seed,
         "bootstrap_resamples": bootstrap_resamples,
-        **inference_settings,
+        "models": model_systems,
     }
-    fingerprint = settings_fingerprint(to_jsonable(resolved_settings))
+    model_hashes = {spec.name: spec.resolved_model.digest for spec in specs}
+    fingerprint = settings_fingerprint(
+        to_jsonable(
+            {
+                "schema": 4,
+                "cohort": cohort.fingerprint,
+                "models": [
+                    {
+                        "name": spec.name,
+                        "sha256": model_hashes[spec.name],
+                        "resolution": spec.resolution,
+                        "settings": spec.inference_overrides,
+                    }
+                    for spec in specs
+                ],
+                "settings": resolved_settings,
+            }
+        )
+    )
     target = (
         Path(destination).expanduser().resolve()
         if destination
-        else dataset.location.parent / f"{dataset.name}__compare-models__{fingerprint}"
+        else dataset.location / "evaluations" / fingerprint
     )
-    ensure_safe_destination(dataset.location, target)
+    if target == dataset.location:
+        raise ValueError("Comparison destination cannot replace the dataset")
     target.parent.mkdir(parents=True, exist_ok=True)
+    existing_result = target / "reports" / "result.json"
+    if (
+        existing_result.is_file()
+        and (target / "reports" / "plots.png").is_file()
+        and (target / "reports" / "comparison.png").is_file()
+        and (not save_prediction_plots or (target / "predictions").is_dir())
+    ):
+        cached_manifest = json.loads(existing_result.read_text(encoding="utf-8"))
+        if cached_manifest.get("schema") == 5:
+            print(f"Reusing complete comparison: {target}")
+            return _result_from_manifest(target, cached_manifest)
     temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.building-", dir=target.parent))
-    cache_root = _cache_root(cache, dataset.location)
-    cache_migration_log = temporary / "cache_migrations.jsonl"
+    cache_root = default_cache_root(dataset.location)
     package_versions_snapshot = package_versions()
     print(
         f"Comparing {len(specs)} models on frozen {cohort.split!r} cohort "
         f"({len(cohort.records)} images, fingerprint {cohort.fingerprint[:12]})\nDestination: {target}\n"
-        f"Backend: requested={effective_inference}, resolved={backend}; protocol={protocol}"
+        f"Systems: {comparison_unit}; protocol={protocol}"
     )
     try:
-        write_cohort(cohort, temporary / "evaluation-cohort.jsonl")
-        cache_migration_log.touch()
-        (temporary / "predictions").mkdir(parents=True, exist_ok=True)
-        if calibration:
-            write_cohort(calibration, temporary / "calibration-cohort.jsonl")
-        write_json(temporary / "reports" / "leakage_audit.json", leakage)
-        write_json(
-            temporary / "reports" / "cohort_audit.json",
-            {
-                "fingerprint": cohort.fingerprint,
-                "verified": True,
-                "split": cohort.split,
-                "images": len(cohort.records),
-                "annotations": sum(len(record.annotations) for record in cohort.records),
-                "independent_clusters": independent_clusters,
-            },
-        )
+        statistics_key = f"comparison-{fingerprint}"
+        cached_statistics = load_evaluation_cache(cache_root, statistics_key)
         model_outputs: dict[str, dict[str, Any]] = {}
         cache_audit: dict[str, Any] = {}
-        model_hashes: dict[str, str] = {}
         for spec in specs:
-            sha = spec.resolved_model.digest
-            model_hashes[spec.name] = sha
-            spec_backend = (
-                backend
-                if inference is not None
-                else str(spec.inference_overrides.get("inference", backend))
-            )
-            spec_backend = resolve_backend(spec_backend, cohort.task)
+            sha = model_hashes[spec.name]
+            spec_backend = model_backends[spec.name]
             model_outputs[spec.name] = _evaluate_model(
                 spec,
                 cohort,
-                calibration,
                 backend=spec_backend,
                 protocol=protocol,
                 cache_root=cache_root,
-                notebook_cache=Path(notebook_cache).expanduser().resolve() if notebook_cache else None,
-                cache_log=cache_migration_log,
                 model_sha=sha,
-                device=device,
+                device=spec.resolved_model.device,
                 progress=progress,
-                settings={**spec.inference_overrides, **inference_settings},
-                allow_unverified_cache=allow_unverified_cache,
+                settings=dict(spec.inference_overrides),
             )
             cache_audit[spec.name] = model_outputs[spec.name]["cache"]
 
@@ -232,7 +181,15 @@ def _compare_models(
             grid_rows = output["grid"]
             full_grid.extend({"model": spec.name, **row["summary"], "confidence": row["confidence"], "postprocess": row["postprocess"], "score": row["summary"][primary_metric]} for row in grid_rows)
             best = output["best"]
-            ci_low, ci_high = bootstrap_metric(best["per_image"], resamples=bootstrap_resamples, seed=seed)
+            cached_interval = (
+                (cached_statistics or {}).get("intervals", {}).get(spec.name)
+            )
+            if isinstance(cached_interval, list) and len(cached_interval) == 2:
+                ci_low, ci_high = map(float, cached_interval)
+            else:
+                ci_low, ci_high = bootstrap_metric(
+                    best["per_image"], resamples=bootstrap_resamples, seed=seed
+                )
             duration = float(output["timing"].get("inference_seconds", 0))
             rank_row = {
                 "model": spec.name,
@@ -255,7 +212,7 @@ def _compare_models(
                 "precision": best["summary"]["precision"], "recall": best["summary"]["recall"], "f1": best["summary"]["f1"],
                 "inference_seconds": duration,
                 "throughput_images_per_second": len(cohort.records) / duration if duration > 0 else None,
-                "protocol_label": "validation/model-selection" if protocol == "validation" else protocol,
+                "protocol_label": protocol,
             }
             ranking.append(rank_row)
             best_rows[spec.name] = best["per_image"]
@@ -268,22 +225,24 @@ def _compare_models(
         for index, row in enumerate(ranking, start=1):
             row["rank"] = index
         _assert_ranking_invariants(ranking, cohort)
-        paired = paired_statistics(best_rows, baseline, resamples=bootstrap_resamples, seed=seed)
+        if cached_statistics is not None and isinstance(cached_statistics.get("paired"), list):
+            paired = list(cached_statistics["paired"])
+        else:
+            paired = paired_statistics(
+                best_rows, baseline, resamples=bootstrap_resamples, seed=seed
+            )
+            save_evaluation_cache(
+                cache_root,
+                statistics_key,
+                {
+                    "intervals": {
+                        row["model"]: [row["ci_low"], row["ci_high"]]
+                        for row in ranking
+                    },
+                    "paired": paired,
+                },
+            )
 
-        write_csv(temporary / "metrics" / "ranking.csv", ranking)
-        write_csv(temporary / "metrics" / "full_grid.csv", full_grid)
-        write_csv(temporary / "metrics" / "per_image.csv", per_image)
-        write_csv(temporary / "metrics" / "per_class.csv", per_class)
-        write_csv(temporary / "metrics" / "paired_statistics.csv", paired)
-        write_tables(temporary, ranking)
-        write_json(temporary / "reports" / "cache_audit.json", cache_audit)
-        write_json(
-            temporary / "predictions" / "cache-locations.json",
-            {name: value.get("root") for name, value in cache_audit.items()},
-        )
-        write_json(temporary / "reports" / "limitations.json", {"limitations": limitations})
-        figure_paths: list[str] = []
-        qualitative_paths: list[str] = []
         figure_metadata = {
             "cohort_fingerprint": cohort.fingerprint,
             "model_hashes": model_hashes,
@@ -292,32 +251,39 @@ def _compare_models(
             "independent_clusters": independent_clusters,
             "metric_definition": primary_metric,
         }
-        if visualize:
-            figure_paths = render_figures(
-                temporary, cohort=cohort, ranking=ranking, grid=full_grid, per_class=per_class,
-                paired=paired, per_image=per_image, pr_data=pr_data, cache_audit=cache_audit,
-                leakage_audit=leakage,
-                metadata=figure_metadata,
-            )
-            qualitative_paths = render_qualitative(
-                temporary, cohort, best_predictions, best_confidences,
+        render_figures(
+            temporary, cohort=cohort, ranking=ranking, grid=full_grid, per_class=per_class,
+            paired=paired, per_image=per_image, pr_data=pr_data, cache_audit=cache_audit,
+            leakage_audit=leakage,
+            metadata=figure_metadata,
+        )
+        render_qualitative(
+            temporary, cohort, best_predictions, best_confidences,
+            [row["model"] for row in ranking],
+            seed=seed,
+        )
+        reports_dir = temporary / "reports"
+        combine_report_plots((temporary / "figures",), reports_dir / "plots.png")
+        combine_report_plots((temporary / "qualitative",), reports_dir / "comparison.png")
+        prediction_paths: list[str] = []
+        if save_prediction_plots:
+            prediction_paths = render_prediction_grids(
+                temporary,
+                cohort,
+                best_predictions,
+                best_confidences,
                 [row["model"] for row in ranking],
-                baseline=baseline,
-            )
-        if write_notebook_cache:
-            _export_notebook_caches(
-                temporary, specs, cohort, model_outputs, model_hashes,
             )
 
         cache_verified = bool(cache_root) and all(bool(value.get("verified")) for value in cache_audit.values())
         cache_statistics = {
             "models": cache_audit,
-            "package_hits": sum(value.get("source") == "package" for value in cache_audit.values()),
-            "notebook_imports": sum(str(value.get("source", "")).startswith("notebook") for value in cache_audit.values()),
+            "prediction_hits": sum(value.get("source") == "package" for value in cache_audit.values()),
+            "evaluation_hits": sum(value.get("evaluation") == "hit" for value in cache_audit.values()),
             "fresh_inference": sum(value.get("source") == "fresh" for value in cache_audit.values()),
         }
         manifest = {
-            "schema": 2,
+            "schema": 5,
             "kind": "model-comparison",
             "dataset": {"name": dataset.name, "location": str(dataset.location), "task": cohort.task},
             "cohort_fingerprint": cohort.fingerprint,
@@ -332,13 +298,23 @@ def _compare_models(
             "model_hashes": model_hashes,
             "ranking": ranking,
             "limitations": limitations,
-            "figures": figure_paths,
-            "qualitative": qualitative_paths,
+            "reports": {
+                "plots": "reports/plots.png",
+                "comparison": "reports/comparison.png",
+                "prediction_plots": prediction_paths,
+            },
+            "paired_statistics": paired,
+            "worst_cases": _bounded_worst_cases(per_image),
             "environment": environment_snapshot(),
             "started_at_unix": started,
             "completed_at_unix": time.time(),
         }
-        write_json(temporary / "model-comparison.json", manifest)
+        write_json(reports_dir / "result.json", manifest)
+        if target.exists():
+            previous = target / "reports" / "result.json"
+            if not previous.is_file():
+                raise FileExistsError(f"Refusing to replace unrelated comparison destination: {target}")
+            shutil.rmtree(target)
         temporary.replace(target)
     except Exception:
         _remove_build_dir(temporary)
@@ -365,19 +341,30 @@ def _compare_models(
 def _evaluate_model(
     spec: ModelSpec,
     cohort: Cohort,
-    calibration: Cohort | None,
-    *, backend: str, protocol: str, cache_root: Path | None, notebook_cache: Path | None,
-    cache_log: Path, model_sha: str, device: str | None, progress: bool,
-    settings: dict[str, Any], allow_unverified_cache: bool,
+    *, backend: str, protocol: str, cache_root: Path,
+    model_sha: str, device: str | None, progress: bool,
+    settings: dict[str, Any],
 ) -> dict[str, Any]:
-    confidences = spec.confidence_thresholds or ()
-    posts = spec.postprocess_thresholds or ()
-    if protocol == "locked":
-        if spec.locked_confidence is not None: confidences = (spec.locked_confidence,)
-        if spec.locked_postprocess is not None: posts = (spec.locked_postprocess,)
-        if len(confidences) != 1 or len(posts) != 1:
-            raise ValueError(f"Locked protocol requires one confidence and postprocess setting for {spec.name}")
-    floor = min(confidences)
+    confidence = float(spec.confidence)
+    postprocess = float(spec.postprocess)
+    floor = confidence
+    evaluation_key = cache_key(
+        {
+            "schema": 1,
+            "model_sha256": model_sha,
+            "cohort_fingerprint": cohort.fingerprint,
+            "task": cohort.task,
+            "classes": cohort.classes,
+            "backend": backend,
+            "resolution": spec.resolution,
+            "confidence": confidence,
+            "postprocess": postprocess,
+            "protocol": protocol,
+            "device": device,
+            "settings": settings,
+            "versions": package_versions(),
+        }
+    )
 
     def get_predictions(active: Cohort, active_posts: tuple[float, ...]) -> tuple[dict[float, dict[str, list[Prediction]]], dict[str, Any], dict[str, float]]:
         payload = {
@@ -386,105 +373,77 @@ def _evaluate_model(
             "resolution": spec.resolution, "confidence_floor": floor, "postprocess_thresholds": active_posts,
             "device": device, "settings": settings,
         }
-        root = model_cache_dir(cache_root, spec.name, cache_key(payload)) if cache_root else None
+        prediction_identity = {
+            key: value
+            for key, value in payload.items()
+            if key != "postprocess_thresholds"
+        }
+        root = model_cache_dir(cache_root, spec.name, cache_key(prediction_identity))
         loaded: dict[float, dict[str, list[Prediction]]] = {}
         shards = 0
         source = "fresh"
-        imported_verified = False
-        if root:
-            loaded, shards, complete = load_package_cache(root, active, active_posts)
-            if complete:
-                source = "package"
-        if not loaded and active.task == "polo" and backend == "sahi" and len(active.classes) == 1:
-            legacy_dirs = notebook_cache_dirs(Path(active.records[0].image_path).parents[2], notebook_cache)
-            imported, import_meta = import_notebook_cache(
-                legacy_dirs,
-                model_sha256=model_sha, resolution=spec.resolution, confidence_floor=floor,
-                thresholds=active_posts, cohort=active,
-                expected_key={
-                    "device": str(device),
-                    "sahi_slice_height": int(settings.get("sahi_slice_height", spec.resolution)),
-                    "sahi_slice_width": int(settings.get("sahi_slice_width", spec.resolution)),
-                    "sahi_overlap_height_ratio": float(settings.get("sahi_overlap_height_ratio", settings.get("sahi_overlap", .2))),
-                    "sahi_overlap_width_ratio": float(settings.get("sahi_overlap_width_ratio", settings.get("sahi_overlap", .2))),
-                    "sahi_postprocess_type": str(settings.get("sahi_postprocess_type", "GREEDYNMM")),
-                    "sahi_postprocess_match_metric": str(settings.get("sahi_postprocess_match_metric", "IOS")),
-                    "sahi_postprocess_class_agnostic": bool(settings.get("sahi_postprocess_class_agnostic", False)),
-                    "sahi_model_type": str(settings.get("sahi_model_type", "ultralytics")),
-                },
-                allow_unverified=allow_unverified_cache,
-            )
-            if imported:
-                loaded = imported; source = import_meta["format"]
-                imported_verified = bool(import_meta.get("verified"))
-                append_migration_log(cache_log, {"event": "import", **import_meta, "model": spec.name})
-            else:
-                candidates = [
-                    str(path)
-                    for directory in legacy_dirs if directory.is_dir()
-                    for pattern in ("*.gridcache_v3", "*.gridcache.pkl")
-                    for path in directory.glob(pattern)
-                ]
-                if candidates:
-                    append_migration_log(
-                        cache_log,
-                        {"event": "rejection", "model": spec.name, "candidates": candidates,
-                         "reason": "no candidate passed key, structure, cohort, and content validation"},
-                    )
+        loaded, shards, complete = load_package_cache(root, active, active_posts)
+        if complete:
+            source = "package"
         start = time.perf_counter()
         predictions, timings = run_inference(
             spec, active, backend=backend, thresholds=active_posts, confidence_floor=floor, device=device,
             progress=progress, settings=settings, existing=loaded,
-            on_threshold=(lambda threshold, values: save_package_cache(root, active, payload, {**loaded, threshold: values})) if root else None,
+            on_threshold=(lambda threshold, values: save_package_cache(root, active, payload, {**loaded, threshold: values})),
         )
         inference_seconds = time.perf_counter() - start if source == "fresh" or len(loaded) < len(active_posts) else 0.0
-        if root:
-            save_package_cache(root, active, payload, predictions)
-            verified_loaded, verified_shards, verified = load_package_cache(root, active, active_posts)
-            if not verified or set(verified_loaded) != set(map(float, active_posts)):
-                raise DatasetValidationError("Package prediction cache failed post-write verification")
-            shards = verified_shards
-        else:
-            verified = False
-        content_verified = imported_verified if source.startswith("notebook") else (verified if root else source == "fresh")
-        return predictions, {"source": source, "verified": content_verified, "shards": shards, "root": str(root) if root else None}, {"inference_seconds": inference_seconds, **timings}
+        save_package_cache(root, active, payload, predictions)
+        verified_loaded, verified_shards, verified = load_package_cache(root, active, active_posts)
+        if not verified or set(verified_loaded) != set(map(float, active_posts)):
+            raise DatasetValidationError("Package prediction cache failed post-write verification")
+        shards = verified_shards
+        return predictions, {"source": source, "verified": verified, "shards": shards, "root": str(root)}, {"inference_seconds": inference_seconds, **timings}
 
     grid: list[dict[str, Any]] = []
-    tune_grid: list[dict[str, Any]] = []
-    metric_name = "map100_10" if cohort.task == "polo" else "map50_95"
-    if calibration is not None:
-        calibration_predictions, calibration_cache, calibration_timing = get_predictions(calibration, posts)
-        for post in posts:
-            for confidence in confidences:
-                tuned = evaluate_configuration(calibration, calibration_predictions[float(post)], confidence)
-                tune_grid.append({"confidence": confidence, "postprocess": post, **tuned})
-        selected = max(tune_grid, key=lambda row: (row["summary"][metric_name], row["summary"]["f1"], -row["confidence"], -row["postprocess"]))
-        selected_post = float(selected["postprocess"])
+    cached_evaluation = load_evaluation_cache(cache_root, evaluation_key)
+    if cached_evaluation is not None:
+        selected_post = float(cached_evaluation["best_postprocess"])
         evaluation_predictions, cache_info, timing = get_predictions(cohort, (selected_post,))
-        cache_info["calibration"] = calibration_cache
-        timing["calibration_inference_seconds"] = calibration_timing.get("inference_seconds", 0)
-        evaluated = evaluate_configuration(cohort, evaluation_predictions[selected_post], float(selected["confidence"]))
-        best = {"confidence": selected["confidence"], "postprocess": selected_post, **evaluated}
-        grid = [best]
-    else:
-        evaluation_predictions, cache_info, timing = get_predictions(cohort, posts)
-        for post in posts:
-            for confidence in confidences:
-                evaluated = evaluate_configuration(cohort, evaluation_predictions[float(post)], confidence)
-                grid.append({"confidence": confidence, "postprocess": post, **evaluated})
-        selected = max(grid, key=lambda row: (row["summary"][metric_name], row["summary"]["f1"], -row["confidence"], -row["postprocess"]))
-        best = selected
+        cache_info["evaluation"] = "hit"
+        return {
+            "backend": backend,
+            "predictions": evaluation_predictions,
+            "cache": cache_info,
+            "timing": timing,
+            "grid": cached_evaluation["grid"],
+            "best": cached_evaluation["best"],
+            "best_confidence": float(cached_evaluation["best_confidence"]),
+            "best_postprocess": selected_post,
+            "settings": settings,
+        }
+    evaluation_predictions, cache_info, timing = get_predictions(
+        cohort, (postprocess,)
+    )
+    selected_post = postprocess
+    selected_confidence = confidence
+    evaluated = evaluate_configuration(
+        cohort, evaluation_predictions[selected_post], selected_confidence
+    )
+    selected = {
+        "confidence": selected_confidence,
+        "postprocess": selected_post,
+        **evaluated,
+    }
+    grid = [selected]
+    best = selected
+    cached_result = {
+        "grid": grid,
+        "best": best,
+        "best_confidence": selected["confidence"],
+        "best_postprocess": selected["postprocess"],
+    }
+    save_evaluation_cache(cache_root, evaluation_key, cached_result)
+    cache_info["evaluation"] = "fresh"
     return {
         "backend": backend, "predictions": evaluation_predictions, "cache": cache_info, "timing": timing,
-        "grid": grid, "best": best, "best_confidence": selected["confidence"], "best_postprocess": selected["postprocess"],
+        **cached_result,
         "settings": settings,
     }
-
-
-def _cache_root(cache: bool | str | Path, location: Path) -> Path | None:
-    if cache is False: return None
-    if isinstance(cache, (str, Path)) and not isinstance(cache, bool): return Path(cache).expanduser().resolve()
-    return default_cache_root(location)
 
 
 def _assert_ranking_invariants(rows: list[dict[str, Any]], cohort: Cohort) -> None:
@@ -497,86 +456,50 @@ def _assert_ranking_invariants(rows: list[dict[str, Any]], cohort: Cohort) -> No
             )
 
 
-def _export_notebook_caches(
-    root: Path, specs: list[ModelSpec], cohort: Cohort, outputs: dict[str, dict[str, Any]],
-    hashes: dict[str, str],
-) -> None:
-    if cohort.task != "polo" or len(cohort.classes) != 1:
-        raise ValueError("write_notebook_cache requires a single-class POLO cohort")
-    export_root = root / "predictions" / "notebook-cache"
-    first = cohort.records[0].image_path
-    dataset_root = first.parent.parent
-    if first.parent.name != "images" or not (dataset_root / "labels").is_dir():
-        raise ValueError(
-            "Notebook cache export requires the notebook split layout "
-            "<split>/images/* and <split>/labels/* (nested canonical images/{split} is not directly loadable by the notebook)"
-        )
-    dataset_sha = notebook_dataset_hash(dataset_root)
-    for spec in specs:
-        output = outputs[spec.name]
-        if output["backend"] != "sahi":
-            raise ValueError("write_notebook_cache requires POLO predictions produced through SAHI")
-        confidence_floor = min(spec.confidence_thresholds or ())
-        settings = output["settings"]
-        key = {
-            "cache_version": 3, "cache_format": "gridcache_v3_numpy_sharded",
-            "model_path": str(spec.path), "model_hash": hashes[spec.name],
-            "dataset_root": str(dataset_root.resolve()), "dataset_hash": dataset_sha,
-            "resolution": spec.resolution, "min_conf": confidence_floor,
-            "iou_list": sorted(output["predictions"]), "device": None,
-            "sahi_slice_height": settings.get("sahi_slice_height", spec.resolution),
-            "sahi_slice_width": settings.get("sahi_slice_width", spec.resolution),
-            "sahi_overlap_height_ratio": settings.get("sahi_overlap_height_ratio", settings.get("sahi_overlap", .2)),
-            "sahi_overlap_width_ratio": settings.get("sahi_overlap_width_ratio", settings.get("sahi_overlap", .2)),
-            "sahi_postprocess_type": settings.get("sahi_postprocess_type", "GREEDYNMM"),
-            "sahi_postprocess_match_metric": settings.get("sahi_postprocess_match_metric", "IOS"),
-            "sahi_postprocess_class_agnostic": settings.get("sahi_postprocess_class_agnostic", False),
-            "sahi_model_type": settings.get("sahi_model_type", "ultralytics"),
-        }
-        target = export_root / notebook_cache_basename(spec.path, key, numpy=True)
-        write_notebook_numpy_cache(target, key=key, cohort=cohort, predictions=output["predictions"])
-        imported, imported_meta = import_notebook_cache(
-            [export_root], model_sha256=hashes[spec.name], resolution=spec.resolution,
-            confidence_floor=confidence_floor, thresholds=tuple(sorted(output["predictions"])),
-            cohort=cohort,
-            expected_key={
-                "device": "None",
-                "sahi_slice_height": int(key["sahi_slice_height"]),
-                "sahi_slice_width": int(key["sahi_slice_width"]),
-                "sahi_overlap_height_ratio": float(key["sahi_overlap_height_ratio"]),
-                "sahi_overlap_width_ratio": float(key["sahi_overlap_width_ratio"]),
-                "sahi_postprocess_type": str(key["sahi_postprocess_type"]),
-                "sahi_postprocess_match_metric": str(key["sahi_postprocess_match_metric"]),
-                "sahi_postprocess_class_agnostic": bool(key["sahi_postprocess_class_agnostic"]),
-                "sahi_model_type": str(key["sahi_model_type"]),
-            },
-        )
-        if imported is None or not imported_meta or not imported_meta.get("verified"):
-            raise DatasetValidationError("Notebook cache round-trip verification failed")
-        _assert_notebook_roundtrip(output["predictions"], imported)
-        append_migration_log(root / "cache_migrations.jsonl", {"event": "export", "model": spec.name, "target": str(target)})
-
-
 def _remove_build_dir(path: Path) -> None:
-    import shutil
     shutil.rmtree(path, ignore_errors=True)
 
 
-def _assert_notebook_roundtrip(
-    expected: dict[float, dict[str, list[Prediction]]],
-    actual: dict[float, dict[str, list[Prediction]]],
-) -> None:
-    if set(expected) != set(actual):
-        raise DatasetValidationError("Notebook cache round trip changed postprocessing thresholds")
-    for threshold, by_image in expected.items():
-        if list(by_image) != list(actual[threshold]):
-            raise DatasetValidationError("Notebook cache round trip changed image ordering")
-        for image_id, predictions in by_image.items():
-            restored = actual[threshold][image_id]
-            if len(predictions) != len(restored):
-                raise DatasetValidationError("Notebook cache round trip changed prediction counts")
-            for left, right in zip(predictions, restored):
-                if left.point is None or right.point is None:
-                    raise DatasetValidationError("Notebook cache round trip lost POLO points")
-                if any(abs(a - b) > 1e-3 for a, b in zip(left.point, right.point)) or abs(left.score - right.score) > 1e-5:
-                    raise DatasetValidationError("Notebook cache round trip changed prediction values")
+def _bounded_worst_cases(rows: list[dict[str, Any]], *, limit: int = 12) -> list[dict[str, Any]]:
+    by_image: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        image_id = str(row.get("image_id") or row.get("relative_path") or "")
+        entry = by_image.setdefault(
+            image_id,
+            {
+                "image_id": image_id,
+                "relative_path": row.get("relative_path"),
+                "error_count": 0,
+                "models": [],
+            },
+        )
+        error_count = int(row.get("fp", 0)) + int(row.get("fn", 0))
+        entry["error_count"] += error_count
+        entry["models"].append(
+            {
+                "model": row.get("model"),
+                "fp": int(row.get("fp", 0)),
+                "fn": int(row.get("fn", 0)),
+                "f1": row.get("f1"),
+            }
+        )
+    return sorted(
+        by_image.values(),
+        key=lambda value: (-int(value["error_count"]), str(value["relative_path"])),
+    )[:limit]
+
+
+def _result_from_manifest(target: Path, manifest: dict[str, Any]) -> ComparisonResult:
+    return ComparisonResult(
+        location=target,
+        ranking=tuple(manifest.get("ranking") or ()),
+        cohort_fingerprint=str(manifest.get("cohort_fingerprint") or ""),
+        cohort_verified=bool(manifest.get("cohort_verified")),
+        training_overlap_detected=bool(manifest.get("training_overlap_detected")),
+        training_provenance_complete=bool(manifest.get("training_provenance_complete")),
+        cache_verified=bool(manifest.get("cache_verified")),
+        cache_statistics=dict(manifest.get("cache_statistics") or {}),
+        protocol=str(manifest.get("protocol") or "fixed"),
+        settings=dict(manifest.get("settings") or {}),
+        limitations=tuple(str(value) for value in manifest.get("limitations") or ()),
+    )

@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import csv
-import os
-import pickle
 import sys
 import types
 from pathlib import Path
@@ -13,19 +10,14 @@ import pytest
 from dataset_fixer import (
     ComparisonResult,
     Dataset,
+    DatasetValidationError,
     Model,
     ModelCollection,
     PredictionResult,
 )
 from dataset_fixer.comparison.cache import (
-    import_notebook_cache,
     load_package_cache,
-    model_hash,
-    notebook_cache_basename,
-    notebook_dataset_hash,
-    restricted_pickle_load,
     save_package_cache,
-    write_notebook_numpy_cache,
 )
 from dataset_fixer.comparison.cohort import freeze_cohort
 from dataset_fixer.comparison.inference import _run_native, resolve_backend
@@ -75,68 +67,6 @@ def test_package_cache_is_pickle_free_and_detects_corruption(detect_dataset: Pat
     shard.write_bytes(b"broken")
     loaded, _, complete = load_package_cache(root, cohort, (0.5,))
     assert not complete and 0.5 not in loaded
-
-
-def test_restricted_pickle_rejects_globals(tmp_path: Path) -> None:
-    class Evil:
-        def __reduce__(self):
-            return os.system, ("echo forbidden",)
-
-    path = tmp_path / "malicious.gridcache.pkl"
-    path.write_bytes(pickle.dumps(Evil()))
-    with pytest.raises(pickle.UnpicklingError, match="forbidden"):
-        restricted_pickle_load(path)
-
-
-def test_notebook_v3_round_trip_is_content_verified(tmp_path: Path) -> None:
-    split_root = tmp_path / "val"
-    (split_root / "images").mkdir(parents=True)
-    (split_root / "labels").mkdir()
-    image = split_root / "images" / "fruit.jpg"
-    Image.new("RGB", (100, 80), (20, 30, 40)).save(image)
-    (split_root / "labels" / "fruit.txt").write_text("0 15 0.5 0.5\n", encoding="utf-8")
-    dataset = Dataset.open(split_root, task="polo", names=["fruit"], radii={0: 15}, progress=False)
-    cohort = freeze_cohort(dataset, "train")
-    checkpoint = tmp_path / "model.pt"
-    checkpoint.write_bytes(b"model")
-    predictions = {
-        .75: {cohort.records[0].image_id: [Prediction(0, .9, bbox=(35, 25, 65, 55), point=(50, 40))]}
-    }
-    key = {
-        "cache_version": 3,
-        "cache_format": "gridcache_v3_numpy_sharded",
-        "model_path": str(checkpoint.resolve()),
-        "model_hash": model_hash(checkpoint),
-        "dataset_root": str(split_root.resolve()),
-        "dataset_hash": notebook_dataset_hash(split_root),
-        "resolution": 480,
-        "min_conf": .35,
-        "iou_list": [.75],
-        "device": "None",
-        "sahi_slice_height": 480,
-        "sahi_slice_width": 480,
-        "sahi_overlap_height_ratio": .2,
-        "sahi_overlap_width_ratio": .2,
-        "sahi_postprocess_type": "GREEDYNMM",
-        "sahi_postprocess_match_metric": "IOS",
-        "sahi_postprocess_class_agnostic": False,
-        "sahi_model_type": "ultralytics",
-    }
-    cache_dir = tmp_path / "legacy"
-    target = cache_dir / notebook_cache_basename(checkpoint, key, numpy=True)
-    write_notebook_numpy_cache(target, key=key, cohort=cohort, predictions=predictions)
-    restored, audit = import_notebook_cache(
-        [cache_dir], model_sha256=model_hash(checkpoint), resolution=480,
-        confidence_floor=.35, thresholds=(.75,), cohort=cohort,
-        expected_key={
-            "device": "None", "sahi_slice_height": 480, "sahi_slice_width": 480,
-            "sahi_overlap_height_ratio": .2, "sahi_overlap_width_ratio": .2,
-            "sahi_postprocess_type": "GREEDYNMM", "sahi_postprocess_match_metric": "IOS",
-            "sahi_postprocess_class_agnostic": False, "sahi_model_type": "ultralytics",
-        },
-    )
-    assert audit and audit["verified"] is True
-    assert restored[.75][cohort.records[0].image_id][0].point == pytest.approx((50, 40))
 
 
 def test_class_aware_optimal_matching_and_metrics(detect_dataset: Path) -> None:
@@ -261,19 +191,62 @@ def test_model_load_many_returns_reusable_unbound_collection(
             "baseline": {
                 "path": checkpoint,
                 "resolution": 384,
-                "confidence_thresholds": (0.5,),
+                "confidence": 0.5,
+                "postprocess": 0.5,
+                "inference": "native",
+                "device": "mps",
             }
-        },
-        inference="native",
-        device="mps",
+        }
     )
 
     assert isinstance(models, ModelCollection)
-    assert models.source is None
+    assert not hasattr(models, "source")
     assert models.names == ("baseline",)
     assert models["baseline"].resolution == 384
     assert models["baseline"].device == "mps"
-    assert models["baseline"].settings["confidence_thresholds"] == (0.5,)
+    assert models["baseline"].confidence == pytest.approx(0.5)
+    assert models["baseline"].postprocess == pytest.approx(0.5)
+
+
+def test_model_collection_rejects_removed_shared_configuration(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    models = Model.load_many({"candidate": {"path": checkpoint, "task": "detect"}})
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'resolution'"):
+        models.compare(object(), resolution=640)
+    with pytest.raises(TypeError, match="unexpected keyword argument 'baseline'"):
+        models.compare(object(), baseline="candidate")
+    with pytest.raises(TypeError, match="unexpected keyword argument 'inference'"):
+        Model.load_many({"candidate": checkpoint}, inference="sahi")
+    with pytest.raises(DatasetValidationError, match="missing path"):
+        Model.load_many({"candidate": {"model_folder": checkpoint}})
+
+
+def test_model_owns_explicit_comparison_and_sahi_settings(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    model = Model(
+        checkpoint,
+        task="detect",
+        resolution=640,
+        inference="sahi",
+        confidence=0.4,
+        postprocess=0.8,
+        sahi_slice_height=320,
+        sahi_slice_width=256,
+        sahi_overlap=0.1,
+    )
+
+    assert model.resolution == 640
+    assert model.inference == "sahi"
+    assert model.confidence == pytest.approx(0.4)
+    assert model.postprocess == pytest.approx(0.8)
+    assert model.settings["sahi_slice_height"] == 320
+    assert model.settings["sahi_slice_width"] == 256
+    assert model.settings["sahi_overlap"] == pytest.approx(0.1)
 
 
 def test_model_collection_compare_atomic_result(
@@ -284,6 +257,7 @@ def test_model_collection_compare_atomic_result(
     checkpoint.write_bytes(b"checkpoint")
 
     def fake_inference(spec, cohort, *, thresholds, **kwargs):
+        fake_inference.calls += 1
         values = {}
         for threshold in thresholds:
             values[float(threshold)] = {
@@ -294,46 +268,60 @@ def test_model_collection_compare_atomic_result(
                 for record in cohort.records
             }
         return values, {"fake": 0.01}
+    fake_inference.calls = 0
 
     monkeypatch.setattr("dataset_fixer.comparison.engine.run_inference", fake_inference)
     destination = tmp_path / "comparison"
-    models = Model.load_many({"baseline": checkpoint}, task="detect")
+    models = Model.load_many(
+        {
+            "baseline": {
+                "path": checkpoint,
+                "task": "detect",
+                "confidence": 0.5,
+                "postprocess": 0.5,
+            }
+        }
+    )
     result = models.compare(
         dataset,
         split="val",
-        baseline="baseline",
-        inference="native",
-        training_provenance="ignore",
-        confidence_thresholds=(0.5,),
-        postprocess_thresholds=(0.5,),
-        cache=False,
-        visualize=False,
         progress=False,
         destination=destination,
-        bootstrap_resamples=20,
     )
     assert isinstance(result, ComparisonResult)
     assert result.cohort_verified
     assert result.ranking[0]["score"] == pytest.approx(1.0)
-    assert (destination / "model-comparison.json").is_file()
-    assert (destination / "metrics" / "ranking.csv").is_file()
+    assert (destination / "reports" / "result.json").is_file()
+    assert (destination / "reports" / "plots.png").is_file()
+    assert (destination / "reports" / "comparison.png").is_file()
+    assert not list(destination.rglob("*.csv"))
+    assert not list(destination.rglob("*.jsonl"))
+    assert (dataset.location / ".cache" / "evaluations").is_dir()
     assert not list(tmp_path.glob(".comparison.building-*"))
 
-    direct = Model(checkpoint, name="direct", task="detect")
+    models.compare(
+        dataset,
+        split="val",
+        progress=False,
+        destination=destination,
+    )
+    assert fake_inference.calls == 1
+
+    direct = Model(
+        checkpoint,
+        name="direct",
+        task="detect",
+        confidence=0.5,
+        postprocess=0.5,
+    )
     direct_result = direct.compare(
         dataset,
         split="val",
-        training_provenance="ignore",
-        confidence_thresholds=(0.5,),
-        postprocess_thresholds=(0.5,),
-        cache=False,
-        visualize=False,
         progress=False,
         destination=tmp_path / "direct-comparison",
-        bootstrap_resamples=20,
     )
     assert direct_result.ranking[0]["model"] == "direct"
-    assert direct_result.settings["inference_requested"] == "native"
+    assert direct_result.settings["models"]["direct"]["backend"] == "native"
 
 
 def test_comparison_visuals_have_data_and_metadata_sidecars(
@@ -357,21 +345,24 @@ def test_comparison_visuals_have_data_and_metadata_sidecars(
 
     monkeypatch.setattr("dataset_fixer.comparison.engine.run_inference", fake_inference)
     destination = tmp_path / "visual-comparison"
-    models = Model.load_many({"visual": checkpoint}, task="detect")
-    models.compare(
-        dataset, inference="native", training_provenance="ignore",
-        confidence_thresholds=(.5,), postprocess_thresholds=(.5,), cache=False,
-        visualize=True, progress=False, destination=destination, bootstrap_resamples=20,
+    models = Model.load_many(
+        {
+            "visual": {
+                "path": checkpoint,
+                "task": "detect",
+                "confidence": .5,
+                "postprocess": .5,
+            }
+        }
     )
-    for name in ("ranking_forest", "precision_recall", "f1_confidence", "cohort_composition"):
-        assert (destination / "figures" / f"{name}.pdf").is_file()
-        assert (destination / "figures" / f"{name}.svg").is_file()
-        assert (destination / "figures" / f"{name}.png").is_file()
-        assert (destination / "figures" / "data" / f"{name}.csv").is_file()
-        assert (destination / "figures" / "metadata" / f"{name}.json").is_file()
-    with (destination / "figures" / "data" / "cohort_composition.csv").open(
-        newline="", encoding="utf-8"
-    ) as handle:
-        composition = list(csv.DictReader(handle))
-    assert composition[-1]["class_name"] == "background"
-    assert composition[-1]["unit"] == "empty images"
+    models.compare(
+        dataset,
+        save_prediction_plots=True,
+        progress=False,
+        destination=destination,
+    )
+    assert (destination / "reports" / "plots.png").is_file()
+    assert (destination / "reports" / "comparison.png").is_file()
+    assert len(list((destination / "predictions").rglob("*.png"))) == 2
+    assert not (destination / "figures").exists()
+    assert not (destination / "qualitative").exists()

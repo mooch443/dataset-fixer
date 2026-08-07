@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import csv
-import json
 from pathlib import Path
 
 import pytest
@@ -23,6 +21,10 @@ def _augmented_sample(dataset: Dataset, split: str = "train"):
         for sample in dataset._samples
         if sample.split == split and "__aug-001" in sample.relative_path.stem
     )
+
+
+def _audit(dataset: Dataset, name: str):
+    return dataset.manifest["audits"][name]
 
 
 def test_augment_is_virtual_deterministic_and_records_full_provenance(tmp_path: Path) -> None:
@@ -52,21 +54,17 @@ def test_augment_is_virtual_deterministic_and_records_full_provenance(tmp_path: 
     assert len([sample for sample in first._samples if sample.split == "train"]) == 1
     assert len([sample for sample in first._samples if sample.split == "val"]) == 1
     assert sha256_file(augmented.image_path) == sha256_file(_augmented_sample(second).image_path)
-    assert (first.location / "reports" / "augmentation_preview.jpg").is_file()
-    report = json.loads((first.location / "reports" / "augmentation.json").read_text(encoding="utf-8"))
+    assert (first.location / "reports" / "plots.png").is_file()
+    report = _audit(first, "augmentation")
     assert report["generated_images"] == 1
-    counts = json.loads(
-        (first.location / "reports" / "augmentation_class_counts.json").read_text(encoding="utf-8")
-    )
-    assert counts["before"]["background"] == 0
-    assert counts["after"]["background"] == 0
+    counts = _audit(first, "augmentation_class_counts")
+    assert counts["result"]["background"] == 0
     assert counts["names"]["background"] == "background"
-    assert (first.location / "reports" / "augmentation_class_counts.jpg").is_file()
     record = first.provenance[f"train/images/{augmented.relative_path.as_posix()}"]
     assert record["augmentation_index"] == 1
     assert record["augmentation_seed"]
     assert record["albumentations_applied"]
-    manifest = json.loads((first.location / "dataset-fixer.json").read_text(encoding="utf-8"))
+    manifest = first.manifest
     assert manifest["environment"]["packages"]["albumentations"] == A.__version__
     assert manifest["history"][0]["settings"]["pipeline"]["__version__"]
 
@@ -158,7 +156,7 @@ def test_polo_augmentation_rejects_non_circular_geometry_unless_explicitly_lossy
         allow_lossy=True,
         visualize=False,
     ).export(destination=tmp_path / "lossy", visualize=False, progress=False)
-    report = json.loads((lossy.location / "reports" / "augmentation.json").read_text(encoding="utf-8"))
+    report = _audit(lossy, "augmentation")
     assert report["lossy_annotations"] == 1
 
 
@@ -212,7 +210,7 @@ def test_coverage_crop_pipeline_transforms_before_crop_without_border_fill(
     assert train.provenance["crop"] == repeated_train.provenance["crop"]
     assert sha256_file(train.image_path) == sha256_file(repeated_train.image_path)
     assert val.provenance["tile_mode"] == "coverage"
-    report = json.loads((exported.location / "reports" / "crop_augmentation.json").read_text())
+    report = _audit(exported, "crop_augmentation")
     assert report["coordinate_order"] == "full-source transform, then coverage crop"
     assert report["sampling_unit"] == (
         "one independently seeded full-source virtual camera per crop candidate"
@@ -221,11 +219,7 @@ def test_coverage_crop_pipeline_transforms_before_crop_without_border_fill(
     assert "augment_val=False" in report["unchanged_splits"]["val"]
     assert report["stats"]["accepted_positive_tiles"] >= 1
     assert any("augment_val=False" in warning for warning in exported.warnings)
-    coverage_rows = list(
-        csv.DictReader(
-            (exported.location / "coverage_summary" / "source_pixel_coverage.csv").open()
-        )
-    )
+    coverage_rows = _audit(exported, "coverage.source_pixel_coverage")["rows"]
     train_coverage = next(row for row in coverage_rows if row["split"] == "train")
     assert train_coverage["coverage_status"] == "exact"
     assert float(train_coverage["source_pixel_coverage_percent"]) == pytest.approx(
@@ -285,9 +279,7 @@ def test_each_repeated_positive_crop_samples_a_distinct_virtual_camera(
         sample.provenance["tile_mode"] == "coverage-augmented"
         for sample in exported._samples
     )
-    report = json.loads(
-        (exported.location / "reports" / "crop_augmentation.json").read_text()
-    )
+    report = _audit(exported, "crop_augmentation")
     assert report["accepted_virtual_camera_crops"] == 4
     assert report["distinct_accepted_virtual_camera_seeds"] == 4
     assert report["fresh_seed_per_accepted_crop"] is True
@@ -358,15 +350,11 @@ def test_virtual_coverage_errors_skip_rejects_and_resamples_candidate(
     )
 
     assert len(exported._samples) == 1
-    report = json.loads(
-        (exported.location / "reports" / "tiling_skips.json").read_text()
-    )
+    report = _audit(exported, "tiling_skips")
     assert report["skipped_candidates"] == 1
     assert report["items"][0]["mode"] == "coverage-virtual"
     assert report["items"][0]["details"]["result_geometry"]["type"] == "GeometryCollection"
-    crop_report = json.loads(
-        (exported.location / "reports" / "crop_augmentation.json").read_text()
-    )
+    crop_report = _audit(exported, "crop_augmentation")
     assert crop_report["stats"]["rejected_geometry"] == 1
 
 
@@ -420,9 +408,7 @@ def test_virtual_background_filter_sees_final_transformed_crop(
         "coverage-background-augmented"
     )
     assert background.provenance["background_filter_result"] == "accepted"
-    report = json.loads(
-        (exported.location / "reports" / "background_filter.json").read_text()
-    )
+    report = _audit(exported, "background_filter")
     assert report["rejected_candidates"] == 1
     assert report["accepted_candidates"] == 1
     assert report["by_origin"][

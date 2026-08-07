@@ -52,6 +52,8 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
         "export_formats",
         "visualize",
         "assert_trainable",
+        "trace",
+        "update",
     }
     public = {name: value for name, value in Dataset.__dict__.items() if not name.startswith("_")}
     assert set(public) == expected
@@ -81,12 +83,22 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
     assert "background_filter" in tile_signature
     assert "**settings" not in tile_signature
     assert "Literal['raise', 'skip']" in open_signature
-    assert "Literal['native', 'sahi']" in comparison_signature
-    assert "sahi_slice_height" in comparison_signature
-    assert "sahi_overlap" in comparison_signature
+    assert "save_prediction_plots" in comparison_signature
+    for removed in (
+        "baseline",
+        "comparison_space",
+        "inference",
+        "confidence",
+        "postprocess",
+        "protocol",
+        "resolution",
+        "comparison_unit",
+        "device",
+        "sahi_",
+    ):
+        assert removed not in comparison_signature
     assert inspect.getdoc(ComparisonResult)
     assert inspect.getdoc(SemanticComparisonResult)
-    assert "comparison_space" in comparison_signature
     assert "folds" not in comparison_signature
     assert "upscale_factor" not in comparison_signature
     assert not hasattr(Dataset, "compare_models")
@@ -99,9 +111,42 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
     assert inspect.getdoc(Model.predict)
     assert inspect.getdoc(Model.compare)
     assert inspect.getdoc(Model.load_many)
-    assert "defaults" not in inspect.signature(Model.load_many).parameters
+    assert tuple(inspect.signature(Model.load_many).parameters) == ("models",)
     assert not hasattr(Model, "model_sha256")
     assert inspect.getdoc(ModelCollection)
+
+
+def test_public_model_api_documents_every_parameter() -> None:
+    entries = (
+        (Model, inspect.signature(Model), inspect.getdoc(Model)),
+        (Model.predict, inspect.signature(Model.predict), inspect.getdoc(Model.predict)),
+        (Model.compare, inspect.signature(Model.compare), inspect.getdoc(Model.compare)),
+        (Model.visualize, inspect.signature(Model.visualize), inspect.getdoc(Model.visualize)),
+        (Model.load_many, inspect.signature(Model.load_many), inspect.getdoc(Model.load_many)),
+        (
+            ModelCollection.predict,
+            inspect.signature(ModelCollection.predict),
+            inspect.getdoc(ModelCollection.predict),
+        ),
+        (
+            ModelCollection.compare,
+            inspect.signature(ModelCollection.compare),
+            inspect.getdoc(ModelCollection.compare),
+        ),
+        (
+            ModelCollection.visualize,
+            inspect.signature(ModelCollection.visualize),
+            inspect.getdoc(ModelCollection.visualize),
+        ),
+    )
+    for target, signature, doc in entries:
+        assert doc is not None
+        missing = [
+            name
+            for name in signature.parameters
+            if name not in {"self", "cls"} and f"{name}:" not in doc
+        ]
+        assert not missing, f"{target} does not document {missing}"
     assert inspect.getdoc(ModelCollection.compare)
     assert inspect.getdoc(PredictionResult)
 

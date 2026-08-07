@@ -18,7 +18,11 @@ from dataset_fixer import (
     SemanticComparisonResult,
 )
 from dataset_fixer.comparison.types import Prediction
-from dataset_fixer.semantic_comparison import _SemanticCase, _canonicalize_predictions
+from dataset_fixer.semantic_comparison import (
+    _SemanticCase,
+    _canonicalize_predictions,
+    _select_visual_cases,
+)
 from conftest import make_yolo_dataset
 
 
@@ -187,6 +191,39 @@ def test_canonical_projection_area_pools_probabilities_instead_of_sampling_hard_
         assert projected.getpixel((0, 0)) == 1
 
 
+def test_comparison_case_selection_is_seeded_random_and_excludes_empty_masks(
+    tmp_path: Path,
+) -> None:
+    cases: list[_SemanticCase] = []
+    for index in range(12):
+        image_path = tmp_path / f"image-{index}.png"
+        mask_path = tmp_path / f"mask-{index}.png"
+        Image.new("RGB", (4, 4), "black").save(image_path)
+        mask = np.zeros((4, 4), dtype=np.uint8)
+        if index >= 2:
+            mask[index % 4, index % 4] = 1
+        Image.fromarray(mask).save(mask_path)
+        cases.append(
+            _SemanticCase(
+                case_id=f"case-{index}",
+                relative_path=Path(f"image-{index}.png"),
+                image_path=image_path,
+                mask_path=mask_path,
+                width=4,
+                height=4,
+                image_sha256=f"image-{index}",
+                mask_sha256=f"mask-{index}",
+            )
+        )
+
+    first = _select_visual_cases(cases, samples=8, include_empty=False, seed=42)
+    second = _select_visual_cases(cases, samples=8, include_empty=False, seed=42)
+
+    assert [case.case_id for case in first] == [case.case_id for case in second]
+    assert len(first) == 8
+    assert all(int(case.case_id.removeprefix("case-")) >= 2 for case in first)
+
+
 def test_semantic_comparison_reports_finite_dice_support(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -221,11 +258,9 @@ def test_semantic_comparison_reports_finite_dice_support(
         lambda: {"test": True},
     )
 
-    models = Model.load_many({"perfect": model}, workers=1)
+    models = Model.load_many({"perfect": {"path": model, "workers": 1}})
     result = models.compare(
         exported,
-        bootstrap_resamples=10,
-        visualize=False,
         progress=False,
         destination=tmp_path / "finite-support-comparison",
     )
@@ -247,13 +282,34 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
     nnunet_path = _nnunet_model(tmp_path / "semantic-model")
     models = Model.load_many(
         {
-            "yolo-seg": {"path": yolo_path, "task": "segment"},
-            "yolo-semantic": {"path": yolo_semantic_path, "task": "semantic"},
-            "nnunet": {"model_folder": nnunet_path},
-        },
-        source=exported,
-        device="cpu",
-        workers=1,
+            "yolo-seg": {
+                "path": yolo_path,
+                "task": "segment",
+                "device": "cpu",
+                "inference": "sahi",
+                "sahi_slice_height": 24,
+                "sahi_slice_width": 20,
+                "sahi_overlap": 0.25,
+            },
+            "yolo-semantic": {
+                "path": yolo_semantic_path,
+                "task": "semantic",
+                "device": "cpu",
+                "inference": "sahi",
+                "sahi_slice_height": 24,
+                "sahi_slice_width": 20,
+                "sahi_overlap": 0.25,
+            },
+            "nnunet": {
+                "path": nnunet_path,
+                "device": "cpu",
+                "workers": 1,
+                "inference": "sahi",
+                "sahi_slice_height": 24,
+                "sahi_slice_width": 20,
+                "sahi_overlap": 0.25,
+            },
+        }
     )
 
     prediction_options: list[dict[str, object]] = []
@@ -325,15 +381,8 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
     )
     destination = tmp_path / "mixed-comparison"
     result = models.compare(
-        comparison_space="auto",
+        exported,
         split="val",
-        baseline="yolo-seg",
-        inference="sahi",
-        sahi_slice_height=24,
-        sahi_slice_width=20,
-        sahi_overlap=0.25,
-        bootstrap_resamples=10,
-        visualize=False,
         progress=False,
         destination=destination,
     )
@@ -353,7 +402,7 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
     assert by_name["yolo-semantic"]["native_task"] == "semantic_segment"
     assert by_name["yolo-semantic"]["projection"] == "native-semantic-mask"
     assert by_name["yolo-seg"]["micro_dice"] == pytest.approx(1.0)
-    manifest = json.loads((destination / "semantic-model-comparison.json").read_text())
+    manifest = json.loads((destination / "reports" / "result.json").read_text())
     assert manifest["backend"] == "common-semantic-mask"
     assert manifest["negotiated_comparison_space"] == "semantic"
     assert set(manifest["settings"]["sahi_models"]) == {
@@ -362,9 +411,18 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
         "nnunet",
     }
     assert all(options["inference"] == "sahi" for options in prediction_options)
-    assert all(options["sahi_slice_height"] == 24 for options in prediction_options)
-    cohort = json.loads((destination / "evaluation-cohort.jsonl").read_text().splitlines()[0])
-    assert cohort["projection"] == "binary-foreground-union"
+    assert all(model.settings["sahi_slice_height"] == 24 for model in models)
+    assert (destination / "reports" / "plots.png").is_file()
+    assert (destination / "reports" / "comparison.png").is_file()
+    assert not list(destination.rglob("*.jsonl"))
+    calls_after_first = len(prediction_options)
+    models.compare(
+        exported,
+        split="val",
+        progress=False,
+        destination=tmp_path / "mixed-comparison-from-cache",
+    )
+    assert len(prediction_options) == calls_after_first
 
 
 def test_mixed_comparison_rejects_tasks_without_a_semantic_denominator(
@@ -376,16 +434,13 @@ def test_mixed_comparison_rejects_tasks_without_a_semantic_denominator(
     models = Model.load_many(
         {
             "detector": {"path": detector_path, "task": "detect"},
-            "semantic": {"model_folder": _nnunet_model(tmp_path / "semantic-model")},
-        },
-        source=exported,
+            "semantic": {"path": _nnunet_model(tmp_path / "semantic-model")},
+        }
     )
 
     with pytest.raises(DatasetValidationError, match="No common semantic denominator"):
         models.compare(
-            comparison_space="auto",
-            bootstrap_resamples=10,
-            visualize=False,
+            exported,
             progress=False,
             destination=tmp_path / "unsupported-comparison",
         )
@@ -417,17 +472,18 @@ def test_loaded_semantic_models_visualize_only_sampled_cases_with_shared_mask_gr
     loaded = Model.load_many(
         {
             "resenc-m-very-long-model-name-alpha": {
-                "model_folder": perfect,
+                "path": perfect,
                 "upscale_factor": 2,
+                "device": "mps",
+                "workers": 1,
             },
             "resenc-m-very-long-model-name-beta": {
-                "model_folder": weak,
+                "path": weak,
                 "upscale_factor": 1,
+                "device": "mps",
+                "workers": 1,
             },
-        },
-        kind="nnunet",
-        device="mps",
-        workers=1,
+        }
     )
 
     assert isinstance(loaded, ModelCollection)
@@ -503,6 +559,39 @@ def test_generic_model_predicts_semantic_export_and_saves_masks(
     assert len(list((saved / "masks").glob("*.png"))) == 2
 
 
+def test_nnunet_without_a_device_uses_runtime_device_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exported = _semantic_export(tmp_path)
+    folder = _nnunet_model(tmp_path / "automatic-device-model")
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return _fake_nnunet_run(command, **kwargs)
+
+    monkeypatch.setattr(
+        "dataset_fixer.semantic_comparison.shutil.which",
+        lambda command: f"/fake/{command}",
+    )
+    monkeypatch.setattr(
+        "dataset_fixer.semantic_comparison.subprocess.run",
+        fake_run,
+    )
+    monkeypatch.setattr(
+        "dataset_fixer.model._default_nnunet_device",
+        lambda: "mps",
+    )
+
+    model = Model(folder, workers=1)
+    result = model.predict(exported, split="val", progress=False)
+
+    assert model.device is None
+    assert result.settings["device"] == "mps"
+    assert commands[0][commands[0].index("-device") + 1] == "mps"
+
+
 def test_nnunet_sahi_stitches_tile_probabilities_at_native_and_canonical_scale(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -553,7 +642,7 @@ def test_nnunet_sahi_stitches_tile_probabilities_at_native_and_canonical_scale(
     )
 
     assert result.backend == "sahi"
-    assert len(commands) == 2
+    assert len(commands) == 1
     assert all("--save_probabilities" in command for command in commands)
     assert all(record.mask.shape == (30, 40) for record in result.records)
     assert all(record.native_mask.shape == (60, 80) for record in result.records)
@@ -585,22 +674,19 @@ def test_semantic_export_compares_official_nnunet_model_folders(
             # Passing fold_0 mirrors the notebook's FOLD_OUTPUT value. The API
             # normalizes it to the complete trained-model folder automatically.
             "perfect": {
-                "model_folder": perfect / "fold_0",
+                "path": perfect / "fold_0",
                 "upscale_factor": 2,
+                "workers": 1,
             },
             "weak": {
-                "model_folder": weak,
+                "path": weak,
                 "upscale_factor": 1,
+                "workers": 1,
             },
-        },
-        workers=1,
+        }
     )
     result = models.compare(
         exported,
-        baseline="perfect",
-        bootstrap_resamples=20,
-        seed=7,
-        visualize=True,
         progress=True,
         destination=destination,
     )
@@ -621,35 +707,20 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     assert predict[predict.index("-m") + 1] == str(perfect)
     assert predict[predict.index("-f") + 1] == "0"
     assert predict[predict.index("-chk") + 1] == "checkpoint_final.pth"
-    assert predict[predict.index("-device") + 1] == "cuda"
+    assert predict[predict.index("-device") + 1] == models["perfect"]._resolved_device()
     assert "--save_probabilities" in predict
-    cohort = [json.loads(line) for line in (destination / "evaluation-cohort.jsonl").read_text().splitlines()]
-    assert len(cohort) == 2
-    assert cohort[0]["width"] == 40
-    assert cohort[0]["height"] == 30
-    assert cohort[0]["projection"] == "probability-area-pool-argmax"
-    assert cohort[0]["model_inputs"]["perfect"]["prepared_width"] == 80
-    assert cohort[0]["model_inputs"]["weak"]["prepared_width"] == 40
     assert not (destination / "cohort").exists()
-    assert len(list((destination / "predictions" / "perfect").glob("*.png"))) == 2
-    with Image.open(destination / "predictions" / "perfect" / "val_000000.png") as prediction:
-        assert prediction.size == (40, 30)
-    assert (destination / "ranking.csv").is_file()
-    assert (destination / "per-case.csv").is_file()
-    assert (destination / "paired-statistics.csv").is_file()
-    assert (destination / "ranking.png").is_file()
-    assert (destination / "comparison.png").is_file()
-    assert not (destination / "ranking.pdf").exists()
-    assert not (destination / "ranking.svg").exists()
+    assert not (destination / "predictions").exists()
+    assert not list(destination.rglob("*.csv"))
+    assert not list(destination.rglob("*.jsonl"))
+    assert (destination / "reports" / "plots.png").is_file()
+    assert (destination / "reports" / "comparison.png").is_file()
     assert not (destination / "figures").exists()
     assert not (destination / "qualitative").exists()
-    assert not (destination / "reports").exists()
-    manifest = json.loads((destination / "semantic-model-comparison.json").read_text())
+    manifest = json.loads((destination / "reports" / "result.json").read_text())
     assert manifest["backend"] == "native"
     assert manifest["adapter"] == "nnunetv2-official"
-    assert manifest["schema"] == 4
-    assert manifest["figures"] == ["ranking.png"]
-    assert manifest["qualitative"] == ["comparison.png"]
+    assert manifest["schema"] == 7
     assert manifest["cases"] == 2
     assert "upscale_factor" not in manifest["settings"]
     assert [model["upscale_factor"] for model in manifest["settings"]["models"]] == [2, 1]
@@ -657,14 +728,15 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     assert result.ranking[0]["cohort_cases"] == 2
     assert result.ranking[0]["support_cases"] == 2
     assert result.ranking[0]["native_dice"] == pytest.approx(1.0)
-    official = json.loads((destination / "perfect-metrics.json").read_text())
-    assert official["metric_per_case"][0]["reference_file"].startswith("dataset://val/masks/0/")
-    assert official["metric_per_case"][0]["prediction_file"].startswith("predictions/perfect/")
-    assert official["projection"] == "probability-area-pool-argmax"
-    native = json.loads((destination / "perfect-native-metrics.json").read_text())
-    assert native["foreground_mean"]["Dice"] == pytest.approx(1.0)
-    assert native["metric_per_case"][0]["prediction_file"] is None
-    assert native["projection"] == "none"
+    assert manifest["worst_cases"]
+    command_count = len(commands)
+    cached = models.compare(
+        exported,
+        progress=False,
+        destination=tmp_path / "comparison-from-cache",
+    )
+    assert len(commands) == command_count
+    assert all(row["cache"] == "hit" for row in cached.ranking)
 
 
 def test_semantic_comparison_failure_is_atomic(
@@ -681,11 +753,9 @@ def test_semantic_comparison_failure_is_atomic(
     monkeypatch.setattr("dataset_fixer.semantic_comparison.subprocess.run", fail)
     destination = tmp_path / "failed-comparison"
     with pytest.raises(RuntimeError, match="synthetic failure"):
-        models = Model.load_many({"broken": model}, workers=1)
+        models = Model.load_many({"broken": {"path": model, "workers": 1}})
         models.compare(
             exported,
-            bootstrap_resamples=10,
-            visualize=False,
             progress=False,
             destination=destination,
         )
@@ -705,11 +775,9 @@ def test_semantic_comparison_requires_binary_png_model_folder(
     monkeypatch.setattr("dataset_fixer.semantic_comparison.shutil.which", lambda command: f"/fake/{command}")
 
     with pytest.raises(DatasetValidationError, match="requires binary nnU-Net labels"):
-        models = Model.load_many({"multiclass": model}, workers=1)
+        models = Model.load_many({"multiclass": {"path": model, "workers": 1}})
         models.compare(
             exported,
-            bootstrap_resamples=10,
-            visualize=False,
             progress=False,
             destination=tmp_path / "invalid-comparison",
         )
@@ -721,13 +789,10 @@ def test_semantic_comparison_validates_model_specific_upscale_factor(tmp_path: P
 
     with pytest.raises(DatasetValidationError, match="upscale_factor must be a positive integer"):
         models = Model.load_many(
-            {"bad-scale": {"model_folder": model, "upscale_factor": 0}},
-            workers=1,
+            {"bad-scale": {"path": model, "upscale_factor": 0, "workers": 1}},
         )
         models.compare(
             exported,
-            bootstrap_resamples=10,
-            visualize=False,
             progress=False,
             destination=tmp_path / "invalid-scale-comparison",
         )

@@ -705,7 +705,7 @@ def _write_tiling_skip_report(
     if rows:
         builder.warnings.append(
             f"Skipped {len(rows)} tile candidate(s) with non-exportable geometry; "
-            "see reports/tiling_skips.json"
+            "see reports/dataset-info.json#audits.tiling_skips"
         )
 
 
@@ -840,7 +840,7 @@ def _write_background_filter_report(
     if stats["rejected"]:
         builder.warnings.append(
             f"Background filter rejected {stats['rejected']} candidate(s); "
-            "see reports/background_filter.json"
+            "see reports/dataset-info.json#audits.background_filter"
         )
 
 
@@ -1163,7 +1163,8 @@ def _tile_coverage(
                 if errors == "skip":
                     builder.warnings.append(
                         f"{sample.split}/{sample.relative_path}: missed {missed} requested "
-                        "object appearances after candidate rejection; see reports/tiling_skips.json"
+                        "object appearances after candidate rejection; see "
+                        "reports/dataset-info.json#audits.tiling_skips"
                     )
                 elif use_virtual_camera:
                     raise DatasetValidationError(

@@ -21,6 +21,23 @@ PredictionTask = Literal["detect", "segment", "pose", "polo", "semantic_segment"
 ModelTask = PredictionTask | Literal["auto", "locate", "semantic"]
 
 
+def _default_nnunet_device() -> Literal["cpu", "cuda", "mps"]:
+    """Select the best device exposed by the current PyTorch runtime."""
+
+    try:
+        import torch
+    except ImportError:
+        # The official nnU-Net executable may live in a separate environment.
+        # CPU is the only safe assumption when this process cannot inspect it.
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(getattr(torch, "backends", None), "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 @dataclass(frozen=True)
 class ModelInput:
     """One image supplied to :meth:`Model.predict`.
@@ -341,7 +358,19 @@ class Model:
         checkpoint: nnU-Net checkpoint filename within each fold.
         upscale_factor: nnU-Net input adapter scale used during training.
         workers: nnU-Net preprocessing/export worker count.
-        settings: Additional adapter defaults such as SAHI slicing options.
+        confidence: Default prediction confidence floor.
+        postprocess: Default native IoU or SAHI match threshold.
+        sahi_slice_height: SAHI tile height in canonical source pixels.
+        sahi_slice_width: SAHI tile width in canonical source pixels.
+        sahi_overlap: Default SAHI overlap ratio for both axes.
+        sahi_overlap_height_ratio: Optional vertical overlap override.
+        sahi_overlap_width_ratio: Optional horizontal overlap override.
+        sahi_postprocess_type: SAHI merge algorithm.
+        sahi_postprocess_match_metric: SAHI matching metric.
+        sahi_postprocess_class_agnostic: Whether SAHI may merge predictions
+            from different classes.
+        sahi_model_type: SAHI adapter name.
+        settings: Additional low-level adapter defaults.
     """
 
     def __init__(
@@ -359,6 +388,17 @@ class Model:
         checkpoint: str = "checkpoint_final.pth",
         upscale_factor: int = 1,
         workers: int = 2,
+        confidence: float = 0.25,
+        postprocess: float = 0.7,
+        sahi_slice_height: int | None = None,
+        sahi_slice_width: int | None = None,
+        sahi_overlap: float | None = None,
+        sahi_overlap_height_ratio: float | None = None,
+        sahi_overlap_width_ratio: float | None = None,
+        sahi_postprocess_type: Literal["GREEDYNMM", "NMM", "NMS", "LSNMS"] | None = None,
+        sahi_postprocess_match_metric: Literal["IOU", "IOS"] | None = None,
+        sahi_postprocess_class_agnostic: bool | None = None,
+        sahi_model_type: str | None = None,
         settings: Mapping[str, Any] | None = None,
     ) -> None:
         path = Path(source).expanduser().resolve()
@@ -403,9 +443,70 @@ class Model:
         self._inference = inference
         self._device = device
         self._settings = dict(settings or {})
-        from .sahi_support import reject_legacy_sahi_settings
+        explicit_settings = {
+            "confidence": confidence,
+            "postprocess": postprocess,
+            "sahi_slice_height": sahi_slice_height,
+            "sahi_slice_width": sahi_slice_width,
+            "sahi_overlap": sahi_overlap,
+            "sahi_overlap_height_ratio": sahi_overlap_height_ratio,
+            "sahi_overlap_width_ratio": sahi_overlap_width_ratio,
+            "sahi_postprocess_type": sahi_postprocess_type,
+            "sahi_postprocess_match_metric": sahi_postprocess_match_metric,
+            "sahi_postprocess_class_agnostic": sahi_postprocess_class_agnostic,
+            "sahi_model_type": sahi_model_type,
+        }
+        self._settings.update(
+            {key: value for key, value in explicit_settings.items() if value is not None}
+        )
+        removed_comparison_settings = sorted(
+            {
+                "baseline",
+                "comparison_space",
+                "protocol",
+                "calibration_split",
+                "training_provenance",
+                "comparison_unit",
+                "prediction_plots",
+                "bootstrap_resamples",
+                "seed",
+            }
+            & self._settings.keys()
+        )
+        if removed_comparison_settings:
+            raise ValueError(
+                "Removed comparison options cannot be stored on a model: "
+                + ", ".join(removed_comparison_settings)
+            )
+        from .sahi_support import reject_legacy_sahi_settings, resolve_sahi_settings
 
         reject_legacy_sahi_settings(self._settings)
+        if inference == "sahi" or any(
+            key.startswith("sahi_") for key in self._settings
+        ):
+            resolve_sahi_settings(
+                self._settings,
+                resolution=int(resolution) if resolution is not None else 480,
+            )
+        for key in ("confidence", "postprocess"):
+            if key in self._settings:
+                value = float(self._settings[key])
+                if not math.isfinite(value) or not 0 <= value <= 1:
+                    raise ValueError(f"{key} must be finite and in [0, 1]")
+                self._settings[key] = value
+        removed_thresholds = {
+            key: "confidence" if key == "confidence_thresholds" else "postprocess"
+            for key in ("confidence_thresholds", "postprocess_thresholds")
+            if key in self._settings
+        }
+        if removed_thresholds:
+            migration = ", ".join(
+                f"{old}->{new}" for old, new in removed_thresholds.items()
+            )
+            raise ValueError(
+                "Threshold sweeps were removed; configure one fixed value per model: "
+                f"{migration}"
+            )
         self._upscale_factor = upscale_factor
         self._workers = workers
         self._folds: tuple[str, ...] = ()
@@ -559,9 +660,29 @@ class Model:
 
     @property
     def device(self) -> str | None:
-        """Default inference device."""
+        """Configured inference device, or ``None`` for runtime selection."""
 
         return self._device
+
+    def _resolved_device(self, override: str | None = None) -> str | None:
+        """Resolve an execution device without expanding the public API."""
+
+        configured = override if override is not None else self.device
+        if self.kind == "nnunet" and configured is None:
+            return _default_nnunet_device()
+        return configured
+
+    @property
+    def confidence(self) -> float:
+        """Fixed prediction/evaluation confidence floor."""
+
+        return float(self._settings["confidence"])
+
+    @property
+    def postprocess(self) -> float:
+        """Fixed native IoU or SAHI match threshold."""
+
+        return float(self._settings["postprocess"])
 
     @property
     def training_dataset(self) -> Path | None:
@@ -648,6 +769,8 @@ class Model:
             ),
             "inference": self.inference,
             "device": self.device,
+            "confidence": self.confidence,
+            "postprocess": self.postprocess,
             "folds": self.folds,
             "checkpoint": self.checkpoint if self.kind == "nnunet" else None,
             "checkpoint_sha256": (
@@ -665,21 +788,21 @@ class Model:
         split: Literal["train", "val", "test"] | None = None,
         inference: Literal["native", "sahi"] | None = None,
         resolution: int | None = None,
-        confidence: float = 0.25,
-        postprocess: float = 0.7,
+        confidence: float | None = None,
+        postprocess: float | None = None,
         device: str | None = None,
         progress: bool = True,
         destination: str | Path | None = None,
         settings: Mapping[str, Any] | None = None,
         sahi_slice_height: int | None = None,
         sahi_slice_width: int | None = None,
-        sahi_overlap: float = 0.2,
+        sahi_overlap: float | None = None,
         sahi_overlap_height_ratio: float | None = None,
         sahi_overlap_width_ratio: float | None = None,
-        sahi_postprocess_type: Literal["GREEDYNMM", "NMM", "NMS", "LSNMS"] = "GREEDYNMM",
-        sahi_postprocess_match_metric: Literal["IOU", "IOS"] = "IOS",
-        sahi_postprocess_class_agnostic: bool = False,
-        sahi_model_type: str = "ultralytics",
+        sahi_postprocess_type: Literal["GREEDYNMM", "NMM", "NMS", "LSNMS"] | None = None,
+        sahi_postprocess_match_metric: Literal["IOU", "IOS"] | None = None,
+        sahi_postprocess_class_agnostic: bool | None = None,
+        sahi_model_type: str | None = None,
         _keep_native: bool = False,
     ) -> PredictionResult:
         """Predict images, directories, datasets, exports, or frozen inputs.
@@ -692,37 +815,59 @@ class Model:
                 sources and is ignored for direct image inputs.
             inference: Explicit native or sliced SAHI inference.
             resolution: Ultralytics input size override.
-            confidence: Prediction confidence floor.
-            postprocess: Native IoU or SAHI postprocessing threshold.
+            confidence: Prediction confidence floor override. If omitted, use
+                the model's ``confidence`` setting, then ``0.25``.
+            postprocess: Native IoU or SAHI match-threshold override. If
+                omitted, use the model's ``postprocess`` setting, then ``0.7``.
             device: Device override.
             progress: Show package-managed progress bars.
             destination: Optional new/empty directory receiving saved output.
             settings: Additional per-call adapter overrides.
             sahi_slice_height: Optional SAHI tile height in source pixels.
             sahi_slice_width: Optional SAHI tile width in source pixels.
-            sahi_overlap: Default overlap ratio for both tile axes.
+            sahi_overlap: Optional default overlap ratio for both tile axes.
+            sahi_overlap_height_ratio: Optional vertical overlap override.
+            sahi_overlap_width_ratio: Optional horizontal overlap override.
+            sahi_postprocess_type: Optional SAHI merge algorithm override.
+            sahi_postprocess_match_metric: Optional SAHI matching metric.
+            sahi_postprocess_class_agnostic: Whether SAHI may merge predictions
+                from different classes.
+            sahi_model_type: Optional SAHI adapter name.
+            _keep_native: Internal nnU-Net evaluation flag retaining the
+                adapter-scale semantic mask.
 
         Returns:
             Ordered :class:`PredictionResult` values with stable image IDs.
         """
 
-        if not math.isfinite(float(confidence)) or not 0 <= float(confidence) <= 1:
+        combined_settings = {**self.settings, **dict(settings or {})}
+        effective_confidence = (
+            float(confidence)
+            if confidence is not None
+            else self.confidence
+        )
+        effective_postprocess = (
+            float(postprocess)
+            if postprocess is not None
+            else self.postprocess
+        )
+        if not math.isfinite(effective_confidence) or not 0 <= effective_confidence <= 1:
             raise ValueError("confidence must be finite and in [0, 1]")
-        if not math.isfinite(float(postprocess)) or not 0 <= float(postprocess) <= 1:
+        if not math.isfinite(effective_postprocess) or not 0 <= effective_postprocess <= 1:
             raise ValueError("postprocess must be finite and in [0, 1]")
         inputs, source_task = normalize_model_inputs(source, split=split)
         if not inputs:
             raise ValueError("Prediction source contains no supported images")
-        selected_device = device if device is not None else self.device
-        combined_settings = {**self.settings, **dict(settings or {})}
+        selected_device = self._resolved_device(device)
+        explicit_sahi = {
+            "sahi_overlap": sahi_overlap,
+            "sahi_postprocess_type": sahi_postprocess_type,
+            "sahi_postprocess_match_metric": sahi_postprocess_match_metric,
+            "sahi_postprocess_class_agnostic": sahi_postprocess_class_agnostic,
+            "sahi_model_type": sahi_model_type,
+        }
         combined_settings.update(
-            {
-                "sahi_overlap": sahi_overlap,
-                "sahi_postprocess_type": sahi_postprocess_type,
-                "sahi_postprocess_match_metric": sahi_postprocess_match_metric,
-                "sahi_postprocess_class_agnostic": sahi_postprocess_class_agnostic,
-                "sahi_model_type": sahi_model_type,
-            }
+            {key: value for key, value in explicit_sahi.items() if value is not None}
         )
         if sahi_slice_height is not None:
             combined_settings["sahi_slice_height"] = sahi_slice_height
@@ -752,7 +897,7 @@ class Model:
             records = predict_nnunet_model(
                 self,
                 inputs,
-                device=selected_device or "cuda",
+                device=str(selected_device),
                 progress=progress,
                 keep_native=_keep_native,
                 inference=selected_backend,
@@ -762,7 +907,7 @@ class Model:
             backend = selected_backend
             task: PredictionTask = "semantic_segment"
             resolved_settings = {
-                "device": selected_device or "cuda",
+                "device": selected_device,
                 "folds": self.folds,
                 "checkpoint": self.checkpoint,
                 "upscale_factor": self.upscale_factor,
@@ -783,8 +928,8 @@ class Model:
                 task=known_task,
                 backend=selected_backend,
                 resolution=effective_resolution,
-                confidence=float(confidence),
-                postprocess=float(postprocess),
+                confidence=effective_confidence,
+                postprocess=effective_postprocess,
                 device=selected_device,
                 progress=progress,
                 settings={**combined_settings, **resolved_sahi.as_dict()},
@@ -821,8 +966,8 @@ class Model:
             resolved_settings = {
                 "device": selected_device,
                 "resolution": effective_resolution,
-                "confidence": confidence,
-                "postprocess": postprocess,
+                "confidence": effective_confidence,
+                "postprocess": effective_postprocess,
                 **combined_settings,
                 **(resolved_sahi.as_dict() if selected_backend == "sahi" else {}),
             }
@@ -839,10 +984,38 @@ class Model:
             result.save(destination)
         return result
 
-    def compare(self, source: Any, **options: Any) -> Any:
-        """Compare this model on a dataset or semantic-mask export."""
+    def compare(
+        self,
+        source: Any,
+        *,
+        split: Literal["train", "val", "test"] = "val",
+        save_prediction_plots: bool = False,
+        progress: bool = True,
+        destination: str | Path | None = None,
+    ) -> Any:
+        """Evaluate this model on one frozen dataset cohort.
 
-        return ModelCollection((self,), source=source).compare(**options)
+        Parameters:
+            source: Fixed, on-disk :class:`Dataset` to evaluate.
+            split: Dataset split forming the frozen evaluation cohort.
+            save_prediction_plots: Write one annotated comparison grid per
+                source image under ``predictions/``. This can be storage-heavy.
+            progress: Show package-managed progress bars.
+            destination: Optional report directory. By default the report is
+                content-addressed below ``<dataset>/evaluations/``.
+
+        Returns:
+            A task-appropriate comparison result. Prediction and evaluation
+            settings come exclusively from this model.
+        """
+
+        return ModelCollection((self,)).compare(
+            source,
+            split=split,
+            save_prediction_plots=save_prediction_plots,
+            progress=progress,
+            destination=destination,
+        )
 
     def visualize(
         self,
@@ -857,7 +1030,23 @@ class Model:
         progress: bool = True,
         prediction_options: Mapping[str, Any] | None = None,
     ) -> Any:
-        """Predict a source and render sampled original/prediction pairs."""
+        """Predict a source and render sampled original/prediction pairs.
+
+        Parameters:
+            source: Any source accepted by :meth:`predict`.
+            split: Dataset split. Direct image inputs ignore this value.
+            samples: Maximum number of images to render.
+            columns: Number of image pairs per figure row.
+            seed: Deterministic sampling seed.
+            panel_size: Width and height, in inches, of each image panel.
+            destination: Optional PNG output path.
+            progress: Show package-managed progress bars.
+            prediction_options: Optional per-call overrides forwarded to
+                :meth:`predict`.
+
+        Returns:
+            The rendered Matplotlib figure.
+        """
 
         options = dict(prediction_options or {})
         options.setdefault("split", split)
@@ -875,32 +1064,23 @@ class Model:
     def load_many(
         cls,
         models: Any,
-        *,
-        source: Any | None = None,
-        kind: Literal["auto", "ultralytics", "nnunet"] | None = None,
-        task: ModelTask | None = None,
-        resolution: int | None = None,
-        training_dataset: str | Path | None = None,
-        inference: Literal["native", "sahi"] | None = None,
-        device: str | None = None,
-        folds: tuple[int | str, ...] | None = None,
-        checkpoint: str | None = None,
-        upscale_factor: int | None = None,
-        workers: int | None = None,
-        settings: Mapping[str, Any] | None = None,
     ) -> "ModelCollection":
         """Normalize paths/configurations into an ordered model collection.
 
-        Common keyword values are collection defaults; a model's own mapping
-        overrides them.
+        Parameters:
+            models: A model, model path, sequence of either, or ordered
+                name-to-model mapping. Mapping specifications must contain a
+                ``path`` and put every model-specific option in that same
+                specification; no collection-wide defaults are applied.
+
+        Returns:
+            An unbound :class:`ModelCollection` preserving input order.
         """
 
         if isinstance(models, ModelCollection):
-            if source is None or models.source is source:
-                return models
-            return ModelCollection(models.models, source=source)
+            return models
         if isinstance(models, Model):
-            return ModelCollection((models,), source=source)
+            return ModelCollection((models,))
         if isinstance(models, (str, Path)):
             items = [(None, models)]
         elif isinstance(models, Mapping):
@@ -913,24 +1093,6 @@ class Model:
             )
         if not items:
             raise ValueError("At least one model is required")
-        base: dict[str, Any] = {}
-        explicit_defaults = {
-            "kind": kind,
-            "task": task,
-            "resolution": resolution,
-            "training_dataset": training_dataset,
-            "inference": inference,
-            "device": device,
-            "folds": folds,
-            "checkpoint": checkpoint,
-            "upscale_factor": upscale_factor,
-            "workers": workers,
-        }
-        base.update(
-            {key: value for key, value in explicit_defaults.items() if value is not None}
-        )
-        if settings is not None:
-            base["settings"] = dict(settings)
         resolved: list[Model] = []
         seen_names: set[str] = set()
         seen_slugs: set[str] = set()
@@ -952,25 +1114,21 @@ class Model:
                         checkpoint=value.checkpoint,
                         upscale_factor=value.upscale_factor,
                         workers=value.workers,
+                        confidence=value.confidence,
+                        postprocess=value.postprocess,
                         settings=value.settings,
                     )
             else:
-                configuration = dict(base)
                 if isinstance(value, Mapping):
-                    configuration.update(value)
-                    raw_source = configuration.pop(
-                        "source",
-                        configuration.pop(
-                            "model_folder",
-                            configuration.pop("path", None),
-                        ),
-                    )
+                    configuration = dict(value)
+                    raw_source = configuration.pop("path", None)
                 else:
+                    configuration = {}
                     raw_source = value
                 if raw_source is None:
                     raise DatasetValidationError(
                         ValidationIssue(
-                            "Model specification is missing path/model_folder",
+                            "Model specification is missing path",
                             source=str(raw_name) if raw_name is not None else None,
                         )
                     )
@@ -985,6 +1143,17 @@ class Model:
                     "checkpoint",
                     "upscale_factor",
                     "workers",
+                    "confidence",
+                    "postprocess",
+                    "sahi_slice_height",
+                    "sahi_slice_width",
+                    "sahi_overlap",
+                    "sahi_overlap_height_ratio",
+                    "sahi_overlap_width_ratio",
+                    "sahi_postprocess_type",
+                    "sahi_postprocess_match_metric",
+                    "sahi_postprocess_class_agnostic",
+                    "sahi_model_type",
                 }
                 adapter_settings = dict(configuration.pop("settings", {}) or {})
                 adapter_settings.update(
@@ -1010,7 +1179,7 @@ class Model:
             seen_names.add(model.name)
             seen_slugs.add(model.slug)
             resolved.append(model)
-        return ModelCollection(tuple(resolved), source=source)
+        return ModelCollection(tuple(resolved))
 
     def __repr__(self) -> str:
         return (
@@ -1021,10 +1190,13 @@ class Model:
 
 @dataclass(frozen=True)
 class ModelCollection:
-    """Ordered models optionally bound to a dataset or semantic-mask export."""
+    """Ordered, independently configured models.
+
+    Parameters:
+        models: Non-empty tuple of unique :class:`Model` values.
+    """
 
     models: tuple[Model, ...]
-    source: Any | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.models:
@@ -1052,104 +1224,57 @@ class ModelCollection:
 
     def predict(
         self,
-        source: Any | None = None,
+        source: Any,
         *,
-        inference: Literal["native", "sahi"] | None = None,
-        sahi_slice_height: int | None = None,
-        sahi_slice_width: int | None = None,
-        sahi_overlap: float = 0.2,
-        sahi_overlap_height_ratio: float | None = None,
-        sahi_overlap_width_ratio: float | None = None,
-        sahi_postprocess_type: Literal["GREEDYNMM", "NMM", "NMS", "LSNMS"] = "GREEDYNMM",
-        sahi_postprocess_match_metric: Literal["IOU", "IOS"] = "IOS",
-        sahi_postprocess_class_agnostic: bool = False,
-        sahi_model_type: str = "ultralytics",
-        **options: Any,
+        split: Literal["train", "val", "test"] | None = None,
+        progress: bool = True,
     ) -> dict[str, PredictionResult]:
-        """Run every model through the common prediction interface.
+        """Run every independently configured model on the same inputs.
 
         Parameters:
-            source: Prediction source, or the collection's bound source.
-            inference: Explicit backend override for every model.
-            sahi_slice_height: Optional source-space SAHI tile height.
-            sahi_slice_width: Optional source-space SAHI tile width.
-            sahi_overlap: Default overlap ratio for both axes.
-            options: Remaining :meth:`Model.predict` options.
+            source: Any source accepted by :meth:`Model.predict`.
+            split: Dataset split. Direct image inputs ignore this value.
+            progress: Show package-managed progress bars.
+
+        Returns:
+            Prediction results keyed by model name. Resolution, backend,
+            thresholds, device, and SAHI options come from each model.
         """
 
-        active = self.source if source is None else source
-        if active is None:
-            raise ValueError("A prediction source is required for an unbound model collection")
-        shared = {
-            **options,
-            "sahi_slice_height": sahi_slice_height,
-            "sahi_slice_width": sahi_slice_width,
-            "sahi_overlap": sahi_overlap,
-            "sahi_overlap_height_ratio": sahi_overlap_height_ratio,
-            "sahi_overlap_width_ratio": sahi_overlap_width_ratio,
-            "sahi_postprocess_type": sahi_postprocess_type,
-            "sahi_postprocess_match_metric": sahi_postprocess_match_metric,
-            "sahi_postprocess_class_agnostic": sahi_postprocess_class_agnostic,
-            "sahi_model_type": sahi_model_type,
+        return {
+            model.name: model.predict(source, split=split, progress=progress)
+            for model in self.models
         }
-        if inference is not None:
-            shared["inference"] = inference
-        return {model.name: model.predict(active, **shared) for model in self.models}
 
     def compare(
         self,
-        source: Any | None = None,
+        source: Any,
         *,
         split: Literal["train", "val", "test"] = "val",
-        baseline: str | None = None,
-        comparison_space: Literal["auto", "native", "semantic"] = "auto",
-        inference: Literal["native", "sahi"] | None = None,
-        confidence: float = 0.25,
-        postprocess: float = 0.7,
-        keep_predictions: bool = True,
-        protocol: Literal["validation", "locked", "calibrate_then_test"] = "validation",
-        calibration_split: Literal["train", "val", "test"] | None = None,
-        training_provenance: Literal["required", "warn", "ignore"] = "required",
-        confidence_thresholds: tuple[float, ...] = (0.35, 0.45, 0.55, 0.65, 0.75, 0.85),
-        postprocess_thresholds: tuple[float, ...] = (0.75, 0.85, 0.95),
-        resolution: int = 480,
-        comparison_unit: Literal["model", "system"] = "model",
-        cache: bool | str | Path = True,
-        notebook_cache: str | Path | None = None,
-        write_notebook_cache: bool = False,
-        allow_unverified_cache: bool = False,
-        visualize: bool = True,
+        save_prediction_plots: bool = False,
         progress: bool = True,
         destination: str | Path | None = None,
-        device: str | None = None,
-        seed: int = 42,
-        bootstrap_resamples: int = 10_000,
-        augment_inference: bool = False,
-        precision: Literal["full", "half"] = "full",
-        sahi_slice_height: int | None = None,
-        sahi_slice_width: int | None = None,
-        sahi_overlap: float = 0.2,
-        sahi_overlap_height_ratio: float | None = None,
-        sahi_overlap_width_ratio: float | None = None,
-        sahi_postprocess_type: Literal["GREEDYNMM", "NMM", "NMS", "LSNMS"] = "GREEDYNMM",
-        sahi_postprocess_match_metric: Literal["IOU", "IOS"] = "IOS",
-        sahi_postprocess_class_agnostic: bool = False,
-        sahi_model_type: str = "ultralytics",
     ) -> Any:
-        """Compare this collection on one frozen dataset cohort.
+        """Compare the configured models on one frozen dataset cohort.
 
-        ``comparison_space="auto"`` preserves native evaluation for compatible
-        same-task collections. Mixed instance and semantic segmenters negotiate
-        the binary semantic-mask space when the source is a semantic-mask
-        :class:`Dataset`. Use ``"native"`` or ``"semantic"`` to
-        require one behavior explicitly.
+        Parameters:
+            source: Fixed, on-disk :class:`Dataset` to evaluate.
+            split: Dataset split forming the frozen evaluation cohort.
+            save_prediction_plots: Write one annotated comparison grid per
+                source image under ``predictions/``. Rows contain at most two
+                model panels, so this option can be storage-heavy.
+            progress: Show package-managed progress bars.
+            destination: Optional report directory. By default the report is
+                content-addressed below ``<dataset>/evaluations/``.
+
+        Returns:
+            A task-appropriate comparison result. Comparison space is inferred
+            from the dataset and model tasks; all inference settings come from
+            each :class:`Model`. The first loaded model is the fixed reference
+            for paired differences.
         """
 
-        active = self.source if source is None else source
-        if active is None:
-            raise ValueError("A comparison source is required for an unbound model collection")
-        if comparison_space not in {"auto", "native", "semantic"}:
-            raise ValueError("comparison_space must be 'auto', 'native', or 'semantic'")
+        active = source
         from .dataset import Dataset
 
         if not isinstance(active, Dataset):
@@ -1163,9 +1288,7 @@ class ModelCollection:
             model_tasks = {model.task for model in self.models}
             all_nnunet = all(model.kind == "nnunet" for model in self.models)
             semantic_compatible = model_tasks <= {"segment", "semantic_segment"}
-            if comparison_space == "auto":
-                comparison_space = "native" if all_nnunet else "semantic"
-            if comparison_space == "semantic":
+            if not all_nnunet:
                 if not semantic_compatible:
                     raise DatasetValidationError(
                         ValidationIssue(
@@ -1187,40 +1310,9 @@ class ModelCollection:
                     active,
                     self,
                     split=split,
-                    baseline=baseline,
-                    device=device,
-                    inference=inference,
-                    confidence=confidence,
-                    postprocess=postprocess,
-                    bootstrap_resamples=bootstrap_resamples,
-                    seed=seed,
-                    keep_predictions=keep_predictions,
-                    visualize=visualize,
+                    save_prediction_plots=save_prediction_plots,
                     progress=progress,
                     destination=destination,
-                    resolution=resolution,
-                    comparison_unit=comparison_unit,
-                    sahi_slice_height=sahi_slice_height,
-                    sahi_slice_width=sahi_slice_width,
-                    sahi_overlap=sahi_overlap,
-                    sahi_overlap_height_ratio=sahi_overlap_height_ratio,
-                    sahi_overlap_width_ratio=sahi_overlap_width_ratio,
-                    sahi_postprocess_type=sahi_postprocess_type,
-                    sahi_postprocess_match_metric=sahi_postprocess_match_metric,
-                    sahi_postprocess_class_agnostic=sahi_postprocess_class_agnostic,
-                    sahi_model_type=sahi_model_type,
-                )
-            if not all_nnunet:
-                raise DatasetValidationError(
-                    ValidationIssue(
-                        "Native semantic-export comparison requires only semantic models",
-                        value=[
-                            {"model": model.name, "kind": model.kind, "task": model.task}
-                            for model in self.models
-                        ],
-                        expected="all official nnU-Net semantic_segment models",
-                        suggestion="use comparison_space='semantic' for YOLO-seg/semantic mixtures",
-                    )
                 )
             from .semantic_comparison import compare_nnunet_models
 
@@ -1228,42 +1320,9 @@ class ModelCollection:
                 active,
                 self,
                 split=split,
-                baseline=baseline,
-                folds=(0,),
-                checkpoint="checkpoint_final.pth",
-                device=device or self.models[0].device or "cuda",
-                workers=self.models[0].workers,
-                bootstrap_resamples=bootstrap_resamples,
-                seed=seed,
-                keep_predictions=keep_predictions,
-                visualize=visualize,
+                save_prediction_plots=save_prediction_plots,
                 progress=progress,
                 destination=destination,
-                inference=inference,
-                resolution=resolution,
-                comparison_unit=comparison_unit,
-                sahi_slice_height=sahi_slice_height,
-                sahi_slice_width=sahi_slice_width,
-                sahi_overlap=sahi_overlap,
-                sahi_overlap_height_ratio=sahi_overlap_height_ratio,
-                sahi_overlap_width_ratio=sahi_overlap_width_ratio,
-                sahi_postprocess_type=sahi_postprocess_type,
-                sahi_postprocess_match_metric=sahi_postprocess_match_metric,
-                sahi_postprocess_class_agnostic=sahi_postprocess_class_agnostic,
-                sahi_model_type=sahi_model_type,
-            )
-
-        if comparison_space == "semantic":
-            raise DatasetValidationError(
-                ValidationIssue(
-                    "Semantic comparison requires canonical mask ground truth",
-                    value=str(active.location),
-                    expected="a semantic-mask Dataset source",
-                    suggestion=(
-                        "export the segmentation dataset with format='semantic_masks' "
-                        "and compare against that returned artifact"
-                    ),
-                )
             )
         if any(model.kind != "ultralytics" for model in self.models):
             raise DatasetValidationError(
@@ -1294,51 +1353,50 @@ class ModelCollection:
 
         from .comparison.engine import _compare_models
 
-        inference_settings = {
-            "augment": augment_inference,
-            "precision": precision,
-            "sahi_slice_height": resolution if sahi_slice_height is None else sahi_slice_height,
-            "sahi_slice_width": resolution if sahi_slice_width is None else sahi_slice_width,
-            "sahi_overlap": sahi_overlap,
-            "sahi_postprocess_type": sahi_postprocess_type,
-            "sahi_postprocess_match_metric": sahi_postprocess_match_metric,
-            "sahi_postprocess_class_agnostic": sahi_postprocess_class_agnostic,
-            "sahi_model_type": sahi_model_type,
-        }
-        if sahi_overlap_height_ratio is not None:
-            inference_settings["sahi_overlap_height_ratio"] = sahi_overlap_height_ratio
-        if sahi_overlap_width_ratio is not None:
-            inference_settings["sahi_overlap_width_ratio"] = sahi_overlap_width_ratio
         return _compare_models(
             active,
             self,
             split=split,
-            baseline=baseline,
-            inference=inference,
-            protocol=protocol,
-            calibration_split=calibration_split,
-            training_provenance=training_provenance,
-            confidence_thresholds=confidence_thresholds,
-            postprocess_thresholds=postprocess_thresholds,
-            resolution=resolution,
-            comparison_unit=comparison_unit,
-            cache=cache,
-            notebook_cache=notebook_cache,
-            write_notebook_cache=write_notebook_cache,
-            allow_unverified_cache=allow_unverified_cache,
-            visualize=visualize,
+            save_prediction_plots=save_prediction_plots,
             progress=progress,
             destination=destination,
-            device=device,
-            seed=seed,
-            bootstrap_resamples=bootstrap_resamples,
-            **inference_settings,
         )
 
-    def visualize(self, source: Any | None = None, **options: Any) -> Any:
-        """Render a sampled semantic cohort with the shared comparison grid."""
+    def visualize(
+        self,
+        source: Any,
+        *,
+        split: Literal["train", "val", "test"] = "val",
+        samples: int = 8,
+        examples_per_row: int = 1,
+        include_empty: bool = False,
+        seed: int = 42,
+        panel_size: float = 3.0,
+        model_title_length: int = 30,
+        image_title_length: int = 72,
+        progress: bool = True,
+        destination: str | Path | None = None,
+    ) -> Any:
+        """Render a sampled semantic cohort with the shared comparison grid.
 
-        active = self.source if source is None else source
+        Parameters:
+            source: Semantic-mask :class:`Dataset` to visualize.
+            split: Dataset split to sample.
+            samples: Maximum number of source images to render.
+            examples_per_row: Source images placed in each grid row.
+            include_empty: Permit samples whose reference mask is empty.
+            seed: Deterministic sampling seed.
+            panel_size: Width and height, in inches, of each grid panel.
+            model_title_length: Maximum displayed model-name length.
+            image_title_length: Maximum displayed source-path length.
+            progress: Show package-managed progress bars.
+            destination: Optional PNG output path or directory.
+
+        Returns:
+            The rendered Matplotlib figure.
+        """
+
+        active = source
         from .dataset import Dataset
 
         if not isinstance(active, Dataset) or active.format != "semantic_masks":
@@ -1348,28 +1406,23 @@ class ModelCollection:
             )
         from .semantic_comparison import visualize_nnunet_models
 
-        defaults = {
-            "split": "val",
-            "samples": 8,
-            "examples_per_row": 1,
-            "include_empty": False,
-            "seed": 42,
-            "panel_size": 3.0,
-            "model_title_length": 30,
-            "image_title_length": 72,
-            "progress": True,
-            "destination": None,
-        }
-        defaults.update(options)
-        active_collection = (
-            self
-            if self.source is active
-            else ModelCollection(self.models, source=active)
+        return visualize_nnunet_models(
+            active,
+            self,
+            split=split,
+            samples=samples,
+            examples_per_row=examples_per_row,
+            include_empty=include_empty,
+            seed=seed,
+            panel_size=panel_size,
+            model_title_length=model_title_length,
+            image_title_length=image_title_length,
+            progress=progress,
+            destination=destination,
         )
-        return visualize_nnunet_models(active_collection, **defaults)
 
     def __repr__(self) -> str:
-        return f"ModelCollection(models={self.names!r}, bound={self.source is not None})"
+        return f"ModelCollection(models={self.names!r})"
 
 
 def normalize_model_inputs(

@@ -10,6 +10,7 @@ from PIL import Image, ImageOps
 from tqdm.auto import tqdm
 
 from .errors import DatasetValidationError, ValidationIssue
+from .artifacts import DATASET_INFO_NAME, dataset_info_path
 from .models import Annotation, DatasetMetadata, Sample, Task
 from .utils import IMAGE_SUFFIXES, image_files, normalize_split
 
@@ -55,7 +56,12 @@ def load_source(
         )
 
     coco_files = sorted(root.rglob("*.json"))
-    coco_files = [p for p in coco_files if p.name not in {"dataset-fixer.json"}]
+    coco_files = [
+        p
+        for p in coco_files
+        if p.name not in {"dataset-fixer.json", DATASET_INFO_NAME, "source.json"}
+        and not {".cache", "evaluations", "reports"}.intersection(p.relative_to(root).parts)
+    ]
     if coco_files:
         return _load_coco(
             root,
@@ -484,7 +490,10 @@ def _load_coco(
 ) -> tuple[Path, str, Task, DatasetMetadata, list[Sample], dict[str, Any]]:
     root = source.parent if source.is_file() else source
     json_files = [source] if source.is_file() else sorted(
-        p for p in source.rglob("*.json") if p.name not in {"dataset-fixer.json"}
+        p
+        for p in source.rglob("*.json")
+        if p.name not in {"dataset-fixer.json", DATASET_INFO_NAME, "source.json"}
+        and not {".cache", "evaluations", "reports"}.intersection(p.relative_to(source).parts)
     )
     if not json_files:
         raise DatasetValidationError(f"No COCO JSON annotations found in {source}")
@@ -880,7 +889,12 @@ def _load_manifest(
     errors: Literal["raise", "skip"],
     warnings: list[str],
 ) -> dict[str, Any]:
-    path = root / "dataset-fixer.json"
+    path = dataset_info_path(root)
+    if not path.is_file():
+        # Old datasets remain readable in memory, but all writers emit the new
+        # compact reports layout.
+        legacy = root / "dataset-fixer.json"
+        path = legacy if legacy.is_file() else path
     if not path.is_file():
         return {}
     try:

@@ -31,7 +31,7 @@ print(exported.data_yaml)
 in-memory planning operations. Only `export()` writes files. Export validates
 before atomic publication, records every effective setting and tool/environment
 version, and maps each output image back to its parent and ultimate original in
-`provenance.jsonl`.
+the compressed `reports/lineage.json.gz` index.
 
 ## Loading and validation
 
@@ -189,15 +189,15 @@ pass-through images are unchanged. Tiling defaults to `errors="raise"`, whose
 diagnostic includes the source image, annotation index, crop coordinates, and
 the exact Shapely result and component types. Set `errors="skip"` to reject
 those whole candidates instead: coverage mode resamples replacements, grid
-mode omits the affected windows, and details are written to
-`reports/tiling_skips.json`.
+mode omits the affected windows, and details are embedded in
+`reports/dataset-info.json`.
 
 Each produced training crop samples its own independently seeded full-source
 virtual camera. Validation stays in the original orientation unless
 `augment_val=True`; test is never transformed. This matters when previewing
 validation with `visualize(split="val", ...)`. The exact transformed and
 unchanged splits, along with per-candidate sampling statistics, are recorded in
-`reports/crop_augmentation.json`; it also audits the accepted crop count,
+the `audits` section of `reports/dataset-info.json`; it also audits the accepted crop count,
 distinct seed count, and `fresh_seed_per_accepted_crop` invariant.
 
 Set both appearance parameters to the same value to request a uniform count for
@@ -207,8 +207,8 @@ images across the complete coverage output of each split, including copied
 small images and newly generated crops. Half of the target is sampled from
 wholly empty source images and half from object-free regions of populated
 images where possible. If either source cannot supply its half, the other
-cross-fills the target and the exact counts and reason are written to
-`coverage_summary/background_sampling.json`. IDEs can autocomplete the literal
+cross-fills the target and the exact counts and reason are recorded in the
+dataset information report. IDEs can autocomplete the literal
 choices for `mode`, `negative_tiles`, `errors`, tasks, splits, comparison
 protocols, and inference backends; all coverage controls are explicit `tile()`
 parameters. `background_filter` also applies to negative grid windows, copied
@@ -217,19 +217,16 @@ cropping paths. It runs after any applicable transforms, cropping, and final
 resizing, never sees a positive tile, and receives an isolated RGB PIL image so
 it cannot mutate output pixels. Absolute accepted/rejected counts, percentages,
 per-source-path breakdowns, and the callback description are recorded in
-`reports/background_filter.json`.
+`reports/dataset-info.json`.
 
-Coverage tiling also audits what the output actually represents. It always
-writes per-source unioned spatial coverage to
-`coverage_summary/source_pixel_coverage.csv` and aggregate train/validation
-statistics to `source_pixel_coverage.json`. With visualization enabled (the
-default), `source_pixel_coverage.jpg` compares pixel-weighted, mean, median, and
-per-source coverage, while `label_coverage.jpg` compares labels reached at
-least once with requested appearances produced. Virtual affine/projective crop
+Coverage tiling also audits what the output actually represents. Per-source
+unioned spatial coverage, aggregate train/validation statistics, and label-hit
+counts are stored under `audits` in `reports/dataset-info.json`. With
+visualization enabled, the visual summaries are panels in the single
+`reports/plots.png`. Virtual affine/projective crop
 footprints are inverse-mapped into source coordinates before unioning; an
 unsupported non-projective transform is reported explicitly and excluded from
-exact aggregates. Semantic-mask exports preserve the complete
-`coverage_summary/` directory.
+exact aggregates.
 
 `rebalance_empty(max_empty_fraction=...)` deterministically downsamples empty
 images without duplicating data. The cap is applied independently to each
@@ -323,19 +320,18 @@ from dataset_fixer import Model
 models = Model.load_many(
     {
         "resenc-capped": {
-            "model_folder": capped_fold_output.parent,
+            "path": capped_fold_output.parent,
             "folds": (0,),
             "checkpoint": "checkpoint_best.pth",
             "upscale_factor": 2,
         },
         "resenc-l": {
-            "model_folder": large_fold_output.parent,
+            "path": large_fold_output.parent,
             "folds": (0,),
             "checkpoint": "checkpoint_best.pth",
             "upscale_factor": 1,
         },
-    },
-    device="cuda",
+    }
 )
 
 # Predict only eight sampled validation images and return a Matplotlib figure.
@@ -351,14 +347,13 @@ figure = models.visualize(
 comparison = models.compare(
     masks,
     split="val",
-    baseline="resenc-capped",
 )
 ```
 
 Mixed YOLO segmentation and semantic-segmentation models use the same API.
-With ``comparison_space="auto"``, YOLO polygons are unioned into binary
-foreground masks at the exported mask resolution, then every model receives
-the same semantic Dice/IoU evaluation:
+For a semantic-mask dataset, YOLO polygons are automatically unioned into
+binary foreground masks at the exported mask resolution, then every model
+receives the same semantic Dice/IoU evaluation:
 
 ```python
 models = Model.load_many({
@@ -368,7 +363,7 @@ models = Model.load_many({
         "resolution": 640,
     },
     "nnunet": {
-        "model_folder": "/models/nnUNetTrainer__Plans__2d",
+        "path": "/models/nnUNetTrainer__Plans__2d",
         "folds": (0,),
         "checkpoint": "checkpoint_best.pth",
     },
@@ -377,10 +372,6 @@ models = Model.load_many({
 comparison = models.compare(
     masks,
     split="val",
-    comparison_space="auto",
-    confidence=0.25,
-    postprocess=0.70,
-    baseline="yolo-seg",
 )
 ```
 
@@ -399,20 +390,20 @@ Install the optional official backend with
 `pip install 'dataset-fixer[nnunet]'`. Comparison calls
 `nnUNetv2_predict_from_modelfolder` and `nnUNetv2_evaluate_folder`, verifies
 that every model predicted the exact same image set, and ranks the official
-foreground Dice/IoU results. Each model receives inputs at its own configured
+foreground Dice/IoU results. When `device` is omitted, nnU-Net execution uses
+CUDA when available, then Apple MPS, and otherwise CPU. An explicit per-model
+`device` remains unchanged. Each model receives inputs at its own configured
 training-adapter scale. nnU-Net class probabilities are area-averaged back to
 the original export resolution before `argmax`, so comparison does not depend
 on an arbitrary nearest-neighbor sample from each high-resolution block. All
 models are ranked against the same canonical masks; the report also retains
-the official native-resolution score for each model. It includes per-case
-metrics, finite and total cohort support, paired Dice deltas with bootstrap
-intervals, model/checkpoint hashes, canonical and native official summaries,
-retained canonical prediction masks, a ranking figure, and a qualitative error
-grid drawn from cases with foreground annotations. The report is intentionally
-shallow: its main files are `ranking.png`, `comparison.png`, `ranking.csv`,
-`per-case.csv`, `paired-statistics.csv`, and one canonical/native metric JSON
-pair per model; retained masks live under `predictions/`.
-For the attached official-training notebook, `model_folder` is
+the official native-resolution score for each model. Aggregate metrics, finite
+and total cohort support, paired Dice deltas, bounded worst cases, hashes, and
+resolved settings live in `reports/result.json`; the two mandatory visual files
+are `reports/plots.png` and `reports/comparison.png`. Canonical masks and
+official per-case results remain only in the dataset-local cache. Set
+`save_prediction_plots=True` when per-image annotated comparison grids are
+wanted. For the attached official-training notebook, `path` is
 `FOLD_OUTPUT.parent`, `folds=(FOLD,)`, `checkpoint=PREDICTION_CHECKPOINT`, and
 the model configuration's `upscale_factor` is `UPSCALE_FACTOR`.
 
@@ -471,8 +462,8 @@ mask_predictions = segmenter.predict(masks, split="val")
 `PredictionResult` preserves input ordering and stable image IDs. Object-style
 models populate each record's `objects`; semantic models populate `mask`.
 `by_id`, `masks`, `summary()`, and `save()` provide common inspection/export
-utilities. Direct `Model.predict` defaults to native prediction. A dataset
-collection opts into tiled inference explicitly with `inference="sahi"`; no
+utilities. Direct `Model.predict` defaults to native prediction. Configure a
+model with `inference="sahi"` to opt it into tiled inference; no
 availability-based selection or fallback is performed.
 
 Use `Model.load_many(...)` to normalize an ordered model collection once. The
@@ -488,48 +479,57 @@ checkpoint or training configuration.
 ```python
 models = Model.load_many(
     {
-        "baseline": {
-            "path": "/models/baseline.pt",
-            "training_dataset": "/datasets/baseline-training",
+        "reference": {
+            "path": "/models/reference.pt",
+            "training_dataset": "/datasets/reference-training",
             "resolution": 480,
+            "confidence": 0.50,
+            "postprocess": 0.85,
         },
         "random-crops-2": {
             "path": "/models/crops-2.pt",
             "training_dataset": "/datasets/random-crops-2",
             "resolution": 480,
+            "confidence": 0.50,
+            "postprocess": 0.85,
         },
-    },
-    inference="native",
+    }
 )
 
 comparison = models.compare(
     dataset,
     split="val",
-    baseline="baseline",
-    protocol="validation",
 )
 
-# Use the same explicit source-space tiling for every candidate.
-sliced = models.compare(
-    dataset,
-    split="val",
-    inference="sahi",
-    sahi_slice_height=512,
-    sahi_slice_width=512,
-    sahi_overlap=0.2,
-)
+# SAHI belongs to each model specification, not the comparison call.
+sliced_models = Model.load_many({
+    "sahi-512": {
+        "path": "/models/crops-2.pt",
+        "inference": "sahi",
+        "resolution": 640,
+        "sahi_slice_height": 512,
+        "sahi_slice_width": 512,
+        "sahi_overlap": 0.2,
+    },
+})
+sliced = sliced_models.compare(dataset, split="val")
 ```
 
-`protocol="validation"` labels threshold selection as validation/model
-selection. `protocol="locked"` evaluates one predetermined configuration per
-model. `protocol="calibrate_then_test"` selects settings only on
-`calibration_split` and applies them to the distinct requested split.
+`models.compare()` has no shared inference, resolution, threshold, protocol,
+comparison-space, comparison-unit, or baseline options. Each model carries its
+own configuration, the dataset/task pair determines the canonical metric
+space, and the first loaded model is the fixed paired-difference reference.
+The report labels candidates as model variants only when their inference
+systems match; otherwise it labels them as distinct systems automatically.
 
 Native and sliced SAHI inference are supported for detection, instance
 segmentation, pose, POLO, Ultralytics semantic segmentation, and nnU-Net.
 Pose keypoints and POLO point/radius payloads are retained while duplicates are
 merged, and dense semantic tiles are feather-blended as probabilities before a
-single full-image argmax. All SAHI-only options use the `sahi_` prefix; the
+single full-image argmax. Ultralytics tiles are submitted in bounded GPU
+batches; nnU-Net tiles are grouped into bounded official-CLI batches and then
+stitched one source image at a time, avoiding checkpoint/process startup for
+every source image. All SAHI-only options use the `sahi_` prefix; the
 removed unprefixed names and `inference="auto"` are rejected. Install optional
 integrations with:
 
@@ -537,33 +537,62 @@ integrations with:
 pip install 'dataset-fixer[comparison,sahi]'
 ```
 
-Predictions are cached independently of metrics and figures in an atomic,
-content-addressed NumPy format. Compatible notebook `.gridcache.pkl` and
-`.gridcache_v3` caches are validated and imported; new pickle caches are never
-written. Single-class POLO/SAHI results can be mirrored back to the notebook
-format with `write_notebook_cache=True`.
+Predictions and completed per-model evaluations are cached independently in
+`<dataset>/.cache/evaluations/`. Keys include the frozen cohort, checkpoint
+bytes, backend, resolved model inference/SAHI settings, metric protocol, and relevant
+dependency versions. Repeating the same comparison performs no inference or
+evaluation; changing one model recomputes only that model. Caching is always
+enabled and has no public switch.
 
 The returned `ComparisonResult` reports factual state: the cohort fingerprint,
 cohort verification, training overlap, provenance completeness, cache
-verification, ranking, settings, and explicit limitations. Its output contains
-machine-readable metric grids, paired cluster statistics, cache/cohort/leakage
-audits, aligned qualitative panels, and PDF/SVG/600-DPI PNG figures with CSV
-data and JSON metadata sidecars.
+verification, ranking, settings, and explicit limitations. Every evaluation
+writes `reports/result.json`, `reports/plots.png`, and
+`reports/comparison.png`. The comparison image uses a deterministic seeded
+random sample of non-empty ground-truth cases. Pass
+`save_prediction_plots=True` to add one annotated
+`predictions/<image>.png` grid per source image, with at most two model panels
+per row.
 
 ## Output and reproduction
 
-Derived datasets contain `{split}/images`, `{split}/labels`, `data.yaml`,
-`dataset-fixer.json`, `provenance.jsonl`, and operation reports. Coverage mode
-also writes its four CSV reports and annotated originals under
-`coverage_summary/`. Publication is atomic and happens only after the private
-output tree passes full validation.
+Derived datasets contain `{split}/images`, `{split}/labels`, `data.yaml`, and a
+compact `reports/` directory. `reports/dataset-info.json` holds the dataset ID,
+settings, source path/ID/basic metadata, per-split total/labeled/background
+image counts, validation, history, and operation audits; `reports/source.json`
+is the immediate-source snapshot;
+`reports/lineage.json.gz` maps every present output to its physical parent and
+ultimate original. Optional operation visuals are combined into
+`reports/plots.png`. Publication remains atomic.
 
 The manifest records resolved defaults and callbacks, seeds, class mappings,
 source fingerprints, package/setuptools-scm revision, dirty state, caller Git
 revision, Python/platform/dependency versions, timings, warnings, audit paths,
-and operation history. Each provenance row contains immediate-parent and
+and operation history. Each lineage record contains immediate-parent and
 ultimate-original paths/hashes plus crop, scale, tile, class mapping, and
 transformation-chain data.
+
+Datasets can be traced after a move or remount using stable IDs and optional
+path-prefix rewrites:
+
+```python
+trace = exported.trace(
+    search_paths=["/mnt/datasets"],
+    path_rewrites={"/old/datasets": "/mnt/datasets"},
+)
+print(trace.summary())
+tile = trace.for_sample("train/images/example__tile-0001.jpg")
+print(tile.original_image, tile.crop)
+```
+
+Generated datasets can be migrated to the current compact artifact schema
+without changing image, label, or mask bytes. Omit `dest` for an atomic in-place
+report update, or pass a string/`Path` to create an upgraded physical copy:
+
+```python
+updated = dataset.update()
+copied = dataset.update(dest="/datasets/islands-current")
+```
 
 The intentionally small public API is:
 
@@ -577,6 +606,8 @@ The intentionally small public API is:
 - `Dataset.export`
 - `Dataset.visualize`
 - `Dataset.assert_trainable`
+- `Dataset.trace`
+- `Dataset.update`
 - `Model`
 - `Model.predict`
 - `Model.compare`

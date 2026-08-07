@@ -58,15 +58,22 @@ def test_semantic_mask_export_writes_foreground_union_and_empty_masks(tmp_path: 
     manifest = json.loads(exported.manifest_path.read_text(encoding="utf-8"))
     assert manifest["format"] == "semantic_masks"
     assert manifest["class_handling"] == "foreground_union"
+    assert manifest["split_summary"] == {
+        "train": {
+            "total_images": 2,
+            "labeled_images": 1,
+            "background_images": 1,
+        },
+        "val": {
+            "total_images": 1,
+            "labeled_images": 1,
+            "background_images": 0,
+        },
+    }
     assert manifest["validation"]["allowed_mask_values"] == [0, 255]
-    assert (exported.location / "reports" / "semantic_mask_preview.png").is_file()
-    assert (
-        exported.location / "coverage_summary" / "source_pixel_coverage.csv"
-    ).is_file()
-    assert (
-        exported.location / "coverage_summary" / "source_pixel_coverage.jpg"
-    ).is_file()
-    records = [json.loads(line) for line in (exported.location / "provenance.jsonl").read_text().splitlines()]
+    assert (exported.location / "reports" / "plots.png").is_file()
+    assert not (exported.location / "coverage_summary").exists()
+    records = list(exported.provenance.values())
     assert all(record["output_mask_sha256"] for record in records)
 
     reopened = Dataset.open(exported.location, task="segment", progress=False)
@@ -88,6 +95,22 @@ def test_semantic_mask_export_writes_foreground_union_and_empty_masks(tmp_path: 
     assert exported.manifest_path is not None
     assert Dataset.open(exported.manifest_path, progress=False).location == exported.location
     assert "manifest=" not in repr(reopened)
+    manifest.pop("split_summary")
+    manifest["schema_version"] = 2
+    exported.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    updated = Dataset.open(exported.location, progress=False).update()
+    assert updated.manifest["split_summary"] == {
+        "train": {
+            "total_images": 2,
+            "labeled_images": 1,
+            "background_images": 1,
+        },
+        "val": {
+            "total_images": 1,
+            "labeled_images": 1,
+            "background_images": 0,
+        },
+    }
     with pytest.raises(DatasetValidationError, match="requires vector annotations"):
         reopened.split({"train": 0.8, "val": 0.2})
 
@@ -201,7 +224,7 @@ def test_export_formats_materializes_yolo_then_semantic_masks(tmp_path: Path) ->
     assert isinstance(outputs["yolo"], Dataset)
     assert isinstance(outputs["semantic_masks"], Dataset)
     assert outputs["semantic_masks"].format == "semantic_masks"
-    assert outputs["semantic_masks"].manifest["source_dataset"]["location"] == str(
+    assert outputs["semantic_masks"].manifest["source_dataset"]["path"] == str(
         outputs["yolo"].location
     )
     assert (outputs["yolo"].location / "data.yaml").is_file()
@@ -254,19 +277,12 @@ def test_semantic_mask_export_includes_split_group_audit(tmp_path: Path) -> None
         progress=False,
     )
 
-    report = json.loads(
-        (exported.location / "reports" / "split_group_audit.json").read_text(
-            encoding="utf-8"
-        )
-    )
+    report = exported.manifest["audits"]["split_group_audit"]
     assert report["status"] == "passed"
     assert report["total"] == {"images": 3, "distinct_groups": 3}
     validation = exported.manifest["validation"]["split_group_isolation"]
-    assert validation["report"] == "reports/split_group_audit.json"
-    records = [
-        json.loads(line)
-        for line in (exported.location / "provenance.jsonl").read_text().splitlines()
-    ]
+    assert validation["report"] == "reports/dataset-info.json#audits.split_group_audit"
+    records = list(exported.provenance.values())
     assert all("split_group" in record for record in records)
 
 

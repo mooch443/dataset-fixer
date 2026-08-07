@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import tempfile
@@ -12,6 +11,19 @@ from typing import TYPE_CHECKING, Any, Iterable
 from PIL import Image, ImageDraw
 from tqdm.auto import tqdm
 
+from .artifacts import (
+    DATASET_INFO_SCHEMA,
+    combine_report_plots,
+    collect_report_payloads,
+    dataset_info_path,
+    lineage_path,
+    source_dataset_id,
+    source_info_path,
+    split_image_summary,
+    stable_dataset_id,
+    write_json,
+    write_lineage,
+)
 from .errors import DatasetValidationError, ValidationIssue
 from .models import Task
 from .split_group_audit import (
@@ -26,7 +38,6 @@ from .utils import (
     settings_fingerprint,
     sha256_file,
     slugify,
-    to_jsonable,
 )
 from .validation_audit import stage_load_validation_audit
 
@@ -122,23 +133,12 @@ def export_semantic_masks(
     try:
         reports = staging / "reports"
         reports.mkdir(parents=True, exist_ok=True)
-        source_reports = dataset.location / "reports"
-        if source_reports.is_dir():
-            shutil.copytree(source_reports, reports, dirs_exist_ok=True)
         write_split_group_audit(reports, group_report)
         load_validation, load_visualization = stage_load_validation_audit(
             dataset._validation_audit,
             dataset._validation_audit_visualization,
             reports,
         )
-        source_coverage = dataset.location / "coverage_summary"
-        if source_coverage.is_dir():
-            shutil.copytree(
-                source_coverage,
-                staging / "coverage_summary",
-                dirs_exist_ok=True,
-            )
-
         iterator = tqdm(samples, desc="Exporting semantic masks", unit="image", disable=not progress)
         first_pair: tuple[Path, Path] | None = None
         for sample in iterator:
@@ -154,6 +154,7 @@ def export_semantic_masks(
             for annotation in sample.annotations:
                 assert annotation.polygon is not None
                 draw.polygon(annotation.polygon, fill=255)
+            has_foreground = mask.getbbox() is not None
             mask.save(mask_output, format="PNG", optimize=False)
             if first_pair is None:
                 first_pair = image_output, mask_output
@@ -165,26 +166,40 @@ def export_semantic_masks(
                     mask_output,
                     staging,
                     settings,
+                    has_foreground=has_foreground,
                 )
             )
 
         _validate_semantic_tree(staging, records)
-        visuals = [
-            str(path)
-            for path in dataset._manifest.get("visuals") or []
-            if (staging / str(path)).is_file()
-        ]
+        visuals: list[str] = []
         if load_visualization is not None:
             visuals.append(str(load_visualization.relative_to(staging)))
         if visualize and first_pair is not None:
             preview = reports / "semantic_mask_preview.png"
             _write_preview(*first_pair, preview)
             visuals.append(str(preview.relative_to(staging)))
-        visuals = list(dict.fromkeys(visuals))
-        provenance_path = staging / "provenance.jsonl"
-        with provenance_path.open("w", encoding="utf-8") as handle:
-            for record in records:
-                handle.write(json.dumps(to_jsonable(record), sort_keys=True) + "\n")
+        audits = dict(dataset._manifest.get("audits") or {})
+        audits.update(collect_report_payloads(reports))
+        if group_validation.get("status") == "not_applicable":
+            audits.pop("split_group_audit", None)
+        plot = combine_report_plots((reports,), reports / "plots.png")
+        source_plot = dataset.location / "reports" / "plots.png"
+        if plot is None and source_plot.is_file():
+            plot = reports / "plots.png"
+            shutil.copy2(source_plot, plot)
+        visuals = ["reports/plots.png"] if plot is not None else []
+        if load_validation.get("skipped_count", 0):
+            load_validation["report"] = (
+                "reports/dataset-info.json#audits.load_validation_audit"
+            )
+            load_validation["visualization"] = (
+                "reports/plots.png" if plot is not None else None
+            )
+            if isinstance(audits.get("load_validation_audit"), dict):
+                audits["load_validation_audit"]["report"] = load_validation["report"]
+                audits["load_validation_audit"]["visualization"] = load_validation[
+                    "visualization"
+                ]
 
         environment = environment_snapshot()
         try:
@@ -204,13 +219,55 @@ def export_semantic_masks(
                 "visuals": visuals,
             },
         ]
+        source_id = source_dataset_id(
+            source_manifest=dataset._manifest,
+            source_name=dataset.name,
+            source_path=dataset.location,
+            records=records,
+        )
+        dataset_id = stable_dataset_id(
+            name=final_name,
+            task=Task.SEGMENT.value,
+            format_name="semantic_masks",
+            classes=dataset.classes,
+            records=records,
+        )
+        for record in records:
+            record.setdefault("parent_dataset_id", source_id)
+            record.setdefault("dataset_id", dataset_id)
+        write_lineage(lineage_path(staging), records)
+        source_info = {
+            "schema": "dataset-fixer-source",
+            "schema_version": DATASET_INFO_SCHEMA,
+            "id": source_id,
+            "path": str(dataset.location),
+            "name": dataset.name,
+            "format": dataset.format,
+            "task": dataset.task.value,
+            "fingerprint": settings_fingerprint(
+                sorted((record["parent_sha256"], record["original_sha256"]) for record in records)
+            ),
+            "classes": dataset.classes,
+            "splits": list(dataset.splits),
+            "state": {
+                "images": len(dataset._samples),
+                "splits": {
+                    split: sum(sample.split == split for sample in dataset._samples)
+                    for split in dataset.splits
+                },
+            },
+        }
+        write_json(source_info_path(staging), source_info)
         manifest = {
-            "schema_version": 1,
+            "schema": "dataset-fixer-dataset-info",
+            "schema_version": DATASET_INFO_SCHEMA,
+            "dataset_id": dataset_id,
             "name": final_name,
             "location": str(final_destination),
             "task": Task.SEGMENT.value,
             "format": "semantic_masks",
             "splits": sorted(selected),
+            "split_summary": split_image_summary(records),
             "classes": dataset.classes,
             "original_classes": dataset.classes,
             "mask_encoding": settings["mask_encoding"],
@@ -223,8 +280,14 @@ def export_semantic_masks(
             "settings_fingerprint": fingerprint,
             "history": history,
             "source_dataset": {
+                "id": source_id,
                 "name": dataset.name,
-                "location": str(dataset.location),
+                "path": str(dataset.location),
+                "format": dataset.format,
+                "task": dataset.task.value,
+                "classes": dataset.classes,
+                "splits": list(dataset.splits),
+                "source_dataset": dataset._manifest.get("source_dataset"),
             },
             "dataset_fixer": {
                 "version": __version__,
@@ -234,7 +297,12 @@ def export_semantic_masks(
             "environment": environment,
             "warnings": warnings,
             "visuals": visuals,
-            "provenance": "provenance.jsonl",
+            "lineage": {
+                "path": "reports/lineage.json.gz",
+                "schema_version": 2,
+                "records": len(records),
+            },
+            "audits": audits,
             "validation": {
                 "passed": True,
                 "images": len(records),
@@ -244,10 +312,7 @@ def export_semantic_masks(
                 "load_validation": load_validation,
             },
         }
-        (staging / "dataset-fixer.json").write_text(
-            json.dumps(to_jsonable(manifest), indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        write_json(dataset_info_path(staging), manifest)
         os.replace(staging, final_destination)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
@@ -296,6 +361,8 @@ def _provenance_record(
     mask_output: Path,
     staging: Path,
     settings: dict[str, Any],
+    *,
+    has_foreground: bool,
 ) -> dict[str, Any]:
     immediate_sha = sample.source_sha256 or sha256_file(sample.image_path)
     parent = sample.provenance or {}
@@ -331,6 +398,7 @@ def _provenance_record(
         "output_mask_sha256": sha256_file(mask_output),
         "output_split": sample.split,
         "output_annotation_count": len(sample.annotations),
+        "output_has_labels": has_foreground,
         "source_annotation_ids": [a.source_id for a in sample.annotations if a.source_id is not None],
         "parent_dataset": parent.get("dataset_name") or dataset.name,
         "parent_location": parent.get("dataset_location") or str(dataset.location),

@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 
 REPORT_NAME = "split_group_audit.json"
-REPORT_PATH = f"reports/{REPORT_NAME}"
+REPORT_PATH = "reports/dataset-info.json#audits.split_group_audit"
 
 
 def audit_split_groups(

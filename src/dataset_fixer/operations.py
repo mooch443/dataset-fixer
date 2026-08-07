@@ -559,7 +559,7 @@ def _publish(
         f"images: {len(result._samples)} | annotations: {annotations} | training_ready: {result.training_ready}"
     )
     if manifest.get("warnings"):
-        print(f"Warnings: {len(manifest['warnings'])} (see dataset-fixer.json)")
+        print(f"Warnings: {len(manifest['warnings'])} (see reports/dataset-info.json)")
     if manifest.get("visuals"):
         print(f"Visual audits: {manifest['visuals']}")
     print(f"Reports: {result.location / 'reports'}")

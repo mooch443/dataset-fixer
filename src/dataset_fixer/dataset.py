@@ -10,6 +10,12 @@ from typing import Any, Callable, Hashable, Iterable, Literal, Mapping, Sequence
 from PIL import Image
 from tqdm.auto import tqdm
 
+from .artifacts import (
+    DATASET_INFO_NAME,
+    dataset_info_path,
+    lineage_path,
+    read_lineage,
+)
 from .augmentation import augment_dataset, serialize_pipeline
 from .errors import DatasetValidationError, ValidationIssue
 from .io import _label_path_for_image, load_source
@@ -33,6 +39,7 @@ from .planning import (
 )
 from .semantic_export import export_semantic_masks
 from .tiling import tile_dataset
+from .tracing import DatasetTrace, trace_dataset
 from .utils import IMAGE_SUFFIXES, ensure_safe_destination, normalize_split, settings_fingerprint, slugify
 from .validation import validate_dataset
 from .validation_audit import ValidationFailureExample, build_load_validation_audit
@@ -146,7 +153,7 @@ class Dataset:
 
         Parameters:
             location: Dataset root, YOLO YAML, COCO JSON, or a
-                ``dataset-fixer.json`` semantic-mask manifest.
+                ``reports/dataset-info.json`` semantic-mask manifest.
             task: Annotation task. Pass a :class:`Task` or one of ``"detect"``,
                 ``"segment"``, ``"pose"``, or ``"polo"`` when inference is
                 ambiguous.
@@ -188,6 +195,8 @@ class Dataset:
                 errors=errors,
                 progress=progress,
             )
+        if requested.is_file() and requested.name == DATASET_INFO_NAME:
+            requested = requested.parent.parent
         warnings: list[str] = []
         root, resolved_name, resolved_task, metadata, samples, manifest = load_source(
             requested,
@@ -261,6 +270,8 @@ class Dataset:
         progress: bool,
     ) -> "Dataset":
         root = requested.parent if requested.is_file() else requested
+        if requested.is_file() and requested.name == DATASET_INFO_NAME and root.name == "reports":
+            root = root.parent
         if task is not None and task is not Task.SEGMENT:
             raise DatasetValidationError(
                 ValidationIssue(
@@ -360,8 +371,56 @@ class Dataset:
     @property
     def manifest_path(self) -> Path | None:
         """Dataset-fixer manifest path when one exists on disk."""
-        candidate = self.location / "dataset-fixer.json"
-        return candidate if candidate.is_file() else None
+        candidate = dataset_info_path(self.location)
+        if candidate.is_file():
+            return candidate
+        legacy = self.location / "dataset-fixer.json"
+        return legacy if legacy.is_file() else None
+
+    def trace(
+        self,
+        *,
+        search_paths: Iterable[str | Path] = (),
+        path_rewrites: Mapping[str | Path, str | Path] | None = None,
+    ) -> DatasetTrace:
+        """Resolve physical ancestry and exact source mappings for present samples.
+
+        Parameters:
+            search_paths: Additional roots in which generated datasets are
+                discovered by stable dataset ID.
+            path_rewrites: Old absolute path prefixes mapped to their new
+                locations after a move or remount.
+
+        Returns:
+            A concise dataset chain with exact present-sample and tile mappings.
+        """
+
+        return trace_dataset(
+            self,
+            search_paths=search_paths,
+            path_rewrites=path_rewrites,
+        )
+
+    def update(self, dest: str | Path | None = None) -> "Dataset":
+        """Upgrade this materialized dataset to the latest artifact schema.
+
+        Parameters:
+            dest: Optional destination root. A string is expanded and converted
+                to :class:`Path`. ``None`` updates reports atomically in place;
+                a distinct path creates an upgraded copy without modifying the
+                source dataset.
+
+        Returns:
+            The validated, upgraded materialized dataset.
+        """
+
+        if self._plan:
+            raise DatasetValidationError(
+                "Dataset.update requires a materialized dataset; call export(...) first"
+            )
+        from .updating import update_dataset
+
+        return update_dataset(self, dest=dest)
 
     @property
     def image_dirs(self) -> dict[str, Path]:
@@ -1776,11 +1835,13 @@ def _resolve_data_yaml(requested: Path, root: Path) -> Path | None:
 
 
 def _semantic_mask_manifest(requested: Path) -> dict[str, Any] | None:
-    manifest_path = (
-        requested
-        if requested.is_file() and requested.name == "dataset-fixer.json"
-        else requested / "dataset-fixer.json"
-    )
+    if requested.is_file() and requested.name in {"dataset-fixer.json", DATASET_INFO_NAME}:
+        manifest_path = requested
+    else:
+        manifest_path = dataset_info_path(requested)
+        if not manifest_path.is_file():
+            legacy = requested / "dataset-fixer.json"
+            manifest_path = legacy if legacy.is_file() else manifest_path
     if not manifest_path.is_file():
         return None
     try:
@@ -1833,7 +1894,7 @@ def _load_semantic_mask_samples(
         raise DatasetValidationError(
             ValidationIssue(
                 "Semantic-mask manifest has no splits",
-                source=str(root / "dataset-fixer.json"),
+                source=str(dataset_info_path(root)),
                 expected="a non-empty splits list",
             )
         )
@@ -2038,29 +2099,45 @@ def _load_provenance(
     errors: Literal["raise", "skip"],
     warnings: list[str],
 ) -> dict[str, dict[str, Any]]:
-    path = root / "provenance.jsonl"
-    if not path.is_file():
+    path = lineage_path(root)
+    legacy = root / "provenance.jsonl"
+    if not path.is_file() and not legacy.is_file():
         return {}
     records: dict[str, dict[str, Any]] = {}
     issues: list[ValidationIssue] = []
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
+        if path.is_file():
+            for line_number, record in enumerate(read_lineage(path), start=1):
                 try:
-                    record = json.loads(line)
                     records[str(Path(record["output_image"]))] = record
-                except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                except (KeyError, TypeError) as exc:
                     issues.append(
                         ValidationIssue(
-                            "Invalid provenance record",
+                            "Invalid lineage record",
                             source=str(path),
                             line=line_number,
                             value=str(exc),
                         )
                     )
-    except OSError as exc:
+        else:
+            path = legacy
+            with path.open("r", encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                        records[str(Path(record["output_image"]))] = record
+                    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                        issues.append(
+                            ValidationIssue(
+                                "Invalid provenance record",
+                                source=str(path),
+                                line=line_number,
+                                value=str(exc),
+                            )
+                        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         issues.append(
             ValidationIssue(
                 f"Unreadable provenance file: {exc}",

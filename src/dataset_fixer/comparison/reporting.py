@@ -93,46 +93,24 @@ def render_qualitative(
     confidences: dict[str, float],
     model_order: list[str],
     *,
-    baseline: str | None = None,
     n: int = 6,
+    seed: int = 42,
 ) -> list[str]:
     if not cohort.records:
         return []
-    from .metrics import optimal_match
-
-    scored = []
-    for record in cohort.records:
-        counts = [sum(p.score >= confidences[name] for p in predictions[name][record.image_id]) for name in model_order]
-        errors = {}
-        for name in model_order:
-            selected = [p for p in predictions[name][record.image_id] if p.score >= confidences[name]]
-            match = optimal_match(list(record.annotations), selected, cohort.task, cohort.metadata)
-            errors[name] = len(match["unmatched_gt"]) + len(match["unmatched_pred"])
-        scored.append({"disagreement": max(counts)-min(counts), "density": len(record.annotations), "errors": errors, "record": record})
-    by_path = lambda value: value["record"].relative_path
-    candidates = [
-        ("largest_inter_model_disagreement", max(scored, key=lambda v: (v["disagreement"], v["density"], by_path(v)))),
-        ("highest_ranked_model_failure", max(scored, key=lambda v: (v["errors"][model_order[0]], v["density"], by_path(v)))),
-        ("densest", max(scored, key=lambda v: (v["density"], by_path(v)))),
-        ("sparsest", min(scored, key=lambda v: (v["density"], by_path(v)))),
-    ]
-    if baseline in model_order:
-        candidates.insert(1, ("baseline_failure", max(scored, key=lambda v: (v["errors"][baseline], v["density"], by_path(v)))))
-    ordered_density = sorted(scored, key=lambda v: (v["density"], by_path(v)))
-    candidates.append(("representative_median", ordered_density[len(ordered_density)//2]))
-    chosen: list[tuple[str, Any]] = []
-    seen: set[str] = set()
-    for reason, value in candidates + [("additional_disagreement", v) for v in sorted(scored, key=lambda x: (-x["disagreement"], by_path(x)))]:
-        image_id = value["record"].image_id
-        if image_id not in seen:
-            chosen.append((reason, value["record"])); seen.add(image_id)
-        if len(chosen) >= min(n, len(scored)):
-            break
+    records = sorted(cohort.records, key=lambda record: record.relative_path)
+    count = min(n, len(records))
+    if count == len(records):
+        chosen = records
+    else:
+        rng = np.random.default_rng(seed)
+        indices = sorted(rng.choice(len(records), size=count, replace=False).tolist())
+        chosen = [records[index] for index in indices]
     output_dir = root / "qualitative"
     output_dir.mkdir(parents=True, exist_ok=True)
     result: list[str] = []
     selection_rows = []
-    for index, (reason, record) in enumerate(chosen, start=1):
+    for index, record in enumerate(chosen, start=1):
         fig, axes = plt.subplots(1, len(model_order) + 1, figsize=(4 * (len(model_order) + 1), 4), squeeze=False)
         image = Image.open(record.image_path).convert("RGB")
         _draw_panel(axes[0, 0], image, list(record.annotations), cohort.task, "Ground truth", truth=True)
@@ -142,15 +120,66 @@ def render_qualitative(
                 axes[0, column], image, list(record.annotations), selected,
                 cohort.task, cohort.metadata, name,
             )
-        fig.suptitle(record.relative_path)
+        fig.suptitle(f"Random sample (seed={seed}) — {record.relative_path}")
         fig.tight_layout()
         path = output_dir / f"comparison_{index:02d}.png"
         fig.savefig(path, dpi=300, bbox_inches="tight")
         plt.close(fig)
         result.append(str(path.relative_to(root)))
-        selection_rows.append({"index": index, "reason": reason, "image_id": record.image_id, "relative_path": record.relative_path})
+        selection_rows.append({"index": index, "seed": seed, "image_id": record.image_id, "relative_path": record.relative_path})
     write_json(output_dir / "selection.json", selection_rows)
     return result
+
+
+def render_prediction_grids(
+    root: Path,
+    cohort: Cohort,
+    predictions: dict[str, dict[str, list[Prediction]]],
+    confidences: dict[str, float],
+    model_order: list[str],
+) -> list[str]:
+    """Render one annotated grid per image, with at most two models per row."""
+
+    output_root = root / "predictions"
+    rendered: list[str] = []
+    for record in cohort.records:
+        columns = min(2, len(model_order))
+        rows = (len(model_order) + columns - 1) // columns
+        fig, axes = plt.subplots(
+            rows,
+            columns,
+            figsize=(5 * columns, 5 * rows),
+            squeeze=False,
+        )
+        image = Image.open(record.image_path).convert("RGB")
+        for index, name in enumerate(model_order):
+            row, column = divmod(index, columns)
+            selected = [
+                prediction
+                for prediction in predictions[name][record.image_id]
+                if prediction.score >= confidences[name]
+            ]
+            _draw_matched_panel(
+                axes[row, column],
+                image,
+                list(record.annotations),
+                selected,
+                cohort.task,
+                cohort.metadata,
+                name,
+            )
+        for index in range(len(model_order), rows * columns):
+            row, column = divmod(index, columns)
+            axes[row, column].axis("off")
+        fig.suptitle(record.relative_path)
+        fig.tight_layout()
+        relative = Path(record.relative_path).with_suffix(".png")
+        path = output_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, dpi=220, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        rendered.append(str(path.relative_to(root)))
+    return rendered
 
 
 def _save_figure(root: Path, name: str, fig: Any, rows: list[dict[str, Any]], metadata: dict[str, Any]) -> list[str]:

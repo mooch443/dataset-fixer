@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import json
 from collections import Counter
 from pathlib import Path
@@ -14,6 +13,10 @@ from dataset_fixer import tiling as tiling_module
 from dataset_fixer.models import Annotation, Sample
 from dataset_fixer.visualization import _polygon_invalidity_details, save_coverage_annotated_original
 from conftest import make_image, make_yolo_dataset
+
+
+def _audit(dataset: Dataset, name: str):
+    return dataset.manifest["audits"][name]
 
 
 def test_segment_pose_and_polo_load(tmp_path: Path) -> None:
@@ -83,15 +86,15 @@ def test_invalid_segmentation_can_be_skipped_virtually(tmp_path: Path) -> None:
     )
     exported_train_label = next((exported.location / "train" / "labels").rglob("*.txt"))
     assert len(exported_train_label.read_text(encoding="utf-8").splitlines()) == 1
-    manifest = json.loads((exported.location / "dataset-fixer.json").read_text(encoding="utf-8"))
+    manifest = exported.manifest
     assert any("Skipped invalid annotation" in warning for warning in manifest["warnings"])
     assert manifest["validation"]["load_validation"]["skipped_count"] == 1
-    assert (exported.location / "reports" / "load_validation_audit.json").is_file()
-    assert (exported.location / "reports" / "load_validation_examples.png").is_file()
+    assert "load_validation_audit" in manifest["audits"]
+    assert (exported.location / "reports" / "plots.png").is_file()
     reopened = Dataset.open(exported.location, task="segment", progress=False)
     assert reopened.validation_audit["skipped_count"] == 1
     assert reopened._validation_audit_visualization == (
-        exported.location / "reports" / "load_validation_examples.png"
+        exported.location / "reports" / "plots.png"
     )
 
     semantic = dataset.export(
@@ -101,8 +104,8 @@ def test_invalid_segmentation_can_be_skipped_virtually(tmp_path: Path) -> None:
         progress=False,
     )
     assert semantic.manifest["validation"]["load_validation"]["skipped_count"] == 1
-    assert (semantic.location / "reports" / "load_validation_audit.json").is_file()
-    assert (semantic.location / "reports" / "load_validation_examples.png").is_file()
+    assert "load_validation_audit" in semantic.manifest["audits"]
+    assert (semantic.location / "reports" / "plots.png").is_file()
 
 
 def test_skip_audit_counts_all_failures_and_visualizes_at_most_four(
@@ -288,11 +291,7 @@ def test_tiling_geometry_errors_are_diagnostic_and_skippable(tmp_path: Path) -> 
         progress=False,
     )
 
-    report = json.loads(
-        (skipped.location / "reports" / "tiling_skips.json").read_text(
-            encoding="utf-8"
-        )
-    )
+    report = _audit(skipped, "tiling_skips")
     assert report["errors"] == "skip"
     assert report["skipped_candidates"] >= 1
     mixed = next(
@@ -307,7 +306,7 @@ def test_tiling_geometry_errors_are_diagnostic_and_skippable(tmp_path: Path) -> 
             "train_0__x8_y8_w8_h8.jpg"
         )
     )
-    assert any("tiling_skips.json" in warning for warning in skipped.warnings)
+    assert any("dataset-info.json" in warning for warning in skipped.warnings)
 
 
 def test_polo_coverage_reports_and_visual_audit(tmp_path: Path) -> None:
@@ -335,16 +334,18 @@ def test_polo_coverage_reports_and_visual_audit(tmp_path: Path) -> None:
         visualize=True,
         progress=False,
     ).export(destination=tmp_path / "coverage", visualize=False, progress=False)
-    summary = tiled.location / "coverage_summary"
-    for filename in ("label_coverage.csv", "label_hit_summary.csv", "class_coverage_summary.csv", "tile_summary.csv"):
-        assert (summary / filename).is_file()
-    assert list((summary / "annotated_originals").rglob("*.jpg"))
-    rows = list(csv.DictReader((summary / "label_coverage.csv").open(encoding="utf-8")))
+    assert (tiled.location / "reports" / "plots.png").is_file()
+    for name in (
+        "coverage.label_coverage",
+        "coverage.label_hit_summary",
+        "coverage.class_coverage_summary",
+        "coverage.tile_summary",
+    ):
+        assert name in tiled.manifest["audits"]
+    rows = _audit(tiled, "coverage.label_coverage")
     assert rows and all(float(row["actual_coverages"]) >= 1 for row in rows)
     assert all(row["coverage_type"] == "sparse" for row in rows)
     assert all(annotation.radius == 10 for sample in tiled._samples for annotation in sample.annotations)
-    with Image.open(next((summary / "annotated_originals").rglob("*.jpg"))) as preview:
-        assert preview.height > 260
 
 
 def test_coverage_resamples_tiles_that_cut_annotations(tmp_path: Path) -> None:
@@ -412,19 +413,17 @@ def test_coverage_writes_source_pixel_and_label_jpg_audits(tmp_path: Path) -> No
         progress=False,
     )
 
-    summary = tiled.location / "coverage_summary"
-    assert (summary / "source_pixel_coverage.jpg").is_file()
-    assert (summary / "label_coverage.jpg").is_file()
-    rows = list(csv.DictReader((summary / "source_pixel_coverage.csv").open()))
+    assert (tiled.location / "reports" / "plots.png").is_file()
+    coverage = _audit(tiled, "coverage.source_pixel_coverage")
+    rows = coverage["rows"]
     assert {row["split"] for row in rows} == {"train", "val"}
     assert all(row["coverage_status"] == "exact" for row in rows)
     assert all(int(row["output_tiles"]) == 1 for row in rows)
     assert all(float(row["source_pixel_coverage_percent"]) == pytest.approx(50.0) for row in rows)
-    aggregate = json.loads((summary / "source_pixel_coverage.json").read_text())
+    aggregate = coverage["summary"]
     assert aggregate["splits"]["train"]["pixel_weighted_coverage_percent"] == pytest.approx(50.0)
     assert aggregate["splits"]["val"]["pixel_weighted_coverage_percent"] == pytest.approx(50.0)
-    assert "coverage_summary/source_pixel_coverage.jpg" in tiled._manifest["visuals"]
-    assert "coverage_summary/label_coverage.jpg" in tiled._manifest["visuals"]
+    assert tiled._manifest["visuals"] == ["reports/plots.png"]
 
 
 def test_lossless_coverage_fails_atomically_when_no_complete_crop_exists(tmp_path: Path) -> None:
@@ -550,9 +549,7 @@ def test_coverage_background_ratio_applies_to_complete_output(tmp_path: Path) ->
 
     summary = {
         row["split"]: row
-        for row in csv.DictReader(
-            (tiled.location / "coverage_summary" / "tile_summary.csv").open(encoding="utf-8")
-        )
+        for row in _audit(tiled, "coverage.tile_summary")
     }
     for split in ("train", "val", "all"):
         assert float(summary[split]["background_fraction"]) == 0.25
@@ -560,18 +557,16 @@ def test_coverage_background_ratio_applies_to_complete_output(tmp_path: Path) ->
     assert int(summary["train"]["dropped_background_source_images"]) == 6
     assert int(summary["train"]["target_background_images"]) == 1
     assert int(summary["train"]["actual_background_images"]) == 1
-    class_counts = json.loads(
-        (tiled.location / "reports" / "class_counts.json").read_text(encoding="utf-8")
-    )
+    class_counts = _audit(tiled, "class_counts")
     assert class_counts["operation"] == "tile-coverage"
-    assert class_counts["after"]["background"] == 2
-    assert class_counts["image_composition"]["after"] == {
+    assert class_counts["result"]["background"] == 2
+    assert class_counts["image_composition"]["result"] == {
         "annotated": 6,
         "background": 2,
         "total": 8,
         "background_fraction": 0.25,
     }
-    assert class_counts["annotation_counts"]["after"]["0"] == 6
+    assert class_counts["annotation_counts"]["result"]["0"] == 6
 
 
 def test_coverage_balances_background_source_types(tmp_path: Path) -> None:
@@ -606,13 +601,7 @@ def test_coverage_balances_background_source_types(tmp_path: Path) -> None:
         )
     )
 
-    sampling = json.loads(
-        (
-            tiled.location
-            / "coverage_summary"
-            / "background_sampling.json"
-        ).read_text(encoding="utf-8")
-    )
+    sampling = _audit(tiled, "coverage.background_sampling")
     for split in ("train", "val"):
         details = sampling["splits"][split]
         assert details["status"] == "target and equal source mix met"
@@ -685,9 +674,7 @@ def test_coverage_background_filter_discards_black_crop_candidates(
     with Image.open(backgrounds[0].image_path) as candidate:
         assert candidate.convert("RGB").getbbox() is not None
     assert backgrounds[0].provenance["background_filter_result"] == "accepted"
-    report = json.loads(
-        (tiled.location / "reports" / "background_filter.json").read_text()
-    )
+    report = _audit(tiled, "background_filter")
     assert report["evaluated_candidates"] == 2
     assert report["accepted_candidates"] == 1
     assert report["rejected_candidates"] == 1
@@ -739,9 +726,7 @@ def test_coverage_background_filter_applies_to_copied_empty_sources(
     with Image.open(background.image_path) as candidate:
         assert candidate.convert("RGB").getbbox() is not None
     assert background.provenance["tile_mode"] == "coverage-background-copy"
-    report = json.loads(
-        (tiled.location / "reports" / "background_filter.json").read_text()
-    )
+    report = _audit(tiled, "background_filter")
     assert report["by_origin"]["coverage-background-copy"]["accepted"] == 1
 
 
@@ -777,9 +762,7 @@ def test_grid_background_filter_discards_black_windows(tmp_path: Path) -> None:
     backgrounds = [sample for sample in tiled._samples if not sample.annotations]
     assert len(backgrounds) == 1
     assert backgrounds[0].relative_path.name.endswith("__x100_y0_w100_h100.jpg")
-    report = json.loads(
-        (tiled.location / "reports" / "background_filter.json").read_text()
-    )
+    report = _audit(tiled, "background_filter")
     assert report["evaluated_candidates"] == 2
     assert report["accepted_candidates"] == 1
     assert report["rejected_candidates"] == 1
@@ -854,11 +837,9 @@ def test_grid_negative_fraction_applies_to_complete_output(tmp_path: Path) -> No
         assert len(output) == 4
         assert sum(not sample.annotations for sample in output) == 1
         assert sum(not sample.annotations for sample in output) / len(output) == 0.25
-    class_counts = json.loads(
-        (tiled.location / "reports" / "class_counts.json").read_text(encoding="utf-8")
-    )
+    class_counts = _audit(tiled, "class_counts")
     assert class_counts["operation"] == "tile-grid"
-    assert class_counts["after"]["background"] == 2
+    assert class_counts["result"]["background"] == 2
 
 
 @pytest.mark.parametrize("task", ["detect", "segment", "pose", "polo"])
@@ -905,7 +886,7 @@ def test_coverage_tiling_supports_every_task(task: str, tmp_path: Path) -> None:
         )
     )
 
-    rows_out = list(csv.DictReader((tiled.location / "coverage_summary" / "label_coverage.csv").open()))
+    rows_out = _audit(tiled, "coverage.label_coverage")
     assert rows_out
     assert all(int(row["requested_coverages"]) == 2 for row in rows_out)
     assert all(int(row["actual_coverages"]) == 2 for row in rows_out)
@@ -942,7 +923,7 @@ def test_coverage_object_appearance_override_uses_source_id(tmp_path: Path) -> N
         progress=False,
     )
 
-    rows = list(csv.DictReader((tiled.location / "coverage_summary" / "label_coverage.csv").open()))
+    rows = _audit(tiled, "coverage.label_coverage")
     overridden = next(row for row in rows if row["source_id"] == str(source_id))
     assert int(overridden["requested_coverages"]) == 3
     assert int(overridden["actual_coverages"]) == 3

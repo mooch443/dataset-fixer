@@ -5,6 +5,7 @@ from .comparison.types import ComparisonResult
 from .errors import DatasetValidationError
 from .model import ImagePrediction, Model, ModelCollection, ModelInput, PredictionResult
 from .models import SemanticComparisonResult, Task
+from .tracing import DatasetTrace, DatasetTraceNode, SampleTrace
 
 try:
     from ._version import __version__
@@ -15,12 +16,15 @@ __all__ = [
     "Dataset",
     "ComparisonResult",
     "DatasetValidationError",
+    "DatasetTrace",
+    "DatasetTraceNode",
     "ImagePrediction",
     "Model",
     "ModelCollection",
     "ModelInput",
     "PredictionResult",
     "SemanticComparisonResult",
+    "SampleTrace",
     "Task",
     "__version__",
 ]

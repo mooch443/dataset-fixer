@@ -187,9 +187,15 @@ def test_sahi_ultralytics_detection_uses_source_coordinate_tiles(
             pass
 
         def predict(self, **kwargs: object):
-            assert np.asarray(kwargs["source"]).shape == (4, 4, 3)
+            sources = kwargs["source"]
+            assert isinstance(sources, list)
+            assert len(sources) == 2
+            assert all(np.asarray(source).shape == (4, 4, 3) for source in sources)
             boxes = types.SimpleNamespace(xyxy=[[1, 1, 3, 3]], conf=[0.9], cls=[0])
-            return [types.SimpleNamespace(boxes=boxes, masks=None, keypoints=None)]
+            return [
+                types.SimpleNamespace(boxes=boxes, masks=None, keypoints=None)
+                for _ in sources
+            ]
 
     monkeypatch.setitem(sys.modules, "ultralytics", types.SimpleNamespace(YOLO=FakeYOLO))
     result = Model(checkpoint, task="detect").predict(
@@ -226,14 +232,19 @@ def test_sahi_ultralytics_semantic_stitches_class_maps(
         def __init__(self, _: str) -> None:
             pass
 
-        def predict(self, **_: object):
+        def predict(self, **kwargs: object):
             nonlocal calls
-            class_id = calls
             calls += 1
-            semantic = types.SimpleNamespace(
-                data=np.full((4, 4), class_id, dtype=np.uint8)
-            )
-            return [types.SimpleNamespace(semantic_mask=semantic)]
+            sources = kwargs["source"]
+            assert isinstance(sources, list)
+            return [
+                types.SimpleNamespace(
+                    semantic_mask=types.SimpleNamespace(
+                        data=np.full((4, 4), class_id, dtype=np.uint8)
+                    )
+                )
+                for class_id, _ in enumerate(sources)
+            ]
 
     monkeypatch.setitem(sys.modules, "ultralytics", types.SimpleNamespace(YOLO=FakeYOLO))
     result = Model(checkpoint, task="semantic").predict(
@@ -246,6 +257,7 @@ def test_sahi_ultralytics_semantic_stitches_class_maps(
     )
     mask = result.records[0].mask
     assert result.task == "semantic_segment"
+    assert calls == 1
     assert np.all(mask[:, :4] == 0)
     assert np.all(mask[:, 4:] == 1)
 

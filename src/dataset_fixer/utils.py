@@ -165,7 +165,14 @@ def ensure_safe_destination(source: Path, destination: Path) -> None:
 
 
 def image_files(path: Path) -> list[Path]:
-    return sorted(p for p in path.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
+    ignored = {".cache", "evaluations", "reports"}
+    return sorted(
+        candidate
+        for candidate in path.rglob("*")
+        if candidate.is_file()
+        and candidate.suffix.lower() in IMAGE_SUFFIXES
+        and not ignored.intersection(candidate.relative_to(path).parts)
+    )
 
 
 def unique_preserving_order(values: Iterable[Any]) -> list[Any]:

@@ -139,7 +139,11 @@ def stage_load_validation_audit(
 
     reports_dir.mkdir(parents=True, exist_ok=True)
     staged_visualization: Path | None = None
-    if visualization is not None and visualization.is_file():
+    if (
+        visualization is not None
+        and visualization.is_file()
+        and visualization.name not in {"plots.png", "comparison.png"}
+    ):
         staged_visualization = visualization_path
         shutil.copy2(visualization, staged_visualization)
         detail["visualization"] = f"reports/{VISUALIZATION_NAME}"

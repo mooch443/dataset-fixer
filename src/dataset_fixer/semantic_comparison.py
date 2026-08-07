@@ -16,20 +16,30 @@ import numpy as np
 from PIL import Image, ImageDraw
 from tqdm.auto import tqdm
 
-from .comparison.reporting import write_csv, write_json
+from .comparison.cache import (
+    cache_key,
+    default_cache_root,
+    load_evaluation_cache,
+    save_evaluation_cache,
+)
+from .comparison.reporting import write_json
 from .errors import DatasetValidationError, ValidationIssue
 from .model import ImagePrediction, Model, ModelCollection, ModelInput
 from .models import SemanticComparisonResult
 from .sahi_support import resolve_sahi_settings
 from .utils import (
     IMAGE_SUFFIXES,
-    ensure_safe_destination,
     environment_snapshot,
     normalize_split,
+    package_versions,
     settings_fingerprint,
     sha256_file,
     to_jsonable,
 )
+
+
+_NNUNET_SAHI_PROBABILITY_BATCH_BYTES = 512 * 1024 * 1024
+_NNUNET_SAHI_MAX_IMAGES_PER_BATCH = 512
 
 
 @dataclass(frozen=True)
@@ -53,90 +63,46 @@ def compare_nnunet_models(
     models: Any,
     *,
     split: str,
-    baseline: str | None,
-    folds: tuple[int | str, ...],
-    checkpoint: str,
-    device: str,
-    workers: int,
-    bootstrap_resamples: int,
-    seed: int,
-    keep_predictions: bool,
-    visualize: bool,
+    save_prediction_plots: bool,
     progress: bool,
     destination: str | Path | None,
-    inference: str | None = "native",
-    resolution: int = 480,
-    comparison_unit: str = "model",
-    sahi_slice_height: int | None = None,
-    sahi_slice_width: int | None = None,
-    sahi_overlap: float = 0.2,
-    sahi_overlap_height_ratio: float | None = None,
-    sahi_overlap_width_ratio: float | None = None,
-    sahi_postprocess_type: str = "GREEDYNMM",
-    sahi_postprocess_match_metric: str = "IOS",
-    sahi_postprocess_class_agnostic: bool = False,
-    sahi_model_type: str = "ultralytics",
 ) -> SemanticComparisonResult:
     """Run official nnU-Net v2 prediction and evaluation for an export."""
 
+    seed = 42
+    bootstrap_resamples = 10_000
     split = normalize_split(split)
     if split not in export.splits:
         raise ValueError(f"Unknown semantic-mask split {split!r}; available splits are {export.splits}")
-    if workers <= 0:
-        raise ValueError("workers must be positive")
-    if bootstrap_resamples <= 0:
-        raise ValueError("bootstrap_resamples must be positive")
-    if device not in {"cpu", "cuda", "mps"}:
-        raise ValueError("device must be 'cpu', 'cuda', or 'mps'")
-    if inference is not None and inference not in {"native", "sahi"}:
-        raise ValueError("inference must be 'native', 'sahi', or None; 'auto' was removed")
-    if comparison_unit not in {"model", "system"}:
-        raise ValueError("comparison_unit must be 'model' or 'system'")
-
-    sahi_options = {
-        "sahi_slice_height": sahi_slice_height,
-        "sahi_slice_width": sahi_slice_width,
-        "sahi_overlap": sahi_overlap,
-        "sahi_overlap_height_ratio": sahi_overlap_height_ratio,
-        "sahi_overlap_width_ratio": sahi_overlap_width_ratio,
-        "sahi_postprocess_type": sahi_postprocess_type,
-        "sahi_postprocess_match_metric": sahi_postprocess_match_metric,
-        "sahi_postprocess_class_agnostic": sahi_postprocess_class_agnostic,
-        "sahi_model_type": sahi_model_type,
+    specs = _parse_models(models)
+    resolved_devices = {
+        spec.name: str(spec._resolved_device())
+        for spec in specs
     }
-    effective_sahi_options = {
-        key: value for key, value in sahi_options.items() if value is not None
-    }
-
-    specs = _parse_models(models, default_folds=folds, default_checkpoint=checkpoint)
-    model_backends = {spec.name: inference or spec.inference for spec in specs}
-    if comparison_unit == "model" and len(set(model_backends.values())) != 1:
-        raise ValueError("Mixed native/SAHI configurations require comparison_unit='system'")
+    model_backends = {spec.name: spec.inference for spec in specs}
     resolved_sahi_by_model = {
         spec.name: resolve_sahi_settings(
-            {**spec.settings, **effective_sahi_options},
-            resolution=spec.resolution or resolution,
+            spec.settings,
+            resolution=spec.resolution or 480,
         ).as_dict()
         for spec in specs
         if model_backends[spec.name] == "sahi"
     }
-    if comparison_unit == "model" and len(
-        {
-            tuple(sorted(configuration.items()))
-            for configuration in resolved_sahi_by_model.values()
+    model_systems = {
+        spec.name: {
+            "backend": model_backends[spec.name],
+            "resolution": spec.resolution or 480,
+            "sahi": resolved_sahi_by_model.get(spec.name),
+            "upscale_factor": spec.upscale_factor,
         }
-    ) > 1:
-        raise ValueError(
-            "Different SAHI tile configurations require comparison_unit='system'"
-        )
-    if baseline is None:
-        baseline = specs[0].name
-    if baseline not in {spec.name for spec in specs}:
-        raise ValueError(f"Unknown baseline {baseline!r}")
-    _require_official_commands(
-        "nnUNetv2_predict_from_modelfolder",
-        "nnUNetv2_evaluate_folder",
+        for spec in specs
+    }
+    comparison_unit = (
+        "model"
+        if len({settings_fingerprint(value) for value in model_systems.values()}) == 1
+        else "system"
     )
+    baseline = specs[0].name
     cases, cohort_fingerprint = _freeze_cohort(export, split)
 
     resolved_settings = {
@@ -146,7 +112,7 @@ def compare_nnunet_models(
             else "mixed"
         ),
         "adapter": "nnunetv2-official",
-        "report_schema": 4,
+        "report_schema": 7,
         "canonical_projection": (
             "sahi-feathered-probability-area-pool-argmax"
             if set(model_backends.values()) == {"sahi"}
@@ -158,17 +124,12 @@ def compare_nnunet_models(
         ),
         "split": split,
         "baseline": baseline,
-        "device": device,
-        "workers": workers,
         "bootstrap_resamples": bootstrap_resamples,
         "seed": seed,
-        "keep_predictions": keep_predictions,
-        "visualize": visualize,
-        "inference": inference,
         "model_backends": model_backends,
-        "resolution": resolution,
         "comparison_unit": comparison_unit,
         "sahi_models": resolved_sahi_by_model,
+        "model_systems": model_systems,
         "models": [
             {
                 "name": spec.name,
@@ -178,7 +139,7 @@ def compare_nnunet_models(
                 "checkpoint_sha256": spec.checkpoint_sha256,
                 "model_sha256": spec.digest,
                 "upscale_factor": spec.upscale_factor,
-                "device": spec.device or device,
+                "device": resolved_devices[spec.name],
                 "workers": spec.workers,
             }
             for spec in specs
@@ -190,10 +151,21 @@ def compare_nnunet_models(
     target = (
         Path(destination).expanduser().resolve()
         if destination is not None
-        else export.location.parent / f"{export.name}__compare-nnunet__{fingerprint}"
+        else export.location / "evaluations" / fingerprint
     )
-    ensure_safe_destination(export.location, target)
+    if target == export.location:
+        raise ValueError("Comparison destination cannot replace the dataset")
     target.parent.mkdir(parents=True, exist_ok=True)
+    existing = target / "reports" / "result.json"
+    if (
+        existing.is_file()
+        and (target / "reports" / "plots.png").is_file()
+        and (target / "reports" / "comparison.png").is_file()
+        and (not save_prediction_plots or (target / "predictions").is_dir())
+    ):
+        cached_manifest = json.loads(existing.read_text(encoding="utf-8"))
+        if cached_manifest.get("schema") == 7:
+            return _semantic_result_from_manifest(target, cached_manifest)
     temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.building-", dir=target.parent))
     started = time.time()
     limitations = [
@@ -215,98 +187,115 @@ def compare_nnunet_models(
         )
 
     try:
+        statistics_key = f"semantic-comparison-{fingerprint}"
+        statistics_cache = default_cache_root(export.location)
+        cached_statistics = load_evaluation_cache(statistics_cache, statistics_key)
         canonical_labels = temporary / "cohort" / "canonical" / "labels"
         _prepare_labels(cases, canonical_labels)
-        _write_cohort(
-            temporary / "evaluation-cohort.jsonl",
-            cases,
-            split,
-            specs,
-            projection=(
-                "sahi-feathered-probability-area-pool-argmax"
-                if set(model_backends.values()) == {"sahi"}
-                else (
-                    "per-model-see-settings"
-                    if len(set(model_backends.values())) > 1
-                    else "probability-area-pool-argmax"
-                )
-            ),
-        )
-
         model_rows: dict[str, list[dict[str, Any]]] = {}
         ranking: list[dict[str, Any]] = []
-        official_summaries: dict[str, str] = {}
-        native_official_summaries: dict[str, str] = {}
         prediction_dirs: dict[str, Path] = {}
         model_inputs = _model_inputs_from_cases(cases)
         for model_index, spec in enumerate(specs):
             selected_backend = model_backends[spec.name]
-            native_labels = temporary / "cohort" / "models" / spec.slug / "labels"
-            _prepare_labels(cases, native_labels, upscale_factor=spec.upscale_factor)
-            native_prediction_dir = temporary / "native-predictions" / spec.slug
-            native_prediction_dir.mkdir(parents=True, exist_ok=True)
-            prediction_dir = temporary / "predictions" / spec.slug
-            prediction_dir.mkdir(parents=True, exist_ok=True)
+            cache_identity = cache_key(
+                {
+                    "schema": 1,
+                    "space": "nnunet-semantic",
+                    "cohort": cohort_fingerprint,
+                    "model_sha256": spec.digest,
+                    "backend": selected_backend,
+                    "folds": spec.folds,
+                    "checkpoint": spec.checkpoint,
+                    "upscale_factor": spec.upscale_factor,
+                    "device": resolved_devices[spec.name],
+                    "resolution": spec.resolution or 480,
+                    "sahi": resolved_sahi_by_model.get(spec.name),
+                    "versions": package_versions(),
+                }
+            )
+            cache_dir = default_cache_root(export.location) / "semantic" / cache_identity
+            cached = _load_semantic_cache(cache_dir, cases)
+            if cached is not None and all(
+                key in cached for key in ("summary", "native_summary", "native_rows")
+            ):
+                prediction_dir = cache_dir / "predictions"
+                summary = dict(cached["summary"])
+                native_summary = dict(cached["native_summary"])
+                rows = [{**row, "model": spec.name} for row in cached["rows"]]
+                native_rows = [
+                    {**row, "model": spec.name} for row in cached["native_rows"]
+                ]
+                inference_seconds = float(cached.get("inference_seconds", 0.0))
+                cache_status = "hit"
+            else:
+                _require_official_commands(
+                    "nnUNetv2_predict_from_modelfolder",
+                    "nnUNetv2_evaluate_folder",
+                )
+                native_labels = temporary / "cohort" / "models" / spec.slug / "labels"
+                _prepare_labels(cases, native_labels, upscale_factor=spec.upscale_factor)
+                native_prediction_dir = temporary / "working" / "native-predictions" / spec.slug
+                native_prediction_dir.mkdir(parents=True, exist_ok=True)
+                prediction_dir = temporary / "working" / "predictions" / spec.slug
+                prediction_dir.mkdir(parents=True, exist_ok=True)
+                summary_path = temporary / "working" / f"{spec.slug}-metrics.json"
+                native_summary_path = temporary / "working" / f"{spec.slug}-native-metrics.json"
+                print(
+                    f"Evaluating {spec.name!r} with official nnU-Net v2 "
+                    f"(folds={spec.folds}, checkpoint={spec.checkpoint}, "
+                    f"input_scale={spec.upscale_factor}x)"
+                )
+                prediction_result = spec.predict(
+                    model_inputs,
+                    device=resolved_devices[spec.name],
+                    progress=progress,
+                    _keep_native=True,
+                    inference=selected_backend,
+                    resolution=spec.resolution or 480,
+                )
+                inference_seconds = prediction_result.inference_seconds
+                _write_semantic_prediction_masks(
+                    prediction_result.records,
+                    prediction_dir,
+                    native_prediction_dir,
+                )
+                _assert_exact_predictions(native_prediction_dir, cases, spec.name)
+                _run_command(
+                    [
+                        "nnUNetv2_evaluate_folder", str(native_labels), str(native_prediction_dir),
+                        "-djfile", str(spec.model_folder / "dataset.json"),
+                        "-pfile", str(spec.model_folder / "plans.json"),
+                        "-o", str(native_summary_path), "-np", str(spec.workers),
+                    ]
+                )
+                native_summary = _load_official_summary(native_summary_path, spec.name)
+                native_rows = _per_case_rows(native_summary, cases, spec.name)
+                _assert_exact_predictions(prediction_dir, cases, spec.name)
+                _run_command(
+                    [
+                        "nnUNetv2_evaluate_folder", str(canonical_labels), str(prediction_dir),
+                        "-djfile", str(spec.model_folder / "dataset.json"),
+                        "-pfile", str(spec.model_folder / "plans.json"),
+                        "-o", str(summary_path), "-np", str(spec.workers),
+                    ]
+                )
+                summary = _load_official_summary(summary_path, spec.name)
+                rows = _per_case_rows(summary, cases, spec.name)
+                _save_semantic_cache(
+                    cache_dir,
+                    prediction_dir,
+                    {
+                        "rows": rows,
+                        "native_rows": native_rows,
+                        "summary": summary,
+                        "native_summary": native_summary,
+                        "inference_seconds": inference_seconds,
+                    },
+                )
+                prediction_dir = cache_dir / "predictions"
+                cache_status = "fresh"
             prediction_dirs[spec.name] = prediction_dir
-            summary_path = temporary / f"{spec.slug}-metrics.json"
-            native_summary_path = temporary / f"{spec.slug}-native-metrics.json"
-            print(
-                f"Evaluating {spec.name!r} with official nnU-Net v2 "
-                f"(folds={spec.folds}, checkpoint={spec.checkpoint}, "
-                f"input_scale={spec.upscale_factor}x)"
-            )
-            prediction_result = spec.predict(
-                model_inputs,
-                device=spec.device or device,
-                progress=progress,
-                _keep_native=True,
-                inference=selected_backend,
-                resolution=resolution,
-                **sahi_options,
-            )
-            inference_seconds = prediction_result.inference_seconds
-            _write_semantic_prediction_masks(
-                prediction_result.records,
-                prediction_dir,
-                native_prediction_dir,
-            )
-            _assert_exact_predictions(native_prediction_dir, cases, spec.name)
-            _run_command(
-                [
-                    "nnUNetv2_evaluate_folder",
-                    str(native_labels),
-                    str(native_prediction_dir),
-                    "-djfile",
-                    str(spec.model_folder / "dataset.json"),
-                    "-pfile",
-                    str(spec.model_folder / "plans.json"),
-                    "-o",
-                    str(native_summary_path),
-                    "-np",
-                    str(spec.workers),
-                ]
-            )
-            native_summary = _load_official_summary(native_summary_path, spec.name)
-            native_rows = _per_case_rows(native_summary, cases, spec.name)
-            _assert_exact_predictions(prediction_dir, cases, spec.name)
-            shutil.rmtree(native_prediction_dir)
-            _run_command(
-                [
-                    "nnUNetv2_evaluate_folder",
-                    str(canonical_labels),
-                    str(prediction_dir),
-                    "-djfile",
-                    str(spec.model_folder / "dataset.json"),
-                    "-pfile",
-                    str(spec.model_folder / "plans.json"),
-                    "-o",
-                    str(summary_path),
-                    "-np",
-                    str(spec.workers),
-                ]
-            )
-            summary = _load_official_summary(summary_path, spec.name)
-            rows = _per_case_rows(summary, cases, spec.name)
             model_rows[spec.name] = rows
             aggregate = summary["foreground_mean"]
             dice = _metric(aggregate, "Dice")
@@ -318,11 +307,17 @@ def compare_nnunet_models(
             native_finite_support = sum(
                 math.isfinite(row["dice"]) for row in native_rows
             )
-            ci_low, ci_high = _bootstrap_interval(
-                [row["dice"] for row in rows],
-                resamples=bootstrap_resamples,
-                seed=seed + model_index,
+            cached_interval = (
+                (cached_statistics or {}).get("intervals", {}).get(spec.name)
             )
+            if isinstance(cached_interval, list) and len(cached_interval) == 2:
+                ci_low, ci_high = map(float, cached_interval)
+            else:
+                ci_low, ci_high = _bootstrap_interval(
+                    [row["dice"] for row in rows],
+                    resamples=bootstrap_resamples,
+                    seed=seed + model_index,
+                )
             ranking.append(
                 {
                     "model": spec.name,
@@ -356,73 +351,51 @@ def compare_nnunet_models(
                     "native_evaluation_resolution": f"model-input-{spec.upscale_factor}x",
                     "cohort_fingerprint": cohort_fingerprint,
                     "inference_seconds": inference_seconds,
+                    "cache": cache_status,
                     "throughput_cases_per_second": (
                         len(cases) / inference_seconds if inference_seconds > 0 else None
                     ),
                 }
             )
-            sanitized = _sanitize_official_summary(
-                summary,
-                cases,
-                split=split,
-                model_slug=spec.slug,
-                keep_predictions=keep_predictions,
-            )
-            sanitized["evaluation_resolution"] = "canonical-export"
-            sanitized["projection"] = (
-                "sahi-feathered-probability-area-pool-argmax"
-                if selected_backend == "sahi"
-                else "probability-area-pool-argmax"
-            )
-            write_json(summary_path, sanitized)
-            official_summaries[spec.name] = str(summary_path.relative_to(temporary))
-            sanitized_native = _sanitize_official_summary(
-                native_summary,
-                cases,
-                split=split,
-                model_slug=spec.slug,
-                keep_predictions=False,
-            )
-            sanitized_native["evaluation_resolution"] = f"model-input-{spec.upscale_factor}x"
-            sanitized_native["projection"] = "none"
-            write_json(native_summary_path, sanitized_native)
-            native_official_summaries[spec.name] = str(
-                native_summary_path.relative_to(temporary)
-            )
 
         ranking.sort(key=lambda row: (-_sortable_score(row["score"]), row["model"]))
         for rank, row in enumerate(ranking, start=1):
             row["rank"] = rank
-        paired = _paired_statistics(
-            model_rows,
-            baseline,
-            resamples=bootstrap_resamples,
-            seed=seed,
-        )
-        per_case = [row for name in [spec.name for spec in specs] for row in model_rows[name]]
-        write_csv(temporary / "ranking.csv", ranking)
-        write_csv(temporary / "per-case.csv", per_case)
-        write_csv(temporary / "paired-statistics.csv", paired)
-
-        figure_paths: list[str] = []
-        qualitative_paths: list[str] = []
-        if visualize:
-            figure_paths = _render_ranking(temporary, ranking)
-            qualitative_paths = _render_qualitative(
-                temporary,
-                cases,
-                prediction_dirs,
+        if cached_statistics is not None and isinstance(cached_statistics.get("paired"), list):
+            paired = list(cached_statistics["paired"])
+        else:
+            paired = _paired_statistics(
                 model_rows,
+                baseline,
+                resamples=bootstrap_resamples,
                 seed=seed,
             )
-
-        if not keep_predictions:
-            shutil.rmtree(temporary / "predictions", ignore_errors=True)
-        shutil.rmtree(temporary / "native-predictions", ignore_errors=True)
+            save_evaluation_cache(
+                statistics_cache,
+                statistics_key,
+                {
+                    "intervals": {
+                        row["model"]: [row["ci_low"], row["ci_high"]]
+                        for row in ranking
+                    },
+                    "paired": paired,
+                },
+            )
+        per_case = [row for name in [spec.name for spec in specs] for row in model_rows[name]]
+        reports = temporary / "reports"
+        reports.mkdir(parents=True, exist_ok=True)
+        _render_ranking(reports, ranking)
+        _render_qualitative(reports, cases, prediction_dirs, model_rows, seed=seed)
+        prediction_paths: list[str] = []
+        if save_prediction_plots:
+            prediction_paths = _render_semantic_prediction_grids(
+                temporary, cases, prediction_dirs, model_rows
+            )
+        shutil.rmtree(temporary / "working", ignore_errors=True)
         shutil.rmtree(temporary / "cohort", ignore_errors=True)
 
         manifest = {
-            "schema": 4,
+            "schema": 7,
             "kind": "semantic-mask-model-comparison",
             "backend": resolved_settings["backend"],
             "adapter": "nnunetv2-official",
@@ -441,16 +414,22 @@ def compare_nnunet_models(
             "settings_fingerprint": fingerprint,
             "ranking": ranking,
             "paired_statistics": paired,
-            "official_summaries": official_summaries,
-            "native_official_summaries": native_official_summaries,
             "limitations": limitations,
-            "figures": figure_paths,
-            "qualitative": qualitative_paths,
+            "worst_cases": _bounded_semantic_cases(per_case),
+            "reports": {
+                "plots": "reports/plots.png",
+                "comparison": "reports/comparison.png",
+                "prediction_plots": prediction_paths,
+            },
             "environment": environment_snapshot(),
             "started_at_unix": started,
             "completed_at_unix": time.time(),
         }
-        write_json(temporary / "semantic-model-comparison.json", manifest)
+        write_json(reports / "result.json", manifest)
+        if target.exists():
+            if not (target / "reports" / "result.json").is_file():
+                raise FileExistsError(f"Refusing to replace unrelated comparison destination: {target}")
+            shutil.rmtree(target)
         temporary.replace(target)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -477,84 +456,48 @@ def compare_semantic_models(
     models: ModelCollection,
     *,
     split: str,
-    baseline: str | None,
-    device: str | None,
-    inference: str | None,
-    confidence: float,
-    postprocess: float,
-    bootstrap_resamples: int,
-    seed: int,
-    keep_predictions: bool,
-    visualize: bool,
+    save_prediction_plots: bool,
     progress: bool,
     destination: str | Path | None,
-    resolution: int = 480,
-    comparison_unit: str = "model",
-    sahi_slice_height: int | None = None,
-    sahi_slice_width: int | None = None,
-    sahi_overlap: float = 0.2,
-    sahi_overlap_height_ratio: float | None = None,
-    sahi_overlap_width_ratio: float | None = None,
-    sahi_postprocess_type: str = "GREEDYNMM",
-    sahi_postprocess_match_metric: str = "IOS",
-    sahi_postprocess_class_agnostic: bool = False,
-    sahi_model_type: str = "ultralytics",
 ) -> SemanticComparisonResult:
     """Compare instance and semantic segmenters in one binary mask space."""
 
+    seed = 42
+    bootstrap_resamples = 10_000
     split = normalize_split(split)
     if split not in export.splits:
         raise ValueError(
             f"Unknown semantic-mask split {split!r}; available splits are {export.splits}"
         )
-    if baseline is None:
-        baseline = models.models[0].name
-    if baseline not in models.names:
-        raise ValueError(f"Unknown baseline {baseline!r}")
-    if bootstrap_resamples <= 0:
-        raise ValueError("bootstrap_resamples must be positive")
-    if not math.isfinite(float(confidence)) or not 0 <= float(confidence) <= 1:
-        raise ValueError("confidence must be finite and in [0, 1]")
-    if not math.isfinite(float(postprocess)) or not 0 <= float(postprocess) <= 1:
-        raise ValueError("postprocess must be finite and in [0, 1]")
-    if inference is not None and inference not in {"native", "sahi"}:
-        raise ValueError("inference must be 'native', 'sahi', or None; 'auto' was removed")
-    if comparison_unit not in {"model", "system"}:
-        raise ValueError("comparison_unit must be 'model' or 'system'")
-    selected_backends = {inference or model.inference for model in models}
-    if comparison_unit == "model" and len(selected_backends) != 1:
-        raise ValueError("Mixed native/SAHI configurations require comparison_unit='system'")
-    sahi_options = {
-        "sahi_slice_height": sahi_slice_height,
-        "sahi_slice_width": sahi_slice_width,
-        "sahi_overlap": sahi_overlap,
-        "sahi_overlap_height_ratio": sahi_overlap_height_ratio,
-        "sahi_overlap_width_ratio": sahi_overlap_width_ratio,
-        "sahi_postprocess_type": sahi_postprocess_type,
-        "sahi_postprocess_match_metric": sahi_postprocess_match_metric,
-        "sahi_postprocess_class_agnostic": sahi_postprocess_class_agnostic,
-        "sahi_model_type": sahi_model_type,
-    }
-    effective_sahi_options = {
-        key: value for key, value in sahi_options.items() if value is not None
+    baseline = models.models[0].name
+    resolved_devices = {
+        model.name: model._resolved_device()
+        for model in models
     }
     resolved_sahi_by_model = {
         model.name: resolve_sahi_settings(
-            {**model.settings, **effective_sahi_options},
-            resolution=model.resolution or resolution,
+            model.settings,
+            resolution=model.resolution or 480,
         ).as_dict()
         for model in models
-        if (inference or model.inference) == "sahi"
+        if model.inference == "sahi"
     }
-    if comparison_unit == "model" and len(
-        {
-            tuple(sorted(configuration.items()))
-            for configuration in resolved_sahi_by_model.values()
+    model_systems = {
+        model.name: {
+            "backend": model.inference,
+            "device": resolved_devices[model.name],
+            "resolution": model.resolution or 480,
+            "confidence": model.confidence if model.kind == "ultralytics" else None,
+            "postprocess": model.postprocess if model.kind == "ultralytics" else None,
+            "sahi": resolved_sahi_by_model.get(model.name),
         }
-    ) > 1:
-        raise ValueError(
-            "Different SAHI tile configurations require comparison_unit='system'"
-        )
+        for model in models
+    }
+    comparison_unit = (
+        "model"
+        if len({settings_fingerprint(value) for value in model_systems.values()}) == 1
+        else "system"
+    )
     incompatible = [
         {"model": model.name, "kind": model.kind, "task": model.task}
         for model in models
@@ -573,25 +516,20 @@ def compare_semantic_models(
     cases, cohort_fingerprint = _freeze_cohort(export, split)
     resolved_settings = {
         "backend": "common-semantic-mask",
-        "report_schema": 5,
+        "report_schema": 7,
         "comparison_space": "semantic",
         "canonical_projection": "binary-foreground-union",
         "split": split,
         "baseline": baseline,
-        "device": device,
-        "inference": inference,
-        "resolution": resolution,
         "comparison_unit": comparison_unit,
         "sahi_models": resolved_sahi_by_model,
-        "confidence": float(confidence),
-        "postprocess": float(postprocess),
+        "model_systems": model_systems,
         "bootstrap_resamples": bootstrap_resamples,
         "seed": seed,
-        "keep_predictions": keep_predictions,
-        "visualize": visualize,
         "models": [
             {
                 **model.describe(),
+                "device": resolved_devices[model.name],
                 "semantic_projection": (
                     "polygon-foreground-union"
                     if model.task == "segment"
@@ -607,10 +545,21 @@ def compare_semantic_models(
     target = (
         Path(destination).expanduser().resolve()
         if destination is not None
-        else export.location.parent / f"{export.name}__compare-semantic__{fingerprint}"
+        else export.location / "evaluations" / fingerprint
     )
-    ensure_safe_destination(export.location, target)
+    if target == export.location:
+        raise ValueError("Comparison destination cannot replace the dataset")
     target.parent.mkdir(parents=True, exist_ok=True)
+    existing = target / "reports" / "result.json"
+    if (
+        existing.is_file()
+        and (target / "reports" / "plots.png").is_file()
+        and (target / "reports" / "comparison.png").is_file()
+        and (not save_prediction_plots or (target / "predictions").is_dir())
+    ):
+        cached_manifest = json.loads(existing.read_text(encoding="utf-8"))
+        if cached_manifest.get("schema") == 7:
+            return _semantic_result_from_manifest(target, cached_manifest)
     temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.building-", dir=target.parent))
     started = time.time()
     limitations = [
@@ -622,27 +571,21 @@ def compare_semantic_models(
     ]
 
     try:
-        _write_cohort(
-            temporary / "evaluation-cohort.jsonl",
-            cases,
-            split,
-            list(models.models),
-            projection="binary-foreground-union",
-        )
+        statistics_key = f"semantic-comparison-{fingerprint}"
+        statistics_cache = default_cache_root(export.location)
+        cached_statistics = load_evaluation_cache(statistics_cache, statistics_key)
         model_inputs = _model_inputs_from_cases(cases)
         model_rows: dict[str, list[dict[str, Any]]] = {}
         prediction_dirs: dict[str, Path] = {}
         ranking: list[dict[str, Any]] = []
         for model_index, model in enumerate(models):
-            prediction_dir = temporary / "predictions" / model.slug
-            prediction_dir.mkdir(parents=True, exist_ok=True)
-            prediction_dirs[model.name] = prediction_dir
+            confidence = model.confidence
+            postprocess = model.postprocess
             predict_options: dict[str, Any] = {
-                "device": model.device or device,
+                "device": resolved_devices[model.name],
                 "progress": progress,
-                "inference": inference or model.inference,
-                "resolution": model.resolution or resolution,
-                **sahi_options,
+                "inference": model.inference,
+                "resolution": model.resolution or 480,
             }
             if model.kind == "ultralytics":
                 predict_options.update(
@@ -651,17 +594,71 @@ def compare_semantic_models(
                         "postprocess": float(postprocess),
                     }
                 )
-            prediction_result = model.predict(model_inputs, **predict_options)
-            projected, projection = _project_semantic_predictions(
-                prediction_result.records,
-                prediction_result.task,
-                cases,
-                model.name,
-                confidence=float(confidence),
+            cache_identity = cache_key(
+                {
+                    "schema": 1,
+                    "space": "binary-semantic",
+                    "cohort": cohort_fingerprint,
+                    "model_sha256": model.digest,
+                    "kind": model.kind,
+                    "task": model.task,
+                    "model_settings": model.settings,
+                    "folds": model.folds,
+                    "checkpoint": model.checkpoint,
+                    "upscale_factor": model.upscale_factor,
+                    "workers": model.workers,
+                    "settings": {
+                        key: value
+                        for key, value in predict_options.items()
+                        if key != "progress"
+                    },
+                    "versions": package_versions(),
+                }
             )
-            _write_semantic_prediction_masks(projected, prediction_dir)
-            _assert_exact_predictions(prediction_dir, cases, model.name)
-            rows = _sample_metric_rows(cases, prediction_dir, model.name)
+            cache_dir = default_cache_root(export.location) / "semantic" / cache_identity
+            cached = _load_semantic_cache(cache_dir, cases)
+            if cached is not None:
+                prediction_dir = cache_dir / "predictions"
+                rows = [
+                    {**row, "model": model.name}
+                    for row in cached["rows"]
+                ]
+                projection = str(cached["projection"])
+                native_task = str(cached["native_task"])
+                prediction_backend = str(cached["backend"])
+                inference_seconds = float(cached.get("inference_seconds", 0.0))
+                cache_status = "hit"
+            else:
+                prediction_dir = temporary / "working" / "predictions" / model.slug
+                prediction_dir.mkdir(parents=True, exist_ok=True)
+                prediction_result = model.predict(model_inputs, **predict_options)
+                projected, projection = _project_semantic_predictions(
+                    prediction_result.records,
+                    prediction_result.task,
+                    cases,
+                    model.name,
+                    confidence=float(confidence),
+                )
+                _write_semantic_prediction_masks(projected, prediction_dir)
+                _assert_exact_predictions(prediction_dir, cases, model.name)
+                rows = _sample_metric_rows(cases, prediction_dir, model.name)
+                native_task = prediction_result.task
+                prediction_backend = prediction_result.backend
+                inference_seconds = prediction_result.inference_seconds
+                _save_semantic_cache(
+                    cache_dir,
+                    prediction_dir,
+                    {
+                        "rows": rows,
+                        "projection": projection,
+                        "native_task": native_task,
+                        "backend": prediction_backend,
+                        "inference_seconds": inference_seconds,
+                    },
+                )
+                prediction_dir = cache_dir / "predictions"
+                cache_status = "fresh"
+            prediction_dirs[model.name] = prediction_dir
             model_rows[model.name] = rows
             finite_dice = [row["dice"] for row in rows if math.isfinite(row["dice"])]
             finite_iou = [row["iou"] for row in rows if math.isfinite(row["iou"])]
@@ -672,17 +669,23 @@ def compare_semantic_models(
             fn = sum(int(row["fn"]) for row in rows)
             micro_dice_denominator = 2 * tp + fp + fn
             micro_iou_denominator = tp + fp + fn
-            ci_low, ci_high = _bootstrap_interval(
-                [row["dice"] for row in rows],
-                resamples=bootstrap_resamples,
-                seed=seed + model_index,
+            cached_interval = (
+                (cached_statistics or {}).get("intervals", {}).get(model.name)
             )
+            if isinstance(cached_interval, list) and len(cached_interval) == 2:
+                ci_low, ci_high = map(float, cached_interval)
+            else:
+                ci_low, ci_high = _bootstrap_interval(
+                    [row["dice"] for row in rows],
+                    resamples=bootstrap_resamples,
+                    seed=seed + model_index,
+                )
             ranking.append(
                 {
                     "model": model.name,
                     "model_kind": model.kind,
-                    "native_task": prediction_result.task,
-                    "backend": prediction_result.backend,
+                    "native_task": native_task,
+                    "backend": prediction_backend,
                     "metric": "canonical.macro_foreground.Dice",
                     "score": dice,
                     "dice": dice,
@@ -706,10 +709,11 @@ def compare_semantic_models(
                     "projection": projection,
                     "cohort_fingerprint": cohort_fingerprint,
                     "model_sha256": model.digest,
-                    "inference_seconds": prediction_result.inference_seconds,
+                    "inference_seconds": inference_seconds,
+                    "cache": cache_status,
                     "throughput_cases_per_second": (
-                        len(cases) / prediction_result.inference_seconds
-                        if prediction_result.inference_seconds > 0
+                        len(cases) / inference_seconds
+                        if inference_seconds > 0
                         else None
                     ),
                 }
@@ -718,41 +722,49 @@ def compare_semantic_models(
         ranking.sort(key=lambda row: (-_sortable_score(row["score"]), row["model"]))
         for rank, row in enumerate(ranking, start=1):
             row["rank"] = rank
-        paired = _paired_statistics(
-            model_rows,
-            baseline,
-            resamples=bootstrap_resamples,
-            seed=seed,
-        )
+        if cached_statistics is not None and isinstance(cached_statistics.get("paired"), list):
+            paired = list(cached_statistics["paired"])
+        else:
+            paired = _paired_statistics(
+                model_rows,
+                baseline,
+                resamples=bootstrap_resamples,
+                seed=seed,
+            )
+            save_evaluation_cache(
+                statistics_cache,
+                statistics_key,
+                {
+                    "intervals": {
+                        row["model"]: [row["ci_low"], row["ci_high"]]
+                        for row in ranking
+                    },
+                    "paired": paired,
+                },
+            )
         per_case = [
             row
             for model in models
             for row in model_rows[model.name]
         ]
-        write_csv(temporary / "ranking.csv", ranking)
-        write_csv(temporary / "per-case.csv", per_case)
-        write_csv(temporary / "paired-statistics.csv", paired)
-        figure_paths: list[str] = []
-        qualitative_paths: list[str] = []
-        if visualize:
-            figure_paths = _render_ranking(
-                temporary,
-                ranking,
-                xlabel="Canonical binary foreground mean Dice",
-                title="Semantic-space model comparison",
+        reports = temporary / "reports"
+        reports.mkdir(parents=True, exist_ok=True)
+        _render_ranking(
+            reports,
+            ranking,
+            xlabel="Canonical binary foreground mean Dice",
+            title="Semantic-space model comparison",
+        )
+        _render_qualitative(reports, cases, prediction_dirs, model_rows, seed=seed)
+        prediction_paths: list[str] = []
+        if save_prediction_plots:
+            prediction_paths = _render_semantic_prediction_grids(
+                temporary, cases, prediction_dirs, model_rows
             )
-            qualitative_paths = _render_qualitative(
-                temporary,
-                cases,
-                prediction_dirs,
-                model_rows,
-                seed=seed,
-            )
-        if not keep_predictions:
-            shutil.rmtree(temporary / "predictions", ignore_errors=True)
+        shutil.rmtree(temporary / "working", ignore_errors=True)
 
         manifest = {
-            "schema": 5,
+            "schema": 7,
             "kind": "semantic-mask-model-comparison",
             "backend": "common-semantic-mask",
             "negotiated_comparison_space": "semantic",
@@ -772,13 +784,21 @@ def compare_semantic_models(
             "ranking": ranking,
             "paired_statistics": paired,
             "limitations": limitations,
-            "figures": figure_paths,
-            "qualitative": qualitative_paths,
+            "worst_cases": _bounded_semantic_cases(per_case),
+            "reports": {
+                "plots": "reports/plots.png",
+                "comparison": "reports/comparison.png",
+                "prediction_plots": prediction_paths,
+            },
             "environment": environment_snapshot(),
             "started_at_unix": started,
             "completed_at_unix": time.time(),
         }
-        write_json(temporary / "semantic-model-comparison.json", manifest)
+        write_json(reports / "result.json", manifest)
+        if target.exists():
+            if not (target / "reports" / "result.json").is_file():
+                raise FileExistsError(f"Refusing to replace unrelated comparison destination: {target}")
+            shutil.rmtree(target)
         temporary.replace(target)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -1044,44 +1064,53 @@ def _predict_nnunet_sahi(
 
     resolved = resolve_sahi_settings(settings, resolution=resolution)
     records: list[ImagePrediction] = []
-    iterator = tqdm(
+    manifests = {
+        value.image_id: build_tile_manifest(
+            width=value.width,
+            height=value.height,
+            settings=resolved,
+        )
+        for value in inputs
+    }
+    batches = _nnunet_sahi_input_batches(
         inputs,
-        desc=f"{model.name} SAHI nnU-Net",
-        unit="image",
-        disable=not progress,
+        manifests,
+        upscale_factor=model.upscale_factor,
     )
     with tempfile.TemporaryDirectory(prefix="dataset-fixer-nnunet-sahi-") as temporary:
         root = Path(temporary)
-        for value in iterator:
-            with Image.open(value.image_path) as opened:
-                source_image = opened.convert("RGB")
-            if source_image.size != (value.width, value.height):
-                raise DatasetValidationError(
-                    f"Prediction input dimensions changed while slicing {value.image_path}"
-                )
-            manifest = build_tile_manifest(
-                width=value.width,
-                height=value.height,
-                settings=resolved,
-            )
-            image_dir = root / "images" / value.image_id
-            prediction_dir = root / "predictions" / value.image_id
+        iterator = tqdm(
+            batches,
+            desc=f"{model.name} SAHI nnU-Net batches",
+            unit="batch",
+            disable=not progress,
+        )
+        for batch_index, batch in enumerate(iterator, start=1):
+            image_dir = root / "images" / f"batch_{batch_index:06d}"
+            prediction_dir = root / "predictions" / f"batch_{batch_index:06d}"
             image_dir.mkdir(parents=True, exist_ok=True)
             prediction_dir.mkdir(parents=True, exist_ok=True)
-            case_ids: dict[int, str] = {}
-            for tile in manifest:
-                case_id = f"{value.image_id}__tile_{tile.index:06d}"
-                case_ids[tile.index] = case_id
-                image = source_image.crop(tile.box)
-                if model.upscale_factor != 1:
-                    image = image.resize(
-                        (
-                            tile.width * model.upscale_factor,
-                            tile.height * model.upscale_factor,
-                        ),
-                        Image.Resampling.BICUBIC,
+            case_ids: dict[tuple[str, int], str] = {}
+            for value in batch:
+                with Image.open(value.image_path) as opened:
+                    source_image = opened.convert("RGB")
+                if source_image.size != (value.width, value.height):
+                    raise DatasetValidationError(
+                        f"Prediction input dimensions changed while slicing {value.image_path}"
                     )
-                image.save(image_dir / f"{case_id}_0000.png", format="PNG")
+                for tile in manifests[value.image_id]:
+                    case_id = f"{value.image_id}__tile_{tile.index:06d}"
+                    case_ids[(value.image_id, tile.index)] = case_id
+                    image = source_image.crop(tile.box)
+                    if model.upscale_factor != 1:
+                        image = image.resize(
+                            (
+                                tile.width * model.upscale_factor,
+                                tile.height * model.upscale_factor,
+                            ),
+                            Image.Resampling.BICUBIC,
+                        )
+                    image.save(image_dir / f"{case_id}_0000.png", format="PNG")
             _run_command(
                 [
                     "nnUNetv2_predict_from_modelfolder",
@@ -1120,59 +1149,100 @@ def _predict_nnunet_sahi(
                         expected=f"exactly {len(expected_pngs)} tile predictions",
                     )
                 )
-            tile_probabilities = [
-                (
-                    tile,
-                    _load_nnunet_tile_probabilities(
-                        prediction_dir / f"{case_ids[tile.index]}.npz",
-                        expected_shape=(
-                            tile.height * model.upscale_factor,
-                            tile.width * model.upscale_factor,
+            for value in batch:
+                manifest = manifests[value.image_id]
+                tile_probabilities = [
+                    (
+                        tile,
+                        _load_nnunet_tile_probabilities(
+                            prediction_dir
+                            / f"{case_ids[(value.image_id, tile.index)]}.npz",
+                            expected_shape=(
+                                tile.height * model.upscale_factor,
+                                tile.width * model.upscale_factor,
+                            ),
+                            source=f"{model.name}/{value.image_id}/tile-{tile.index}",
                         ),
-                        source=f"{model.name}/{value.image_id}/tile-{tile.index}",
-                    ),
-                )
-                for tile in manifest
-            ]
-            native_probabilities = stitch_probability_tiles(
-                width=value.width,
-                height=value.height,
-                tiles=tile_probabilities,
-                scale=model.upscale_factor,
-            )
-            native_mask = np.argmax(native_probabilities, axis=0).astype(np.uint8)
-            if model.upscale_factor == 1:
-                canonical_probabilities = native_probabilities
-            else:
-                canonical_probabilities = native_probabilities.reshape(
-                    2,
-                    value.height,
-                    model.upscale_factor,
-                    value.width,
-                    model.upscale_factor,
-                ).mean(axis=(2, 4))
-            mask = np.argmax(canonical_probabilities, axis=0).astype(np.uint8)
-            records.append(
-                ImagePrediction(
-                    image_id=value.image_id,
-                    image_path=value.image_path,
-                    relative_path=value.relative_path,
+                    )
+                    for tile in manifest
+                ]
+                native_probabilities = stitch_probability_tiles(
                     width=value.width,
                     height=value.height,
-                    mask=mask,
-                    native_mask=native_mask if keep_native else None,
-                    metadata={
-                        "backend": "sahi",
-                        "adapter": "nnunetv2-official",
-                        "upscale_factor": model.upscale_factor,
-                        "projection": "sahi-feathered-probability-area-pool-argmax",
-                        **resolved.as_dict(),
-                    },
+                    tiles=tile_probabilities,
+                    scale=model.upscale_factor,
                 )
-            )
+                native_mask = np.argmax(native_probabilities, axis=0).astype(np.uint8)
+                if model.upscale_factor == 1:
+                    canonical_probabilities = native_probabilities
+                else:
+                    canonical_probabilities = native_probabilities.reshape(
+                        2,
+                        value.height,
+                        model.upscale_factor,
+                        value.width,
+                        model.upscale_factor,
+                    ).mean(axis=(2, 4))
+                mask = np.argmax(canonical_probabilities, axis=0).astype(np.uint8)
+                records.append(
+                    ImagePrediction(
+                        image_id=value.image_id,
+                        image_path=value.image_path,
+                        relative_path=value.relative_path,
+                        width=value.width,
+                        height=value.height,
+                        mask=mask,
+                        native_mask=native_mask if keep_native else None,
+                        metadata={
+                            "backend": "sahi",
+                            "adapter": "nnunetv2-official",
+                            "upscale_factor": model.upscale_factor,
+                            "projection": "sahi-feathered-probability-area-pool-argmax",
+                            "tile_count": len(manifest),
+                            "cli_batch_images": len(batch),
+                            "cli_batch_tiles": len(case_ids),
+                            **resolved.as_dict(),
+                        },
+                    )
+                )
             shutil.rmtree(image_dir)
             shutil.rmtree(prediction_dir)
     return tuple(records)
+
+
+def _nnunet_sahi_input_batches(
+    inputs: tuple[ModelInput, ...],
+    manifests: dict[str, tuple[Any, ...]],
+    *,
+    upscale_factor: int,
+) -> tuple[tuple[ModelInput, ...], ...]:
+    """Bound CLI batches by estimated uncompressed probability output size."""
+
+    batches: list[tuple[ModelInput, ...]] = []
+    pending: list[ModelInput] = []
+    pending_bytes = 0
+    for value in inputs:
+        estimated_bytes = sum(
+            2
+            * tile.width
+            * upscale_factor
+            * tile.height
+            * upscale_factor
+            * np.dtype(np.float32).itemsize
+            for tile in manifests[value.image_id]
+        )
+        if pending and (
+            pending_bytes + estimated_bytes > _NNUNET_SAHI_PROBABILITY_BATCH_BYTES
+            or len(pending) >= _NNUNET_SAHI_MAX_IMAGES_PER_BATCH
+        ):
+            batches.append(tuple(pending))
+            pending = []
+            pending_bytes = 0
+        pending.append(value)
+        pending_bytes += estimated_bytes
+    if pending:
+        batches.append(tuple(pending))
+    return tuple(batches)
 
 
 def _load_nnunet_tile_probabilities(
@@ -1213,6 +1283,7 @@ def _load_nnunet_tile_probabilities(
 
 
 def visualize_nnunet_models(
+    export: "Dataset",
     cohort: ModelCollection,
     *,
     split: str,
@@ -1228,11 +1299,10 @@ def visualize_nnunet_models(
 ) -> Any:
     """Run sampled official nnU-Net inference and render model masks."""
 
-    export = cohort.source
     from .dataset import Dataset
 
     if not isinstance(export, Dataset) or export.format != "semantic_masks":
-        raise TypeError("Semantic visualization requires a bound semantic-mask Dataset")
+        raise TypeError("Semantic visualization requires a semantic-mask Dataset")
     split = normalize_split(split)
     if split not in export.splits:
         raise ValueError(
@@ -1269,7 +1339,7 @@ def visualize_nnunet_models(
             predictions.mkdir(parents=True, exist_ok=True)
             result = spec.predict(
                 model_inputs,
-                device=spec.device or "cuda",
+                device=spec._resolved_device(),
                 progress=progress,
             )
             _write_semantic_prediction_masks(
@@ -1304,18 +1374,8 @@ def visualize_nnunet_models(
         return figure
 
 
-def _parse_models(
-    models: Any,
-    *,
-    default_folds: tuple[int | str, ...],
-    default_checkpoint: str,
-) -> list[Model]:
-    collection = Model.load_many(
-        models,
-        kind="nnunet",
-        folds=default_folds,
-        checkpoint=default_checkpoint,
-    )
+def _parse_models(models: Any) -> list[Model]:
+    collection = Model.load_many(models)
     incompatible = [model.name for model in collection if model.kind != "nnunet"]
     if incompatible:
         raise DatasetValidationError(
@@ -1906,32 +1966,6 @@ def _paired_statistics(
     return output
 
 
-def _sanitize_official_summary(
-    summary: dict[str, Any],
-    cases: list[_SemanticCase],
-    *,
-    split: str,
-    model_slug: str,
-    keep_predictions: bool,
-) -> dict[str, Any]:
-    case_map = {case.case_id: case for case in cases}
-    sanitized = json.loads(json.dumps(summary))
-    for result in sanitized.get("metric_per_case", []):
-        case_id = Path(str(result.get("prediction_file", ""))).stem
-        case = case_map.get(case_id)
-        if case is None:
-            continue
-        result["reference_file"] = (
-            f"dataset://{split}/masks/0/{case.relative_path.with_suffix('.png').as_posix()}"
-        )
-        result["prediction_file"] = (
-            f"predictions/{model_slug}/{case_id}.png" if keep_predictions else None
-        )
-        result["source_image"] = f"dataset://{split}/images/{case.relative_path.as_posix()}"
-    sanitized["predictions_retained"] = keep_predictions
-    return sanitized
-
-
 def _sortable_score(value: Any) -> float:
     try:
         parsed = float(value)
@@ -1964,7 +1998,7 @@ def _render_ranking(
         label = f"{float(row['dice']):.3f}" if math.isfinite(float(row["dice"])) else "n/a"
         axis.text(min(score + 0.01, 0.98), index, label, va="center")
     figure.tight_layout()
-    path = root / "ranking.png"
+    path = root / "plots.png"
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
     plt.close(figure)
     return [str(path.relative_to(root))]
@@ -1999,6 +2033,170 @@ def _render_qualitative(
     figure.savefig(output, dpi=160, bbox_inches="tight", facecolor="white")
     plt.close(figure)
     return [str(output.relative_to(root))]
+
+
+def _render_semantic_prediction_grids(
+    root: Path,
+    cases: list[_SemanticCase],
+    prediction_dirs: dict[str, Path],
+    rows_by_model: dict[str, list[dict[str, Any]]],
+) -> list[str]:
+    """Write one image-level comparison with at most two models per row."""
+
+    import matplotlib.pyplot as plt
+
+    model_names = list(prediction_dirs)
+    row_lookup = {
+        name: {str(row["case_id"]): row for row in rows}
+        for name, rows in rows_by_model.items()
+    }
+    output_root = root / "predictions"
+    rendered: list[str] = []
+    for case in cases:
+        columns = min(2, len(model_names))
+        rows = math.ceil(len(model_names) / columns)
+        figure, axes = plt.subplots(
+            rows,
+            columns,
+            figsize=(5 * columns, 5 * rows),
+            squeeze=False,
+        )
+        with Image.open(case.image_path) as opened:
+            image = np.asarray(opened.convert("RGB"), dtype=np.float32)
+        with Image.open(case.mask_path) as opened:
+            truth = np.asarray(opened.convert("L")) > 0
+        for index, name in enumerate(model_names):
+            row, column = divmod(index, columns)
+            with Image.open(prediction_dirs[name] / f"{case.case_id}.png") as opened:
+                prediction = np.asarray(opened.convert("L")) > 0
+            overlay = image.copy()
+            overlay[truth] = 0.55 * overlay[truth] + 0.45 * np.asarray([0, 200, 90])
+            overlay[prediction] = 0.55 * overlay[prediction] + 0.45 * np.asarray([215, 50, 160])
+            metric = row_lookup[name][case.case_id]
+            axes[row, column].imshow(overlay.astype(np.uint8))
+            axes[row, column].set_title(
+                f"{name}\nDice={_format_metric(metric['dice'])} · "
+                f"IoU={_format_metric(metric['iou'])}"
+            )
+            axes[row, column].axis("off")
+        for index in range(len(model_names), rows * columns):
+            row, column = divmod(index, columns)
+            axes[row, column].axis("off")
+        figure.suptitle(f"{case.relative_path} · green=truth, magenta=prediction")
+        figure.tight_layout()
+        relative = case.relative_path.with_suffix(".png")
+        output = output_root / relative
+        output.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output, dpi=220, bbox_inches="tight", facecolor="white")
+        plt.close(figure)
+        rendered.append(str(output.relative_to(root)))
+    return rendered
+
+
+def _bounded_semantic_cases(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    by_case: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        case_id = str(row.get("case_id") or "")
+        entry = by_case.setdefault(
+            case_id,
+            {
+                "case_id": case_id,
+                "relative_path": row.get("relative_path"),
+                "models": [],
+            },
+        )
+        entry["models"].append(
+            {
+                "model": row.get("model"),
+                "dice": row.get("dice"),
+                "iou": row.get("iou"),
+                "fp": row.get("fp"),
+                "fn": row.get("fn"),
+            }
+        )
+    values = list(by_case.values())
+    for value in values:
+        finite = [
+            float(row["dice"])
+            for row in value["models"]
+            if math.isfinite(float(row["dice"]))
+        ]
+        value["mean_dice"] = float(np.mean(finite)) if finite else None
+    return sorted(
+        values,
+        key=lambda value: (
+            math.inf if value["mean_dice"] is None else float(value["mean_dice"]),
+            str(value["relative_path"]),
+        ),
+    )[:limit]
+
+
+def _semantic_result_from_manifest(
+    target: Path,
+    manifest: dict[str, Any],
+) -> SemanticComparisonResult:
+    return SemanticComparisonResult(
+        location=target,
+        ranking=tuple(manifest.get("ranking") or ()),
+        cohort_fingerprint=str(manifest.get("cohort_fingerprint") or ""),
+        cohort_verified=bool(manifest.get("cohort_verified")),
+        split=str(manifest.get("split") or "val"),
+        baseline=str(manifest.get("baseline") or ""),
+        settings=dict(manifest.get("settings") or {}),
+        limitations=tuple(str(value) for value in manifest.get("limitations") or ()),
+    )
+
+
+def _load_semantic_cache(
+    cache_dir: Path,
+    cases: list[_SemanticCase],
+) -> dict[str, Any] | None:
+    metadata = cache_dir / "evaluation.json"
+    predictions = cache_dir / "predictions"
+    if not metadata.is_file() or not predictions.is_dir():
+        return None
+    expected = {f"{case.case_id}.png" for case in cases}
+    actual = {path.name for path in predictions.glob("*.png") if path.is_file()}
+    if actual != expected:
+        return None
+    try:
+        value = json.loads(metadata.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or value.get("schema") != 1:
+        return None
+    rows = value.get("rows")
+    if not isinstance(rows, list) or {str(row.get("case_id")) for row in rows} != {
+        case.case_id for case in cases
+    }:
+        return None
+    return value
+
+
+def _save_semantic_cache(
+    cache_dir: Path,
+    prediction_dir: Path,
+    metadata: dict[str, Any],
+) -> None:
+    if (cache_dir / "evaluation.json").is_file():
+        return
+    cache_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{cache_dir.name}.building-", dir=cache_dir.parent)
+    )
+    try:
+        shutil.copytree(prediction_dir, staging / "predictions")
+        write_json(staging / "evaluation.json", {"schema": 1, **metadata})
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+        staging.replace(cache_dir)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 def _select_visual_cases(

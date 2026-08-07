@@ -12,6 +12,19 @@ from typing import Any
 import yaml
 from PIL import Image
 
+from .artifacts import (
+    DATASET_INFO_SCHEMA,
+    combine_report_plots,
+    collect_report_payloads,
+    dataset_info_path,
+    lineage_path,
+    source_dataset_id,
+    source_info_path,
+    split_image_summary,
+    stable_dataset_id,
+    write_json,
+    write_lineage,
+)
 from .io import annotation_to_yolo
 from .models import Annotation, DatasetMetadata, Sample, Task
 from .utils import environment_snapshot, settings_fingerprint, sha256_file, slugify, to_jsonable
@@ -47,20 +60,11 @@ class OutputBuilder:
         self.staging = Path(tempfile.mkdtemp(prefix=f".{self.destination.name}.tmp-", dir=self.destination.parent))
         self.reports_dir = self.staging / "reports"
         self.reports_dir.mkdir(parents=True, exist_ok=True)
-        source_reports = self.source_root / "reports"
-        if source_reports.is_dir():
-            shutil.copytree(source_reports, self.reports_dir, dirs_exist_ok=True)
-        source_coverage = self.source_root / "coverage_summary"
-        if source_coverage.is_dir():
-            shutil.copytree(source_coverage, self.staging / "coverage_summary", dirs_exist_ok=True)
+        self.source_plot = self.source_root / "reports" / "plots.png"
         self.records: list[dict[str, Any]] = []
         self.output_samples: list[Sample] = []
         self.validation_details: dict[str, Any] = {}
-        self.visuals = [
-            str(path)
-            for path in parent_manifest.get("visuals") or []
-            if (self.staging / str(path)).is_file()
-        ]
+        self.visuals: list[str] = []
         self.warnings: list[str] = []
 
     def cleanup(self) -> None:
@@ -178,6 +182,7 @@ class OutputBuilder:
             "original_sha256": parent.get("original_sha256") or immediate_sha,
             "output_split": split,
             "output_annotation_count": len(annotations),
+            "output_has_labels": bool(annotations),
             "source_annotation_ids": [a.source_id for a in annotations if a.source_id is not None],
             "operation": self.operation,
             "transformation_chain": [
@@ -219,18 +224,9 @@ class OutputBuilder:
         (self.staging / "data.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
     def write_reports(self, *, class_mapping: dict[int, int] | None = None) -> dict[str, Any]:
-        self.visuals = list(
-            dict.fromkeys(
-                path for path in self.visuals if (self.staging / path).is_file()
-            )
-        )
         for record in self.records:
             record.setdefault("class_mapping", class_mapping)
             record.setdefault("warnings", [])
-        provenance_path = self.staging / "provenance.jsonl"
-        with provenance_path.open("w", encoding="utf-8") as handle:
-            for record in self.records:
-                handle.write(json.dumps(to_jsonable(record), sort_keys=True) + "\n")
         history = list(self.parent_manifest.get("history") or [])
         operation_record = {
             "operation": self.operation,
@@ -257,22 +253,120 @@ class OutputBuilder:
             from . import __version__
         except ImportError:
             __version__ = "unknown"
+        source_id = source_dataset_id(
+            source_manifest=self.parent_manifest,
+            source_name=self.source_name,
+            source_path=self.source_root,
+            records=self.records,
+        )
+        dataset_id = stable_dataset_id(
+            name=self.name,
+            task=self.task.value,
+            format_name="yolo",
+            classes=self.metadata.names,
+            records=self.records,
+        )
+        for record in self.records:
+            record.setdefault("parent_dataset_id", source_id)
+            record.setdefault("dataset_id", dataset_id)
+        write_lineage(lineage_path(self.staging), self.records)
+
+        audits = dict(self.parent_manifest.get("audits") or {})
+        audits.update(collect_report_payloads(self.reports_dir))
+        split_validation = self.validation_details.get("split_group_isolation")
+        if (
+            isinstance(split_validation, dict)
+            and split_validation.get("status") == "not_applicable"
+        ):
+            audits.pop("split_group_audit", None)
+        coverage_dir = self.staging / "coverage_summary"
+        if coverage_dir.is_dir():
+            audits.update(
+                {
+                    f"coverage.{key}": value
+                    for key, value in collect_report_payloads(coverage_dir).items()
+                }
+            )
+        plot = combine_report_plots(
+            (self.reports_dir, coverage_dir),
+            self.reports_dir / "plots.png",
+        )
+        if plot is None and self.source_plot.is_file():
+            plot = self.reports_dir / "plots.png"
+            shutil.copy2(self.source_plot, plot)
+        self.visuals = ["reports/plots.png"] if plot is not None else []
+        load_validation = self.validation_details.get("load_validation")
+        if isinstance(load_validation, dict) and load_validation.get("skipped_count", 0):
+            load_validation["report"] = (
+                "reports/dataset-info.json#audits.load_validation_audit"
+            )
+            load_validation["visualization"] = (
+                "reports/plots.png" if plot is not None else None
+            )
+            if isinstance(audits.get("load_validation_audit"), dict):
+                audits["load_validation_audit"]["report"] = load_validation["report"]
+                audits["load_validation_audit"]["visualization"] = load_validation[
+                    "visualization"
+                ]
+        source_info = {
+            "schema": "dataset-fixer-source",
+            "schema_version": DATASET_INFO_SCHEMA,
+            "id": source_id,
+            "path": str(self.source_root),
+            "name": self.parent_manifest.get("name") or self.source_name,
+            "format": self.parent_manifest.get("format") or (
+                "yolo"
+                if any((self.source_root / name).is_file() for name in ("data.yaml", "dataset.yaml", "data.yml"))
+                else "coco"
+            ),
+            "task": self.parent_manifest.get("task") or self.task.value,
+            "fingerprint": source_fingerprint,
+            "classes": self.parent_manifest.get("classes") or self.metadata.names,
+            "splits": self.parent_manifest.get("splits") or sorted(
+                {str(record.get("parent_split")) for record in self.records}
+            ),
+            "state": {
+                "images": len({str(record.get("parent_image")) for record in self.records}),
+                "splits": {
+                    split: len(
+                        {
+                            str(record.get("parent_image"))
+                            for record in self.records
+                            if record.get("parent_split") == split
+                        }
+                    )
+                    for split in sorted(
+                        {str(record.get("parent_split")) for record in self.records}
+                    )
+                },
+            },
+        }
+        write_json(source_info_path(self.staging), source_info)
         manifest = {
-            "schema_version": 1,
+            "schema": "dataset-fixer-dataset-info",
+            "schema_version": DATASET_INFO_SCHEMA,
+            "dataset_id": dataset_id,
             "name": self.name,
             "location": str(self.destination),
             "task": self.task.value,
             "format": "yolo",
             "splits": sorted({r["output_split"] for r in self.records}),
+            "split_summary": split_image_summary(self.records),
             "classes": self.metadata.names,
             "settings": self.settings,
             "settings_fingerprint": self._settings_fingerprint,
             "history": history,
             "parent_manifest_fingerprint": settings_fingerprint(self.parent_manifest) if self.parent_manifest else None,
             "source_dataset": {
+                "id": source_id,
                 "name": self.parent_manifest.get("name") or self.source_name,
-                "location": str(self.source_root),
+                "path": str(self.source_root),
+                "format": source_info["format"],
+                "task": self.parent_manifest.get("task") or self.task.value,
                 "fingerprint": source_fingerprint,
+                "classes": source_info["classes"],
+                "splits": source_info["splits"],
+                "source_dataset": self.parent_manifest.get("source_dataset"),
             },
             "dataset_fixer": {
                 "version": __version__,
@@ -283,7 +377,12 @@ class OutputBuilder:
             "class_mapping": class_mapping,
             "warnings": self.warnings,
             "visuals": self.visuals,
-            "provenance": "provenance.jsonl",
+            "lineage": {
+                "path": "reports/lineage.json.gz",
+                "schema_version": 2,
+                "records": len(self.records),
+            },
+            "audits": audits,
             "validation": {
                 "passed": True,
                 "warnings": self.warnings,
@@ -296,9 +395,7 @@ class OutputBuilder:
                 "duration_seconds": finished - self.started,
             },
         }
-        (self.staging / "dataset-fixer.json").write_text(
-            json.dumps(to_jsonable(manifest), indent=2, sort_keys=True), encoding="utf-8"
-        )
+        write_json(dataset_info_path(self.staging), manifest)
         return manifest
 
     def publish(
@@ -335,9 +432,7 @@ class OutputBuilder:
                 "warnings": self.warnings,
                 **self.validation_details,
             }
-        (self.staging / "dataset-fixer.json").write_text(
-            json.dumps(to_jsonable(manifest), indent=2, sort_keys=True), encoding="utf-8"
-        )
+        write_json(dataset_info_path(self.staging), manifest)
         self.write_yaml(dataset_root=self.destination)
         os.replace(self.staging, self.destination)
         return manifest

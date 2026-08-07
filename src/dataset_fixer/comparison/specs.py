@@ -9,13 +9,7 @@ from ..model import Model, ModelCollection
 from .types import ModelSpec
 
 
-def parse_models(
-    models: Any,
-    *,
-    default_resolution: int,
-    confidence_thresholds: tuple[float, ...],
-    postprocess_thresholds: tuple[float, ...],
-) -> list[ModelSpec]:
+def parse_models(models: Any) -> list[ModelSpec]:
     if isinstance(models, ModelCollection):
         items = [(model.name, model) for model in models]
     elif isinstance(models, Model):
@@ -47,7 +41,7 @@ def parse_models(
             settings = {
                 "path": loaded.path,
                 "training_dataset": loaded.training_dataset,
-                "resolution": loaded.resolution or default_resolution,
+                "resolution": loaded.resolution or 480,
                 "inference": loaded.inference,
                 **loaded.settings,
             }
@@ -66,12 +60,10 @@ def parse_models(
                 )
             )
             continue
-        resolution = int(settings.get("resolution", default_resolution))
+        resolution = int(settings.get("resolution", 480))
         if resolution <= 0:
             issues.append(ValidationIssue("Model resolution must be positive", source=name, value=resolution))
             continue
-        conf = _thresholds(settings.get("confidence_thresholds", confidence_thresholds), "confidence", name, issues)
-        post = _thresholds(settings.get("postprocess_thresholds", postprocess_thresholds), "postprocess", name, issues)
         adapter_settings = {
             key: value
             for key, value in settings.items()
@@ -81,10 +73,8 @@ def parse_models(
                 "model_folder",
                 "training_dataset",
                 "resolution",
-                "confidence_thresholds",
-                "postprocess_thresholds",
-                "locked_confidence",
-                "locked_postprocess",
+                "confidence",
+                "postprocess",
                 "inference",
             }
         }
@@ -94,6 +84,8 @@ def parse_models(
             resolution=resolution,
             training_dataset=settings.get("training_dataset"),
             inference=str(settings.get("inference", "native")),
+            confidence=float(settings.get("confidence", 0.25)),
+            postprocess=float(settings.get("postprocess", 0.7)),
             settings=adapter_settings,
         )
         training = settings.get("training_dataset") or resolved_model.training_dataset
@@ -103,17 +95,15 @@ def parse_models(
                 path=path,
                 training_dataset=Path(training).expanduser().resolve() if training else None,
                 resolution=resolution,
-                confidence_thresholds=conf,
-                postprocess_thresholds=post,
-                locked_confidence=_optional_probability(settings.get("locked_confidence"), name, issues),
-                locked_postprocess=_optional_probability(settings.get("locked_postprocess"), name, issues),
+                confidence=resolved_model.confidence,
+                postprocess=resolved_model.postprocess,
                 inference_overrides={
                     key: value
                     for key, value in settings.items()
                     if key
                     not in {
-                        "path", "model_folder", "training_dataset", "resolution", "confidence_thresholds",
-                        "postprocess_thresholds", "locked_confidence", "locked_postprocess",
+                        "path", "model_folder", "training_dataset", "resolution",
+                        "confidence", "postprocess",
                     }
                 },
                 model=resolved_model,
@@ -123,35 +113,4 @@ def parse_models(
         raise DatasetValidationError(issues)
     if not result:
         raise ValueError("At least one model is required")
-    return result
-
-
-def _thresholds(value: Any, kind: str, name: str, issues: list[ValidationIssue]) -> tuple[float, ...]:
-    try:
-        values = tuple(sorted({float(item) for item in value}))
-    except (TypeError, ValueError):
-        issues.append(ValidationIssue(f"Invalid {kind} thresholds", source=name, value=value))
-        return ()
-    if not values or any(not 0 <= item <= 1 for item in values):
-        issues.append(
-            ValidationIssue(
-                f"Invalid {kind} thresholds",
-                source=name,
-                value=values,
-                expected="one or more finite values in [0, 1]",
-            )
-        )
-    return values
-
-
-def _optional_probability(value: Any, name: str, issues: list[ValidationIssue]) -> float | None:
-    if value is None:
-        return None
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        issues.append(ValidationIssue("Invalid locked threshold", source=name, value=value))
-        return None
-    if not 0 <= result <= 1:
-        issues.append(ValidationIssue("Locked threshold must be in [0, 1]", source=name, value=result))
     return result

@@ -12,10 +12,8 @@ class ModelSpec:
     path: Path
     training_dataset: Path | None = None
     resolution: int = 480
-    confidence_thresholds: tuple[float, ...] | None = None
-    postprocess_thresholds: tuple[float, ...] | None = None
-    locked_confidence: float | None = None
-    locked_postprocess: float | None = None
+    confidence: float = 0.25
+    postprocess: float = 0.7
     inference_overrides: dict[str, Any] = field(default_factory=dict)
     model: Any | None = field(default=None, repr=False, compare=False)
 

@@ -25,6 +25,10 @@ if TYPE_CHECKING:
     from ..model import Model, ModelInput, PredictionTask
 
 
+_ULTRALYTICS_SAHI_BATCH_PIXELS = 4 * 1024 * 1024
+_ULTRALYTICS_SAHI_MAX_BATCH_SIZE = 32
+
+
 def resolve_backend(requested: str, task: str) -> str:
     requested = requested.lower()
     if requested not in {"native", "sahi"}:
@@ -368,42 +372,51 @@ def _predict_sahi_inputs(
         )
         raw_objects: list[Prediction] = []
         semantic_tiles: list[tuple[SahiTile, np.ndarray]] = []
-        for tile in manifest:
-            crop = source_image.crop(tile.box)
-            result = _predict_ultralytics_tile(
+        batch_size = max(
+            1,
+            min(
+                _ULTRALYTICS_SAHI_MAX_BATCH_SIZE,
+                _ULTRALYTICS_SAHI_BATCH_PIXELS // max(1, resolution * resolution),
+            ),
+        )
+        for offset in range(0, len(manifest), batch_size):
+            tile_batch = manifest[offset : offset + batch_size]
+            crops = [source_image.crop(tile.box) for tile in tile_batch]
+            results = _predict_ultralytics_tiles(
                 loaded,
-                crop,
+                crops,
                 resolution=resolution,
                 confidence=confidence_floor,
                 postprocess=threshold,
                 device=device,
                 settings=settings,
-                source=f"{source_model.name}:{record.relative_path}:tile-{tile.index}",
+                source=f"{source_model.name}:{record.relative_path}:tiles-{offset}-{offset + len(tile_batch) - 1}",
             )
-            if detected_task == "semantic_segment":
-                semantic_tiles.append(
-                    (
-                        tile,
-                        _semantic_probabilities(
-                            result,
-                            expected_shape=(tile.height, tile.width),
-                            num_classes=_model_class_count(loaded),
-                            source=f"{source_model.name}:{record.relative_path}:tile-{tile.index}",
-                        ),
+            for tile, result in zip(tile_batch, results):
+                if detected_task == "semantic_segment":
+                    semantic_tiles.append(
+                        (
+                            tile,
+                            _semantic_probabilities(
+                                result,
+                                expected_shape=(tile.height, tile.width),
+                                num_classes=_model_class_count(loaded),
+                                source=f"{source_model.name}:{record.relative_path}:tile-{tile.index}",
+                            ),
+                        )
                     )
+                    continue
+                tile_objects = _parse_native_result(result, detected_task)
+                raw_objects.extend(
+                    _shift_tile_prediction(
+                        value,
+                        tile,
+                        loaded,
+                        full_width=record.width,
+                        full_height=record.height,
+                    )
+                    for value in tile_objects
                 )
-                continue
-            tile_objects = _parse_native_result(result, detected_task)
-            raw_objects.extend(
-                _shift_tile_prediction(
-                    value,
-                    tile,
-                    loaded,
-                    full_width=record.width,
-                    full_height=record.height,
-                )
-                for value in tile_objects
-            )
         if detected_task == "semantic_segment":
             probabilities = stitch_probability_tiles(
                 width=record.width,
@@ -472,9 +485,9 @@ def _sahi_prediction(
     )
 
 
-def _predict_ultralytics_tile(
+def _predict_ultralytics_tiles(
     model: Any,
-    image: Image.Image,
+    images: list[Image.Image],
     *,
     resolution: int,
     confidence: float,
@@ -482,10 +495,13 @@ def _predict_ultralytics_tile(
     device: str | None,
     settings: dict[str, Any],
     source: str,
-) -> Any:
-    array = np.asarray(image, dtype=np.uint8)
+) -> list[Any]:
+    arrays = [
+        np.ascontiguousarray(np.asarray(image, dtype=np.uint8)[:, :, ::-1])
+        for image in images
+    ]
     kwargs: dict[str, Any] = {
-        "source": np.ascontiguousarray(array[:, :, ::-1]),
+        "source": arrays[0] if len(arrays) == 1 else arrays,
         "imgsz": resolution,
         "conf": confidence,
         "iou": postprocess,
@@ -498,16 +514,16 @@ def _predict_ultralytics_tile(
     if settings.get("precision") == "half":
         kwargs["half"] = True
     results = model.predict(**kwargs)
-    if len(results) != 1:
+    if len(results) != len(images):
         raise DatasetValidationError(
             ValidationIssue(
-                "SAHI tile inference did not return exactly one result",
+                "SAHI tile batch did not return exactly one result per tile",
                 source=source,
                 value=len(results),
-                expected="one result for one source tile",
+                expected=f"exactly {len(images)} ordered tile results",
             )
         )
-    return results[0]
+    return list(results)
 
 
 def _shift_tile_prediction(

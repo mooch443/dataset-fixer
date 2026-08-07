@@ -11,6 +11,10 @@ from dataset_fixer import Dataset, DatasetValidationError, Task
 from dataset_fixer.utils import settings_fingerprint, to_jsonable
 
 
+def _audit(dataset: Dataset, name: str):
+    return dataset.manifest["audits"][name]
+
+
 def test_open_identity_and_automatic_validation(detect_dataset: Path) -> None:
     dataset = Dataset.open(detect_dataset, task="detect", progress=False)
     assert dataset.name == "orchard"
@@ -128,7 +132,7 @@ def test_split_grouping_manifest_and_provenance(detect_dataset: Path, tmp_path: 
     assert all(len(splits) == 1 for splits in group_targets.values())
     assert result.training_ready
     assert len(result.provenance) == len(result._samples)
-    manifest = json.loads((result.location / "dataset-fixer.json").read_text(encoding="utf-8"))
+    manifest = result.manifest
     assert manifest["history"][0]["settings"]["seed"] == 7
     assert manifest["environment"]["dataset_fixer_git"]["commit"]
     assert manifest["dataset_fixer"]["version"]
@@ -158,11 +162,7 @@ def test_group_aware_export_writes_aggregate_split_audit(
         progress=False,
     )
 
-    report = json.loads(
-        (result.location / "reports" / "split_group_audit.json").read_text(
-            encoding="utf-8"
-        )
-    )
+    report = _audit(result, "split_group_audit")
     assert report["status"] == "passed"
     assert report["scope"] == "all_current_source_splits"
     assert report["total"] == {"images": 6, "distinct_groups": 3}
@@ -174,12 +174,10 @@ def test_group_aware_export_writes_aggregate_split_audit(
         assert sum(histogram.values()) == details["distinct_groups"]
         assert sum(int(size) * count for size, count in histogram.items()) == details["images"]
 
-    manifest = json.loads(
-        (result.location / "dataset-fixer.json").read_text(encoding="utf-8")
-    )
+    manifest = result.manifest
     validation = manifest["validation"]["split_group_isolation"]
     assert validation["status"] == "passed"
-    assert validation["report"] == "reports/split_group_audit.json"
+    assert validation["report"] == "reports/dataset-info.json#audits.split_group_audit"
     assert validation["distinct_groups"] == 3
     assert "Split-group audit: passed" in capsys.readouterr().out
 
@@ -267,11 +265,7 @@ def test_tiling_preserves_groups_and_audits_current_output_population(
         progress=False,
     )
 
-    report = json.loads(
-        (result.location / "reports" / "split_group_audit.json").read_text(
-            encoding="utf-8"
-        )
-    )
+    report = _audit(result, "split_group_audit")
     assert report["total"]["images"] == len(result._samples)
     assert report["total"]["images"] > len(source._samples)
     assert report["total"]["distinct_groups"] == 3
@@ -293,7 +287,7 @@ def test_latest_ungrouped_split_removes_inherited_group_audit(
         visualize=False,
         progress=False,
     )
-    assert (grouped.location / "reports" / "split_group_audit.json").is_file()
+    assert "split_group_audit" in grouped.manifest["audits"]
 
     result = grouped.split(
         {"train": 0.5, "val": 0.5},
@@ -306,10 +300,8 @@ def test_latest_ungrouped_split_removes_inherited_group_audit(
         progress=False,
     )
 
-    assert not (result.location / "reports" / "split_group_audit.json").exists()
-    manifest = json.loads(
-        (result.location / "dataset-fixer.json").read_text(encoding="utf-8")
-    )
+    assert "split_group_audit" not in result.manifest["audits"]
+    manifest = result.manifest
     validation = manifest["validation"]["split_group_isolation"]
     assert validation["status"] == "not_applicable"
     assert validation["report"] is None
@@ -326,10 +318,8 @@ def test_export_without_group_aware_history_marks_audit_not_applicable(
         progress=False,
     )
 
-    assert not (result.location / "reports" / "split_group_audit.json").exists()
-    manifest = json.loads(
-        (result.location / "dataset-fixer.json").read_text(encoding="utf-8")
-    )
+    assert "split_group_audit" not in result.manifest["audits"]
+    manifest = result.manifest
     assert manifest["validation"]["split_group_isolation"]["status"] == "not_applicable"
 
 
@@ -371,12 +361,10 @@ def test_remove_classes_compacts_and_chains_original(detect_dataset: Path, tmp_p
     assert records
     assert all(record["original_dataset"] == "orchard" for record in records)
     assert all("class_mapping" in record for record in records)
-    counts = json.loads((clean.location / "reports" / "class_counts.json").read_text(encoding="utf-8"))
-    assert counts["before"]["background"] == 0
-    assert counts["after"]["background"] == 3
-    assert counts["names_before"]["background"] == "background"
-    assert counts["names_after"]["background"] == "background"
-    assert (clean.location / "reports" / "class_counts.jpg").is_file()
+    counts = _audit(clean, "class_counts")
+    assert counts["result"]["background"] == 3
+    assert counts["names"]["background"] == "background"
+    assert (clean.location / "reports" / "plots.png").is_file()
 
 
 @pytest.mark.parametrize(
@@ -420,11 +408,9 @@ def test_remove_classes_can_merge_annotations_into_surviving_class(
 
     assert exported.classes == {0: expected_name}
     assert sum(len(sample.annotations) for sample in exported._samples) == original_annotation_count
-    counts = json.loads(
-        (exported.location / "reports" / "class_counts.json").read_text(encoding="utf-8")
-    )
-    assert counts["after"]["0"] == original_annotation_count
-    assert counts["after"]["background"] == 0
+    counts = _audit(exported, "class_counts")
+    assert counts["result"]["0"] == original_annotation_count
+    assert counts["result"]["background"] == 0
     assert all(
         record["class_mapping"] == {"0": 0, "1": 0}
         for record in exported.provenance.values()
@@ -480,8 +466,7 @@ def test_rename_classes_is_virtual_validated_and_exported(
         for sample in exported._samples
         for annotation in sample.annotations
     ] == original_ids
-    assert (exported.location / "reports" / "class_renames.json").is_file()
-    assert not (exported.location / "reports" / "rename_classes_summary.jpg").exists()
+    assert "class_renames" in exported.manifest["audits"]
     assert all("class_renames" in record for record in exported.provenance.values())
     data = yaml.safe_load(exported.data_yaml.read_text(encoding="utf-8"))
     assert data["names"] == {0: "apple", 1: "blemished"}
@@ -545,13 +530,10 @@ def test_empty_balance_report_is_a_distribution_plot(tmp_path: Path) -> None:
         .rebalance_empty(0.5, splits=("train",), seed=42, visualize=True)
         .export(destination=tmp_path / "empty_report", visualize=False, progress=False)
     )
-    report = json.loads(
-        (exported.location / "reports" / "empty_image_balance.json").read_text(encoding="utf-8")
-    )
-    assert report["train"]["before"] == {"annotated": 1, "background": 3}
-    assert report["train"]["after"] == {"annotated": 1, "background": 1}
-    assert report["val"]["before"] == {"annotated": 1, "background": 1}
-    assert (exported.location / "reports" / "empty_image_balance.jpg").is_file()
+    report = _audit(exported, "empty_image_balance")
+    assert report["train"]["result"] == {"annotated": 1, "background": 1}
+    assert report["val"]["result"] == {"annotated": 1, "background": 1}
+    assert (exported.location / "reports" / "plots.png").is_file()
 
 
 def test_empty_rebalancing_after_deferred_tiling(tmp_path: Path) -> None:
@@ -642,11 +624,11 @@ def test_streaming_staged_validation_rejects_corrupt_provenance_atomically(
 
     def write_reports_then_corrupt(self, **kwargs):
         manifest = original_write_reports(self, **kwargs)
-        (self.staging / "provenance.jsonl").write_text("{not-json}\n", encoding="utf-8")
+        (self.staging / "reports" / "lineage.json.gz").write_bytes(b"not-gzip")
         return manifest
 
     monkeypatch.setattr(OutputBuilder, "write_reports", write_reports_then_corrupt)
-    with pytest.raises(DatasetValidationError, match="Invalid provenance record"):
+    with pytest.raises(DatasetValidationError, match="Unreadable staged lineage"):
         dataset.export(destination=destination, visualize=False, progress=False)
     assert not destination.exists()
 

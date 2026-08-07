@@ -12,6 +12,7 @@ from PIL import Image, ImageOps
 from shapely.geometry import Polygon
 from tqdm.auto import tqdm
 
+from .artifacts import dataset_info_path, lineage_path, read_lineage
 from .errors import DatasetValidationError, ValidationIssue
 from .io import _label_path_for_image, _parse_yolo_line
 from .models import Annotation, DatasetMetadata, Sample, Task
@@ -268,11 +269,11 @@ def _validate_staged_metadata_files(
         if task is Task.POLO and not data.get("radii"):
             add_issue(ValidationIssue("Staged POLO data.yaml is missing radii", source=str(yaml_path)))
 
-    manifest_path = root / "dataset-fixer.json"
+    manifest_path = dataset_info_path(root)
     if not manifest_path.is_file() or manifest_path.stat().st_size == 0:
         add_issue(
             ValidationIssue(
-                "Staged dataset-fixer manifest is missing or empty",
+                "Staged dataset information is missing or empty",
                 source=str(manifest_path),
             )
         )
@@ -288,62 +289,44 @@ def _validate_staged_metadata_files(
 
 
 def _validate_staged_provenance(root: Path, records: list[dict[str, Any]], add_issue) -> None:
-    provenance_path = root / "provenance.jsonl"
-    record_count = 0
+    provenance_path = lineage_path(root)
     try:
-        with provenance_path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                record_count += 1
-                try:
-                    record = json.loads(line)
-                    output_image = str(Path(record["output_image"]))
-                except (json.JSONDecodeError, KeyError, TypeError) as error:
-                    add_issue(
-                        ValidationIssue(
-                            "Invalid provenance record",
-                            source=str(provenance_path),
-                            line=line_number,
-                            value=str(error),
-                        )
+        loaded = read_lineage(provenance_path)
+        for index, record in enumerate(loaded):
+            output_image = str(Path(record["output_image"]))
+            if index >= len(records):
+                add_issue(
+                    ValidationIssue(
+                        "Unexpected extra lineage record",
+                        source=str(provenance_path),
+                        value=output_image,
                     )
-                    continue
-                if record_count > len(records):
-                    add_issue(
-                        ValidationIssue(
-                            "Unexpected extra provenance record",
-                            source=str(provenance_path),
-                            line=line_number,
-                            value=output_image,
-                        )
+                )
+                continue
+            expected = str(Path(records[index]["output_image"]))
+            if output_image != expected:
+                add_issue(
+                    ValidationIssue(
+                        "Lineage output path differs from the staged image index",
+                        source=str(provenance_path),
+                        value=output_image,
+                        expected=expected,
                     )
-                    continue
-                expected = str(Path(records[record_count - 1]["output_image"]))
-                if output_image != expected:
-                    add_issue(
-                        ValidationIssue(
-                            "Provenance output path differs from the staged image index",
-                            source=str(provenance_path),
-                            line=line_number,
-                            value=output_image,
-                            expected=expected,
-                        )
-                    )
-    except OSError as error:
+                )
+    except (OSError, ValueError, KeyError, TypeError) as error:
         add_issue(
             ValidationIssue(
-                f"Unreadable staged provenance: {error}",
+                f"Unreadable staged lineage: {error}",
                 source=str(provenance_path),
             )
         )
         return
-    if record_count != len(records):
+    if len(loaded) != len(records):
         add_issue(
             ValidationIssue(
-                "Staged provenance count differs from output image count",
+                "Staged lineage count differs from output image count",
                 source=str(provenance_path),
-                value=record_count,
+                value=len(loaded),
                 expected=str(len(records)),
             )
         )
