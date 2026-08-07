@@ -163,6 +163,7 @@ def _update_root(
         classes=dataset.classes,
         output=staged_reports / "plots.png",
         metadata=dataset._metadata,
+        coverage=audits.get("coverage.source_coverage"),
     )
 
     environment = environment_snapshot()

@@ -39,6 +39,7 @@ _ANNOTATION_COLORS = (
 _OUTER = 48
 _INNER = 32
 _GAP = 24
+_COVERAGE_DETAIL_HEIGHT = 260
 
 
 def render_dataset_report(
@@ -51,9 +52,14 @@ def render_dataset_report(
     classes: Mapping[int, str],
     output: Path,
     metadata: DatasetMetadata | None = None,
+    coverage: Mapping[str, Any] | None = None,
     width: int = REPORT_WIDTH,
 ) -> Path | None:
     """Draw ``output`` from the images and labels physically present in ``root``.
+
+    Parameters:
+        coverage: Optional source-coverage statistic from an operation that can
+            leave part of its source behind, rendered as its own panel.
 
     Returns the written path, or ``None`` when no split holds a readable image.
     """
@@ -66,7 +72,10 @@ def render_dataset_report(
     cell_width = (content - (EXAMPLES_PER_SPLIT - 1) * _GAP) // EXAMPLES_PER_SPLIT
     cell_height = round(cell_width * 0.72)
     header = _render_header(width, name=name, task=task, format_name=format_name, classes=classes)
-    sections = [
+    sections = []
+    if coverage:
+        sections.append(_render_coverage(coverage, width=width))
+    sections += [
         _render_split(
             view,
             width=width,
@@ -186,6 +195,254 @@ def _render_header(
         draw.text((left, y), line, fill=_MUTED, font=body_font)
         y += 38
     return panel
+
+
+def _render_coverage(coverage: Mapping[str, Any], *, width: int) -> Image.Image:
+    """Draw how much of the source dataset reached this dataset."""
+
+    title_font = _font(38)
+    body_font = _font(28)
+    caption_font = _font(22)
+    bar_height = 46
+    caption_gap = 38
+    row_gap = 26
+    height = (
+        26 + 46 + row_gap
+        + caption_gap + bar_height
+        + row_gap
+        + caption_gap + bar_height
+        + row_gap + 8 + _COVERAGE_DETAIL_HEIGHT
+        + 30
+    )
+    panel = Image.new("RGB", (width, height), _BACKDROP)
+    draw = ImageDraw.Draw(panel)
+    draw.rounded_rectangle(
+        (_OUTER, 0, width - _OUTER, height - 1),
+        radius=18,
+        fill=_PANEL,
+        outline=_BORDER,
+        width=2,
+    )
+    left = _OUTER + _INNER
+    right = width - _OUTER - _INNER
+    draw.text((left, 26), "source coverage", fill=_TEXT, font=title_font)
+
+    labels_total = int(coverage.get("source_labels") or 0)
+    labels_hit = int(coverage.get("source_labels_covered_at_least_once") or 0)
+    never = int(coverage.get("source_labels_never_covered") or 0)
+    label_pct = float(coverage.get("source_label_coverage_percent") or 0.0)
+    space_pct = float(coverage.get("source_image_space_coverage_percent") or 0.0)
+
+    y = 26 + 46 + row_gap
+    draw.text(
+        (left, y),
+        f"{labels_hit:,} of {labels_total:,} source labels represented at least once"
+        + (f"   ·   {never:,} never covered" if never else "   ·   none lost"),
+        fill="#b00020" if never else _MUTED,
+        font=body_font,
+    )
+    y += caption_gap
+    _draw_ratio_bar(
+        draw,
+        (left, y, right, y + bar_height),
+        fraction=label_pct / 100.0,
+        filled_label=f"labels covered {label_pct:.1f}%",
+        empty_label=f"never covered {100 - label_pct:.1f}%",
+        font=caption_font,
+        fill=_ANNOTATED if not never else "#d98324",
+    )
+
+    y += bar_height + row_gap
+    draw.text(
+        (left, y),
+        f"{space_pct:.1f}% of the source image area is covered by output tiles",
+        fill=_MUTED,
+        font=body_font,
+    )
+    y += caption_gap
+    _draw_ratio_bar(
+        draw,
+        (left, y, right, y + bar_height),
+        fraction=space_pct / 100.0,
+        filled_label=f"image space covered {space_pct:.1f}%",
+        empty_label=f"not sampled {100 - space_pct:.1f}%",
+        font=caption_font,
+        fill="#2f6fb0",
+    )
+
+    y += bar_height + row_gap + 8
+    column = (right - left - _GAP) // 2
+    _draw_split_distribution(
+        draw,
+        (left, y, left + column, y + _COVERAGE_DETAIL_HEIGHT),
+        coverage,
+        body_font=body_font,
+        caption_font=caption_font,
+    )
+    _draw_position_heatmap(
+        panel,
+        draw,
+        (right - column, y, right, y + _COVERAGE_DETAIL_HEIGHT),
+        coverage.get("label_positions"),
+        body_font=body_font,
+        caption_font=caption_font,
+    )
+    return panel
+
+
+def _draw_split_distribution(
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    coverage: Mapping[str, Any],
+    *,
+    body_font: ImageFont.ImageFont,
+    caption_font: ImageFont.ImageFont,
+) -> None:
+    """Show where the source labels ended up, including the ones that did not."""
+
+    left, top, right, bottom = box
+    draw.text((left, top), "source labels by destination split", fill=_TEXT, font=body_font)
+    splits = coverage.get("splits") or {}
+    segments = [
+        (split, int((value or {}).get("source_labels_covered_at_least_once") or 0))
+        for split, value in sorted(splits.items())
+    ]
+    never = int(coverage.get("source_labels_never_covered") or 0)
+    if never:
+        segments.append(("never covered", never))
+    total = sum(count for _, count in segments)
+    bar_top = top + 44
+    bar_bottom = bar_top + 40
+    if total <= 0:
+        draw.rounded_rectangle((left, bar_top, right, bar_bottom), radius=8, fill=_BACKGROUND)
+        return
+    palette = {"train": "#2f9e5f", "val": "#2f6fb0", "test": "#8a5cd6"}
+    x = left
+    for index, (name, count) in enumerate(segments):
+        width = (
+            right - x
+            if index == len(segments) - 1
+            else max(2, round((right - left) * count / total))
+        )
+        color = "#b00020" if name == "never covered" else palette.get(name, "#7a8595")
+        draw.rounded_rectangle((x, bar_top, x + width, bar_bottom), radius=8, fill=color)
+        _bar_label(
+            draw,
+            f"{name} {count:,}",
+            (x, bar_top, x + width, bar_bottom),
+            font=caption_font,
+            fill="#ffffff",
+        )
+        x += width
+    legend = "   ·   ".join(
+        f"{name}: {count:,} ({100.0 * count / total:.1f}%)" for name, count in segments
+    )
+    draw.text(
+        (left, bar_bottom + 12),
+        _fit(legend, caption_font, right - left),
+        fill=_MUTED,
+        font=caption_font,
+    )
+
+    images = int(coverage.get("source_images") or 0)
+    represented = int(coverage.get("source_images_represented") or 0)
+    lines = [
+        f"source images represented: {represented:,} of {images:,} "
+        f"({float(coverage.get('source_image_representation_percent') or 0.0):.1f}%)"
+    ]
+    missing_area = int(coverage.get("source_images_without_exact_area") or 0)
+    if missing_area:
+        lines.append(
+            f"{missing_area:,} source image(s) have no exact area measurement"
+        )
+    y = bar_bottom + 52
+    for line in lines:
+        draw.text((left, y), _fit(line, caption_font, right - left), fill=_MUTED, font=caption_font)
+        y += 30
+
+
+def _draw_position_heatmap(
+    panel: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    histogram: Mapping[str, Any] | None,
+    *,
+    body_font: ImageFont.ImageFont,
+    caption_font: ImageFont.ImageFont,
+) -> None:
+    """Show where labels sit in the source frame, flagging uncovered cells."""
+
+    left, top, right, bottom = box
+    draw.text(
+        (left, top),
+        "source label positions",
+        fill=_TEXT,
+        font=body_font,
+    )
+    if not histogram:
+        return
+    grid = histogram.get("labels") or []
+    uncovered = histogram.get("uncovered") or []
+    rows = len(grid)
+    columns = len(grid[0]) if rows else 0
+    if not rows or not columns:
+        return
+    peak = max((max(line) for line in grid), default=0)
+    map_top = top + 44
+    map_bottom = bottom - 26
+    cell_width = (right - left) / columns
+    cell_height = (map_bottom - map_top) / rows
+    for row_index in range(rows):
+        for column_index in range(columns):
+            count = grid[row_index][column_index]
+            missing = uncovered[row_index][column_index] if uncovered else 0
+            x0 = left + column_index * cell_width
+            y0 = map_top + row_index * cell_height
+            cell = (x0, y0, x0 + cell_width - 1, y0 + cell_height - 1)
+            if missing:
+                colour = "#b00020"
+            elif count:
+                weight = count / peak if peak else 0.0
+                # Light to saturated blue, so density reads without a legend.
+                colour = (
+                    round(226 - 179 * weight),
+                    round(236 - 125 * weight),
+                    round(247 - 71 * weight),
+                )
+            else:
+                colour = "#f1f4f8"
+            draw.rectangle(cell, fill=colour)
+    draw.rectangle((left, map_top, right, map_bottom), outline=_BORDER, width=1)
+    draw.text(
+        (left, map_bottom + 6),
+        f"densest cell: {peak:,} label(s)"
+        + ("   ·   red cells were never covered" if any(any(line) for line in uncovered) else ""),
+        fill=_MUTED,
+        font=caption_font,
+    )
+
+
+def _draw_ratio_bar(
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    *,
+    fraction: float,
+    filled_label: str,
+    empty_label: str,
+    font: ImageFont.ImageFont,
+    fill: str,
+) -> None:
+    left, top, right, bottom = box
+    span = right - left
+    fraction = max(0.0, min(1.0, fraction))
+    draw.rounded_rectangle(box, radius=8, fill=_BACKGROUND)
+    if fraction > 0:
+        filled = left + max(2, round(span * fraction))
+        draw.rounded_rectangle((left, top, filled, bottom), radius=8, fill=fill)
+        _bar_label(draw, filled_label, (left, top, filled, bottom), font=font, fill="#ffffff")
+    if fraction < 1:
+        start = left + round(span * fraction)
+        _bar_label(draw, empty_label, (start, top, right, bottom), font=font, fill="#33404f")
 
 
 def _render_split(

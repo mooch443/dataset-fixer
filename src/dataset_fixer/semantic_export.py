@@ -182,6 +182,9 @@ def export_semantic_masks(
             format_name="semantic_masks",
             classes=dataset.classes,
             output=reports / "plots.png",
+            # Source coverage is inherited from the operation that produced the
+            # polygons, so a mask export reports it exactly like a YOLO export.
+            coverage=audits.get("coverage.source_coverage"),
         )
         visuals = ["reports/plots.png"] if plot is not None else []
         if load_validation.get("skipped_count", 0):

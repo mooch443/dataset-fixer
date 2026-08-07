@@ -500,7 +500,16 @@ def test_crop_pipeline_rejects_grid_and_allows_lossy_final_mask_crop(tmp_path: P
     assert all(0 <= x <= 80 and 0 <= y <= 80 for x, y in polygon)
 
 
-def test_virtual_camera_reports_insufficient_transformed_view_atomically(tmp_path: Path) -> None:
+def test_a_transformed_view_smaller_than_the_tile_still_covers_its_labels(
+    tmp_path: Path,
+) -> None:
+    """A view too small for the requested window must not cost the label.
+
+    ``CenterCrop(40, 40)`` leaves less than the 80px window the zoom asks for.
+    Rather than rejecting every draw, the window shrinks to the view and the
+    tile is upscaled, so the annotation is still covered.
+    """
+
     source = make_yolo_dataset(
         tmp_path / "too_small_view",
         task="detect",
@@ -509,8 +518,8 @@ def test_virtual_camera_reports_insufficient_transformed_view_atomically(tmp_pat
         val_rows=["0 0.5 0.5 0.2 0.2"],
         size=(200, 200),
     )
-    destination = tmp_path / "insufficient"
-    plan = Dataset.open(source, task="detect", progress=False).tile(
+
+    tiled = Dataset.open(source, task="detect", progress=False).tile(
         mode="coverage",
         splits=("train",),
         tile_size=80,
@@ -524,11 +533,12 @@ def test_virtual_camera_reports_insufficient_transformed_view_atomically(tmp_pat
         crop_transforms=A.CenterCrop(height=40, width=40, p=1.0),
         visualize=False,
         progress=False,
-    )
+    ).export(destination=tmp_path / "insufficient", visualize=False, progress=False)
 
-    with pytest.raises(DatasetValidationError, match="retry budget"):
-        plan.export(destination=destination, visualize=False, progress=False)
-    assert not destination.exists()
+    coverage = tiled.manifest["audits"]["coverage.source_coverage"]
+    assert coverage["source_labels_never_covered"] == 0
+    assert coverage["source_label_coverage_percent"] == 100.0
+    assert all(sample.width == 80 and sample.height == 80 for sample in tiled._samples)
 
 
 @pytest.mark.parametrize(

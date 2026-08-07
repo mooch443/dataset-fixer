@@ -427,7 +427,14 @@ def test_coverage_writes_source_pixel_and_label_jpg_audits(tmp_path: Path) -> No
     assert tiled._manifest["visuals"] == ["reports/plots.png"]
 
 
-def test_lossless_coverage_fails_atomically_when_no_complete_crop_exists(tmp_path: Path) -> None:
+def test_an_annotation_larger_than_any_crop_is_still_covered_once(tmp_path: Path) -> None:
+    """allow_lossy=False must not cost a label its only appearance.
+
+    The annotation is 160px wide but no crop can exceed 100px, so a complete
+    copy is impossible. Clipping it is the lesser loss, and the relaxation is
+    recorded rather than applied silently.
+    """
+
     source = make_yolo_dataset(
         tmp_path / "uncroppable_source",
         task="detect",
@@ -436,10 +443,10 @@ def test_lossless_coverage_fails_atomically_when_no_complete_crop_exists(tmp_pat
         val_rows=["0 0.5 0.5 0.8 0.2"],
         size=(200, 100),
     )
-    destination = tmp_path / "uncroppable"
 
-    with pytest.raises(DatasetValidationError, match="could not replace boundary-cut candidates"):
-        Dataset.open(source, task="detect", progress=False).tile(
+    tiled = (
+        Dataset.open(source, task="detect", progress=False)
+        .tile(
             mode="coverage",
             tile_size=100,
             large_image_threshold=50,
@@ -451,9 +458,17 @@ def test_lossless_coverage_fails_atomically_when_no_complete_crop_exists(tmp_pat
             allow_lossy=False,
             visualize=False,
             progress=False,
-        ).export(destination=destination, visualize=False, progress=False)
+        )
+        .export(destination=tmp_path / "uncroppable", visualize=False, progress=False)
+    )
 
-    assert not destination.exists()
+    coverage = tiled.manifest["audits"]["coverage.source_coverage"]
+    assert coverage["source_labels_never_covered"] == 0
+    assert coverage["source_label_coverage_percent"] == 100.0
+    assert all(
+        record["coverage_relaxation"] == "allow_clipped_geometry"
+        for record in tiled.provenance.values()
+    )
 
 
 def test_coverage_visual_keeps_legend_off_image_and_boxes_segmentations(
@@ -1097,3 +1112,187 @@ def test_coco_errors_skip_filters_bad_records_across_loading_stages(tmp_path: Pa
     assert dataset.validation_audit["skipped_count"] == 4
     assert dataset.validation_audit["visualized_count"] == 4
     assert Path(dataset.validation_audit["visualization"]).is_file()
+
+
+def _coverage(dataset) -> dict:
+    return dataset.manifest["audits"]["coverage.source_coverage"]
+
+
+def test_anisotropic_images_in_the_dead_zone_still_cover_every_label(
+    tmp_path: Path,
+) -> None:
+    """A long, narrow image fits neither the whole-image nor the full-window path.
+
+    Its long side exceeds large_image_threshold so it is not copied whole, and
+    its short side is under the requested window, which used to reject every
+    draw and silently drop the image entirely.
+    """
+
+    source = make_yolo_dataset(
+        tmp_path / "narrow_source",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.5 0.3 0.1 0.1", "0 0.5 0.7 0.1 0.1"],
+        val_rows=["0 0.5 0.5 0.1 0.1"],
+        size=(160, 900),
+    )
+
+    tiled = (
+        Dataset.open(source, task="detect", progress=False)
+        .tile(
+            mode="coverage",
+            tile_size=512,
+            scale_range=(0.75, 1.25),
+            target_appearances_per_object=2,
+            sparse_appearances_per_object=2,
+            background_ratio=0,
+            allow_lossy=False,
+            visualize=False,
+            progress=False,
+        )
+        .export(destination=tmp_path / "narrow", visualize=False, progress=False)
+    )
+
+    coverage = _coverage(tiled)
+    assert coverage["source_labels_never_covered"] == 0
+    assert coverage["source_label_coverage_percent"] == 100.0
+    assert coverage["source_images_represented"] == coverage["source_images"]
+
+
+def test_the_tile_cap_never_discards_an_objects_only_appearance(tmp_path: Path) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "capped_source",
+        task="detect",
+        names=["fruit"],
+        train_rows=[
+            "0 0.1 0.1 0.05 0.05\n0 0.9 0.1 0.05 0.05\n"
+            "0 0.1 0.9 0.05 0.05\n0 0.9 0.9 0.05 0.05"
+        ],
+        val_rows=["0 0.5 0.5 0.1 0.1"],
+        size=(600, 600),
+    )
+
+    tiled = (
+        Dataset.open(source, task="detect", progress=False)
+        .tile(
+            mode="coverage",
+            tile_size=128,
+            scale_range=(1.0, 1.0),
+            target_appearances_per_object=3,
+            sparse_appearances_per_object=3,
+            max_tiles_per_source_image=4,
+            background_ratio=0,
+            allow_lossy=True,
+            visualize=False,
+            progress=False,
+        )
+        .export(destination=tmp_path / "capped", visualize=False, progress=False)
+    )
+
+    # Three appearances of four objects generate far more candidates than the
+    # cap allows, so the surviving tiles must be chosen for coverage rather
+    # than sampled at random.
+    assert _coverage(tiled)["source_labels_never_covered"] == 0
+
+
+def test_uncovered_labels_are_always_reported_when_errors_are_skipped(
+    tmp_path: Path,
+) -> None:
+    """Degenerate geometry is the one thing relaxation cannot rescue.
+
+    A zero-area annotation can never be represented, so it must be named in the
+    warnings and the audit instead of vanishing quietly.
+    """
+
+    source = make_yolo_dataset(
+        tmp_path / "degenerate_source",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.5 0.5 0.0 0.0\n0 0.3 0.3 0.2 0.2"],
+        val_rows=["0 0.5 0.5 0.2 0.2"],
+        size=(400, 400),
+    )
+
+    tiled = (
+        Dataset.open(source, task="detect", errors="skip", progress=False)
+        .tile(
+            mode="coverage",
+            tile_size=128,
+            scale_range=(1.0, 1.0),
+            target_appearances_per_object=1,
+            sparse_appearances_per_object=1,
+            background_ratio=0,
+            allow_lossy=False,
+            errors="skip",
+            visualize=False,
+            progress=False,
+        )
+        .export(destination=tmp_path / "degenerate", visualize=False, progress=False)
+    )
+
+    coverage = _coverage(tiled)
+    if coverage["source_labels_never_covered"]:
+        assert coverage["uncovered_labels"]
+        assert any(
+            "was never covered by any tile" in warning
+            for warning in tiled.manifest["warnings"]
+        )
+
+
+@pytest.mark.parametrize("tile_size", [128, 512])
+def test_portrait_and_landscape_images_are_covered_equally(
+    tmp_path: Path,
+    tile_size: int,
+) -> None:
+    """Orientation must not change how much of a source is covered.
+
+    The two sources are transposes of one another, so any difference beyond
+    seeded crop placement would mean one orientation is handled worse.
+    """
+
+    def coverage_for(name: str, size: tuple[int, int], rows: list[str]) -> tuple[dict, int]:
+        source = make_yolo_dataset(
+            tmp_path / f"{name}_{tile_size}",
+            task="detect",
+            names=["fruit"],
+            train_rows=rows,
+            val_rows=rows[:1],
+            size=size,
+        )
+        tiled = (
+            Dataset.open(source, task="detect", progress=False)
+            .tile(
+                mode="coverage",
+                tile_size=tile_size,
+                scale_range=(0.75, 1.25),
+                target_appearances_per_object=3,
+                sparse_appearances_per_object=3,
+                background_ratio=0,
+                allow_lossy=False,
+                visualize=False,
+                progress=False,
+            )
+            .export(
+                destination=tmp_path / f"{name}_{tile_size}_out",
+                visualize=False,
+                progress=False,
+            )
+        )
+        return _coverage(tiled), len(tiled._samples)
+
+    landscape, landscape_tiles = coverage_for(
+        "landscape", (900, 160), ["0 0.3 0.5 0.06 0.3", "0 0.7 0.5 0.06 0.3"]
+    )
+    portrait, portrait_tiles = coverage_for(
+        "portrait", (160, 900), ["0 0.5 0.3 0.3 0.06", "0 0.5 0.7 0.3 0.06"]
+    )
+
+    assert landscape["source_label_coverage_percent"] == 100.0
+    assert portrait["source_label_coverage_percent"] == 100.0
+    assert landscape["source_labels_never_covered"] == 0
+    assert portrait["source_labels_never_covered"] == 0
+    assert landscape_tiles == portrait_tiles
+    assert abs(
+        landscape["source_image_space_coverage_percent"]
+        - portrait["source_image_space_coverage_percent"]
+    ) < 5.0

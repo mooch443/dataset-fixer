@@ -31,6 +31,12 @@ from .models import Annotation, DatasetMetadata, Sample, Task
 from .utils import environment_snapshot, settings_fingerprint, sha256_file, slugify, to_jsonable
 
 
+# A generated dataset publishes only the canonical report files, so per-
+# operation preview images are pruned before publication. Operations check this
+# before rendering one: a preview that cannot be published must not cost time.
+PUBLISHES_OPERATION_VISUALS = False
+
+
 class OutputBuilder:
     """Build a derived dataset privately, then atomically publish it."""
 
@@ -66,6 +72,9 @@ class OutputBuilder:
         self.validation_details: dict[str, Any] = {}
         self.visuals: list[str] = []
         self.warnings: list[str] = []
+        # Set by operations that can leave part of the source behind, so the
+        # published report can state source coverage without re-deriving it.
+        self.coverage_summary: dict[str, Any] | None = None
 
     def cleanup(self) -> None:
         if self.staging.exists():
@@ -165,6 +174,7 @@ class OutputBuilder:
                 "validity_result",
                 "crop_transform_warnings",
                 "lossy_clipping",
+                "coverage_relaxation",
             )
             if key in parent
         }
@@ -236,7 +246,9 @@ class OutputBuilder:
             "output_images": len(self.records),
             "output_annotations": sum(r["output_annotation_count"] for r in self.records),
             "warnings": self.warnings,
-            "visuals": self.visuals,
+            # Filled in below, once the surviving report files are known, so
+            # history never points at a preview that was pruned.
+            "visuals": [],
         }
         history.append(operation_record)
         finished = time.time()
@@ -296,8 +308,10 @@ class OutputBuilder:
             classes=self.metadata.names,
             output=self.reports_dir / "plots.png",
             metadata=self.metadata,
+            coverage=self.coverage_summary or audits.get("coverage.source_coverage"),
         )
         self.visuals = ["reports/plots.png"] if plot is not None else []
+        operation_record["visuals"] = list(self.visuals)
         load_validation = self.validation_details.get("load_validation")
         if isinstance(load_validation, dict) and load_validation.get("skipped_count", 0):
             load_validation["report"] = (

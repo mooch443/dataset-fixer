@@ -24,6 +24,7 @@ from .errors import DatasetValidationError, ValidationIssue
 from .models import Annotation, Sample, Task
 from .operations import _builder, _print_start, _publish
 from .utils import normalize_split
+from .writer import PUBLISHES_OPERATION_VISUALS
 from .visualization import (
     save_coverage_annotated_original,
     save_label_coverage_summary,
@@ -352,7 +353,7 @@ def _tile_grid(
             dataset._metadata.names,
             visualize=visualize,
         )
-        if visualize:
+        if visualize and PUBLISHES_OPERATION_VISUALS:
             boxes_by_source = {
                 str(sample.image_path): (
                     []
@@ -942,6 +943,7 @@ def _tile_coverage(
         crop_transform_stats: Counter[str] = Counter()
         background_filter_stats: Counter[str] = Counter()
         skipped_geometry: list[dict[str, Any]] = []
+        uncovered_labels: list[dict[str, Any]] = []
         records: list[dict[str, Any]] = []
         small_backgrounds: dict[str, list[Sample]] = defaultdict(list)
         small_preview_sources: list[Sample] = []
@@ -1029,80 +1031,60 @@ def _tile_coverage(
                     provisional.update(indices)
                     crop_transform_stats["accepted_positive_tiles"] += 1
                     continue
-                crop = _make_crop_containing(
-                    sample.annotations[focus_idx],
-                    sample.width,
-                    sample.height,
+                candidate = _plain_positive_candidate(
+                    sample,
+                    focus_idx,
                     dataset.task,
                     cfg,
                     rng,
+                    builder=builder,
+                    skipped_geometry=skipped_geometry,
+                    stats=crop_transform_stats,
+                    errors=errors,
+                    attempt=attempts,
                 )
-                if crop is None:
+                if candidate is None:
                     continue
-                if not allow_lossy and any(
-                    _annotation_is_cut_by_crop(annotation, crop, dataset.task, cfg)
-                    for annotation in sample.annotations
-                ):
+                if any(provisional[idx] >= targets[idx] for idx in candidate["indices"]):
                     continue
-                adjusted: list[Annotation] = []
-                indices: list[int] = []
-                scale = tile_size / (crop[2] - crop[0])
-                candidate_warnings: list[str] = []
-                try:
-                    for idx, annotation in enumerate(sample.annotations):
-                        source_annotation = _coverage_source_annotation(annotation, dataset.task, cfg)
-                        transformed = _transform_annotation(
-                            source_annotation,
-                            crop,
-                            dataset.task,
-                            min_area_ratio,
-                            allow_lossy,
-                            candidate_warnings,
-                            source_image=sample.image_path,
-                            annotation_index=idx,
-                        )
-                        if transformed is not None:
-                            adjusted.append(
-                                _scale_annotation(
-                                    transformed,
-                                    scale,
-                                    dataset.task,
-                                    float(cfg["radius_multiplier"]),
-                                )
-                            )
-                            indices.append(idx)
-                except _SkippableTileGeometryError as exc:
-                    if errors == "raise":
-                        raise
-                    _record_skipped_geometry(
-                        builder,
-                        skipped_geometry,
-                        exc,
-                        sample=sample,
-                        crop=crop,
-                        mode="coverage",
-                        attempt=attempts,
-                        focus_annotation_index=focus_idx,
-                    )
-                    crop_transform_stats["rejected_geometry"] += 1
+                generated.append(candidate)
+                provisional.update(candidate["indices"])
+
+            # Guarantee pass. Any annotation still without a single appearance
+            # is retried on its own budget, escalating the relaxation ladder so
+            # that geometry alone can never drop a label.
+            for focus_idx in sorted(targets):
+                if provisional[focus_idx] > 0:
                     continue
-                if not indices:
-                    continue
-                if any(provisional[idx] >= targets[idx] for idx in indices):
-                    continue
-                generated.append(
-                    {
-                        "box": crop,
-                        "annotations": adjusted,
-                        "indices": indices,
-                        "warnings": candidate_warnings,
-                    }
+                candidate, level = _guaranteed_candidate(
+                    sample,
+                    focus_idx,
+                    source_image,
+                    dataset.task,
+                    cfg,
+                    rng,
+                    builder=builder,
+                    skipped_geometry=skipped_geometry,
+                    stats=crop_transform_stats,
+                    errors=errors,
+                    flip_idx=dataset._metadata.flip_idx,
+                    use_virtual_camera=use_virtual_camera,
+                    attempt_base=attempts,
                 )
-                provisional.update(indices)
+                attempts += int(cfg["max_attempts_per_target"])
+                if candidate is None:
+                    continue
+                candidate.setdefault("provenance", {})["coverage_relaxation"] = (
+                    COVERAGE_RELAXATIONS[level]
+                )
+                if level:
+                    crop_transform_stats[f"guaranteed_by_{COVERAGE_RELAXATIONS[level]}"] += 1
+                generated.append(candidate)
+                provisional.update(candidate["indices"])
             generated_before_cap = len(generated)
             cap = cfg["max_tiles_per_source_image"]
             if cap is not None and len(generated) > int(cap):
-                generated = rng.sample(generated, int(cap))
+                generated = _cap_tiles_preserving_coverage(generated, int(cap), rng)
                 split_summary[sample.split]["positive_tiles_dropped_by_source_cap"] += generated_before_cap - len(generated)
             counts = Counter()
             for tile_idx, tile in enumerate(generated):
@@ -1158,56 +1140,57 @@ def _tile_coverage(
             records.append(record)
             _append_coverage_rows(sample, targets, counts, True, coverage_rows, image_rows, class_totals, cfg)
             iterator.set_postfix(produced=len(builder.records), refresh=False)
-            missed = sum(max(0, targets[i] - counts[i]) for i in targets)
-            if missed:
-                if errors == "skip":
-                    builder.warnings.append(
-                        f"{sample.split}/{sample.relative_path}: missed {missed} requested "
-                        "object appearances after candidate rejection; see "
-                        "reports/dataset-info.json#audits.tiling_skips"
+            # A label that never appears is a data loss; a label that appears
+            # fewer times than requested is only a shortfall. They are reported
+            # separately, and only the former can fail the export.
+            uncovered = sorted(index for index in targets if counts.get(index, 0) == 0)
+            if uncovered:
+                for index in uncovered:
+                    annotation = sample.annotations[index]
+                    identity = annotation.source_id or f"{sample.relative_path}:{index}"
+                    uncovered_labels.append(
+                        {
+                            "split": sample.split,
+                            "image": str(sample.relative_path),
+                            "annotation_index": index,
+                            "annotation_source_id": identity,
+                            "class_id": annotation.class_id,
+                            "attempts": attempts,
+                            "relaxations_tried": list(COVERAGE_RELAXATIONS),
+                            "rejections": dict(crop_transform_stats),
+                        }
                     )
-                elif use_virtual_camera:
+                    builder.warnings.append(
+                        f"{sample.split}/{sample.relative_path}: label {identity} "
+                        "was never covered by any tile; see "
+                        "reports/dataset-info.json#audits.coverage.uncovered_labels"
+                    )
+                if errors == "raise":
                     raise DatasetValidationError(
                         ValidationIssue(
-                            "Virtual-camera coverage tiling exhausted its retry budget",
+                            "Coverage tiling could not cover every label at least once",
                             source=f"{sample.split}/{sample.relative_path}",
                             value={
-                                "missed_object_appearances": missed,
+                                "uncovered_annotation_indices": uncovered,
                                 "attempts": attempts,
-                                "max_attempts": max_attempts,
                                 "crop_transform_rejections": dict(crop_transform_stats),
                             },
-                            expected=(
-                                "a transformed full-source view with enough real source-pixel area "
-                                "for every requested crop"
-                            ),
+                            expected="at least one tile containing every annotation",
                             suggestion=(
-                                "increase max_attempts_per_target, use a smaller tile_size, narrow "
-                                "scale_range or the crop transform, or reduce transform padding"
+                                "these labels survived every relaxation, which usually means "
+                                "degenerate geometry: zero-area, outside the image, or a polygon "
+                                "that cannot be repaired; run with errors='skip' to publish "
+                                "the rest and inspect audits.coverage.uncovered_labels"
                             ),
                         )
                     )
-                elif not allow_lossy:
-                    raise DatasetValidationError(
-                        ValidationIssue(
-                            "Lossless coverage tiling could not replace boundary-cut candidates",
-                            source=f"{sample.split}/{sample.relative_path}",
-                            value={
-                                "missed_object_appearances": missed,
-                                "attempts": attempts,
-                                "max_attempts": max_attempts,
-                            },
-                            expected="all requested object appearances to use complete, uncut annotations",
-                            suggestion=(
-                                "increase max_attempts_per_target, use a larger tile_size, narrow scale_range, "
-                                "or explicitly set allow_lossy=True to permit clipped annotations"
-                            ),
-                        )
-                    )
-                else:
-                    builder.warnings.append(
-                        f"{sample.split}/{sample.relative_path}: missed {missed} requested object appearances"
-                    )
+            missed = sum(max(0, targets[i] - counts[i]) for i in targets)
+            if missed:
+                builder.warnings.append(
+                    f"{sample.split}/{sample.relative_path}: missed {missed} requested "
+                    "object appearances after candidate rejection; every label is still "
+                    "covered at least once; see reports/dataset-info.json#audits.tiling_skips"
+                )
 
         for split in selected:
             positive_count = int(split_summary[split]["positive_output_images"])
@@ -1503,7 +1486,11 @@ def _tile_coverage(
                         tiled_output_images=1,
                         empty_tiled_images=1,
                     )
-                if visualize and (sample.annotations or record["background_boxes"]):
+                if (
+                    visualize
+                    and PUBLISHES_OPERATION_VISUALS
+                    and (sample.annotations or record["background_boxes"])
+                ):
                     output = builder.staging / "coverage_summary" / "annotated_originals" / split / f"{sample.image_path.stem}_coverage.jpg"
                     save_coverage_annotated_original(
                         sample,
@@ -1529,6 +1516,13 @@ def _tile_coverage(
         )
         _raise_if_every_tile_was_skipped(builder, errors, skipped_geometry)
         source_pixel_rows = _source_pixel_coverage_rows(samples, builder.records)
+        builder.coverage_summary = _source_coverage_summary(
+            coverage_rows,
+            source_pixel_rows,
+            selected,
+        )
+        if uncovered_labels:
+            builder.coverage_summary["uncovered_labels"] = uncovered_labels
         coverage_visuals = _write_coverage_reports(
             builder.staging / "coverage_summary",
             coverage_rows,
@@ -1606,7 +1600,7 @@ def _tile_coverage(
             dataset._metadata.names,
             visualize=visualize,
         )
-        if visualize:
+        if visualize and PUBLISHES_OPERATION_VISUALS:
             boxes_by_source = {
                 str(record["sample"].image_path): [
                     *record["tile_boxes"],
@@ -1639,6 +1633,73 @@ def _tile_coverage(
         raise
 
 
+# Progressive relaxations applied, per object, only when an annotation would
+# otherwise receive no coverage at all. Losing a label entirely is worse than
+# covering it with a relaxed crop, so each step is taken in order and recorded.
+COVERAGE_RELAXATIONS = (
+    "none",
+    "no_virtual_camera",
+    "shrink_window_to_image",
+    "allow_clipped_geometry",
+)
+
+
+def _coverage_window_fits(width: int, height: int, cfg: dict[str, Any]) -> bool:
+    """Whether a full-size crop window can fit inside an image at some zoom.
+
+    ``_make_crop_containing`` samples ``tile_size / scale``; the largest zoom
+    yields the smallest window, so that is the one that decides whether the
+    requested-size rule can ever be satisfied for this image.
+    """
+
+    _, highest_zoom = (float(value) for value in cfg["scale_range"])
+    smallest_window = max(1, int(int(cfg["tile_size"]) / highest_zoom))
+    return smallest_window <= min(width, height)
+
+
+def _relaxed_cfg(cfg: dict[str, Any], level: int) -> dict[str, Any]:
+    """Apply one rung of the coverage relaxation ladder to a config copy."""
+
+    relaxed = dict(cfg)
+    if level >= 2:
+        relaxed["require_requested_crop_size"] = False
+    if level >= 3:
+        relaxed["allow_lossy"] = True
+    return relaxed
+
+
+def _cap_tiles_preserving_coverage(
+    generated: list[dict[str, Any]],
+    cap: int,
+    rng: random.Random,
+) -> list[dict[str, Any]]:
+    """Trim to ``cap`` tiles without discarding an object's only appearance.
+
+    Tiles that are the sole cover for some annotation are kept first; the rest
+    of the budget is filled randomly, preserving the previous behaviour for
+    everything that is not coverage-critical.
+    """
+
+    if cap >= len(generated):
+        return generated
+    # Greedy set cover first: repeatedly take the tile that adds the most
+    # not-yet-covered objects. Counting existing appearances is not enough,
+    # because an object covered three times can still lose every one of them.
+    remaining = list(range(len(generated)))
+    chosen: list[int] = []
+    covered: set[int] = set()
+    while remaining and len(chosen) < cap:
+        best = max(remaining, key=lambda i: len(set(generated[i]["indices"]) - covered))
+        if not set(generated[best]["indices"]) - covered:
+            break
+        chosen.append(best)
+        covered |= set(generated[best]["indices"])
+        remaining.remove(best)
+    if len(chosen) < cap and remaining:
+        chosen += rng.sample(remaining, min(cap - len(chosen), len(remaining)))
+    return [generated[index] for index in sorted(chosen)]
+
+
 def _coverage_targets(sample: Sample, cfg: dict[str, Any]) -> dict[int, int]:
     targets: dict[int, int] = {}
     for index, annotation in enumerate(sample.annotations):
@@ -1660,6 +1721,170 @@ def _crop_pipeline_enabled(split: str, cfg: dict[str, Any]) -> bool:
     if cfg.get("crop_pipeline") is None:
         return False
     return split == "train" or (split == "val" and bool(cfg.get("augment_val")))
+
+
+def _plain_positive_candidate(
+    sample: Sample,
+    focus_idx: int,
+    task: Task,
+    cfg: dict[str, Any],
+    rng: random.Random,
+    *,
+    builder: Any,
+    skipped_geometry: list[dict[str, Any]],
+    stats: Counter[str],
+    errors: str,
+    attempt: int,
+) -> dict[str, Any] | None:
+    """Sample one untransformed source crop anchored on ``focus_idx``."""
+
+    crop = _make_crop_containing(
+        sample.annotations[focus_idx],
+        sample.width,
+        sample.height,
+        task,
+        cfg,
+        rng,
+    )
+    if crop is None:
+        stats["rejected_no_containing_crop"] += 1
+        return None
+    allow_lossy = bool(cfg["allow_lossy"])
+    if not allow_lossy and any(
+        _annotation_is_cut_by_crop(annotation, crop, task, cfg)
+        for annotation in sample.annotations
+    ):
+        stats["rejected_strict_annotation_cut"] += 1
+        return None
+    adjusted: list[Annotation] = []
+    indices: list[int] = []
+    scale = int(cfg["tile_size"]) / (crop[2] - crop[0])
+    candidate_warnings: list[str] = []
+    try:
+        for index, annotation in enumerate(sample.annotations):
+            source_annotation = _coverage_source_annotation(annotation, task, cfg)
+            transformed = _transform_annotation(
+                source_annotation,
+                crop,
+                task,
+                float(cfg["min_area_ratio"]),
+                allow_lossy,
+                candidate_warnings,
+                source_image=sample.image_path,
+                annotation_index=index,
+            )
+            if transformed is not None:
+                adjusted.append(
+                    _scale_annotation(
+                        transformed,
+                        scale,
+                        task,
+                        float(cfg["radius_multiplier"]),
+                    )
+                )
+                indices.append(index)
+    except _SkippableTileGeometryError as exc:
+        if errors == "raise":
+            raise
+        _record_skipped_geometry(
+            builder,
+            skipped_geometry,
+            exc,
+            sample=sample,
+            crop=crop,
+            mode="coverage",
+            attempt=attempt,
+            focus_annotation_index=focus_idx,
+        )
+        stats["rejected_geometry"] += 1
+        return None
+    if not indices:
+        stats["rejected_empty_after_crop"] += 1
+        return None
+    return {
+        "box": crop,
+        "annotations": adjusted,
+        "indices": indices,
+        "warnings": candidate_warnings,
+    }
+
+
+def _guaranteed_candidate(
+    sample: Sample,
+    focus_idx: int,
+    source_image: np.ndarray | None,
+    task: Task,
+    cfg: dict[str, Any],
+    rng: random.Random,
+    *,
+    builder: Any,
+    skipped_geometry: list[dict[str, Any]],
+    stats: Counter[str],
+    errors: str,
+    flip_idx: list[int] | None,
+    use_virtual_camera: bool,
+    attempt_base: int,
+) -> tuple[dict[str, Any] | None, int]:
+    """Cover one annotation, escalating relaxations until something works.
+
+    Each rung is tried with a fresh budget, because the rejections that make a
+    rung fail are mostly per-draw: a different virtual-camera seed, or a
+    different sampled window, may succeed where the last one did not. Rungs
+    that remove a structural constraint are what make the search terminate.
+    """
+
+    budget = max(1, int(cfg["max_attempts_per_target"]))
+    for level in range(len(COVERAGE_RELAXATIONS)):
+        level_cfg = _relaxed_cfg(cfg, level)
+        virtual = use_virtual_camera and level < 1
+        if virtual and source_image is None:
+            continue
+        for offset in range(budget):
+            attempt = attempt_base + level * budget + offset + 1
+            if virtual:
+                try:
+                    candidate = _virtual_positive_candidate(
+                        sample,
+                        focus_idx,
+                        source_image,
+                        task,
+                        level_cfg,
+                        rng,
+                        attempt,
+                        flip_idx,
+                        stats,
+                    )
+                except _SkippableTileGeometryError as exc:
+                    if errors == "raise":
+                        raise
+                    _record_skipped_geometry(
+                        builder,
+                        skipped_geometry,
+                        exc,
+                        sample=sample,
+                        crop=_crop_from_geometry_error(exc),
+                        mode="coverage-virtual",
+                        attempt=attempt,
+                        focus_annotation_index=focus_idx,
+                    )
+                    stats["rejected_geometry"] += 1
+                    continue
+            else:
+                candidate = _plain_positive_candidate(
+                    sample,
+                    focus_idx,
+                    task,
+                    level_cfg,
+                    rng,
+                    builder=builder,
+                    skipped_geometry=skipped_geometry,
+                    stats=stats,
+                    errors=errors,
+                    attempt=attempt,
+                )
+            if candidate is not None and focus_idx in candidate["indices"]:
+                return candidate, level
+    return None, len(COVERAGE_RELAXATIONS) - 1
 
 
 def _virtual_positive_candidate(
@@ -1703,7 +1928,14 @@ def _virtual_positive_candidate(
         stats["rejected_missing_focus"] += 1
         return None
     view_cfg = dict(cfg)
-    view_cfg["require_requested_crop_size"] = True
+    # Demand the full requested window only where one can actually fit. An
+    # image narrower than the smallest window would otherwise be rejected on
+    # every draw, losing every label it carries.
+    view_cfg["require_requested_crop_size"] = cfg.get(
+        "require_requested_crop_size", True
+    ) and _coverage_window_fits(
+        int(view_image.shape[1]), int(view_image.shape[0]), cfg
+    )
     if task is Task.POLO:
         view_cfg["polo_radius_px"] = None
     crop = _make_crop_containing(
@@ -2561,6 +2793,98 @@ def _source_pixel_coverage_payload(
     return payload
 
 
+def _source_coverage_summary(
+    coverage_rows: list[dict[str, Any]],
+    source_pixel_rows: list[dict[str, Any]],
+    splits: set[str],
+) -> dict[str, Any]:
+    """Summarize how much of the source dataset reached the destination.
+
+    Two independent questions are answered explicitly: how many source labels
+    survive somewhere in the output, and how much of the source image area the
+    accepted tiles actually cover.
+    """
+
+    def block(rows: list[dict[str, Any]], pixels: list[dict[str, Any]]) -> dict[str, Any]:
+        total_labels = len(rows)
+        covered = sum(1 for row in rows if row["covered_at_least_once"])
+        exact = [row for row in pixels if row["coverage_status"] == "exact"]
+        covered_area = sum(float(row["covered_source_area_px"]) for row in exact)
+        total_area = sum(float(row["source_area_px"]) for row in exact)
+        total_images = len(pixels)
+        represented = sum(1 for row in pixels if int(row["output_tiles"]) > 0)
+        return {
+            "source_labels": total_labels,
+            "source_labels_covered_at_least_once": covered,
+            "source_labels_never_covered": total_labels - covered,
+            "source_label_coverage_percent": (
+                100.0 * covered / total_labels if total_labels else 100.0
+            ),
+            "source_images": total_images,
+            "source_images_represented": represented,
+            "source_image_representation_percent": (
+                100.0 * represented / total_images if total_images else 100.0
+            ),
+            "covered_source_area_px": covered_area,
+            "source_area_px": total_area,
+            "source_image_space_coverage_percent": (
+                100.0 * covered_area / total_area if total_area else 0.0
+            ),
+            "source_images_without_exact_area": len(pixels) - len(exact),
+        }
+
+    payload: dict[str, Any] = {
+        "definition": (
+            "Label coverage counts source annotations appearing in at least one output "
+            "image. Image-space coverage unions accepted tile footprints in source "
+            "coordinates and divides by total source area."
+        ),
+        "splits": {},
+        "label_positions": _label_position_histogram(coverage_rows),
+        **block(coverage_rows, source_pixel_rows),
+    }
+    for split in sorted(splits):
+        payload["splits"][split] = block(
+            [row for row in coverage_rows if row["split"] == split],
+            [row for row in source_pixel_rows if row["split"] == split],
+        )
+    return payload
+
+
+def _label_position_histogram(
+    coverage_rows: list[dict[str, Any]],
+    *,
+    columns: int = 24,
+    rows: int = 12,
+) -> dict[str, Any]:
+    """Bin label positions in normalized source coordinates.
+
+    Two parallel grids are produced so a reader can see both where labels are
+    and where the ones that never reached the output were located.
+    """
+
+    total = [[0] * columns for _ in range(rows)]
+    uncovered = [[0] * columns for _ in range(rows)]
+    for row in coverage_rows:
+        x = min(max(float(row["x_norm"]), 0.0), 0.999999)
+        y = min(max(float(row["y_norm"]), 0.0), 0.999999)
+        column_index = int(x * columns)
+        row_index = int(y * rows)
+        total[row_index][column_index] += 1
+        if not row["covered_at_least_once"]:
+            uncovered[row_index][column_index] += 1
+    return {
+        "definition": (
+            "Counts of source labels binned by their normalized position in the "
+            "source image, and the subset that never reached any output tile."
+        ),
+        "columns": columns,
+        "rows": rows,
+        "labels": total,
+        "uncovered": uncovered,
+    }
+
+
 def _write_coverage_reports(
     root: Path,
     coverage_rows: list[dict[str, Any]],
@@ -2650,6 +2974,13 @@ def _write_coverage_reports(
     tile_rows.append(tile_row("all", combined))
     _write_csv(root / "tile_summary.csv", tile_rows)
     _write_csv(root / "source_pixel_coverage.csv", source_pixel_rows)
+    (root / "source_coverage.json").write_text(
+        json.dumps(
+            _source_coverage_summary(coverage_rows, source_pixel_rows, splits),
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     (root / "source_pixel_coverage.json").write_text(
         json.dumps(
             _source_pixel_coverage_payload(source_pixel_rows, splits),
@@ -2658,7 +2989,7 @@ def _write_coverage_reports(
         ),
         encoding="utf-8",
     )
-    if visualize:
+    if visualize and PUBLISHES_OPERATION_VISUALS:
         visuals.append(
             save_source_pixel_coverage_summary(
                 source_pixel_rows,
@@ -2815,7 +3146,7 @@ def _write_tiling_class_counts(
         json.dumps(payload, indent=2),
         encoding="utf-8",
     )
-    if visualize:
+    if visualize and PUBLISHES_OPERATION_VISUALS:
         before_named = {
             class_name: before_counts.get(class_id, 0)
             for class_id, class_name in sorted(names.items())

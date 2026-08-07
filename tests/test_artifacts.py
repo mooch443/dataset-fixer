@@ -398,3 +398,66 @@ def test_dataset_update_rejects_raw_and_virtual_datasets(tmp_path: Path) -> None
 def _lineage_records(root: Path) -> list[dict]:
     with gzip.open(root / "reports" / "lineage.json.gz", "rt", encoding="utf-8") as handle:
         return json.load(handle)["records"]
+
+
+def test_yolo_and_semantic_exports_report_the_same_source_coverage(
+    tmp_path: Path,
+) -> None:
+    """Both output formats must publish equivalent reports for one source.
+
+    A mask export inherits its coverage statistic from the operation that
+    produced the polygons, so it states the same numbers as the YOLO export
+    rather than silently omitting the panel.
+    """
+
+    source = make_yolo_dataset(
+        tmp_path / "source",
+        task="segment",
+        names=["school"],
+        train_rows=[
+            "0 0.2 0.2 0.4 0.2 0.4 0.4 0.2 0.4",
+            "0 0.6 0.6 0.8 0.6 0.8 0.8 0.6 0.8",
+        ],
+        val_rows=["0 0.3 0.3 0.6 0.3 0.6 0.6 0.3 0.6"],
+        size=(600, 400),
+    )
+    plan = Dataset.open(source, task="segment", progress=False).tile(
+        mode="coverage",
+        tile_size=128,
+        target_appearances_per_object=2,
+        sparse_appearances_per_object=2,
+        background_ratio=0,
+        allow_lossy=True,
+        visualize=False,
+        progress=False,
+    )
+    vector = plan.export(
+        destination=tmp_path / "vector", visualize=False, progress=False
+    )
+    masks = vector.export(
+        destination=tmp_path / "masks",
+        format="semantic_masks",
+        visualize=False,
+        progress=False,
+    )
+
+    vector_coverage = vector.manifest["audits"]["coverage.source_coverage"]
+    mask_coverage = masks.manifest["audits"]["coverage.source_coverage"]
+    for key in (
+        "source_labels",
+        "source_labels_covered_at_least_once",
+        "source_labels_never_covered",
+        "source_label_coverage_percent",
+        "source_image_space_coverage_percent",
+    ):
+        assert vector_coverage[key] == mask_coverage[key]
+
+    # Both publish the same canonical files, and both plots carry the panel.
+    assert {path.name for path in (vector.location / "reports").iterdir()} == {
+        path.name for path in (masks.location / "reports").iterdir()
+    }
+    for dataset in (vector, masks):
+        with Image.open(dataset.location / "reports" / "plots.png") as report:
+            colors = set(report.convert("RGB").getdata())
+        # The image-space coverage bar is drawn in the coverage panel only.
+        assert (47, 111, 176) in colors
