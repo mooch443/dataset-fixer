@@ -913,6 +913,109 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     assert all(row["cache"] == "hit" for row in cached.ranking)
 
 
+def test_repeating_a_sahi_comparison_reuses_cached_predictions_and_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("sahi")
+    exported = _semantic_export(tmp_path)
+    folder = _nnunet_model(tmp_path / "cached-sahi-model")
+    session = _install_fake_session(monkeypatch)
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object):
+        commands.append(command)
+        return _fake_nnunet_run(command, **kwargs)
+
+    monkeypatch.setattr(
+        "dataset_fixer.semantic_comparison.shutil.which",
+        lambda command: f"/fake/{command}",
+    )
+    monkeypatch.setattr("dataset_fixer.semantic_comparison.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "dataset_fixer.semantic_comparison.environment_snapshot",
+        lambda: {"test": True},
+    )
+    models = Model.load_many(
+        {
+            "sliced": {
+                "path": folder,
+                "upscale_factor": 1,
+                "workers": 1,
+                "inference": "sahi",
+                "sahi_slice_height": 16,
+                "sahi_slice_width": 16,
+                "sahi_overlap": 0.25,
+            }
+        }
+    )
+
+    first = models.compare(exported, progress=False, destination=tmp_path / "sliced-a")
+    assert all(row["cache"] == "fresh" for row in first.ranking)
+    inference_calls = len(session.batch_sizes)
+    evaluations = len(commands)
+    assert inference_calls > 0
+    assert evaluations > 0
+
+    # Same models, same settings, same cohort: a different destination still
+    # reuses the per-model prediction and metric cache under <dataset>/.cache.
+    second = models.compare(exported, progress=False, destination=tmp_path / "sliced-b")
+
+    assert all(row["cache"] == "hit" for row in second.ranking)
+    assert len(session.batch_sizes) == inference_calls, "re-ran network inference"
+    assert len(commands) == evaluations, "re-ran the official evaluator"
+    assert second.ranking[0]["score"] == pytest.approx(first.ranking[0]["score"])
+
+    # Repeating into the same destination short-circuits before any per-model work.
+    again = models.compare(exported, progress=False, destination=tmp_path / "sliced-b")
+    assert len(session.batch_sizes) == inference_calls
+    assert again.ranking[0]["score"] == pytest.approx(first.ranking[0]["score"])
+
+
+def test_changing_a_sahi_setting_invalidates_the_cached_prediction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("sahi")
+    exported = _semantic_export(tmp_path)
+    folder = _nnunet_model(tmp_path / "invalidated-model")
+    session = _install_fake_session(monkeypatch)
+    monkeypatch.setattr(
+        "dataset_fixer.semantic_comparison.shutil.which",
+        lambda command: f"/fake/{command}",
+    )
+    monkeypatch.setattr("dataset_fixer.semantic_comparison.subprocess.run", _fake_nnunet_run)
+    monkeypatch.setattr(
+        "dataset_fixer.semantic_comparison.environment_snapshot",
+        lambda: {"test": True},
+    )
+
+    def compare(overlap: float, destination: str):
+        models = Model.load_many(
+            {
+                "sliced": {
+                    "path": folder,
+                    "upscale_factor": 1,
+                    "workers": 1,
+                    "inference": "sahi",
+                    "sahi_slice_height": 16,
+                    "sahi_slice_width": 16,
+                    "sahi_overlap": overlap,
+                }
+            }
+        )
+        return models.compare(
+            exported, progress=False, destination=tmp_path / destination
+        )
+
+    compare(0.25, "overlap-a")
+    calls = len(session.batch_sizes)
+    result = compare(0.5, "overlap-b")
+
+    assert all(row["cache"] == "fresh" for row in result.ranking)
+    assert len(session.batch_sizes) > calls
+
+
 def test_semantic_comparison_failure_is_atomic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
