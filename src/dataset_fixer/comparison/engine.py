@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import json
 import shutil
-import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..errors import DatasetValidationError, ValidationIssue
-from ..artifacts import combine_report_plots
 from ..sahi_support import reject_legacy_sahi_settings, resolve_sahi_settings
 from ..utils import environment_snapshot, package_versions, settings_fingerprint, to_jsonable
 from .cache import (
+    build_staging_dir,
     cache_key,
     default_cache_root,
     load_evaluation_cache,
@@ -24,6 +23,7 @@ from .cohort import check_training_provenance, freeze_cohort
 from .inference import resolve_backend, run_inference
 from .metrics import bootstrap_metric, evaluate_configuration, paired_statistics
 from .reporting import (
+    combine_report_plots,
     render_figures,
     render_prediction_grids,
     render_qualitative,
@@ -138,7 +138,10 @@ def _compare_models(
         if cached_manifest.get("schema") == 5:
             print(f"Reusing complete comparison: {target}")
             return _result_from_manifest(target, cached_manifest)
-    temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.building-", dir=target.parent))
+    temporary = build_staging_dir(
+        target,
+        dataset_location=None if destination else dataset.location,
+    )
     cache_root = default_cache_root(dataset.location)
     package_versions_snapshot = package_versions()
     print(
@@ -316,7 +319,9 @@ def _compare_models(
                 raise FileExistsError(f"Refusing to replace unrelated comparison destination: {target}")
             shutil.rmtree(target)
         temporary.replace(target)
-    except Exception:
+    except BaseException:
+        # BaseException, not Exception: a cancelled run (KeyboardInterrupt)
+        # must not leave a partial evaluation behind either.
         _remove_build_dir(temporary)
         raise
     print(

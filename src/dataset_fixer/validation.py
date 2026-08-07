@@ -225,16 +225,14 @@ def _validate_staged_metadata_files(
     except Exception as error:
         add_issue(ValidationIssue(f"Unreadable staged data.yaml: {error}", source=str(yaml_path)))
     else:
-        configured_root = Path(str(data.get("path") or yaml_path.parent))
-        if not configured_root.is_absolute():
-            configured_root = yaml_path.parent / configured_root
-        if configured_root.resolve() != root:
+        if "path" in data:
             add_issue(
                 ValidationIssue(
-                    "Staged data.yaml points to the wrong dataset root",
+                    "Generated data.yaml must not pin a dataset root",
                     source=str(yaml_path),
-                    value=str(configured_root.resolve()),
-                    expected=str(root),
+                    value=str(data.get("path")),
+                    expected="no path key; split entries are relative to data.yaml",
+                    suggestion="a pinned root breaks the dataset when it is moved or mounted elsewhere",
                 )
             )
         yaml_names = data.get("names") or {}

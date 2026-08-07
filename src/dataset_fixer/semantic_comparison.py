@@ -17,6 +17,7 @@ from PIL import Image, ImageDraw
 from tqdm.auto import tqdm
 
 from .comparison.cache import (
+    build_staging_dir,
     cache_key,
     default_cache_root,
     load_evaluation_cache,
@@ -38,8 +39,18 @@ from .utils import (
 )
 
 
-_NNUNET_SAHI_PROBABILITY_BATCH_BYTES = 512 * 1024 * 1024
-_NNUNET_SAHI_MAX_IMAGES_PER_BATCH = 512
+# Schema versions. These were bumped together when nnU-Net SAHI inference moved
+# from sequential CLI tile processing to in-process minibatched prediction, so
+# results produced by the old engine can never be mistaken for new ones.
+SEMANTIC_REPORT_SCHEMA = 8
+SEMANTIC_PREDICTION_SCHEMA = 2
+SEMANTIC_EVALUATION_CACHE_SCHEMA = 2
+
+# How much in-flight tile memory one SAHI work group may hold, and how much a
+# single grouped inference call may allocate for padded inputs and logits.
+_NNUNET_SAHI_PROBABILITY_GROUP_BYTES = 512 * 1024 * 1024
+_NNUNET_SAHI_MAX_IMAGES_PER_GROUP = 512
+_NNUNET_SAHI_INFERENCE_CHUNK_BYTES = 512 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -112,7 +123,7 @@ def compare_nnunet_models(
             else "mixed"
         ),
         "adapter": "nnunetv2-official",
-        "report_schema": 7,
+        "report_schema": SEMANTIC_REPORT_SCHEMA,
         "canonical_projection": (
             "sahi-feathered-probability-area-pool-argmax"
             if set(model_backends.values()) == {"sahi"}
@@ -164,9 +175,12 @@ def compare_nnunet_models(
         and (not save_prediction_plots or (target / "predictions").is_dir())
     ):
         cached_manifest = json.loads(existing.read_text(encoding="utf-8"))
-        if cached_manifest.get("schema") == 7:
+        if cached_manifest.get("schema") == SEMANTIC_REPORT_SCHEMA:
             return _semantic_result_from_manifest(target, cached_manifest)
-    temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.building-", dir=target.parent))
+    temporary = build_staging_dir(
+        target,
+        dataset_location=None if destination is not None else export.location,
+    )
     started = time.time()
     limitations = [
         "Metrics are produced by the official nnU-Net v2 folder evaluator on binary foreground masks.",
@@ -200,7 +214,7 @@ def compare_nnunet_models(
             selected_backend = model_backends[spec.name]
             cache_identity = cache_key(
                 {
-                    "schema": 1,
+                    "schema": SEMANTIC_EVALUATION_CACHE_SCHEMA,
                     "space": "nnunet-semantic",
                     "cohort": cohort_fingerprint,
                     "model_sha256": spec.digest,
@@ -227,12 +241,12 @@ def compare_nnunet_models(
                     {**row, "model": spec.name} for row in cached["native_rows"]
                 ]
                 inference_seconds = float(cached.get("inference_seconds", 0.0))
+                execution = dict(cached.get("execution") or {})
                 cache_status = "hit"
             else:
-                _require_official_commands(
-                    "nnUNetv2_predict_from_modelfolder",
-                    "nnUNetv2_evaluate_folder",
-                )
+                _require_official_commands("nnUNetv2_evaluate_folder")
+                if selected_backend == "native":
+                    _require_official_commands("nnUNetv2_predict_from_modelfolder")
                 native_labels = temporary / "cohort" / "models" / spec.slug / "labels"
                 _prepare_labels(cases, native_labels, upscale_factor=spec.upscale_factor)
                 native_prediction_dir = temporary / "working" / "native-predictions" / spec.slug
@@ -255,6 +269,7 @@ def compare_nnunet_models(
                     resolution=spec.resolution or 480,
                 )
                 inference_seconds = prediction_result.inference_seconds
+                execution = _engine_telemetry(prediction_result.records)
                 _write_semantic_prediction_masks(
                     prediction_result.records,
                     prediction_dir,
@@ -291,6 +306,7 @@ def compare_nnunet_models(
                         "summary": summary,
                         "native_summary": native_summary,
                         "inference_seconds": inference_seconds,
+                        "execution": execution,
                     },
                 )
                 prediction_dir = cache_dir / "predictions"
@@ -355,6 +371,7 @@ def compare_nnunet_models(
                     "throughput_cases_per_second": (
                         len(cases) / inference_seconds if inference_seconds > 0 else None
                     ),
+                    "execution": execution,
                 }
             )
 
@@ -395,7 +412,7 @@ def compare_nnunet_models(
         shutil.rmtree(temporary / "cohort", ignore_errors=True)
 
         manifest = {
-            "schema": 7,
+            "schema": SEMANTIC_REPORT_SCHEMA,
             "kind": "semantic-mask-model-comparison",
             "backend": resolved_settings["backend"],
             "adapter": "nnunetv2-official",
@@ -431,7 +448,9 @@ def compare_nnunet_models(
                 raise FileExistsError(f"Refusing to replace unrelated comparison destination: {target}")
             shutil.rmtree(target)
         temporary.replace(target)
-    except Exception:
+    except BaseException:
+        # BaseException, not Exception: a cancelled run (KeyboardInterrupt)
+        # must not leave a partial evaluation behind either.
         shutil.rmtree(temporary, ignore_errors=True)
         raise
 
@@ -516,7 +535,7 @@ def compare_semantic_models(
     cases, cohort_fingerprint = _freeze_cohort(export, split)
     resolved_settings = {
         "backend": "common-semantic-mask",
-        "report_schema": 7,
+        "report_schema": SEMANTIC_REPORT_SCHEMA,
         "comparison_space": "semantic",
         "canonical_projection": "binary-foreground-union",
         "split": split,
@@ -558,9 +577,12 @@ def compare_semantic_models(
         and (not save_prediction_plots or (target / "predictions").is_dir())
     ):
         cached_manifest = json.loads(existing.read_text(encoding="utf-8"))
-        if cached_manifest.get("schema") == 7:
+        if cached_manifest.get("schema") == SEMANTIC_REPORT_SCHEMA:
             return _semantic_result_from_manifest(target, cached_manifest)
-    temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.building-", dir=target.parent))
+    temporary = build_staging_dir(
+        target,
+        dataset_location=None if destination is not None else export.location,
+    )
     started = time.time()
     limitations = [
         "All models are evaluated as binary foreground at the canonical semantic-mask export resolution.",
@@ -596,7 +618,7 @@ def compare_semantic_models(
                 )
             cache_identity = cache_key(
                 {
-                    "schema": 1,
+                    "schema": SEMANTIC_EVALUATION_CACHE_SCHEMA,
                     "space": "binary-semantic",
                     "cohort": cohort_fingerprint,
                     "model_sha256": model.digest,
@@ -764,7 +786,7 @@ def compare_semantic_models(
         shutil.rmtree(temporary / "working", ignore_errors=True)
 
         manifest = {
-            "schema": 7,
+            "schema": SEMANTIC_REPORT_SCHEMA,
             "kind": "semantic-mask-model-comparison",
             "backend": "common-semantic-mask",
             "negotiated_comparison_space": "semantic",
@@ -800,7 +822,9 @@ def compare_semantic_models(
                 raise FileExistsError(f"Refusing to replace unrelated comparison destination: {target}")
             shutil.rmtree(target)
         temporary.replace(target)
-    except Exception:
+    except BaseException:
+        # BaseException, not Exception: a cancelled run (KeyboardInterrupt)
+        # must not leave a partial evaluation behind either.
         shutil.rmtree(temporary, ignore_errors=True)
         raise
 
@@ -949,8 +973,9 @@ def predict_nnunet_model(
         raise ValueError("nnU-Net device must be 'cpu', 'cuda', or 'mps'")
     if inference not in {"native", "sahi"}:
         raise ValueError("inference must be 'native' or 'sahi'; 'auto' was removed")
-    _require_official_commands("nnUNetv2_predict_from_modelfolder")
     if inference == "sahi":
+        # Sliced prediction runs in process against nnU-Net's Python API; only
+        # whole-image prediction still shells out to the official CLI.
         return _predict_nnunet_sahi(
             model,
             inputs,
@@ -960,6 +985,7 @@ def predict_nnunet_model(
             resolution=resolution,
             settings=dict(settings or {}),
         )
+    _require_official_commands("nnUNetv2_predict_from_modelfolder")
     with tempfile.TemporaryDirectory(prefix="dataset-fixer-nnunet-predict-") as temporary:
         root = Path(temporary)
         prepared_images = root / "cohort" / "models" / model.slug / "images"
@@ -1056,6 +1082,14 @@ def _predict_nnunet_sahi(
     resolution: int,
     settings: dict[str, Any],
 ) -> tuple[ImagePrediction, ...]:
+    """Predict SAHI tiles in process, as real network minibatches.
+
+    The canonical manifest, tile geometry, overlap, TTA, upscale adapter,
+    feathered probability stitching, and argmax-after-stitch behavior are
+    unchanged; only the execution engine differs from tile-by-tile CLI runs.
+    """
+
+    from .nnunet_engine import EngineTelemetry, load_session
     from .sahi_support import (
         build_tile_manifest,
         resolve_sahi_settings,
@@ -1063,7 +1097,6 @@ def _predict_nnunet_sahi(
     )
 
     resolved = resolve_sahi_settings(settings, resolution=resolution)
-    records: list[ImagePrediction] = []
     manifests = {
         value.image_id: build_tile_manifest(
             width=value.width,
@@ -1072,158 +1105,257 @@ def _predict_nnunet_sahi(
         )
         for value in inputs
     }
-    batches = _nnunet_sahi_input_batches(
+    total_tiles = sum(len(manifests[value.image_id]) for value in inputs)
+    session = load_session(
+        model_folder=model.model_folder,
+        folds=model.folds,
+        checkpoint=model.checkpoint,
+        device=device,
+        workers=model.workers,
+    )
+    telemetry = EngineTelemetry(
+        device=device,
+        plan_batch_size=session.plan_batch_size,
+        requested_batch_size=session.requested_batch_size,
+        resolved_batch_size=session.requested_batch_size,
+        tiles=total_tiles,
+        sources=len(inputs),
+        folds=tuple(model.folds),
+        tta=session.use_tta,
+        workers=session.workers,
+    )
+    records: list[ImagePrediction] = []
+    groups = _nnunet_sahi_source_groups(
         inputs,
         manifests,
         upscale_factor=model.upscale_factor,
+        classes=session.num_classes,
     )
-    with tempfile.TemporaryDirectory(prefix="dataset-fixer-nnunet-sahi-") as temporary:
-        root = Path(temporary)
-        iterator = tqdm(
-            batches,
-            desc=f"{model.name} SAHI nnU-Net batches",
-            unit="batch",
-            disable=not progress,
-        )
-        for batch_index, batch in enumerate(iterator, start=1):
-            image_dir = root / "images" / f"batch_{batch_index:06d}"
-            prediction_dir = root / "predictions" / f"batch_{batch_index:06d}"
-            image_dir.mkdir(parents=True, exist_ok=True)
-            prediction_dir.mkdir(parents=True, exist_ok=True)
-            case_ids: dict[tuple[str, int], str] = {}
-            for value in batch:
-                with Image.open(value.image_path) as opened:
-                    source_image = opened.convert("RGB")
-                if source_image.size != (value.width, value.height):
-                    raise DatasetValidationError(
-                        f"Prediction input dimensions changed while slicing {value.image_path}"
-                    )
-                for tile in manifests[value.image_id]:
-                    case_id = f"{value.image_id}__tile_{tile.index:06d}"
-                    case_ids[(value.image_id, tile.index)] = case_id
-                    image = source_image.crop(tile.box)
-                    if model.upscale_factor != 1:
-                        image = image.resize(
-                            (
-                                tile.width * model.upscale_factor,
-                                tile.height * model.upscale_factor,
-                            ),
-                            Image.Resampling.BICUBIC,
-                        )
-                    image.save(image_dir / f"{case_id}_0000.png", format="PNG")
-            _run_command(
-                [
-                    "nnUNetv2_predict_from_modelfolder",
-                    "-i",
-                    str(image_dir),
-                    "-o",
-                    str(prediction_dir),
-                    "-m",
-                    str(model.model_folder),
-                    "-f",
-                    *model.folds,
-                    "-chk",
-                    model.checkpoint,
-                    "-device",
-                    device,
-                    "-npp",
-                    str(model.workers),
-                    "-nps",
-                    str(model.workers),
-                    "--save_probabilities",
-                ]
+    tile_progress = tqdm(
+        total=total_tiles,
+        desc=f"{model.name} SAHI tiles",
+        unit="tile",
+        disable=not progress,
+    )
+    source_progress = tqdm(
+        total=len(inputs),
+        desc=f"{model.name} SAHI images",
+        unit="image",
+        disable=not progress,
+    )
+    try:
+        for group in groups:
+            started = time.perf_counter()
+            spans: dict[str, tuple[int, int]] = {}
+            images: list[np.ndarray] = []
+            for value in group:
+                tiles = _slice_source_tiles(
+                    value,
+                    manifests[value.image_id],
+                    upscale_factor=model.upscale_factor,
+                )
+                spans[value.image_id] = (len(images), len(images) + len(tiles))
+                images.extend(tiles)
+            prepared = session.preprocess_many(images)
+            del images
+            telemetry.preprocess_seconds += time.perf_counter() - started
+
+            # Folds are outermost inside predict_logits, so a multi-fold model
+            # loads each fold once for the whole group rather than per tile.
+            started = time.perf_counter()
+            logits: list[Any] = [None] * len(prepared)
+            for indices in _equal_shape_batches(
+                [array for array, _ in prepared],
+                classes=session.num_classes,
+                minimum=session.resolved_batch_size,
+            ):
+                predicted = session.predict_logits(
+                    [prepared[index][0] for index in indices]
+                )
+                for index, tile_logits in zip(indices, predicted):
+                    logits[index] = tile_logits
+                tile_progress.update(len(indices))
+            telemetry.inference_seconds += time.perf_counter() - started
+            telemetry.resolved_batch_size = session.resolved_batch_size
+            telemetry.oom_retries = session.oom_retries
+
+            started = time.perf_counter()
+            probabilities = session.to_probabilities_many(
+                [(logits[index], prepared[index][1]) for index in range(len(prepared))]
             )
-            expected_pngs = {f"{case_id}.png" for case_id in case_ids.values()}
-            actual_pngs = {
-                path.name for path in prediction_dir.glob("*.png") if path.is_file()
-            }
-            if actual_pngs != expected_pngs:
-                raise DatasetValidationError(
-                    ValidationIssue(
-                        "nnU-Net SAHI tile predictions are incomplete",
-                        source=f"{model.name}/{value.image_id}",
-                        value={
-                            "unexpected": sorted(actual_pngs - expected_pngs),
-                            "missing": sorted(expected_pngs - actual_pngs),
-                        },
-                        expected=f"exactly {len(expected_pngs)} tile predictions",
-                    )
-                )
-            for value in batch:
-                manifest = manifests[value.image_id]
-                tile_probabilities = [
-                    (
-                        tile,
-                        _load_nnunet_tile_probabilities(
-                            prediction_dir
-                            / f"{case_ids[(value.image_id, tile.index)]}.npz",
-                            expected_shape=(
-                                tile.height * model.upscale_factor,
-                                tile.width * model.upscale_factor,
-                            ),
-                            source=f"{model.name}/{value.image_id}/tile-{tile.index}",
-                        ),
-                    )
-                    for tile in manifest
-                ]
-                native_probabilities = stitch_probability_tiles(
-                    width=value.width,
-                    height=value.height,
-                    tiles=tile_probabilities,
-                    scale=model.upscale_factor,
-                )
-                native_mask = np.argmax(native_probabilities, axis=0).astype(np.uint8)
-                if model.upscale_factor == 1:
-                    canonical_probabilities = native_probabilities
-                else:
-                    canonical_probabilities = native_probabilities.reshape(
-                        2,
-                        value.height,
-                        model.upscale_factor,
-                        value.width,
-                        model.upscale_factor,
-                    ).mean(axis=(2, 4))
-                mask = np.argmax(canonical_probabilities, axis=0).astype(np.uint8)
+            telemetry.conversion_seconds += time.perf_counter() - started
+            del logits, prepared
+
+            started = time.perf_counter()
+            for value in group:
+                first, last = spans[value.image_id]
                 records.append(
-                    ImagePrediction(
-                        image_id=value.image_id,
-                        image_path=value.image_path,
-                        relative_path=value.relative_path,
-                        width=value.width,
-                        height=value.height,
-                        mask=mask,
-                        native_mask=native_mask if keep_native else None,
-                        metadata={
-                            "backend": "sahi",
-                            "adapter": "nnunetv2-official",
-                            "upscale_factor": model.upscale_factor,
-                            "projection": "sahi-feathered-probability-area-pool-argmax",
-                            "tile_count": len(manifest),
-                            "cli_batch_images": len(batch),
-                            "cli_batch_tiles": len(case_ids),
-                            **resolved.as_dict(),
-                        },
+                    _stitch_sahi_source(
+                        value,
+                        manifests[value.image_id],
+                        probabilities[first:last],
+                        model=model,
+                        keep_native=keep_native,
+                        resolved=resolved,
                     )
                 )
-            shutil.rmtree(image_dir)
-            shutil.rmtree(prediction_dir)
+                # Release each completed source image promptly.
+                probabilities[first:last] = [None] * (last - first)
+                source_progress.update(1)
+            telemetry.stitch_seconds += time.perf_counter() - started
+            del probabilities
+    finally:
+        tile_progress.close()
+        source_progress.close()
+        telemetry.weight_loads = session.weight_loads
+        telemetry.forward_passes = session.forward_passes
+        session.release()
+    for record in records:
+        record.metadata.update(telemetry.as_dict())
     return tuple(records)
 
 
-def _nnunet_sahi_input_batches(
+def _slice_source_tiles(
+    value: ModelInput,
+    manifest: tuple[Any, ...],
+    *,
+    upscale_factor: int,
+) -> list[np.ndarray]:
+    """Cut one source image into its canonical SAHI tiles at model input scale.
+
+    Tiles are returned in manifest order, which is how stitching pairs them
+    back with their source-coordinate boxes.
+    """
+
+    with Image.open(value.image_path) as opened:
+        source_image = opened.convert("RGB")
+    if source_image.size != (value.width, value.height):
+        raise DatasetValidationError(
+            f"Prediction input dimensions changed while slicing {value.image_path}"
+        )
+    tiles: list[np.ndarray] = []
+    for tile in manifest:
+        image = source_image.crop(tile.box)
+        if upscale_factor != 1:
+            image = image.resize(
+                (tile.width * upscale_factor, tile.height * upscale_factor),
+                Image.Resampling.BICUBIC,
+            )
+        tiles.append(np.asarray(image))
+    return tiles
+
+
+def _equal_shape_batches(
+    prepared: list[np.ndarray],
+    *,
+    classes: int = 2,
+    minimum: int = 1,
+) -> list[list[int]]:
+    """Group equally shaped preprocessed tiles into bounded inference calls.
+
+    Only equally shaped tiles can share a network minibatch. Each group is then
+    split so one call's padded inputs and accumulated logits stay within a
+    fixed memory budget.
+    """
+
+    grouped: dict[tuple[int, ...], list[int]] = {}
+    for index, array in enumerate(prepared):
+        grouped.setdefault(tuple(array.shape), []).append(index)
+    batches: list[list[int]] = []
+    for shape in sorted(grouped):
+        area = int(np.prod(shape[1:])) if len(shape) > 1 else 1
+        # Padded float32 input, plus fold logits and fold totals in half.
+        per_tile = shape[0] * area * 4 + 2 * classes * area * 2
+        limit = max(minimum, _NNUNET_SAHI_INFERENCE_CHUNK_BYTES // max(1, per_tile))
+        indices = grouped[shape]
+        batches.extend(
+            indices[start : start + limit] for start in range(0, len(indices), limit)
+        )
+    return batches
+
+
+def _stitch_sahi_source(
+    value: ModelInput,
+    manifest: tuple[Any, ...],
+    probabilities: list[np.ndarray],
+    *,
+    model: Model,
+    keep_native: bool,
+    resolved: Any,
+) -> ImagePrediction:
+    from .sahi_support import stitch_probability_tiles
+
+    tile_probabilities = [
+        (
+            tile,
+            _validate_tile_probabilities(
+                probabilities[index],
+                expected_shape=(
+                    tile.height * model.upscale_factor,
+                    tile.width * model.upscale_factor,
+                ),
+                source=f"{model.name}/{value.image_id}/tile-{tile.index}",
+            ),
+        )
+        for index, tile in enumerate(manifest)
+    ]
+    native_probabilities = stitch_probability_tiles(
+        width=value.width,
+        height=value.height,
+        tiles=tile_probabilities,
+        scale=model.upscale_factor,
+    )
+    native_mask = np.argmax(native_probabilities, axis=0).astype(np.uint8)
+    if model.upscale_factor == 1:
+        canonical_probabilities = native_probabilities
+    else:
+        canonical_probabilities = native_probabilities.reshape(
+            native_probabilities.shape[0],
+            value.height,
+            model.upscale_factor,
+            value.width,
+            model.upscale_factor,
+        ).mean(axis=(2, 4))
+    mask = np.argmax(canonical_probabilities, axis=0).astype(np.uint8)
+    return ImagePrediction(
+        image_id=value.image_id,
+        image_path=value.image_path,
+        relative_path=value.relative_path,
+        width=value.width,
+        height=value.height,
+        mask=mask,
+        native_mask=native_mask if keep_native else None,
+        metadata={
+            "backend": "sahi",
+            "adapter": "nnunetv2-official",
+            "upscale_factor": model.upscale_factor,
+            "projection": "sahi-feathered-probability-area-pool-argmax",
+            "tile_count": len(manifest),
+            **resolved.as_dict(),
+        },
+    )
+
+
+def _nnunet_sahi_source_groups(
     inputs: tuple[ModelInput, ...],
     manifests: dict[str, tuple[Any, ...]],
     *,
     upscale_factor: int,
+    classes: int,
 ) -> tuple[tuple[ModelInput, ...], ...]:
-    """Bound CLI batches by estimated uncompressed probability output size."""
+    """Bound in-flight work by the tile memory one group holds at once.
 
-    batches: list[tuple[ModelInput, ...]] = []
+    A group's preprocessed inputs and converted probabilities are all resident
+    until its source images have been stitched, so both are budgeted here.
+    """
+
+    channels = 3
+    groups: list[tuple[ModelInput, ...]] = []
     pending: list[ModelInput] = []
     pending_bytes = 0
     for value in inputs:
         estimated_bytes = sum(
-            2
+            (channels + classes)
             * tile.width
             * upscale_factor
             * tile.height
@@ -1232,54 +1364,61 @@ def _nnunet_sahi_input_batches(
             for tile in manifests[value.image_id]
         )
         if pending and (
-            pending_bytes + estimated_bytes > _NNUNET_SAHI_PROBABILITY_BATCH_BYTES
-            or len(pending) >= _NNUNET_SAHI_MAX_IMAGES_PER_BATCH
+            pending_bytes + estimated_bytes > _NNUNET_SAHI_PROBABILITY_GROUP_BYTES
+            or len(pending) >= _NNUNET_SAHI_MAX_IMAGES_PER_GROUP
         ):
-            batches.append(tuple(pending))
+            groups.append(tuple(pending))
             pending = []
             pending_bytes = 0
         pending.append(value)
         pending_bytes += estimated_bytes
     if pending:
-        batches.append(tuple(pending))
-    return tuple(batches)
+        groups.append(tuple(pending))
+    return tuple(groups)
 
 
-def _load_nnunet_tile_probabilities(
-    path: Path,
+def _engine_telemetry(records: tuple[ImagePrediction, ...]) -> dict[str, Any]:
+    """Lift the shared execution facts a prediction run recorded per image."""
+
+    if not records:
+        return {}
+    metadata = records[0].metadata
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key.startswith("nnunet_")
+    }
+
+
+def _validate_tile_probabilities(
+    probabilities: np.ndarray,
     *,
     expected_shape: tuple[int, int],
     source: str,
 ) -> np.ndarray:
-    try:
-        with np.load(path) as archive:
-            probabilities = np.asarray(archive["probabilities"], dtype=np.float32)
-    except (OSError, KeyError, ValueError) as exc:
-        raise DatasetValidationError(
-            f"Unreadable nnU-Net SAHI probability tile {path}: {exc}"
-        ) from exc
+    values = np.asarray(probabilities, dtype=np.float32)
     if (
-        probabilities.ndim < 3
-        or probabilities.shape[0] != 2
-        or probabilities.shape[-2:] != expected_shape
-        or math.prod(probabilities.shape[1:-2]) != 1
+        values.ndim < 3
+        or values.shape[0] != 2
+        or values.shape[-2:] != expected_shape
+        or math.prod(values.shape[1:-2]) != 1
     ):
         raise DatasetValidationError(
             ValidationIssue(
                 "nnU-Net SAHI probability dimensions do not match the tile adapter",
                 source=source,
-                value=probabilities.shape,
+                value=values.shape,
                 expected=f"(2, ..., {expected_shape[0]}, {expected_shape[1]})",
             )
         )
-    if not np.all(np.isfinite(probabilities)):
+    if not np.all(np.isfinite(values)):
         raise DatasetValidationError(
             ValidationIssue(
                 "nnU-Net SAHI probability tile contains non-finite values",
                 source=source,
             )
         )
-    return probabilities.reshape(2, *expected_shape)
+    return values.reshape(2, *expected_shape)
 
 
 def visualize_nnunet_models(
@@ -1319,7 +1458,8 @@ def visualize_nnunet_models(
         raise ValueError("model_title_length must be at least 5")
     if image_title_length < 5:
         raise ValueError("image_title_length must be at least 5")
-    _require_official_commands("nnUNetv2_predict_from_modelfolder")
+    if any(spec.inference != "sahi" for spec in cohort.models):
+        _require_official_commands("nnUNetv2_predict_from_modelfolder")
 
     cases, _ = _freeze_cohort(export, split)
     selected = _select_visual_cases(
@@ -2167,7 +2307,7 @@ def _load_semantic_cache(
         value = json.loads(metadata.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if not isinstance(value, dict) or value.get("schema") != 1:
+    if not isinstance(value, dict) or value.get("schema") != SEMANTIC_EVALUATION_CACHE_SCHEMA:
         return None
     rows = value.get("rows")
     if not isinstance(rows, list) or {str(row.get("case_id")) for row in rows} != {
@@ -2190,7 +2330,10 @@ def _save_semantic_cache(
     )
     try:
         shutil.copytree(prediction_dir, staging / "predictions")
-        write_json(staging / "evaluation.json", {"schema": 1, **metadata})
+        write_json(
+            staging / "evaluation.json",
+            {"schema": SEMANTIC_EVALUATION_CACHE_SCHEMA, **metadata},
+        )
         if cache_dir.exists():
             shutil.rmtree(cache_dir)
         staging.replace(cache_dir)

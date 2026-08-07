@@ -401,14 +401,25 @@ class Dataset:
             path_rewrites=path_rewrites,
         )
 
-    def update(self, dest: str | Path | None = None) -> "Dataset":
+    def update(
+        self,
+        dest: str | Path | None = None,
+        *,
+        progress: bool = True,
+    ) -> "Dataset":
         """Upgrade this materialized dataset to the latest artifact schema.
+
+        The upgrade rewrites reports and metadata only. Images, labels, and
+        masks are never modified, and any legacy ``path`` key is removed from
+        the training YAML so the dataset resolves wherever it is mounted.
 
         Parameters:
             dest: Optional destination root. A string is expanded and converted
                 to :class:`Path`. ``None`` updates reports atomically in place;
                 a distinct path creates an upgraded copy without modifying the
                 source dataset.
+            progress: Show progress for copying, hashing and indexing, report
+                generation, and validation. Pass ``False`` to run silently.
 
         Returns:
             The validated, upgraded materialized dataset.
@@ -420,7 +431,7 @@ class Dataset:
             )
         from .updating import update_dataset
 
-        return update_dataset(self, dest=dest)
+        return update_dataset(self, dest=dest, progress=progress)
 
     @property
     def image_dirs(self) -> dict[str, Path]:

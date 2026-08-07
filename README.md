@@ -388,9 +388,18 @@ not expose model-loading or model-comparison methods; load models with
 
 Install the optional official backend with
 `pip install 'dataset-fixer[nnunet]'`. Comparison calls
-`nnUNetv2_predict_from_modelfolder` and `nnUNetv2_evaluate_folder`, verifies
+`nnUNetv2_predict_from_modelfolder` for whole-image prediction and
+`nnUNetv2_evaluate_folder` for every reported metric, verifies
 that every model predicted the exact same image set, and ranks the official
-foreground Dice/IoU results. When `device` is omitted, nnU-Net execution uses
+foreground Dice/IoU results. Sliced (`inference="sahi"`) nnU-Net prediction
+runs in process instead, against the same official preprocessing and
+probability-conversion APIs. A model's `workers` setting is the CPU worker
+count for preprocessing and probability conversion; it is not the neural
+network batch size, which is derived from the model's own plan capped at 16 on
+an accelerator and 4 on CPU, halving only on a recognized out-of-memory error.
+The resolved batch size, retries, tile count, per-phase timings, device, and
+execution engine are recorded in prediction and comparison manifests.
+When `device` is omitted, nnU-Net execution uses
 CUDA when available, then Apple MPS, and otherwise CPU. An explicit per-model
 `device` remains unchanged. Each model receives inputs at its own configured
 training-adapter scale. nnU-Net class probabilities are area-averaged back to
@@ -527,11 +536,17 @@ segmentation, pose, POLO, Ultralytics semantic segmentation, and nnU-Net.
 Pose keypoints and POLO point/radius payloads are retained while duplicates are
 merged, and dense semantic tiles are feather-blended as probabilities before a
 single full-image argmax. Ultralytics tiles are submitted in bounded GPU
-batches; nnU-Net tiles are grouped into bounded official-CLI batches and then
-stitched one source image at a time, avoiding checkpoint/process startup for
-every source image. All SAHI-only options use the `sahi_` prefix; the
-removed unprefixed names and `inference="auto"` are rejected. Install optional
-integrations with:
+batches. nnU-Net sliced inference runs in process against nnU-Net's own Python
+preprocessing and probability-conversion APIs: each fold's weights are loaded
+once per run instead of once per tile, equally shaped tiles are grouped into
+real network minibatches, and probabilities stay in memory instead of round
+tripping through one PNG/NPZ pair per tile. Completed source images are
+stitched and released as soon as their tiles finish. The canonical tile
+manifest, overlap, mirroring TTA, upscale adapter, feathered probability
+stitching, and argmax-after-stitch behavior are unchanged, and the official
+evaluator CLI still produces every reported metric. All SAHI-only options use
+the `sahi_` prefix; the removed unprefixed names and `inference="auto"` are
+rejected. Install optional integrations with:
 
 ```shell
 pip install 'dataset-fixer[comparison,sahi]'
@@ -557,13 +572,27 @@ per row.
 ## Output and reproduction
 
 Derived datasets contain `{split}/images`, `{split}/labels`, `data.yaml`, and a
-compact `reports/` directory. `reports/dataset-info.json` holds the dataset ID,
+compact `reports/` directory holding exactly four files.
+`reports/dataset-info.json` holds the dataset ID,
 settings, source path/ID/basic metadata, per-split total/labeled/background
 image counts, validation, history, and operation audits; `reports/source.json`
 is the immediate-source snapshot;
 `reports/lineage.json.gz` maps every present output to its physical parent and
-ultimate original. Optional operation visuals are combined into
-`reports/plots.png`. Publication remains atomic.
+ultimate original; `reports/plots.png` summarizes the dataset as it is on disk.
+Publication remains atomic.
+
+`reports/plots.png` is regenerated from the physically present dataset rather
+than accumulated from previous operations. It shows the dataset name, task,
+format, and classes; one annotated/background composition bar per split with
+image counts and percentages; and one example row per split with four
+deterministically selected images, drawn with task-aware annotation overlays or
+red mask overlays for semantic datasets. Operation audits stay structured in
+`reports/dataset-info.json` instead of becoming report images.
+
+Generated `data.yaml` files contain only relative split entries and metadata,
+with no `path` key, so a dataset resolves correctly wherever it is moved or
+mounted. Absolute physical locations remain recorded in
+`reports/dataset-info.json` and `reports/source.json` for tracing.
 
 The manifest records resolved defaults and callbacks, seeds, class mappings,
 source fingerprints, package/setuptools-scm revision, dirty state, caller Git
@@ -587,11 +616,16 @@ print(tile.original_image, tile.crop)
 
 Generated datasets can be migrated to the current compact artifact schema
 without changing image, label, or mask bytes. Omit `dest` for an atomic in-place
-report update, or pass a string/`Path` to create an upgraded physical copy:
+report update, or pass a string/`Path` to create an upgraded physical copy. The
+upgrade also removes any legacy `path` key from `data.yaml`, making an older
+dataset portable. `progress=True` (the default) reports copying, hashing and
+indexing, report generation, and validation; pass `progress=False` to run
+silently:
 
 ```python
 updated = dataset.update()
 copied = dataset.update(dest="/datasets/islands-current")
+quiet = dataset.update(progress=False)
 ```
 
 The intentionally small public API is:

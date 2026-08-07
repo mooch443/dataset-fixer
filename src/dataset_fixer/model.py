@@ -357,7 +357,9 @@ class Model:
         folds: nnU-Net folds selected for prediction.
         checkpoint: nnU-Net checkpoint filename within each fold.
         upscale_factor: nnU-Net input adapter scale used during training.
-        workers: nnU-Net preprocessing/export worker count.
+        workers: nnU-Net CPU worker count for preprocessing and probability
+            conversion. This is not the neural-network batch size, which is
+            derived from the model's own plan and the inference device.
         confidence: Default prediction confidence floor.
         postprocess: Default native IoU or SAHI match threshold.
         sahi_slice_height: SAHI tile height in canonical source pixels.
@@ -906,7 +908,10 @@ class Model:
             )
             backend = selected_backend
             task: PredictionTask = "semantic_segment"
+            from .semantic_comparison import SEMANTIC_PREDICTION_SCHEMA
+
             resolved_settings = {
+                "schema": SEMANTIC_PREDICTION_SCHEMA,
                 "device": selected_device,
                 "folds": self.folds,
                 "checkpoint": self.checkpoint,
@@ -914,6 +919,11 @@ class Model:
                 "workers": self.workers,
                 "inference": selected_backend,
                 **(resolved_sahi.as_dict() if selected_backend == "sahi" else {}),
+                **{
+                    key: value
+                    for key, value in (records[0].metadata if records else {}).items()
+                    if key.startswith("nnunet_")
+                },
             }
         else:
             from .comparison.inference import predict_model_inputs, resolve_backend

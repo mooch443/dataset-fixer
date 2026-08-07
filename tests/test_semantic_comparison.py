@@ -19,6 +19,7 @@ from dataset_fixer import (
 )
 from dataset_fixer.comparison.types import Prediction
 from dataset_fixer.semantic_comparison import (
+    SEMANTIC_REPORT_SCHEMA,
     _SemanticCase,
     _canonicalize_predictions,
     _select_visual_cases,
@@ -71,6 +72,60 @@ def _nnunet_model(root: Path) -> Path:
     fold.mkdir()
     (fold / "checkpoint_final.pth").write_bytes(f"checkpoint:{root.name}".encode())
     return root
+
+
+class FakeSession:
+    """Stand-in for a loaded nnU-Net model that records how it was driven."""
+
+    def __init__(
+        self,
+        *,
+        num_classes: int = 2,
+        plan_batch_size: int = 50,
+        requested_batch_size: int = 16,
+        workers: int = 1,
+        foreground: float = 1.0,
+    ) -> None:
+        self.num_classes = num_classes
+        self.plan_batch_size = plan_batch_size
+        self.requested_batch_size = requested_batch_size
+        self.resolved_batch_size = requested_batch_size
+        self.oom_retries = 0
+        self.use_tta = True
+        self.workers = workers
+        self.weight_loads = 0
+        self.forward_passes = 0
+        self.foreground = foreground
+        self.batch_sizes: list[int] = []
+        self.released = 0
+
+    def preprocess_many(self, images):
+        return [
+            (
+                np.asarray(image, dtype=np.float32).transpose(2, 0, 1)[:, None],
+                {"tile_shape": np.asarray(image).shape[:2]},
+            )
+            for image in images
+        ]
+
+    def predict_logits(self, prepared):
+        shapes = {tuple(value.shape) for value in prepared}
+        assert len(shapes) == 1, f"minibatch received mixed shapes: {shapes}"
+        self.batch_sizes.append(len(prepared))
+        self.weight_loads += 1
+        self.forward_passes += 1
+        return [value[:1] for value in prepared]
+
+    def to_probabilities_many(self, pairs):
+        output = []
+        for _, properties in pairs:
+            height, width = properties["tile_shape"]
+            foreground = np.full((height, width), self.foreground, dtype=np.float32)
+            output.append(np.stack((1.0 - foreground, foreground))[:, None])
+        return output
+
+    def release(self) -> None:
+        self.released += 1
 
 
 def _fake_nnunet_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
@@ -599,36 +654,8 @@ def test_nnunet_sahi_stitches_tile_probabilities_at_native_and_canonical_scale(
     pytest.importorskip("sahi")
     exported = _semantic_export(tmp_path)
     folder = _nnunet_model(tmp_path / "semantic-sahi-model")
-    commands: list[list[str]] = []
+    session = _install_fake_session(monkeypatch)
 
-    def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-        commands.append(command)
-        image_dir = Path(command[command.index("-i") + 1])
-        prediction_dir = Path(command[command.index("-o") + 1])
-        prediction_dir.mkdir(parents=True, exist_ok=True)
-        for image_path in sorted(image_dir.glob("*_0000.png")):
-            case_id = image_path.stem.removesuffix("_0000")
-            with Image.open(image_path) as opened:
-                width, height = opened.size
-            mask = np.ones((height, width), dtype=np.uint8)
-            Image.fromarray(mask).save(prediction_dir / f"{case_id}.png")
-            probabilities = np.stack(
-                (
-                    np.zeros((height, width), dtype=np.float32),
-                    np.ones((height, width), dtype=np.float32),
-                )
-            )
-            np.savez_compressed(
-                prediction_dir / f"{case_id}.npz",
-                probabilities=probabilities[:, None],
-            )
-        return subprocess.CompletedProcess(command, 0)
-
-    monkeypatch.setattr(
-        "dataset_fixer.semantic_comparison.shutil.which",
-        lambda command: f"/fake/{command}",
-    )
-    monkeypatch.setattr("dataset_fixer.semantic_comparison.subprocess.run", fake_run)
     model = Model(folder, upscale_factor=2, workers=1)
     result = model.predict(
         exported,
@@ -642,12 +669,159 @@ def test_nnunet_sahi_stitches_tile_probabilities_at_native_and_canonical_scale(
     )
 
     assert result.backend == "sahi"
-    assert len(commands) == 1
-    assert all("--save_probabilities" in command for command in commands)
     assert all(record.mask.shape == (30, 40) for record in result.records)
     assert all(record.native_mask.shape == (60, 80) for record in result.records)
     assert all(np.all(record.mask == 1) for record in result.records)
     assert result.settings["sahi_stitching"] == "feathered-probabilities"
+    assert session.released == 1
+
+
+def test_nnunet_sahi_runs_in_process_without_the_prediction_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("sahi")
+    exported = _semantic_export(tmp_path)
+    folder = _nnunet_model(tmp_path / "in-process-model")
+    _install_fake_session(monkeypatch)
+
+    def refuse(command: list[str], **_: object) -> None:
+        raise AssertionError(f"sliced prediction must not shell out: {command}")
+
+    monkeypatch.setattr("dataset_fixer.semantic_comparison.subprocess.run", refuse)
+    monkeypatch.setattr(
+        "dataset_fixer.semantic_comparison.shutil.which",
+        lambda command: None,
+    )
+
+    result = Model(folder, upscale_factor=1, workers=1).predict(
+        exported,
+        split="val",
+        inference="sahi",
+        sahi_slice_height=16,
+        sahi_slice_width=16,
+        sahi_overlap=0.25,
+        progress=False,
+    )
+
+    assert result.backend == "sahi"
+    assert len(result.records) == 2
+
+
+def test_nnunet_sahi_groups_equally_shaped_tiles_into_real_minibatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("sahi")
+    exported = _semantic_export(tmp_path)
+    folder = _nnunet_model(tmp_path / "batched-model")
+    session = _install_fake_session(monkeypatch)
+
+    result = Model(folder, upscale_factor=1, workers=1).predict(
+        exported,
+        split="val",
+        inference="sahi",
+        sahi_slice_height=16,
+        sahi_slice_width=16,
+        sahi_overlap=0.25,
+        progress=False,
+    )
+
+    tiles = sum(record.metadata["tile_count"] for record in result.records)
+    assert tiles == sum(session.batch_sizes)
+    # Tiles are evaluated in real minibatches, not one network call per tile.
+    assert max(session.batch_sizes) > 1
+    assert len(session.batch_sizes) < tiles
+    assert result.settings["nnunet_execution_engine"] == "in-process-minibatched"
+    assert result.settings["nnunet_tiles"] == tiles
+    assert result.settings["nnunet_sources"] == 2
+    assert set(result.settings["nnunet_phase_seconds"]) == {
+        "preprocess",
+        "inference",
+        "probability_conversion",
+        "stitch",
+    }
+
+
+def test_nnunet_sahi_progress_counts_every_tile_and_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("sahi")
+    exported = _semantic_export(tmp_path)
+    folder = _nnunet_model(tmp_path / "progress-model")
+    _install_fake_session(monkeypatch)
+    bars: list[dict] = []
+
+    class RecordingBar:
+        def __init__(self, **kwargs: object) -> None:
+            self.record = {"total": kwargs.get("total"), "unit": kwargs.get("unit"), "seen": 0}
+            bars.append(self.record)
+
+        def update(self, count: int = 1) -> None:
+            self.record["seen"] += count
+
+        def close(self) -> None:
+            self.record["closed"] = True
+
+    monkeypatch.setattr("dataset_fixer.semantic_comparison.tqdm", RecordingBar)
+    result = Model(folder, upscale_factor=1, workers=1).predict(
+        exported,
+        split="val",
+        inference="sahi",
+        sahi_slice_height=16,
+        sahi_slice_width=16,
+        sahi_overlap=0.25,
+        progress=True,
+    )
+
+    tiles = sum(record.metadata["tile_count"] for record in result.records)
+    by_unit = {bar["unit"]: bar for bar in bars}
+    assert by_unit["tile"]["total"] == tiles
+    assert by_unit["tile"]["seen"] == tiles
+    assert by_unit["image"]["total"] == 2
+    assert by_unit["image"]["seen"] == 2
+    assert all(bar.get("closed") for bar in bars)
+
+
+def test_nnunet_sahi_releases_the_session_when_prediction_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("sahi")
+    exported = _semantic_export(tmp_path)
+    folder = _nnunet_model(tmp_path / "interrupted-model")
+    session = _install_fake_session(monkeypatch)
+
+    def cancel(prepared):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(session, "predict_logits", cancel)
+
+    with pytest.raises(KeyboardInterrupt):
+        Model(folder, upscale_factor=1, workers=1).predict(
+            exported,
+            split="val",
+            inference="sahi",
+            sahi_slice_height=16,
+            sahi_slice_width=16,
+            sahi_overlap=0.25,
+            progress=False,
+        )
+
+    assert session.released == 1
+
+
+def _install_fake_session(
+    monkeypatch: pytest.MonkeyPatch,
+    **kwargs: object,
+) -> FakeSession:
+    session = FakeSession(**kwargs)
+    monkeypatch.setattr(
+        "dataset_fixer.nnunet_engine.load_session",
+        lambda **_: session,
+    )
+    return session
 
 
 def test_semantic_export_compares_official_nnunet_model_folders(
@@ -720,7 +894,7 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     manifest = json.loads((destination / "reports" / "result.json").read_text())
     assert manifest["backend"] == "native"
     assert manifest["adapter"] == "nnunetv2-official"
-    assert manifest["schema"] == 7
+    assert manifest["schema"] == SEMANTIC_REPORT_SCHEMA
     assert manifest["cases"] == 2
     assert "upscale_factor" not in manifest["settings"]
     assert [model["upscale_factor"] for model in manifest["settings"]["models"]] == [2, 1]

@@ -3,14 +3,15 @@ from __future__ import annotations
 import csv
 import json
 import math
+import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 from ..utils import to_jsonable
 from .types import Cohort, Prediction
@@ -453,3 +454,111 @@ def _assert_csv_roundtrip(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def _latex(value: Any) -> str:
     text=str(_cell(value)); return text.replace("_","\\_").replace("%","\\%")
+
+
+def combine_report_plots(
+    roots: Iterable[Path],
+    output: Path,
+    *,
+    limit: int = 16,
+) -> Path | None:
+    """Collapse comparison figures into one readable, vertically stacked sheet.
+
+    Each panel is cropped to its visible content and scaled independently. The
+    compositor deliberately does not include an existing aggregate report:
+    doing so would recursively embed ``plots.png`` in every rebuilt comparison.
+    """
+
+    candidates: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        candidates.extend(
+            path
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+            and path != output
+            and path.name not in {"plots.png", "comparison.png", "source-operation.png"}
+            and path.suffix.lower() in {".png", ".jpg", ".jpeg"}
+        )
+    if not candidates:
+        return None
+    chosen = candidates[:limit]
+    canvas_width = 1600
+    outer_padding = 32
+    panel_padding = 24
+    label_height = 52
+    content_width = canvas_width - 2 * (outer_padding + panel_padding)
+    prepared: list[tuple[Path, Image.Image]] = []
+    for path in chosen:
+        with Image.open(path) as opened:
+            image = _crop_plot_whitespace(opened.convert("RGB"))
+        scale = min(content_width / max(1, image.width), 4.0)
+        if abs(scale - 1.0) > 1e-6:
+            image = image.resize(
+                (
+                    max(1, round(image.width * scale)),
+                    max(1, round(image.height * scale)),
+                ),
+                Image.Resampling.LANCZOS,
+            )
+        prepared.append((path, image))
+
+    panel_heights = [label_height + image.height + 2 * panel_padding for _, image in prepared]
+    canvas_height = outer_padding + sum(panel_heights) + outer_padding * len(prepared)
+    canvas = Image.new("RGB", (canvas_width, canvas_height), "#f3f4f6")
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.load_default(size=28)
+    except TypeError:  # Pillow 10.0
+        font = ImageFont.load_default()
+    y = outer_padding
+    for (path, image), panel_height in zip(prepared, panel_heights):
+        panel_left = outer_padding
+        panel_right = canvas_width - outer_padding
+        draw.rounded_rectangle(
+            (panel_left, y, panel_right, y + panel_height),
+            radius=14,
+            fill="white",
+            outline="#d1d5db",
+            width=2,
+        )
+        title = path.stem.replace("_", " ")[:90]
+        draw.text(
+            (panel_left + panel_padding, y + 16),
+            title,
+            fill="#111827",
+            font=font,
+        )
+        image_x = (canvas_width - image.width) // 2
+        image_y = y + label_height + panel_padding
+        canvas.paste(image, (image_x, image_y))
+        y += panel_height + outer_padding
+    output.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output, format="PNG", optimize=True)
+    for path in candidates:
+        path.unlink(missing_ok=True)
+    for root in roots:
+        if root != output.parent and root.is_dir():
+            shutil.rmtree(root, ignore_errors=True)
+    return output
+
+
+def _crop_plot_whitespace(image: Image.Image, *, padding: int = 12) -> Image.Image:
+    """Trim near-white outer margins without cutting into plotted content."""
+
+    background = Image.new("RGB", image.size, "white")
+    difference = ImageChops.difference(image, background).convert("L")
+    visible = difference.point(lambda value: 255 if value > 8 else 0)
+    bounds = visible.getbbox()
+    if bounds is None:
+        return image
+    left, top, right, bottom = bounds
+    return image.crop(
+        (
+            max(0, left - padding),
+            max(0, top - padding),
+            min(image.width, right + padding),
+            min(image.height, bottom + padding),
+        )
+    )

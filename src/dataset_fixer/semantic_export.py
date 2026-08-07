@@ -13,10 +13,10 @@ from tqdm.auto import tqdm
 
 from .artifacts import (
     DATASET_INFO_SCHEMA,
-    combine_report_plots,
     collect_report_payloads,
     dataset_info_path,
     lineage_path,
+    prune_report_directory,
     source_dataset_id,
     source_info_path,
     split_image_summary,
@@ -24,6 +24,7 @@ from .artifacts import (
     write_json,
     write_lineage,
 )
+from .dataset_report import render_dataset_report
 from .errors import DatasetValidationError, ValidationIssue
 from .models import Task
 from .split_group_audit import (
@@ -134,13 +135,12 @@ def export_semantic_masks(
         reports = staging / "reports"
         reports.mkdir(parents=True, exist_ok=True)
         write_split_group_audit(reports, group_report)
-        load_validation, load_visualization = stage_load_validation_audit(
+        load_validation, _ = stage_load_validation_audit(
             dataset._validation_audit,
             dataset._validation_audit_visualization,
             reports,
         )
         iterator = tqdm(samples, desc="Exporting semantic masks", unit="image", disable=not progress)
-        first_pair: tuple[Path, Path] | None = None
         for sample in iterator:
             image_output = staging / sample.split / "images" / sample.relative_path
             mask_relative = sample.relative_path.with_suffix(".png")
@@ -156,8 +156,6 @@ def export_semantic_masks(
                 draw.polygon(annotation.polygon, fill=255)
             has_foreground = mask.getbbox() is not None
             mask.save(mask_output, format="PNG", optimize=False)
-            if first_pair is None:
-                first_pair = image_output, mask_output
             records.append(
                 _provenance_record(
                     dataset,
@@ -171,35 +169,29 @@ def export_semantic_masks(
             )
 
         _validate_semantic_tree(staging, records)
-        visuals: list[str] = []
-        if load_visualization is not None:
-            visuals.append(str(load_visualization.relative_to(staging)))
-        if visualize and first_pair is not None:
-            preview = reports / "semantic_mask_preview.png"
-            _write_preview(*first_pair, preview)
-            visuals.append(str(preview.relative_to(staging)))
         audits = dict(dataset._manifest.get("audits") or {})
         audits.update(collect_report_payloads(reports))
         if group_validation.get("status") == "not_applicable":
             audits.pop("split_group_audit", None)
-        plot = combine_report_plots((reports,), reports / "plots.png")
-        source_plot = dataset.location / "reports" / "plots.png"
-        if plot is None and source_plot.is_file():
-            plot = reports / "plots.png"
-            shutil.copy2(source_plot, plot)
+        prune_report_directory(reports)
+        plot = render_dataset_report(
+            staging,
+            records,
+            name=final_name,
+            task=Task.SEGMENT.value,
+            format_name="semantic_masks",
+            classes=dataset.classes,
+            output=reports / "plots.png",
+        )
         visuals = ["reports/plots.png"] if plot is not None else []
         if load_validation.get("skipped_count", 0):
             load_validation["report"] = (
                 "reports/dataset-info.json#audits.load_validation_audit"
             )
-            load_validation["visualization"] = (
-                "reports/plots.png" if plot is not None else None
-            )
+            load_validation["visualization"] = None
             if isinstance(audits.get("load_validation_audit"), dict):
                 audits["load_validation_audit"]["report"] = load_validation["report"]
-                audits["load_validation_audit"]["visualization"] = load_validation[
-                    "visualization"
-                ]
+                audits["load_validation_audit"]["visualization"] = None
 
         environment = environment_snapshot()
         try:
@@ -487,13 +479,3 @@ def _validate_semantic_tree(staging: Path, records: list[dict[str, Any]]) -> Non
         )
 
 
-def _write_preview(image_path: Path, mask_path: Path, output: Path) -> None:
-    with Image.open(image_path) as opened_image, Image.open(mask_path) as opened_mask:
-        image = opened_image.convert("RGB")
-        mask = opened_mask.convert("L")
-    red = Image.new("RGB", image.size, (255, 0, 0))
-    overlay = Image.composite(red, image, mask.point(lambda value: 120 if value else 0))
-    preview = Image.new("RGB", (image.width * 2, image.height))
-    preview.paste(image, (0, 0))
-    preview.paste(overlay, (image.width, 0))
-    preview.save(output)

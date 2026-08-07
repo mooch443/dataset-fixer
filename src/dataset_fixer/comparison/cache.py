@@ -35,6 +35,24 @@ def default_cache_root(dataset_location: Path) -> Path:
     return dataset_location / ".cache" / "evaluations"
 
 
+def build_staging_dir(target: Path, *, dataset_location: Path | None) -> Path:
+    """Create the private directory an in-progress evaluation is built in.
+
+    Default destinations stage under the dataset's ``.cache`` so a cancelled or
+    failed run never leaves a partial build beside published evaluations. An
+    explicit destination stages beside itself, which keeps publication an
+    atomic same-filesystem rename.
+    """
+
+    root = (
+        dataset_location / ".cache" / "builds"
+        if dataset_location is not None
+        else target.parent
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f".{target.name}.building-", dir=root))
+
+
 def model_cache_dir(cache_root: Path, model_name: str, key: str) -> Path:
     # model_name is accepted for call-site clarity but deliberately excluded
     # from identity: renaming identical model bytes must retain the cache.

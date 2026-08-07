@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -141,7 +142,42 @@ def test_split_grouping_manifest_and_provenance(detect_dataset: Path, tmp_path: 
     assert manifest["timing"]["started_at"] and manifest["timing"]["finished_at"]
     assert manifest["settings_fingerprint"] in result.location.name or manifest["settings_fingerprint"]
     assert all(record["transformation_chain"] for record in result.provenance.values())
-    assert yaml.safe_load(result.data_yaml.read_text(encoding="utf-8"))["path"] == str(result.location)
+    generated_yaml = yaml.safe_load(result.data_yaml.read_text(encoding="utf-8"))
+    assert "path" not in generated_yaml
+    assert generated_yaml["train"] == "train/images"
+    assert generated_yaml["val"] == "val/images"
+
+
+def test_generated_dataset_loads_after_being_moved(
+    detect_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    exported = Dataset.open(detect_dataset, task="detect", progress=False).export(
+        destination=tmp_path / "portable",
+        visualize=False,
+        progress=False,
+    )
+    expected = sorted(
+        sample.image_path.relative_to(exported.location).as_posix()
+        for sample in exported._samples
+    )
+
+    moved = tmp_path / "relocated" / "portable"
+    moved.parent.mkdir()
+    shutil.move(str(exported.location), moved)
+
+    reopened = Dataset.open(moved, task="detect", progress=False)
+
+    assert reopened.location == moved.resolve()
+    assert reopened.data_yaml == moved.resolve() / "data.yaml"
+    assert reopened.training_ready
+    assert (
+        sorted(
+            sample.image_path.relative_to(moved.resolve()).as_posix()
+            for sample in reopened._samples
+        )
+        == expected
+    )
 
 
 def test_group_aware_export_writes_aggregate_split_audit(

@@ -14,10 +14,10 @@ from PIL import Image
 
 from .artifacts import (
     DATASET_INFO_SCHEMA,
-    combine_report_plots,
     collect_report_payloads,
     dataset_info_path,
     lineage_path,
+    prune_report_directory,
     source_dataset_id,
     source_info_path,
     split_image_summary,
@@ -25,6 +25,7 @@ from .artifacts import (
     write_json,
     write_lineage,
 )
+from .dataset_report import render_dataset_report
 from .io import annotation_to_yolo
 from .models import Annotation, DatasetMetadata, Sample, Task
 from .utils import environment_snapshot, settings_fingerprint, sha256_file, slugify, to_jsonable
@@ -60,7 +61,6 @@ class OutputBuilder:
         self.staging = Path(tempfile.mkdtemp(prefix=f".{self.destination.name}.tmp-", dir=self.destination.parent))
         self.reports_dir = self.staging / "reports"
         self.reports_dir.mkdir(parents=True, exist_ok=True)
-        self.source_plot = self.source_root / "reports" / "plots.png"
         self.records: list[dict[str, Any]] = []
         self.output_samples: list[Sample] = []
         self.validation_details: dict[str, Any] = {}
@@ -198,12 +198,11 @@ class OutputBuilder:
         }
         self.records.append(record)
 
-    def write_yaml(self, *, dataset_root: Path | None = None) -> None:
+    def write_yaml(self) -> None:
         available = {record["output_split"] for record in self.records}
         data: dict[str, Any] = {
-            # Validate against the private staging root, then rewrite this to
-            # the final absolute destination immediately before publication.
-            "path": str((dataset_root or self.staging).resolve()),
+            # Split entries stay relative to this file, so the dataset resolves
+            # identically from the staging root and from its final destination.
             "train": "train/images" if "train" in available else None,
             "val": "val/images" if "val" in available else None,
             "test": "test/images" if "test" in available else None,
@@ -287,27 +286,27 @@ class OutputBuilder:
                     for key, value in collect_report_payloads(coverage_dir).items()
                 }
             )
-        plot = combine_report_plots(
-            (self.reports_dir, coverage_dir),
-            self.reports_dir / "plots.png",
+        prune_report_directory(self.reports_dir, extra_roots=(coverage_dir,))
+        plot = render_dataset_report(
+            self.staging,
+            self.records,
+            name=self.name,
+            task=self.task.value,
+            format_name="yolo",
+            classes=self.metadata.names,
+            output=self.reports_dir / "plots.png",
+            metadata=self.metadata,
         )
-        if plot is None and self.source_plot.is_file():
-            plot = self.reports_dir / "plots.png"
-            shutil.copy2(self.source_plot, plot)
         self.visuals = ["reports/plots.png"] if plot is not None else []
         load_validation = self.validation_details.get("load_validation")
         if isinstance(load_validation, dict) and load_validation.get("skipped_count", 0):
             load_validation["report"] = (
                 "reports/dataset-info.json#audits.load_validation_audit"
             )
-            load_validation["visualization"] = (
-                "reports/plots.png" if plot is not None else None
-            )
+            load_validation["visualization"] = None
             if isinstance(audits.get("load_validation_audit"), dict):
                 audits["load_validation_audit"]["report"] = load_validation["report"]
-                audits["load_validation_audit"]["visualization"] = load_validation[
-                    "visualization"
-                ]
+                audits["load_validation_audit"]["visualization"] = None
         source_info = {
             "schema": "dataset-fixer-source",
             "schema_version": DATASET_INFO_SCHEMA,
@@ -433,7 +432,6 @@ class OutputBuilder:
                 **self.validation_details,
             }
         write_json(dataset_info_path(self.staging), manifest)
-        self.write_yaml(dataset_root=self.destination)
         os.replace(self.staging, self.destination)
         return manifest
 

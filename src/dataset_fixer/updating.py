@@ -10,19 +10,21 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 from PIL import Image
+from tqdm.auto import tqdm
 
 from .artifacts import (
     DATASET_INFO_SCHEMA,
-    combine_report_plots,
     collect_report_payloads,
     dataset_info_path,
     lineage_path,
+    prune_report_directory,
     source_info_path,
     split_image_summary,
     stable_dataset_id,
     write_json,
     write_lineage,
 )
+from .dataset_report import render_dataset_report
 from .errors import DatasetValidationError, ValidationIssue
 from .utils import environment_snapshot, ensure_safe_destination, sha256_file
 
@@ -31,7 +33,12 @@ if TYPE_CHECKING:
     from .models import Sample
 
 
-def update_dataset(dataset: "Dataset", *, dest: str | Path | None) -> "Dataset":
+def update_dataset(
+    dataset: "Dataset",
+    *,
+    dest: str | Path | None,
+    progress: bool = True,
+) -> "Dataset":
     """Upgrade generated dataset metadata in place or in a new physical copy."""
 
     source_root = dataset.location.resolve()
@@ -56,15 +63,14 @@ def update_dataset(dataset: "Dataset", *, dest: str | Path | None) -> "Dataset":
             )
         )
         try:
-            shutil.copytree(source_root, staging, dirs_exist_ok=True)
+            _copy_dataset_tree(source_root, staging, progress=progress)
             _update_root(
                 dataset,
                 staging,
                 published_location=target,
-                yaml_location=staging,
+                progress=progress,
             )
-            _validate_updated_root(dataset, staging)
-            _rewrite_yaml_location(dataset, staging, target)
+            _validate_updated_root(dataset, staging, progress=progress)
             os.replace(staging, target)
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
@@ -74,13 +80,27 @@ def update_dataset(dataset: "Dataset", *, dest: str | Path | None) -> "Dataset":
             dataset,
             source_root,
             published_location=source_root,
-            yaml_location=source_root,
+            progress=progress,
         )
-        _validate_updated_root(dataset, source_root)
+        _validate_updated_root(dataset, source_root, progress=progress)
 
     from .dataset import Dataset
 
     return Dataset.open(target, task=dataset.task, progress=False)
+
+
+def _copy_dataset_tree(source_root: Path, staging: Path, *, progress: bool) -> None:
+    paths = [path for path in sorted(source_root.rglob("*")) if path.is_file()]
+    iterator = tqdm(
+        paths,
+        desc="Copying dataset files",
+        unit="file",
+        disable=not progress,
+    )
+    for path in iterator:
+        destination = staging / path.relative_to(source_root)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination)
 
 
 def _update_root(
@@ -88,11 +108,11 @@ def _update_root(
     root: Path,
     *,
     published_location: Path,
-    yaml_location: Path,
+    progress: bool,
 ) -> None:
     manifest = dict(dataset.manifest)
     previous_schema = int(manifest.get("schema_version") or 1)
-    records = _current_lineage_records(dataset)
+    records = _current_lineage_records(dataset, progress=progress)
     dataset_id = str(
         manifest.get("dataset_id")
         or stable_dataset_id(
@@ -131,12 +151,19 @@ def _update_root(
                 for key, value in collect_report_payloads(staged_coverage).items()
             }
         )
-        combine_report_plots(
-            (staged_reports, staged_coverage),
-            staged_reports / "plots.png",
-        )
-    else:
-        combine_report_plots((staged_reports,), staged_reports / "plots.png")
+    prune_report_directory(staged_reports)
+    if progress:
+        print("Rendering dataset report from the physically present dataset...")
+    render_dataset_report(
+        root,
+        records,
+        name=dataset.name,
+        task=dataset.task.value,
+        format_name=dataset.format,
+        classes=dataset.classes,
+        output=staged_reports / "plots.png",
+        metadata=dataset._metadata,
+    )
 
     environment = environment_snapshot()
     try:
@@ -195,16 +222,26 @@ def _update_root(
     finally:
         shutil.rmtree(temporary_root, ignore_errors=True)
 
-    _rewrite_yaml_location(dataset, root, yaml_location)
+    _make_yaml_portable(dataset, root)
     (root / "dataset-fixer.json").unlink(missing_ok=True)
     (root / "provenance.jsonl").unlink(missing_ok=True)
     if coverage.is_dir():
         shutil.rmtree(coverage)
 
 
-def _current_lineage_records(dataset: "Dataset") -> list[dict[str, Any]]:
+def _current_lineage_records(
+    dataset: "Dataset",
+    *,
+    progress: bool = False,
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    for sample in dataset._samples:
+    iterator = tqdm(
+        dataset._samples,
+        desc="Hashing and indexing images",
+        unit="image",
+        disable=not progress,
+    )
+    for sample in iterator:
         relative_image = _relative_to_root(sample.image_path, dataset.location)
         record = dict(sample.provenance or dataset._provenance.get(relative_image, {}))
         image_sha = sha256_file(sample.image_path)
@@ -272,25 +309,31 @@ def _current_source_payload(
     }
 
 
-def _rewrite_yaml_location(
-    dataset: "Dataset",
-    root: Path,
-    published_location: Path,
-) -> None:
+def _make_yaml_portable(dataset: "Dataset", root: Path) -> None:
+    """Drop the legacy absolute or relative ``path`` key from a training YAML.
+
+    Split entries are already relative to the YAML file, so removing ``path``
+    makes the dataset resolve correctly wherever it is moved or mounted.
+    """
+
     if dataset.data_yaml is None:
         return
     relative = dataset.data_yaml.resolve().relative_to(dataset.location.resolve())
     yaml_path = root / relative
     data = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
-    data["path"] = str(published_location)
+    if "path" not in data:
+        return
+    data.pop("path")
     temporary = yaml_path.with_suffix(yaml_path.suffix + ".tmp")
     temporary.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     temporary.replace(yaml_path)
 
 
-def _validate_updated_root(dataset: "Dataset", root: Path) -> None:
+def _validate_updated_root(dataset: "Dataset", root: Path, *, progress: bool) -> None:
     from .dataset import Dataset
 
+    if progress:
+        print("Validating the upgraded dataset before publication...")
     reopened = Dataset.open(root, task=dataset.task, progress=False)
     before = _payload_hashes(dataset.location)
     after = _payload_hashes(root)

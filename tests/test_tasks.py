@@ -93,9 +93,10 @@ def test_invalid_segmentation_can_be_skipped_virtually(tmp_path: Path) -> None:
     assert (exported.location / "reports" / "plots.png").is_file()
     reopened = Dataset.open(exported.location, task="segment", progress=False)
     assert reopened.validation_audit["skipped_count"] == 1
-    assert reopened._validation_audit_visualization == (
-        exported.location / "reports" / "plots.png"
-    )
+    # The audit survives as structured manifest data; the transient example
+    # image is not published, so nothing points at a stale visualization.
+    assert reopened._validation_audit_visualization is None
+    assert manifest["audits"]["load_validation_audit"]["visualization"] is None
 
     semantic = dataset.export(
         destination=tmp_path / "semantic_without_invalid_polygon",
