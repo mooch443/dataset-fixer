@@ -1073,3 +1073,111 @@ def test_semantic_comparison_validates_model_specific_upscale_factor(tmp_path: P
             progress=False,
             destination=tmp_path / "invalid-scale-comparison",
         )
+
+
+def test_prediction_plots_are_bounded_and_skip_empty_cases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the cases the report keeps are drawn, and empty ones are skipped."""
+
+    from dataset_fixer.semantic_comparison import _render_semantic_prediction_grids
+
+    root = tmp_path / "grids"
+    predictions = root / "model-a"
+    predictions.mkdir(parents=True)
+    cases = []
+    for index in range(4):
+        case_id = f"val_{index:06d}"
+        image = tmp_path / f"{case_id}.png"
+        Image.new("RGB", (32, 32), (40, 90, 140)).save(image)
+        mask_path = tmp_path / f"{case_id}_mask.png"
+        # Case 0 has a reference, the rest are empty ground truth.
+        truth = np.zeros((32, 32), dtype=np.uint8)
+        if index == 0:
+            truth[8:20, 8:20] = 255
+        Image.fromarray(truth).save(mask_path)
+        # Case 1 has no reference but a false-positive prediction.
+        prediction = np.zeros((32, 32), dtype=np.uint8)
+        if index in (0, 1):
+            prediction[10:18, 10:18] = 1
+        Image.fromarray(prediction).save(predictions / f"{case_id}.png")
+        cases.append(
+            _SemanticCase(
+                case_id=case_id,
+                relative_path=Path(f"{case_id}.png"),
+                image_path=image,
+                mask_path=mask_path,
+                width=32,
+                height=32,
+                image_sha256="x",
+                mask_sha256="y",
+            )
+        )
+    rows = {
+        "model-a": [
+            {"case_id": case.case_id, "dice": 0.5, "iou": 0.4} for case in cases
+        ]
+    }
+
+    # Ask for three cases; case 2 has neither reference nor prediction.
+    rendered = _render_semantic_prediction_grids(
+        root,
+        cases,
+        {"model-a": predictions},
+        rows,
+        case_ids=["val_000000", "val_000001", "val_000002"],
+    )
+
+    assert len(rendered) == 2
+    written = {path.name for path in (root / "predictions").rglob("*.png")}
+    assert written == {"val_000000.png", "val_000001.png"}
+    # Case 3 was never requested, case 2 was requested but had nothing to show.
+    assert "val_000003.png" not in written
+    assert "val_000002.png" not in written
+
+
+def test_comparison_renders_only_the_cases_it_reports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("sahi")
+    exported = _semantic_export(tmp_path)
+    folder = _nnunet_model(tmp_path / "bounded-plots-model")
+    _install_fake_session(monkeypatch)
+    monkeypatch.setattr(
+        "dataset_fixer.semantic_comparison.shutil.which",
+        lambda command: f"/fake/{command}",
+    )
+    monkeypatch.setattr("dataset_fixer.semantic_comparison.subprocess.run", _fake_nnunet_run)
+    monkeypatch.setattr(
+        "dataset_fixer.semantic_comparison.environment_snapshot",
+        lambda: {"test": True},
+    )
+    models = Model.load_many(
+        {
+            "sliced": {
+                "path": folder,
+                "upscale_factor": 1,
+                "workers": 1,
+                "inference": "sahi",
+                "sahi_slice_height": 16,
+                "sahi_slice_width": 16,
+                "sahi_overlap": 0.25,
+            }
+        }
+    )
+    destination = tmp_path / "bounded-plots"
+
+    models.compare(
+        exported,
+        progress=False,
+        save_prediction_plots=True,
+        destination=destination,
+    )
+
+    manifest = json.loads((destination / "reports" / "result.json").read_text())
+    reported = {Path(p).name for p in manifest["reports"]["prediction_plots"]}
+    written = {p.name for p in (destination / "predictions").rglob("*.png")}
+    assert written == reported
+    assert len(written) <= len(manifest["worst_cases"])

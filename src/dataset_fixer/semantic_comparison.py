@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -403,10 +403,17 @@ def compare_nnunet_models(
         reports.mkdir(parents=True, exist_ok=True)
         _render_ranking(reports, ranking)
         _render_qualitative(reports, cases, prediction_dirs, model_rows, seed=seed)
+        # Render only the cases the report keeps, so nothing is drawn that is
+        # not also referenced in the manifest.
+        worst_cases = _bounded_semantic_cases(per_case)
         prediction_paths: list[str] = []
         if save_prediction_plots:
             prediction_paths = _render_semantic_prediction_grids(
-                temporary, cases, prediction_dirs, model_rows
+                temporary,
+                cases,
+                prediction_dirs,
+                model_rows,
+                case_ids=[str(row["case_id"]) for row in worst_cases],
             )
         shutil.rmtree(temporary / "working", ignore_errors=True)
         shutil.rmtree(temporary / "cohort", ignore_errors=True)
@@ -432,7 +439,7 @@ def compare_nnunet_models(
             "ranking": ranking,
             "paired_statistics": paired,
             "limitations": limitations,
-            "worst_cases": _bounded_semantic_cases(per_case),
+            "worst_cases": worst_cases,
             "reports": {
                 "plots": "reports/plots.png",
                 "comparison": "reports/comparison.png",
@@ -778,10 +785,17 @@ def compare_semantic_models(
             title="Semantic-space model comparison",
         )
         _render_qualitative(reports, cases, prediction_dirs, model_rows, seed=seed)
+        # Render only the cases the report keeps, so nothing is drawn that is
+        # not also referenced in the manifest.
+        worst_cases = _bounded_semantic_cases(per_case)
         prediction_paths: list[str] = []
         if save_prediction_plots:
             prediction_paths = _render_semantic_prediction_grids(
-                temporary, cases, prediction_dirs, model_rows
+                temporary,
+                cases,
+                prediction_dirs,
+                model_rows,
+                case_ids=[str(row["case_id"]) for row in worst_cases],
             )
         shutil.rmtree(temporary / "working", ignore_errors=True)
 
@@ -806,7 +820,7 @@ def compare_semantic_models(
             "ranking": ranking,
             "paired_statistics": paired,
             "limitations": limitations,
-            "worst_cases": _bounded_semantic_cases(per_case),
+            "worst_cases": worst_cases,
             "reports": {
                 "plots": "reports/plots.png",
                 "comparison": "reports/comparison.png",
@@ -2180,8 +2194,16 @@ def _render_semantic_prediction_grids(
     cases: list[_SemanticCase],
     prediction_dirs: dict[str, Path],
     rows_by_model: dict[str, list[dict[str, Any]]],
+    *,
+    case_ids: Iterable[str] | None = None,
 ) -> list[str]:
-    """Write one image-level comparison with at most two models per row."""
+    """Write one image-level comparison with at most two models per row.
+
+    Only ``case_ids`` are rendered. A full cohort is far more output than
+    anyone inspects -- a thousand-image split produced a thousand figures and
+    gigabytes of PNGs -- so the caller selects the cases worth keeping and
+    nothing else is drawn.
+    """
 
     import matplotlib.pyplot as plt
 
@@ -2190,9 +2212,22 @@ def _render_semantic_prediction_grids(
         name: {str(row["case_id"]): row for row in rows}
         for name, rows in rows_by_model.items()
     }
+    if case_ids is not None:
+        selected = set(case_ids)
+        cases = [case for case in cases if case.case_id in selected]
     output_root = root / "predictions"
     rendered: list[str] = []
     for case in cases:
+        with Image.open(case.mask_path) as opened:
+            truth = np.asarray(opened.convert("L")) > 0
+        predictions = {}
+        for name in model_names:
+            with Image.open(prediction_dirs[name] / f"{case.case_id}.png") as opened:
+                predictions[name] = np.asarray(opened.convert("L")) > 0
+        # A case with no reference and no prediction draws an empty overlay on
+        # every panel, so there is nothing in it to look at.
+        if not truth.any() and not any(value.any() for value in predictions.values()):
+            continue
         columns = min(2, len(model_names))
         rows = math.ceil(len(model_names) / columns)
         figure, axes = plt.subplots(
@@ -2203,12 +2238,9 @@ def _render_semantic_prediction_grids(
         )
         with Image.open(case.image_path) as opened:
             image = np.asarray(opened.convert("RGB"), dtype=np.float32)
-        with Image.open(case.mask_path) as opened:
-            truth = np.asarray(opened.convert("L")) > 0
         for index, name in enumerate(model_names):
             row, column = divmod(index, columns)
-            with Image.open(prediction_dirs[name] / f"{case.case_id}.png") as opened:
-                prediction = np.asarray(opened.convert("L")) > 0
+            prediction = predictions[name]
             overlay = image.copy()
             overlay[truth] = 0.55 * overlay[truth] + 0.45 * np.asarray([0, 200, 90])
             overlay[prediction] = 0.55 * overlay[prediction] + 0.45 * np.asarray([215, 50, 160])

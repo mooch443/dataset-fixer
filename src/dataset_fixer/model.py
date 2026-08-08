@@ -1008,8 +1008,10 @@ class Model:
         Parameters:
             source: Fixed, on-disk :class:`Dataset` to evaluate.
             split: Dataset split forming the frozen evaluation cohort.
-            save_prediction_plots: Write one annotated comparison grid per
-                source image under ``predictions/``. This can be storage-heavy.
+            save_prediction_plots: Write annotated comparison grids under
+                ``predictions/`` for the cases the report keeps in
+                ``worst_cases``. Cases with neither a reference nor a
+                prediction are skipped, since their panels are empty.
             progress: Show package-managed progress bars.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.
@@ -1270,9 +1272,11 @@ class ModelCollection:
         Parameters:
             source: Fixed, on-disk :class:`Dataset` to evaluate.
             split: Dataset split forming the frozen evaluation cohort.
-            save_prediction_plots: Write one annotated comparison grid per
-                source image under ``predictions/``. Rows contain at most two
-                model panels, so this option can be storage-heavy.
+            save_prediction_plots: Write annotated comparison grids under
+                ``predictions/`` for the cases the report keeps in
+                ``worst_cases``, with at most two model panels per row.
+                Cases with neither a reference nor a prediction are
+                skipped, since their panels are empty.
             progress: Show package-managed progress bars.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.
