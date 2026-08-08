@@ -600,3 +600,129 @@ def test_virtual_camera_lossy_crops_remain_representable(
         assert annotation.point is not None and annotation.radius is not None
         x, y = annotation.point
         assert 0 < annotation.radius <= min(x, y, 80 - x, 80 - y)
+
+
+def test_validation_can_use_its_own_virtual_camera_pipeline(tmp_path: Path) -> None:
+    """Selecting a checkpoint against colour jitter the model never sees is
+    misleading, so validation may keep geometry-only augmentation."""
+
+    source = make_yolo_dataset(
+        tmp_path / "split_pipelines",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.5 0.5 0.15 0.15", "0 0.3 0.7 0.1 0.1"],
+        val_rows=["0 0.5 0.5 0.15 0.15"],
+        size=(500, 500),
+    )
+    train_pipeline = A.Compose(
+        [
+            A.Affine(p=1.0, scale=(1.0, 1.2), rotate=(-45, 45), fill=0),
+            A.RandomBrightnessContrast(p=1.0),
+            A.HueSaturationValue(p=1.0),
+        ]
+    )
+    val_pipeline = A.Compose([A.Affine(p=1.0, scale=(1.0, 1.2), rotate=(-45, 45), fill=0)])
+
+    tiled = (
+        Dataset.open(source, task="detect", progress=False)
+        .tile(
+            mode="coverage",
+            tile_size=128,
+            target_appearances_per_object=2,
+            sparse_appearances_per_object=2,
+            background_ratio=0,
+            crop_transforms=train_pipeline,
+            val_crop_transforms=val_pipeline,
+            augment_val=True,
+            allow_lossy=True,
+            visualize=False,
+            progress=False,
+        )
+        .export(destination=tmp_path / "split_out", visualize=False, progress=False)
+    )
+
+    audit = tiled.manifest["audits"]["crop_augmentation"]
+    assert audit["pipeline_per_split"] == {
+        "train": "crop_transforms",
+        "val": "val_crop_transforms",
+    }
+
+    def transform_names(pipeline) -> tuple[str, ...]:
+        return tuple(
+            step["__class_fullname__"]
+            for step in (pipeline or {}).get("transform", {}).get("transforms", [])
+        )
+
+    assert transform_names(audit["pipeline"]) == (
+        "Affine",
+        "RandomBrightnessContrast",
+        "HueSaturationValue",
+    )
+    assert transform_names(audit["val_pipeline"]) == ("Affine",)
+
+    used = {"train": set(), "val": set()}
+    for record in tiled.provenance.values():
+        used[record["output_split"]].add(transform_names(record.get("crop_pipeline")))
+    assert used["val"] == {("Affine",)}
+    assert used["train"] == {
+        ("Affine", "RandomBrightnessContrast", "HueSaturationValue")
+    }
+
+
+def test_val_crop_transforms_requires_augmented_validation(tmp_path: Path) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "val_pipeline_guard",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.5 0.5 0.2 0.2"],
+        val_rows=["0 0.5 0.5 0.2 0.2"],
+    )
+    pipeline = A.Compose([A.Affine(p=1.0, scale=(1.0, 1.1), fill=0)])
+
+    with pytest.raises(ValueError, match="val_crop_transforms requires augment_val"):
+        Dataset.open(source, task="detect", progress=False).tile(
+            mode="coverage",
+            tile_size=64,
+            crop_transforms=pipeline,
+            val_crop_transforms=pipeline,
+            augment_val=False,
+            visualize=False,
+            progress=False,
+        )
+
+
+def test_validation_pipeline_alone_still_augments_validation(tmp_path: Path) -> None:
+    """``val_crop_transforms`` without ``crop_transforms`` leaves training clean."""
+
+    source = make_yolo_dataset(
+        tmp_path / "val_only_pipeline",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.5 0.5 0.15 0.15"],
+        val_rows=["0 0.5 0.5 0.15 0.15"],
+        size=(400, 400),
+    )
+    pipeline = A.Compose([A.Affine(p=1.0, scale=(1.0, 1.2), rotate=(-30, 30), fill=0)])
+
+    tiled = (
+        Dataset.open(source, task="detect", progress=False)
+        .tile(
+            mode="coverage",
+            tile_size=128,
+            target_appearances_per_object=2,
+            sparse_appearances_per_object=2,
+            background_ratio=0,
+            val_crop_transforms=pipeline,
+            augment_val=True,
+            allow_lossy=True,
+            visualize=False,
+            progress=False,
+        )
+        .export(destination=tmp_path / "val_only_out", visualize=False, progress=False)
+    )
+
+    by_split = {"train": set(), "val": set()}
+    for record in tiled.provenance.values():
+        by_split[record["output_split"]].add(record.get("crop_transform_seed") is not None)
+    assert by_split["val"] == {True}
+    assert by_split["train"] == {False}

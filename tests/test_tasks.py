@@ -1296,3 +1296,70 @@ def test_portrait_and_landscape_images_are_covered_equally(
         landscape["source_image_space_coverage_percent"]
         - portrait["source_image_space_coverage_percent"]
     ) < 5.0
+
+
+def test_background_tiles_can_be_capped_per_source_image(tmp_path: Path) -> None:
+    """One large empty image should not be able to supply every background tile."""
+
+    rows = ["0 0.5 0.5 0.1 0.1", "0 0.2 0.2 0.08 0.08", "", "", ""]
+    source = make_yolo_dataset(
+        tmp_path / "background_source",
+        task="detect",
+        names=["fruit"],
+        train_rows=rows,
+        val_rows=rows,
+        size=(800, 800),
+    )
+
+    def background_tiles_per_source(cap: int | None, destination: str) -> Counter:
+        tiled = (
+            Dataset.open(source, task="detect", progress=False)
+            .tile(
+                mode="coverage",
+                tile_size=128,
+                target_appearances_per_object=4,
+                sparse_appearances_per_object=4,
+                background_ratio=0.4,
+                max_background_tiles_per_source_image=cap,
+                allow_lossy=True,
+                visualize=False,
+                progress=False,
+            )
+            .export(destination=tmp_path / destination, visualize=False, progress=False)
+        )
+        counts: Counter = Counter()
+        for record in tiled.provenance.values():
+            if int(record["output_annotation_count"]) == 0:
+                counts[Path(record["original_image"]).stem] += 1
+        return counts
+
+    uncapped = background_tiles_per_source(None, "uncapped")
+    capped = background_tiles_per_source(2, "capped")
+
+    assert max(uncapped.values()) > 2, "fixture does not exercise the cap"
+    assert max(capped.values()) <= 2
+    # Capping per source spreads the same quota over more source images.
+    assert len(capped) >= len(uncapped)
+
+
+def test_background_tile_cap_must_be_positive(tmp_path: Path) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "cap_validation",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.5 0.5 0.2 0.2"],
+        val_rows=["0 0.5 0.5 0.2 0.2"],
+    )
+
+    # Coverage settings are validated when the plan is materialized.
+    plan = Dataset.open(source, task="detect", progress=False).tile(
+        mode="coverage",
+        tile_size=64,
+        max_background_tiles_per_source_image=0,
+        visualize=False,
+        progress=False,
+    )
+    with pytest.raises(ValueError, match="max_background_tiles_per_source_image"):
+        plan.export(
+            destination=tmp_path / "invalid_cap", visualize=False, progress=False
+        )

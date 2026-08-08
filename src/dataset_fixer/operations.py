@@ -80,19 +80,51 @@ def split_dataset(
                 )
             locked[group] = target
 
+    # Ratios apply to the annotated images as well as to the total, because a
+    # split that is correct overall can still starve one side of labels when
+    # most images are background.
+    group_annotated = {
+        group: sum(bool(sample.annotations) for sample in group_samples)
+        for group, group_samples in groups.items()
+    }
+    annotated_total = sum(group_annotated.values())
+
     counts = Counter()
+    annotated_counts = Counter()
     for group, target in locked.items():
         counts[target] += len(groups[group])
+        annotated_counts[target] += group_annotated[group]
         for sample in groups[group]:
             assignments[str(sample.image_path)] = target
     rng = random.Random(seed)
     remaining = [group for group in groups if group not in locked]
     rng.shuffle(remaining)
+    # Place annotated groups first: they are the scarce resource, and
+    # background groups can then fill whatever total quota is left.
+    remaining.sort(key=lambda group: -group_annotated[group])
     target_counts = {split: ratio * len(samples) for split, ratio in normalized.items()}
+    target_annotated = {
+        split: ratio * annotated_total for split, ratio in normalized.items()
+    }
+
+    def deficits(split: str) -> tuple[float, float]:
+        return (
+            (target_annotated[split] - annotated_counts[split])
+            / max(target_annotated[split], 1),
+            (target_counts[split] - counts[split]) / max(target_counts[split], 1),
+        )
+
     for group in remaining:
         eligible = [split for split, ratio in normalized.items() if ratio > 0]
-        target = max(eligible, key=lambda split: (target_counts[split] - counts[split]) / max(target_counts[split], 1))
+        carries_labels = group_annotated[group] > 0
+        target = max(
+            eligible,
+            key=lambda split: (
+                deficits(split) if carries_labels else deficits(split)[::-1]
+            ),
+        )
         counts[target] += len(groups[group])
+        annotated_counts[target] += group_annotated[group]
         for sample in groups[group]:
             assignments[str(sample.image_path)] = target
 
@@ -106,12 +138,26 @@ def split_dataset(
     }
     settings = {
         "ratios": normalized,
+        "ratio_targets": "total_and_annotated_images",
         "source_splits": sorted(selected),
         "seed": seed,
         "group_by": _callback_description(group_by),
         "assign": _callback_description(assign),
         "resolved_groups": resolved_groups,
         "resolved_assignments": assignments,
+        "resolved_distribution": {
+            split: {
+                "images": int(counts[split]),
+                "annotated_images": int(annotated_counts[split]),
+                "background_images": int(counts[split] - annotated_counts[split]),
+                "image_fraction": counts[split] / len(samples) if samples else 0.0,
+                "annotated_fraction": (
+                    annotated_counts[split] / annotated_total if annotated_total else 0.0
+                ),
+                "requested_fraction": normalized[split],
+            }
+            for split in normalized
+        },
         "visualize": visualize,
     }
     builder = _builder(dataset, destination, name, "split", settings)

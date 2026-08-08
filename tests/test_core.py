@@ -10,6 +10,7 @@ import yaml
 
 from dataset_fixer import Dataset, DatasetValidationError, Task
 from dataset_fixer.utils import settings_fingerprint, to_jsonable
+from conftest import make_yolo_dataset
 
 
 def _audit(dataset: Dataset, name: str):
@@ -740,3 +741,74 @@ def test_conflicting_group_assignments_fail_before_writes(detect_dataset: Path, 
             progress=False,
         )
     assert not destination.exists()
+
+
+def test_split_ratios_apply_to_annotated_images_as_well_as_totals(
+    tmp_path: Path,
+) -> None:
+    """Background dominates the count, so totals alone can starve val of labels."""
+
+    rows = ["0 0.5 0.5 0.2 0.2" if index % 5 == 0 else "" for index in range(40)]
+    source = make_yolo_dataset(
+        tmp_path / "sparse_labels",
+        task="detect",
+        names=["fruit"],
+        train_rows=rows,
+        val_rows=[""],
+        size=(300, 300),
+    )
+
+    result = (
+        Dataset.open(source, task="detect", progress=False)
+        .split({"train": 0.75, "val": 0.25}, seed=7, visualize=False, progress=False)
+        .export(destination=tmp_path / "split", visualize=False, progress=False)
+    )
+
+    split_record = next(
+        record
+        for record in result.manifest["history"]
+        if record["operation"] == "split"
+    )
+    distribution = split_record["settings"]["resolved_distribution"]
+    assert split_record["settings"]["ratio_targets"] == "total_and_annotated_images"
+
+    annotated = {
+        split: value["annotated_images"] for split, value in distribution.items()
+    }
+    assert sum(annotated.values()) == 8
+    # Both dimensions land on the requested ratio, not just the total.
+    for split, requested in (("train", 0.75), ("val", 0.25)):
+        assert abs(distribution[split]["annotated_fraction"] - requested) <= 0.13
+        assert abs(distribution[split]["image_fraction"] - requested) <= 0.13
+    assert annotated["val"] > 0
+
+
+def test_split_still_honours_groups_while_balancing_annotations(
+    tmp_path: Path,
+) -> None:
+    rows = ["0 0.5 0.5 0.2 0.2" if index % 4 == 0 else "" for index in range(24)]
+    source = make_yolo_dataset(
+        tmp_path / "grouped_labels",
+        task="detect",
+        names=["fruit"],
+        train_rows=rows,
+        val_rows=[""],
+        size=(300, 300),
+    )
+
+    result = (
+        Dataset.open(source, task="detect", progress=False)
+        .split(
+            {"train": 0.5, "val": 0.5},
+            group_by=lambda path: path.parent.name,
+            seed=3,
+            visualize=False,
+            progress=False,
+        )
+        .export(destination=tmp_path / "grouped", visualize=False, progress=False)
+    )
+
+    targets: dict[str, set[str]] = {}
+    for sample in result._samples:
+        targets.setdefault(sample.relative_path.parent.name, set()).add(sample.split)
+    assert all(len(splits) == 1 for splits in targets.values())

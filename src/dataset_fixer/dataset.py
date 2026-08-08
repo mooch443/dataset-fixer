@@ -770,12 +770,14 @@ class Dataset:
         max_attempts_per_target: int = 15,
         max_background_attempts_per_tile: int = 15,
         max_tiles_per_source_image: int | None = 100,
+        max_background_tiles_per_source_image: int | None = None,
         polo_radius_px: float | None = 15.0,
         radius_multiplier: float = 1.0,
         seed: int = 42,
         jpeg_quality: int = 95,
         allow_lossy: bool = False,
         crop_transforms: Any | None = None,
+        val_crop_transforms: Any | None = None,
         augment_val: bool = False,
         background_filter: Callable[[Image.Image], bool] | None = None,
         errors: Literal["raise", "skip"] = "raise",
@@ -815,8 +817,15 @@ class Dataset:
             crop_transforms: Optional serializable Albumentations pipeline
                 applied to a virtual full-source view before each coverage
                 crop is selected. This is supported only in coverage mode.
-            augment_val: Apply ``crop_transforms`` to validation crops as well
-                as training crops. Test crops are never augmented.
+            val_crop_transforms: Optional separate pipeline for validation
+                crops, used instead of ``crop_transforms`` when
+                ``augment_val`` is set. Selecting a checkpoint against
+                appearance changes the deployed model never sees is
+                misleading, so validation can keep geometry-only
+                augmentation while training keeps the full pipeline.
+            augment_val: Apply ``crop_transforms`` -- or
+                ``val_crop_transforms`` when given -- to validation crops as
+                well as training crops. Test crops are never augmented.
             background_filter: Optional predicate called with each annotation-free
                 candidate as an RGB :class:`PIL.Image.Image`. Truthy keeps the
                 candidate and falsey discards it. It applies to copied empty
@@ -872,6 +881,10 @@ class Dataset:
                 each requested background crop.
             max_tiles_per_source_image: Positive-plus-background cap per large
                 source image; ``None`` disables the cap.
+            max_background_tiles_per_source_image: Cap on background tiles
+                taken from any single source image, applied on top of
+                ``max_tiles_per_source_image``. ``None`` disables it, so one
+                large empty image can supply the whole background quota.
             polo_radius_px: POLO source-space radius used for containment and
                 output labels. ``None`` uses each annotation's own radius.
             radius_multiplier: Additional POLO output-radius multiplier.
@@ -893,11 +906,27 @@ class Dataset:
             raise TypeError("augment_val must be a bool")
         if crop_transforms is not None and mode != "coverage":
             raise ValueError("crop_transforms is supported only when mode='coverage'")
-        if augment_val and crop_transforms is None:
-            raise ValueError("augment_val=True requires crop_transforms")
+        if augment_val and crop_transforms is None and val_crop_transforms is None:
+            raise ValueError(
+                "augment_val=True requires crop_transforms or val_crop_transforms"
+            )
+        if val_crop_transforms is not None and not augment_val:
+            raise ValueError(
+                "val_crop_transforms requires augment_val=True; without it "
+                "validation crops are never augmented"
+            )
+        if val_crop_transforms is not None and mode != "coverage":
+            raise ValueError(
+                "val_crop_transforms is supported only when mode='coverage'"
+            )
         if background_filter is not None and not callable(background_filter):
             raise TypeError("background_filter must be callable or None")
         crop_pipeline = serialize_pipeline(crop_transforms, {}) if crop_transforms is not None else None
+        val_crop_pipeline = (
+            serialize_pipeline(val_crop_transforms, {})
+            if val_crop_transforms is not None
+            else None
+        )
         background_filter_description = callback_description(background_filter)
         if mode == "grid":
             if not (
@@ -945,12 +974,14 @@ class Dataset:
             "max_attempts_per_target": max_attempts_per_target,
             "max_background_attempts_per_tile": max_background_attempts_per_tile,
             "max_tiles_per_source_image": max_tiles_per_source_image,
+            "max_background_tiles_per_source_image": max_background_tiles_per_source_image,
             "polo_radius_px": polo_radius_px,
             "radius_multiplier": radius_multiplier,
             "seed": seed,
             "jpeg_quality": jpeg_quality,
             "crop_pipeline": crop_pipeline,
             "augment_val": augment_val,
+            "val_crop_pipeline": val_crop_pipeline,
         }
         public_settings = {
             "mode": mode, "tile_size": tile_size, "overlap": overlap,

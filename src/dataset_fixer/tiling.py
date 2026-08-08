@@ -1409,6 +1409,9 @@ def _tile_coverage(
                             "background_filter_rejections": int(
                                 background_filter_stats["rejected"]
                             ),
+                            "max_background_tiles_per_source_image": cfg.get(
+                                "max_background_tiles_per_source_image"
+                            ),
                             "reason": "; ".join(fallback_reasons)
                             or "all background candidate pools were exhausted",
                         },
@@ -1416,6 +1419,13 @@ def _tile_coverage(
                         suggestion=(
                             "lower background_ratio, raise max_background_attempts_per_tile or "
                             "max_tiles_per_source_image, "
+                            + (
+                                "raise or remove max_background_tiles_per_source_image "
+                                f"(currently {cfg['max_background_tiles_per_source_image']}), "
+                                if cfg.get("max_background_tiles_per_source_image")
+                                is not None
+                                else ""
+                            )
                             + (
                                 "relax background_filter, "
                                 if background_filter is not None
@@ -1566,6 +1576,15 @@ def _tile_coverage(
                 )
             crop_report = {
                 "pipeline": cfg["crop_pipeline"],
+                "val_pipeline": cfg.get("val_crop_pipeline"),
+                "pipeline_per_split": {
+                    split: (
+                        "val_crop_transforms"
+                        if split == "val" and cfg.get("val_crop_pipeline") is not None
+                        else "crop_transforms"
+                    )
+                    for split in transformed_splits
+                },
                 "augment_val": bool(cfg.get("augment_val")),
                 "transformed_splits": transformed_splits,
                 "unchanged_splits": unchanged_splits,
@@ -1717,10 +1736,24 @@ def _coverage_targets(sample: Sample, cfg: dict[str, Any]) -> dict[int, int]:
     return targets
 
 
+def _crop_pipeline_for(split: str, cfg: dict[str, Any]) -> Any | None:
+    """The virtual-camera pipeline a split should use, or ``None`` for none.
+
+    Validation may run its own pipeline so that model selection is not scored
+    against appearance changes the deployed model will never see.
+    """
+
+    if split == "val":
+        if not bool(cfg.get("augment_val")):
+            return None
+        return cfg.get("val_crop_pipeline") or cfg.get("crop_pipeline")
+    if split == "train":
+        return cfg.get("crop_pipeline")
+    return None
+
+
 def _crop_pipeline_enabled(split: str, cfg: dict[str, Any]) -> bool:
-    if cfg.get("crop_pipeline") is None:
-        return False
-    return split == "train" or (split == "val" and bool(cfg.get("augment_val")))
+    return _crop_pipeline_for(split, cfg) is not None
 
 
 def _plain_positive_candidate(
@@ -1911,7 +1944,7 @@ def _virtual_positive_candidate(
     ) = apply_virtual_view(
         sample,
         task,
-        cfg["crop_pipeline"],
+        _crop_pipeline_for(sample.split, cfg),
         seed,
         source_image=source_image,
         flip_idx=flip_idx,
@@ -2015,7 +2048,7 @@ def _virtual_positive_candidate(
             "transformed_view_size": [int(view_image.shape[1]), int(view_image.shape[0])],
             "crop_transform_seed": seed,
             "crop_transform_attempt": attempt,
-            "crop_pipeline": cfg["crop_pipeline"],
+            "crop_pipeline": _crop_pipeline_for(sample.split, cfg),
             "crop_albumentations_applied": applied,
             "valid_pixel_fraction": 1.0,
             "validity_result": "all_output_pixels_map_to_source",
@@ -2262,18 +2295,26 @@ def _allocate_backgrounds(
     stats = stats if stats is not None else Counter()
     filter_stats = filter_stats if filter_stats is not None else Counter()
     cap = cfg["max_tiles_per_source_image"]
+    background_cap = cfg.get("max_background_tiles_per_source_image")
     source_cache: dict[str, np.ndarray] = {}
+
+    def background_count(record: dict[str, Any]) -> int:
+        return len(record["background_boxes"]) + len(record.get("background_tiles", []))
+
     for attempt in range(1, desired * int(cfg["max_background_attempts_per_tile"]) + 1):
         if allocated >= desired:
             break
         eligible = [
             record
             for record in records
-            if cap is None
-            or record["next_tile_idx"]
-            + len(record["background_boxes"])
-            + len(record.get("background_tiles", []))
-            < int(cap)
+            if (
+                cap is None
+                or record["next_tile_idx"] + background_count(record) < int(cap)
+            )
+            and (
+                background_cap is None
+                or background_count(record) < int(background_cap)
+            )
         ]
         if not eligible:
             break
@@ -2306,7 +2347,7 @@ def _allocate_backgrounds(
             ) = apply_virtual_view(
                 sample,
                 task,
-                cfg["crop_pipeline"],
+                _crop_pipeline_for(sample.split, cfg),
                 seed,
                 source_image=source_image,
                 flip_idx=flip_idx,
@@ -2362,7 +2403,7 @@ def _allocate_backgrounds(
                         ],
                         "crop_transform_seed": seed,
                         "crop_transform_attempt": attempt,
-                        "crop_pipeline": cfg["crop_pipeline"],
+                        "crop_pipeline": _crop_pipeline_for(sample.split, cfg),
                         "crop_albumentations_applied": applied,
                         "valid_pixel_fraction": 1.0,
                         "validity_result": "all_output_pixels_map_to_source",
@@ -3268,6 +3309,9 @@ def _validate_coverage_settings(cfg: dict[str, Any]) -> None:
         raise ValueError("large_image_threshold must be non-negative or None")
     if cfg["max_tiles_per_source_image"] is not None and int(cfg["max_tiles_per_source_image"]) <= 0:
         raise ValueError("max_tiles_per_source_image must be positive or None")
+    background_cap = cfg.get("max_background_tiles_per_source_image")
+    if background_cap is not None and int(background_cap) <= 0:
+        raise ValueError("max_background_tiles_per_source_image must be positive or None")
     if not 0 <= float(cfg["background_ratio"]) < 1:
         raise ValueError("background_ratio must be in [0, 1)")
     if not 0 <= float(cfg["min_area_ratio"]) <= 1:
