@@ -32,6 +32,7 @@ from .utils import (
     IMAGE_SUFFIXES,
     environment_snapshot,
     normalize_split,
+    package_versions,
     settings_fingerprint,
     sha256_file,
     to_jsonable,
@@ -240,19 +241,41 @@ def compare_nnunet_models(
             }
             cache_identity = cache_key(cache_payload)
             cache_dir = default_cache_root(export.location) / "semantic" / cache_identity
-            cached = _load_semantic_cache(
-                cache_dir, cases, progress=progress, model_name=spec.name
+            legacy_cache_dir = default_cache_root(export.location) / "semantic" / cache_key(
+                {
+                    "schema": SEMANTIC_EVALUATION_CACHE_SCHEMA,
+                    "space": "nnunet-semantic",
+                    "cohort": cohort_fingerprint,
+                    "model_sha256": spec.digest,
+                    "backend": selected_backend,
+                    "folds": spec.folds,
+                    "checkpoint": spec.checkpoint,
+                    "upscale_factor": spec.upscale_factor,
+                    "device": resolved_devices[spec.name],
+                    "resolution": spec.resolution or 480,
+                    "sahi": resolved_sahi_by_model.get(spec.name),
+                    "versions": package_versions(),
+                }
             )
-            if cached is not None and all(
-                key in cached for key in ("summary", "native_summary", "native_rows")
-            ):
+            cache_dir, cached = _load_compatible_semantic_cache(
+                cache_dir,
+                (legacy_cache_dir,),
+                cases,
+                cache_identity=cache_payload,
+                required_fields=("summary", "native_summary", "native_rows"),
+                progress=progress,
+                model_name=spec.name,
+            )
+            if cached is not None:
                 prediction_dir = cache_dir / "predictions"
                 summary = dict(cached["summary"])
                 native_summary = dict(cached["native_summary"])
-                rows = [{**row, "model": spec.name} for row in cached["rows"]]
-                native_rows = [
-                    {**row, "model": spec.name} for row in cached["native_rows"]
-                ]
+                rows = _rebase_cached_semantic_rows(
+                    cached["rows"], cases, model_name=spec.name
+                )
+                native_rows = _rebase_cached_semantic_rows(
+                    cached["native_rows"], cases, model_name=spec.name
+                )
                 inference_seconds = float(cached.get("inference_seconds", 0.0))
                 execution = dict(cached.get("execution") or {})
                 cache_status = "hit"
@@ -678,17 +701,42 @@ def compare_semantic_models(
             }
             cache_identity = cache_key(cache_payload)
             cache_dir = default_cache_root(export.location) / "semantic" / cache_identity
-            cached = _load_semantic_cache(
-                cache_dir, cases, progress=progress, model_name=model.name
+            legacy_cache_dir = default_cache_root(export.location) / "semantic" / cache_key(
+                {
+                    "schema": SEMANTIC_EVALUATION_CACHE_SCHEMA,
+                    "space": "binary-semantic",
+                    "cohort": cohort_fingerprint,
+                    "model_sha256": model.digest,
+                    "kind": model.kind,
+                    "task": model.task,
+                    "model_settings": model.settings,
+                    "folds": model.folds,
+                    "checkpoint": model.checkpoint,
+                    "upscale_factor": model.upscale_factor,
+                    "workers": model.workers,
+                    "batch_size": model.batch_size,
+                    "settings": {
+                        key: value
+                        for key, value in predict_options.items()
+                        if key != "progress"
+                    },
+                    "versions": package_versions(),
+                }
+            )
+            cache_dir, cached = _load_compatible_semantic_cache(
+                cache_dir,
+                (legacy_cache_dir,),
+                cases,
+                cache_identity=cache_payload,
+                required_fields=("projection", "native_task", "backend"),
+                progress=progress,
+                model_name=model.name,
             )
             if cached is not None:
-                if progress:
-                    print(f"Cache hit: {model.name} ({len(cases)} semantic masks)")
                 prediction_dir = cache_dir / "predictions"
-                rows = [
-                    {**row, "model": model.name}
-                    for row in cached["rows"]
-                ]
+                rows = _rebase_cached_semantic_rows(
+                    cached["rows"], cases, model_name=model.name
+                )
                 projection = str(cached["projection"])
                 native_task = str(cached["native_task"])
                 prediction_backend = str(cached["backend"])
@@ -1755,6 +1803,31 @@ def _model_inputs_from_cases(
     )
 
 
+def _rebase_cached_semantic_rows(
+    rows: Iterable[Mapping[str, Any]],
+    cases: list[_SemanticCase],
+    *,
+    model_name: str,
+) -> list[dict[str, Any]]:
+    """Refresh location-only row metadata after a dataset/cache is moved."""
+
+    by_id = {case.case_id: case for case in cases}
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        value = dict(row)
+        case = by_id[str(value["case_id"])]
+        value.update(
+            {
+                "model": model_name,
+                "relative_path": case.relative_path.as_posix(),
+                "source_image": str(case.image_path),
+                "source_mask": str(case.mask_path),
+            }
+        )
+        output.append(value)
+    return output
+
+
 def _prepare_model_input_labels(
     inputs: tuple[ModelInput, ...],
     label_dir: Path,
@@ -2433,6 +2506,139 @@ def _semantic_result_from_manifest(
     )
 
 
+def _load_compatible_semantic_cache(
+    cache_dir: Path,
+    legacy_cache_dirs: Iterable[Path],
+    cases: list[_SemanticCase],
+    *,
+    cache_identity: dict[str, Any],
+    required_fields: Iterable[str] = (),
+    progress: bool = False,
+    model_name: str | None = None,
+) -> tuple[Path, dict[str, Any] | None]:
+    """Load the current semantic cache key or a compatible historical key.
+
+    First probe the canonical key, then discover entries whose stored logical
+    identity matches even if an archive or older implementation placed them
+    under a different directory hash. Cache identity also used to include
+    execution-only values such as device, batching, worker count, and installed
+    package versions, so the exact historical hash is checked as a final
+    compatibility path. Every verified hit is promoted to the current key.
+    """
+
+    discovered: list[Path] = []
+    unverifiable: list[tuple[Path, str]] = []
+    expected_case_ids = {case.case_id for case in cases}
+    if cache_dir.parent.is_dir():
+        for metadata_path in cache_dir.parent.glob("*/evaluation.json"):
+            if metadata_path.parent.name.startswith("."):
+                # Cache publication is an atomic rename from a hidden staging
+                # directory. Never discover or reuse unpublished work, even if
+                # interruption happened after its metadata was written.
+                continue
+            try:
+                value = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            stored_identity = value.get("cache_identity") if isinstance(value, dict) else None
+            if (
+                isinstance(stored_identity, dict)
+                and cache_key(stored_identity) == cache_key(cache_identity)
+            ):
+                discovered.append(metadata_path.parent)
+            elif not isinstance(stored_identity, dict) and isinstance(value, dict):
+                rows = value.get("rows")
+                if (
+                    model_name is not None
+                    and isinstance(rows, list)
+                    and {str(row.get("model")) for row in rows} == {model_name}
+                    and {str(row.get("case_id")) for row in rows} == expected_case_ids
+                ):
+                    unverifiable.append(
+                        (
+                            metadata_path.parent,
+                            "legacy entry has no stored logical identity, so model bytes/settings cannot be verified",
+                        )
+                    )
+
+    candidates = (cache_dir, *discovered, *legacy_cache_dirs)
+    seen: set[Path] = set()
+    invalid: list[tuple[Path, str]] = list(unverifiable)
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        cached, status = _inspect_semantic_cache(
+            candidate,
+            cases,
+            progress=progress,
+            model_name=model_name,
+        )
+        if cached is None:
+            if status != "not found":
+                invalid.append((candidate, status))
+            continue
+        missing_fields = [field for field in required_fields if field not in cached]
+        if missing_fields:
+            invalid.append(
+                (candidate, f"metadata is missing fields: {', '.join(missing_fields)}")
+            )
+            continue
+        if candidate != cache_dir:
+            promoted = _promote_semantic_cache(
+                candidate,
+                cache_dir,
+                {**cached, "cache_identity": cache_identity},
+            )
+            if promoted:
+                candidate = cache_dir
+            if progress:
+                print(
+                    f"Cache hit: {model_name or 'semantic model'} "
+                    f"({len(cases)} completed masks; compatible historical cache key)"
+                )
+        elif progress:
+            print(
+                f"Cache hit: {model_name or 'semantic model'} "
+                f"({len(cases)} completed masks)"
+            )
+        return candidate, cached
+    if progress:
+        for candidate, reason in invalid:
+            print(
+                f"Cache invalid: {model_name or 'semantic model'} at {candidate}: {reason}"
+            )
+        print(
+            f"Cache miss: {model_name or 'semantic model'} "
+            "(no valid completed prediction cache; running inference)"
+        )
+    return cache_dir, None
+
+
+def _promote_semantic_cache(
+    source: Path,
+    destination: Path,
+    metadata: dict[str, Any],
+) -> bool:
+    """Atomically move a verified historical cache entry to its current key."""
+
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            shutil.rmtree(destination)
+        source.replace(destination)
+    except OSError:
+        # Recognition must still succeed on read-only or cross-device caches.
+        return False
+    try:
+        write_json(destination / "evaluation.json", metadata)
+    except OSError:
+        # The directory name now carries the current identity; the already
+        # verified metadata remains sufficient if refreshing it is impossible.
+        pass
+    return True
+
+
 def _load_semantic_cache(
     cache_dir: Path,
     cases: list[_SemanticCase],
@@ -2440,10 +2646,32 @@ def _load_semantic_cache(
     progress: bool = False,
     model_name: str | None = None,
 ) -> dict[str, Any] | None:
+    value, _ = _inspect_semantic_cache(
+        cache_dir,
+        cases,
+        progress=progress,
+        model_name=model_name,
+    )
+    return value
+
+
+def _inspect_semantic_cache(
+    cache_dir: Path,
+    cases: list[_SemanticCase],
+    *,
+    progress: bool = False,
+    model_name: str | None = None,
+) -> tuple[dict[str, Any] | None, str]:
     metadata = cache_dir / "evaluation.json"
     predictions = cache_dir / "predictions"
-    if not metadata.is_file() or not predictions.is_dir():
-        return None
+    metadata_exists = metadata.is_file()
+    predictions_exist = predictions.is_dir()
+    if not metadata_exists and not predictions_exist:
+        return None, "not found"
+    if not metadata_exists:
+        return None, "incomplete publication: evaluation.json is missing"
+    if not predictions_exist:
+        return None, "incomplete publication: predictions directory is missing"
     expected = {f"{case.case_id}.png" for case in cases}
     paths = list(predictions.glob("*.png"))
     actual = {
@@ -2457,19 +2685,22 @@ def _load_semantic_cache(
         if path.is_file()
     }
     if actual != expected:
-        return None
+        return None, (
+            f"prediction set mismatch (expected {len(expected)}, found {len(actual)}, "
+            f"missing {len(expected - actual)}, unexpected {len(actual - expected)})"
+        )
     try:
         value = json.loads(metadata.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None
+        return None, "evaluation.json is unreadable"
     if not isinstance(value, dict) or value.get("schema") != SEMANTIC_EVALUATION_CACHE_SCHEMA:
-        return None
+        return None, "evaluation.json has an incompatible schema"
     rows = value.get("rows")
     if not isinstance(rows, list) or {str(row.get("case_id")) for row in rows} != {
         case.case_id for case in cases
     }:
-        return None
-    return value
+        return None, "evaluation rows do not match the frozen cohort"
+    return value, "valid"
 
 
 def _save_semantic_cache(
@@ -2480,8 +2711,6 @@ def _save_semantic_cache(
     progress: bool = False,
     model_name: str | None = None,
 ) -> None:
-    if (cache_dir / "evaluation.json").is_file():
-        return
     cache_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(
         tempfile.mkdtemp(prefix=f".{cache_dir.name}.building-", dir=cache_dir.parent)

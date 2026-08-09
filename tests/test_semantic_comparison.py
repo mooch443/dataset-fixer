@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from dataset_fixer import (
     PredictionResult,
     SemanticComparisonResult,
 )
+from dataset_fixer.comparison.cache import cache_key, default_cache_root
 from dataset_fixer.comparison.types import Prediction
 from dataset_fixer.semantic_comparison import (
     SEMANTIC_REPORT_SCHEMA,
@@ -26,6 +28,7 @@ from dataset_fixer.semantic_comparison import (
     _project_semantic_predictions,
     _select_visual_cases,
 )
+from dataset_fixer.utils import package_versions
 from conftest import make_yolo_dataset
 
 
@@ -414,6 +417,7 @@ def test_semantic_comparison_reports_finite_dice_support(
 def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     exported = _semantic_export(tmp_path)
     yolo_path = tmp_path / "yolo-seg.pt"
@@ -565,13 +569,132 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
     assert (destination / "reports" / "comparison.png").is_file()
     assert not list(destination.rglob("*.jsonl"))
     calls_after_first = len(prediction_options)
-    models.compare(
+
+    # Releases before the stable logical cache identity included execution-only
+    # settings and package versions in the directory hash. Simulate an archive
+    # restored from that release and verify it is recognized before prediction.
+    cache_root = default_cache_root(exported.location) / "semantic"
+    legacy_dirs: list[Path] = []
+    current_dirs: list[Path] = []
+    for index, (model, options) in enumerate(zip(models, prediction_options)):
+        current_payload = {
+            "schema": 2,
+            "space": "binary-semantic",
+            "cohort": result.cohort_fingerprint,
+            "model_sha256": model.digest,
+            "kind": model.kind,
+            "task": model.task,
+            "folds": model.folds,
+            "checkpoint": model.checkpoint,
+            "upscale_factor": model.upscale_factor,
+            "inference": model.inference,
+            "resolution": model.resolution or 480,
+            "settings": model.settings,
+        }
+        current_dir = cache_root / cache_key(current_payload)
+        current_dirs.append(current_dir)
+        metadata_path = current_dir / "evaluation.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        legacy_payload = {
+            "schema": 2,
+            "space": "binary-semantic",
+            "cohort": result.cohort_fingerprint,
+            "model_sha256": model.digest,
+            "kind": model.kind,
+            "task": model.task,
+            "model_settings": model.settings,
+            "folds": model.folds,
+            "checkpoint": model.checkpoint,
+            "upscale_factor": model.upscale_factor,
+            "workers": model.workers,
+            "batch_size": model.batch_size,
+            "settings": {
+                key: value for key, value in options.items() if key != "progress"
+            },
+            "versions": package_versions(),
+        }
+        if index == 0:
+            # A portable archive may contain the correct stored identity under
+            # a stale or otherwise noncanonical directory name.
+            legacy_dir = cache_root / (f"restored-{index}-" + "0" * 54)
+        else:
+            # Older entries lacked cache_identity, so recognize their exact
+            # historical key as well.
+            metadata.pop("cache_identity", None)
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            legacy_dir = cache_root / cache_key(legacy_payload)
+        assert legacy_dir != current_dir
+        current_dir.rename(legacy_dir)
+        legacy_dirs.append(legacy_dir)
+
+    restored = models.compare(
         exported,
         split="val",
         progress=False,
         destination=tmp_path / "mixed-comparison-from-cache",
     )
     assert len(prediction_options) == calls_after_first
+    assert not any(path.exists() for path in legacy_dirs)
+    assert restored.cohort_fingerprint == result.cohort_fingerprint
+
+    # The dataset's absolute path is not part of the cache identity. A cache
+    # copied with the dataset must remain valid under a different parent/home.
+    relocated_root = tmp_path / "different-user-home" / "semantic-export"
+    shutil.copytree(exported.location, relocated_root)
+    relocated = Dataset.open(relocated_root, progress=False)
+    relocated_result = models.compare(
+        relocated,
+        split="val",
+        progress=False,
+        destination=tmp_path / "mixed-comparison-relocated",
+    )
+    assert relocated_result.cohort_fingerprint == result.cohort_fingerprint
+    assert len(prediction_options) == calls_after_first
+
+    # A completed-looking entry with a missing mask is invalid, must be
+    # reported before inference, and must be replaced after inference finishes.
+    broken_prediction = next((current_dirs[0] / "predictions").glob("*.png"))
+    broken_prediction.unlink()
+    capsys.readouterr()
+    calls_before_repair = len(prediction_options)
+    models.compare(
+        exported,
+        split="val",
+        progress=True,
+        destination=tmp_path / "mixed-comparison-repair-invalid-cache",
+    )
+    repair_output = capsys.readouterr().out
+    assert f"Cache invalid: {models[0].name}" in repair_output
+    assert "prediction set mismatch" in repair_output
+    assert len(prediction_options) == calls_before_repair + 1
+
+    models.compare(
+        exported,
+        split="val",
+        progress=True,
+        destination=tmp_path / "mixed-comparison-after-repair",
+    )
+    hit_output = capsys.readouterr().out
+    assert f"Cache hit: {models[0].name}" in hit_output
+    assert len(prediction_options) == calls_before_repair + 1
+
+    # Even a staging directory that happens to contain every file is not a
+    # published cache entry and must never be discovered as a hit.
+    unpublished = current_dirs[1].with_name(
+        f".{current_dirs[1].name}.building-interrupted"
+    )
+    current_dirs[1].rename(unpublished)
+    calls_before_unpublished = len(prediction_options)
+    models.compare(
+        exported,
+        split="val",
+        progress=True,
+        destination=tmp_path / "mixed-comparison-unpublished-cache",
+    )
+    unpublished_output = capsys.readouterr().out
+    assert f"Cache miss: {models[1].name}" in unpublished_output
+    assert len(prediction_options) == calls_before_unpublished + 1
+    assert unpublished.is_dir()
 
 
 def test_mixed_comparison_rejects_tasks_without_a_semantic_denominator(
