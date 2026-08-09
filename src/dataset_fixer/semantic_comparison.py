@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -1477,6 +1478,7 @@ def _predict_nnunet_sahi(
             # loads each fold once for the whole group rather than per tile.
             started = time.perf_counter()
             logits: list[Any] = [None] * len(prepared)
+            forward_batch_sizes: list[int] = []
 
             def report_oom_backoff(
                 attempted: int,
@@ -1501,6 +1503,7 @@ def _predict_nnunet_sahi(
             ):
                 predicted = session.predict_logits(
                     [prepared[index][0] for index in indices],
+                    on_batch=forward_batch_sizes.append,
                     on_oom=report_oom_backoff if progress else None,
                 )
                 for index, tile_logits in zip(indices, predicted):
@@ -1549,7 +1552,8 @@ def _predict_nnunet_sahi(
                         f"nnU-Net CUDA warm-up complete: {completed_tiles:,} tiles; "
                         f"CPU prep {preprocess_seconds:.1f}s, GPU {inference_seconds:.1f}s, "
                         f"CPU post {conversion_seconds + stitch_seconds:.1f}s; "
-                        f"effective batch {session.resolved_batch_size}, OOM retries "
+                        f"active batch cap {session.resolved_batch_size}, actual forward "
+                        f"batches {_format_batch_sizes(forward_batch_sizes)}, OOM retries "
                         f"{session.oom_retries}. Steady-state ETA will follow."
                     )
                     if completed_tiles == total_tiles:
@@ -1582,8 +1586,10 @@ def _predict_nnunet_sahi(
                     f"{rate:.2f} tile/s, ETA {eta}; group {group_index:,}/"
                     f"{len(groups):,} phases: CPU prep {preprocess_seconds:.1f}s, "
                     f"GPU {inference_seconds:.1f}s, CPU post "
-                    f"{conversion_seconds + stitch_seconds:.1f}s; effective batch "
-                    f"{session.resolved_batch_size}, OOM retries {session.oom_retries}."
+                    f"{conversion_seconds + stitch_seconds:.1f}s; active batch cap "
+                    f"{session.resolved_batch_size}, actual forward batches "
+                    f"{_format_batch_sizes(forward_batch_sizes)}, OOM retries "
+                    f"{session.oom_retries}."
                 )
                 last_text_report = now
     finally:
@@ -3230,6 +3236,15 @@ def _human_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {seconds:02d}s"
     return f"{seconds}s"
+
+
+def _format_batch_sizes(values: Iterable[int]) -> str:
+    counts = Counter(int(value) for value in values)
+    if not counts:
+        return "none"
+    return ", ".join(
+        f"{size}×{counts[size]}" for size in sorted(counts, reverse=True)
+    )
 
 
 def _visualization_destination(destination: str | Path) -> Path:

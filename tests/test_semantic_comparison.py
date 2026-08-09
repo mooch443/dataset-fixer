@@ -197,10 +197,12 @@ class FakeSession:
             for image in images
         ]
 
-    def predict_logits(self, prepared, *, on_oom=None):
+    def predict_logits(self, prepared, *, on_batch=None, on_oom=None):
         shapes = {tuple(value.shape) for value in prepared}
         assert len(shapes) == 1, f"minibatch received mixed shapes: {shapes}"
         self.batch_sizes.append(len(prepared))
+        if on_batch is not None:
+            on_batch(len(prepared))
         self.weight_loads += 1
         self.forward_passes += 1
         return [value[:1] for value in prepared]
@@ -1042,7 +1044,8 @@ def test_nnunet_sahi_progress_counts_every_tile_and_source(
     assert "Preparing first work group on CPU" in output
     assert "First work group preprocessed" in output
     assert "nnU-Net SAHI progress:" in output
-    assert "effective batch" in output
+    assert "active batch cap" in output
+    assert "actual forward batches" in output
 
 
 def test_nnunet_sahi_releases_the_session_when_prediction_is_interrupted(
