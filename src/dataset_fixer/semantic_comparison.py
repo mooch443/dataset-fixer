@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -1298,27 +1299,62 @@ def _predict_nnunet_sahi(
             f"  workers: {model.workers}\n"
             f"  TTA: {'enabled' if model.nnunet_tta else 'disabled'}"
         )
-    setup_progress = tqdm(
-        total=2,
-        desc=f"Preparing {model.name}",
-        unit="phase",
+    manifest_progress = tqdm(
+        total=len(inputs),
+        desc="Planning nnU-Net SAHI tiles",
+        unit="image",
         disable=not progress,
     )
     try:
         resolved = resolve_sahi_settings(settings, resolution=resolution)
-        manifests = {
-            value.image_id: build_tile_manifest(
+        manifests = {}
+        for value in inputs:
+            manifests[value.image_id] = build_tile_manifest(
                 width=value.width,
                 height=value.height,
                 settings=resolved,
             )
-            for value in inputs
-        }
-        total_tiles = sum(len(manifests[value.image_id]) for value in inputs)
-        setup_progress.update(1)
-        set_description = getattr(setup_progress, "set_description", None)
-        if set_description is not None:
-            set_description(f"Loading {model.name} checkpoint")
+            manifest_progress.update(1)
+    finally:
+        manifest_progress.close()
+    total_tiles = sum(len(manifests[value.image_id]) for value in inputs)
+    if progress:
+        print(
+            f"SAHI tile plan ready: {len(inputs):,} source images, "
+            f"{total_tiles:,} logical tiles. Loading nnU-Net checkpoint…"
+        )
+
+    checkpoint_progress = tqdm(
+        desc="Loading nnU-Net checkpoint",
+        unit="s",
+        disable=not progress,
+    )
+    refresh = getattr(checkpoint_progress, "refresh", None)
+    if refresh is not None:
+        refresh()
+    checkpoint_started = time.perf_counter()
+    checkpoint_stop = threading.Event()
+
+    def update_checkpoint_elapsed() -> None:
+        reported = 0
+        while not checkpoint_stop.wait(1.0):
+            elapsed = int(time.perf_counter() - checkpoint_started)
+            if elapsed > reported:
+                checkpoint_progress.update(elapsed - reported)
+                reported = elapsed
+
+    checkpoint_thread = (
+        threading.Thread(
+            target=update_checkpoint_elapsed,
+            name="dataset-fixer-nnunet-load-progress",
+            daemon=True,
+        )
+        if progress
+        else None
+    )
+    if checkpoint_thread is not None:
+        checkpoint_thread.start()
+    try:
         session = model._runtime_model(
             (
                 "nnunet-sahi",
@@ -1339,9 +1375,16 @@ def _predict_nnunet_sahi(
                 use_tta=model.nnunet_tta,
             ),
         )
-        setup_progress.update(1)
     finally:
-        setup_progress.close()
+        checkpoint_stop.set()
+        if checkpoint_thread is not None:
+            checkpoint_thread.join(timeout=1.0)
+        checkpoint_progress.close()
+    if progress:
+        print(
+            f"nnU-Net runtime ready in "
+            f"{time.perf_counter() - checkpoint_started:.1f}s; starting inference."
+        )
     telemetry = EngineTelemetry(
         device=device,
         plan_batch_size=session.plan_batch_size,
