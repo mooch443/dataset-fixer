@@ -1458,15 +1458,33 @@ def _predict_nnunet_sahi(
             # Folds are outermost inside predict_logits, so a multi-fold model
             # loads each fold once for the whole group rather than per tile.
             started = time.perf_counter()
-            oom_retries_before = session.oom_retries
             logits: list[Any] = [None] * len(prepared)
+
+            def report_oom_backoff(
+                attempted: int,
+                retry: int,
+                retry_number: int,
+                error: str,
+            ) -> None:
+                detail = " ".join(error.split())
+                if len(detail) > 500:
+                    detail = detail[:497] + "..."
+                print(
+                    f"CUDA OOM during nnU-Net forward at batch {attempted}; "
+                    f"cleared temporary CUDA allocations and retrying with batch "
+                    f"{retry} (OOM retry {retry_number}).\n"
+                    f"  CUDA error: {detail}",
+                    flush=True,
+                )
+
             for indices in _equal_shape_batches(
                 [array for array, _ in prepared],
                 classes=session.num_classes,
                 minimum=session.resolved_batch_size,
             ):
                 predicted = session.predict_logits(
-                    [prepared[index][0] for index in indices]
+                    [prepared[index][0] for index in indices],
+                    on_oom=report_oom_backoff if progress else None,
                 )
                 for index, tile_logits in zip(indices, predicted):
                     logits[index] = tile_logits
@@ -1476,13 +1494,6 @@ def _predict_nnunet_sahi(
             telemetry.inference_seconds += inference_seconds
             telemetry.resolved_batch_size = session.resolved_batch_size
             telemetry.oom_retries = session.oom_retries
-            if progress and session.oom_retries > oom_retries_before:
-                print(
-                    f"CUDA OOM backoff: {session.oom_retries - oom_retries_before} "
-                    f"retry/retries in group {group_index}; effective batch is now "
-                    f"{session.resolved_batch_size}.",
-                    flush=True,
-                )
 
             started = time.perf_counter()
             probabilities = session.to_probabilities_many(

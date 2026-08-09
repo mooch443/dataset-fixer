@@ -197,7 +197,7 @@ class FakeSession:
             for image in images
         ]
 
-    def predict_logits(self, prepared):
+    def predict_logits(self, prepared, *, on_oom=None):
         shapes = {tuple(value.shape) for value in prepared}
         assert len(shapes) == 1, f"minibatch received mixed shapes: {shapes}"
         self.batch_sizes.append(len(prepared))
@@ -1054,7 +1054,7 @@ def test_nnunet_sahi_releases_the_session_when_prediction_is_interrupted(
     folder = _nnunet_model(tmp_path / "interrupted-model")
     session = _install_fake_session(monkeypatch)
 
-    def cancel(prepared):
+    def cancel(prepared, **kwargs):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(session, "predict_logits", cancel)

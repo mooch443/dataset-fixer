@@ -203,6 +203,7 @@ class NnUNetSession:
         prepared: Sequence[np.ndarray],
         *,
         on_batch: Callable[[int], None] | None = None,
+        on_oom: Callable[[int, int, int, str], None] | None = None,
     ) -> list[Any]:
         """Predict fold-averaged logits for equally shaped preprocessed tiles.
 
@@ -258,7 +259,11 @@ class NnUNetSession:
                         padded[(slice(None), *slicer)],
                         memory_format=torch.contiguous_format,
                     ).to(self._predictor.device)
-                    predicted = self._forward(patches, on_batch=on_batch)
+                    predicted = self._forward(
+                        patches,
+                        on_batch=on_batch,
+                        on_oom=on_oom,
+                    )
                     logits[(slice(None), *slicer)] += (
                         predicted.to(results_device) * gaussian
                     )
@@ -348,7 +353,13 @@ class NnUNetSession:
         self._loaded_fold = fold_index
         self.weight_loads += 1
 
-    def _forward(self, patches: Any, *, on_batch: Callable[[int], None] | None) -> Any:
+    def _forward(
+        self,
+        patches: Any,
+        *,
+        on_batch: Callable[[int], None] | None,
+        on_oom: Callable[[int, int, int, str], None] | None,
+    ) -> Any:
         """Run mirroring TTA over minibatches, backing off on out-of-memory."""
 
         torch = self._torch
@@ -372,8 +383,16 @@ class NnUNetSession:
             except (RuntimeError, MemoryError) as error:
                 if not _is_out_of_memory(error) or self.resolved_batch_size <= 1:
                     raise
+                attempted_size = size
                 self.resolved_batch_size = max(1, self.resolved_batch_size // 2)
                 self.oom_retries += 1
+                if on_oom is not None:
+                    on_oom(
+                        attempted_size,
+                        self.resolved_batch_size,
+                        self.oom_retries,
+                        str(error),
+                    )
                 self.release()
                 continue
             outputs.append(predicted)

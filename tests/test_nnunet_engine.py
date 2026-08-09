@@ -233,12 +233,24 @@ def test_out_of_memory_halves_the_batch_and_retries_down_to_one() -> None:
     predictor._internal_maybe_mirror_and_predict = failing
     session.release = lambda: None
 
-    logits = session.predict_logits(_tiles(8))
+    backoffs: list[tuple[int, int, int, str]] = []
+    logits = session.predict_logits(
+        _tiles(8),
+        on_oom=lambda attempted, retry, number, error: backoffs.append(
+            (attempted, retry, number, error)
+        ),
+    )
 
     assert len(logits) == 8
     assert session.resolved_batch_size == 1
     assert session.oom_retries == 3
     assert predictor.batch_sizes == [1] * 8
+    assert [(attempted, retry, number) for attempted, retry, number, _ in backoffs] == [
+        (8, 4, 1),
+        (4, 2, 2),
+        (2, 1, 3),
+    ]
+    assert all("out of memory" in error for *_, error in backoffs)
 
 
 def test_a_non_memory_runtime_error_is_not_retried() -> None:
