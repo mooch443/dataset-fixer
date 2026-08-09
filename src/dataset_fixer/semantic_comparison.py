@@ -1403,6 +1403,15 @@ def _predict_nnunet_sahi(
         upscale_factor=model.upscale_factor,
         classes=session.num_classes,
     )
+    inference_started = time.perf_counter()
+    completed_tiles = 0
+    last_text_report = inference_started
+    if progress:
+        print(
+            f"nnU-Net SAHI inference: 0/{total_tiles:,} tiles across "
+            f"{len(groups):,} work groups; requested batch {session.requested_batch_size}.",
+            flush=True,
+        )
     tile_progress = tqdm(
         total=total_tiles,
         desc=f"{model.name} SAHI tiles",
@@ -1416,7 +1425,14 @@ def _predict_nnunet_sahi(
         disable=not progress,
     )
     try:
-        for group in groups:
+        for group_index, group in enumerate(groups, start=1):
+            group_tiles = sum(len(manifests[value.image_id]) for value in group)
+            if progress and group_index == 1:
+                print(
+                    f"Preparing first work group on CPU: {len(group):,} source "
+                    f"image(s), {group_tiles:,} tiles.",
+                    flush=True,
+                )
             started = time.perf_counter()
             spans: dict[str, tuple[int, int]] = {}
             images: list[np.ndarray] = []
@@ -1430,11 +1446,19 @@ def _predict_nnunet_sahi(
                 images.extend(tiles)
             prepared = session.preprocess_many(images)
             del images
-            telemetry.preprocess_seconds += time.perf_counter() - started
+            preprocess_seconds = time.perf_counter() - started
+            telemetry.preprocess_seconds += preprocess_seconds
+            if progress and group_index == 1:
+                print(
+                    f"First work group preprocessed in {preprocess_seconds:.1f}s; "
+                    "sending tiles to CUDA.",
+                    flush=True,
+                )
 
             # Folds are outermost inside predict_logits, so a multi-fold model
             # loads each fold once for the whole group rather than per tile.
             started = time.perf_counter()
+            oom_retries_before = session.oom_retries
             logits: list[Any] = [None] * len(prepared)
             for indices in _equal_shape_batches(
                 [array for array, _ in prepared],
@@ -1447,15 +1471,25 @@ def _predict_nnunet_sahi(
                 for index, tile_logits in zip(indices, predicted):
                     logits[index] = tile_logits
                 tile_progress.update(len(indices))
-            telemetry.inference_seconds += time.perf_counter() - started
+                completed_tiles += len(indices)
+            inference_seconds = time.perf_counter() - started
+            telemetry.inference_seconds += inference_seconds
             telemetry.resolved_batch_size = session.resolved_batch_size
             telemetry.oom_retries = session.oom_retries
+            if progress and session.oom_retries > oom_retries_before:
+                print(
+                    f"CUDA OOM backoff: {session.oom_retries - oom_retries_before} "
+                    f"retry/retries in group {group_index}; effective batch is now "
+                    f"{session.resolved_batch_size}.",
+                    flush=True,
+                )
 
             started = time.perf_counter()
             probabilities = session.to_probabilities_many(
                 [(logits[index], prepared[index][1]) for index in range(len(prepared))]
             )
-            telemetry.conversion_seconds += time.perf_counter() - started
+            conversion_seconds = time.perf_counter() - started
+            telemetry.conversion_seconds += conversion_seconds
             del logits, prepared
 
             started = time.perf_counter()
@@ -1474,8 +1508,39 @@ def _predict_nnunet_sahi(
                 # Release each completed source image promptly.
                 probabilities[first:last] = [None] * (last - first)
                 source_progress.update(1)
-            telemetry.stitch_seconds += time.perf_counter() - started
+            stitch_seconds = time.perf_counter() - started
+            telemetry.stitch_seconds += stitch_seconds
             del probabilities
+            now = time.perf_counter()
+            if (
+                progress
+                and (
+                    group_index == 1
+                    or now - last_text_report >= 15
+                    or completed_tiles == total_tiles
+                )
+            ):
+                elapsed = max(now - inference_started, 1e-9)
+                rate = completed_tiles / elapsed
+                remaining = (
+                    (total_tiles - completed_tiles) / rate if rate > 0 else math.inf
+                )
+                eta = (
+                    _human_duration(remaining)
+                    if math.isfinite(remaining)
+                    else "unknown"
+                )
+                print(
+                    f"nnU-Net SAHI progress: {completed_tiles:,}/{total_tiles:,} "
+                    f"tiles ({completed_tiles / total_tiles:.1%}), "
+                    f"{rate:.2f} tile/s, ETA {eta}; group {group_index:,}/"
+                    f"{len(groups):,} phases: CPU prep {preprocess_seconds:.1f}s, "
+                    f"GPU {inference_seconds:.1f}s, CPU post "
+                    f"{conversion_seconds + stitch_seconds:.1f}s; effective batch "
+                    f"{session.resolved_batch_size}, OOM retries {session.oom_retries}.",
+                    flush=True,
+                )
+                last_text_report = now
     finally:
         tile_progress.close()
         source_progress.close()
@@ -3109,6 +3174,17 @@ def _format_metric(value: Any) -> str:
     except (TypeError, ValueError):
         return "n/a"
     return f"{parsed:.3f}" if math.isfinite(parsed) else "n/a"
+
+
+def _human_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
 
 
 def _visualization_destination(destination: str | Path) -> Path:

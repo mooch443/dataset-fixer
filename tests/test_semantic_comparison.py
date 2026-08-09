@@ -1000,6 +1000,7 @@ def test_nnunet_sahi_groups_equally_shaped_tiles_into_real_minibatches(
 def test_nnunet_sahi_progress_counts_every_tile_and_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     pytest.importorskip("sahi")
     exported = _semantic_export(tmp_path)
@@ -1036,6 +1037,12 @@ def test_nnunet_sahi_progress_counts_every_tile_and_source(
     assert by_unit["image"]["total"] == 2
     assert by_unit["image"]["seen"] == 2
     assert all(bar.get("closed") for bar in bars)
+    output = capsys.readouterr().out
+    assert "nnU-Net SAHI inference: 0/" in output
+    assert "Preparing first work group on CPU" in output
+    assert "First work group preprocessed" in output
+    assert "nnU-Net SAHI progress:" in output
+    assert "effective batch" in output
 
 
 def test_nnunet_sahi_releases_the_session_when_prediction_is_interrupted(
