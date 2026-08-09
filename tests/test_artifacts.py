@@ -13,7 +13,10 @@ from dataset_fixer import Dataset, DatasetTrace, DatasetValidationError
 from dataset_fixer.artifacts import (
     CANONICAL_REPORT_FILES,
     DATASET_INFO_SCHEMA,
+    LINEAGE_SCHEMA,
+    read_lineage,
     split_image_summary,
+    write_lineage,
 )
 from dataset_fixer.dataset_report import render_dataset_report
 from dataset_fixer.validation_audit import stage_load_validation_audit
@@ -69,6 +72,48 @@ def test_compact_dataset_artifacts_and_exact_trace(tmp_path: Path) -> None:
     assert trace.tiles[0].resolved_original_image is not None
     assert trace.for_sample(trace.samples[0].output_image) == trace.samples[0]
     assert "tile(s)" in trace.summary()
+
+
+def test_lineage_schema_deduplicates_transformations_and_reads_schema_2(
+    tmp_path: Path,
+) -> None:
+    step = {
+        "operation": "split",
+        "settings_fingerprint": "same-split",
+        "settings": {"resolved_assignments": "x" * 100_000},
+    }
+    records = [
+        {
+            "output_image": f"train/images/{index}.png",
+            "transformation_chain": [dict(step)],
+        }
+        for index in range(4)
+    ]
+    current = tmp_path / "lineage-v3.json.gz"
+    write_lineage(current, records)
+    with gzip.open(current, "rt", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    assert payload["schema_version"] == LINEAGE_SCHEMA == 3
+    assert len(payload["transformations"]) == 1
+    assert all(record["transformation_chain"] == ["t0"] for record in payload["records"])
+    loaded = read_lineage(current)
+    assert loaded[0]["transformation_chain"][0]["settings"] == step["settings"]
+    assert loaded[0]["transformation_chain"][0] is loaded[-1]["transformation_chain"][0]
+
+    legacy = tmp_path / "lineage-v2.json.gz"
+    with gzip.open(legacy, "wt", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "schema": "dataset-fixer-lineage",
+                "schema_version": 2,
+                "records": records,
+            },
+            handle,
+            separators=(",", ":"),
+        )
+    migrated = read_lineage(legacy)
+    assert len(migrated) == len(records)
+    assert migrated[0]["transformation_chain"][0] is migrated[-1]["transformation_chain"][0]
 
 
 def test_trace_resolves_moved_source_with_path_rewrite(tmp_path: Path) -> None:

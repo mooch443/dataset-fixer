@@ -13,8 +13,8 @@ from tqdm.auto import tqdm
 from .artifacts import (
     DATASET_INFO_NAME,
     dataset_info_path,
+    iter_lineage,
     lineage_path,
-    read_lineage,
 )
 from .augmentation import augment_dataset, serialize_pipeline
 from .errors import DatasetValidationError, ValidationIssue
@@ -73,6 +73,8 @@ class Dataset:
         mask_dirs: Explicit semantic-mask directory for each split.
         mask_paths: Exact image-to-semantic-mask mapping.
         mask_statistics: Cached semantic-mask value statistics by image.
+        defer_provenance: Defer lineage parsing until it is explicitly needed.
+        provenance_progress: Show progress when deferred/eager lineage is read.
     """
 
     def __init__(
@@ -99,6 +101,8 @@ class Dataset:
         mask_dirs: Mapping[str, Path] | None = None,
         mask_paths: Mapping[Path, Path] | None = None,
         mask_statistics: Mapping[Path, Mapping[str, int]] | None = None,
+        defer_provenance: bool = False,
+        provenance_progress: bool = False,
     ) -> None:
         self._location = location.resolve()
         self._name = name
@@ -149,19 +153,30 @@ class Dataset:
             self._validation_audit_visualization = (
                 candidate if candidate.is_absolute() else self._location / candidate
             )
+        has_lineage = lineage_path(self._location).is_file() or (
+            self._location / "provenance.jsonl"
+        ).is_file()
+        self._provenance_deferred = bool(
+            defer_provenance and provenance is None and has_lineage
+        )
+        self._provenance_progress = provenance_progress
         self._provenance = (
             provenance
             if provenance is not None
-            else _load_provenance(self._location, samples, errors=errors, warnings=warnings)
+            else (
+                {}
+                if self._provenance_deferred
+                else _load_provenance(
+                    self._location,
+                    samples,
+                    errors=errors,
+                    warnings=warnings,
+                    progress=provenance_progress,
+                )
+            )
         )
         self._warnings = tuple(warnings)
-        for sample in self._samples:
-            try:
-                key = str(sample.image_path.resolve().relative_to(self._location))
-            except ValueError:
-                key = str(Path("images") / sample.split / sample.relative_path)
-            if key in self._provenance:
-                sample.provenance = self._provenance[key]
+        self._attach_provenance()
 
     @classmethod
     def open(
@@ -271,6 +286,7 @@ class Dataset:
             source_format=source_format,
             warnings=warnings,
             errors=errors,
+            provenance_progress=progress,
         )
         audit, visualization = build_load_validation_audit(
             dataset._warnings,
@@ -332,6 +348,7 @@ class Dataset:
             manifest,
             progress=progress,
             errors=errors,
+            validate_pixels=deep,
         )
         load_warnings.extend(
             validate_dataset(
@@ -360,7 +377,14 @@ class Dataset:
             mask_dirs=mask_dirs,
             mask_paths=mask_paths,
             mask_statistics=mask_statistics,
+            defer_provenance=True,
+            provenance_progress=progress,
         )
+        if progress and dataset._provenance_deferred:
+            print(
+                "Dataset lineage: deferred (loaded only when provenance, update, "
+                "or another lineage-dependent operation is requested)"
+            )
         if load_warnings:
             audit, visualization = build_load_validation_audit(
                 load_warnings,
@@ -460,6 +484,7 @@ class Dataset:
             raise DatasetValidationError(
                 "Dataset.update requires a materialized dataset; call export(...) first"
             )
+        self._ensure_provenance(progress=progress)
         from .updating import update_dataset
 
         return update_dataset(self, dest=dest, progress=progress)
@@ -525,7 +550,33 @@ class Dataset:
     @property
     def provenance(self) -> dict[str, dict[str, Any]]:
         """Per-output-image lineage keyed by relative output image path."""
+        self._ensure_provenance(progress=self._provenance_progress)
         return {key: dict(value) for key, value in self._provenance.items()}
+
+    def _ensure_provenance(self, *, progress: bool) -> None:
+        if not self._provenance_deferred:
+            return
+        warnings = list(self._warnings)
+        loaded = _load_provenance(
+            self._location,
+            self._samples,
+            errors=self._errors,
+            warnings=warnings,
+            progress=progress,
+        )
+        self._provenance = loaded
+        self._provenance_deferred = False
+        self._warnings = tuple(warnings)
+        self._attach_provenance()
+
+    def _attach_provenance(self) -> None:
+        for sample in self._samples:
+            try:
+                key = str(sample.image_path.resolve().relative_to(self._location))
+            except ValueError:
+                key = str(Path("images") / sample.split / sample.relative_path)
+            if key in self._provenance:
+                sample.provenance = self._provenance[key]
 
     @property
     def training_ready(self) -> bool:
@@ -1561,18 +1612,39 @@ class Dataset:
                     statistics["images"],
                     statistics["nonempty"],
                     statistics["empty"],
-                    f"{statistics['foreground_pixels']:,}",
-                    f"{statistics['foreground_fraction']:.1%}",
+                    (
+                        f"{statistics['foreground_pixels']:,}"
+                        if statistics["foreground_pixels"] is not None
+                        else "not scanned"
+                    ),
+                    (
+                        f"{statistics['foreground_fraction']:.1%}"
+                        if statistics["foreground_fraction"] is not None
+                        else "—"
+                    ),
                 )
                 for split, statistics in counts["mask_statistics"].items()
             ]
-            total_pixels = sum(
-                statistics["total_pixels"]
+            pixel_statistics_available = all(
+                statistics["foreground_pixels"] is not None
+                and statistics["total_pixels"] is not None
                 for statistics in counts["mask_statistics"].values()
             )
-            foreground_pixels = sum(
-                statistics["foreground_pixels"]
-                for statistics in counts["mask_statistics"].values()
+            total_pixels = (
+                sum(
+                    statistics["total_pixels"]
+                    for statistics in counts["mask_statistics"].values()
+                )
+                if pixel_statistics_available
+                else None
+            )
+            foreground_pixels = (
+                sum(
+                    statistics["foreground_pixels"]
+                    for statistics in counts["mask_statistics"].values()
+                )
+                if pixel_statistics_available
+                else None
             )
             mask_rows.append(
                 (
@@ -1580,8 +1652,12 @@ class Dataset:
                     counts["images"],
                     counts["annotated"],
                     counts["empty"],
-                    f"{foreground_pixels:,}",
-                    f"{foreground_pixels / total_pixels if total_pixels else 0.0:.1%}",
+                    f"{foreground_pixels:,}" if foreground_pixels is not None else "not scanned",
+                    (
+                        f"{foreground_pixels / total_pixels if total_pixels else 0.0:.1%}"
+                        if foreground_pixels is not None
+                        else "—"
+                    ),
                 )
             )
             lines.extend(
@@ -1713,13 +1789,56 @@ class Dataset:
                     split["nonempty"] += 1
                 else:
                     split["empty"] += 1
-            for statistics in mask_statistics.values():
-                total_pixels = statistics["total_pixels"]
-                statistics["foreground_fraction"] = (
-                    statistics["foreground_pixels"] / total_pixels if total_pixels else 0.0
-                )
             images = len(self._samples)
-            empty = sum(statistics["empty"] for statistics in mask_statistics.values())
+            if masks == images:
+                for statistics in mask_statistics.values():
+                    total_pixels = statistics["total_pixels"]
+                    statistics["foreground_fraction"] = (
+                        statistics["foreground_pixels"] / total_pixels
+                        if total_pixels
+                        else 0.0
+                    )
+                empty = sum(
+                    statistics["empty"] for statistics in mask_statistics.values()
+                )
+            else:
+                summary = self._manifest.get("split_summary")
+                summary_is_complete = _semantic_summary_is_complete(
+                    summary,
+                    split_counts,
+                )
+                if not summary_is_complete:
+                    return {
+                        "splits": split_counts,
+                        "images": images,
+                        "masks": len(self._mask_paths),
+                        "annotations": None,
+                        "annotated": None,
+                        "empty": None,
+                        "empty_fraction": 0.0,
+                        "image_sizes": sorted(
+                            {(sample.width, sample.height) for sample in self._samples}
+                        ),
+                        "split_statistics": None,
+                        "class_statistics": None,
+                        "mask_statistics": None,
+                    }
+                for split, statistics in mask_statistics.items():
+                    details = summary[split]
+                    statistics.update(
+                        {
+                            "images": int(details["total_images"]),
+                            "nonempty": int(details["labeled_images"]),
+                            "empty": int(details["background_images"]),
+                            "foreground_pixels": None,
+                            "total_pixels": None,
+                            "foreground_fraction": None,
+                        }
+                    )
+                masks = len(self._mask_paths)
+                empty = sum(
+                    statistics["empty"] for statistics in mask_statistics.values()
+                )
             return {
                 "splits": split_counts,
                 "images": images,
@@ -1949,12 +2068,32 @@ def _class_names(value: Any) -> dict[int, str]:
     return {}
 
 
+def _semantic_summary_is_complete(
+    summary: Any,
+    split_counts: Mapping[str, int],
+) -> bool:
+    if not isinstance(summary, Mapping):
+        return False
+    try:
+        return all(
+            isinstance(summary.get(split), Mapping)
+            and int(summary[split].get("total_images", -1)) == count
+            and int(summary[split].get("labeled_images", -1))
+            + int(summary[split].get("background_images", -1))
+            == count
+            for split, count in split_counts.items()
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def _load_semantic_mask_samples(
     root: Path,
     manifest: Mapping[str, Any],
     *,
     progress: bool,
     errors: Literal["raise", "skip"],
+    validate_pixels: bool,
 ) -> tuple[
     list[Sample],
     dict[str, Path],
@@ -1999,6 +2138,19 @@ def _load_semantic_mask_samples(
         for image_path in sorted(image_dirs[split].rglob("*"))
         if image_path.is_file() and image_path.suffix.lower() in IMAGE_SUFFIXES
     ]
+    declared_summary = manifest.get("split_summary")
+    candidate_counts = {
+        split: sum(candidate_split == split for candidate_split, _, _ in candidates)
+        for split in splits
+    }
+    summary_is_complete = _semantic_summary_is_complete(
+        declared_summary,
+        candidate_counts,
+    )
+    # Generated artifacts already publish exact labeled/background counts.
+    # Pixel histograms are only needed for old/incomplete manifests or when
+    # the caller explicitly requests deep validation.
+    scan_mask_pixels = validate_pixels or not summary_is_complete
     samples: list[Sample] = []
     mask_paths: dict[Path, Path] = {}
     mask_statistics: dict[Path, dict[str, int]] = {}
@@ -2009,7 +2161,7 @@ def _load_semantic_mask_samples(
     used_masks: dict[Path, Path] = {}
     iterator = tqdm(
         candidates,
-        desc="Loading semantic-mask dataset",
+        desc="Indexing semantic-mask dataset",
         unit="pair",
         disable=not progress,
     )
@@ -2039,8 +2191,6 @@ def _load_semantic_mask_samples(
         else:
             try:
                 with Image.open(image_path) as opened_image, Image.open(mask_path) as opened_mask:
-                    opened_image.load()
-                    opened_mask.load()
                     width, height = opened_image.size
                     if opened_mask.mode != "L":
                         raise ValueError(
@@ -2051,14 +2201,18 @@ def _load_semantic_mask_samples(
                             f"mask dimensions {opened_mask.size} do not match image dimensions "
                             f"{(width, height)}"
                         )
-                    histogram = opened_mask.histogram()
-                    values = {value for value, count in enumerate(histogram) if count}
-                    if not values <= {0, 1, 255}:
-                        raise ValueError(
-                            f"mask values must be 0/1/255, found {sorted(values)[:10]}"
-                        )
-                    foreground_pixels = histogram[1] + histogram[255]
-                    total_pixels = width * height
+                    if scan_mask_pixels:
+                        histogram = opened_mask.histogram()
+                        values = {
+                            value for value, count in enumerate(histogram) if count
+                        }
+                        if not values <= {0, 1, 255}:
+                            raise ValueError(
+                                "mask values must be 0/1/255, found "
+                                f"{sorted(values)[:10]}"
+                            )
+                        foreground_pixels = histogram[1] + histogram[255]
+                        total_pixels = width * height
             except Exception as exc:
                 issue = ValidationIssue(
                     f"Unreadable or invalid semantic image/mask pair: {exc}",
@@ -2095,10 +2249,11 @@ def _load_semantic_mask_samples(
             )
         )
         mask_paths[resolved_image] = resolved_mask
-        mask_statistics[resolved_image] = {
-            "foreground_pixels": foreground_pixels,
-            "total_pixels": total_pixels,
-        }
+        if scan_mask_pixels:
+            mask_statistics[resolved_image] = {
+                "foreground_pixels": foreground_pixels,
+                "total_pixels": total_pixels,
+            }
 
     actual_masks = {
         path.resolve()
@@ -2173,6 +2328,7 @@ def _load_provenance(
     *,
     errors: Literal["raise", "skip"],
     warnings: list[str],
+    progress: bool = False,
 ) -> dict[str, dict[str, Any]]:
     path = lineage_path(root)
     legacy = root / "provenance.jsonl"
@@ -2182,7 +2338,14 @@ def _load_provenance(
     issues: list[ValidationIssue] = []
     try:
         if path.is_file():
-            for line_number, record in enumerate(read_lineage(path), start=1):
+            lineage_records = tqdm(
+                iter_lineage(path),
+                total=len(samples),
+                desc="Loading dataset lineage",
+                unit="record",
+                disable=not progress,
+            )
+            for line_number, record in enumerate(lineage_records, start=1):
                 try:
                     records[str(Path(record["output_image"]))] = record
                 except (KeyError, TypeError) as exc:

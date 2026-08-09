@@ -14,6 +14,7 @@ from PIL import Image
 
 from .artifacts import (
     DATASET_INFO_SCHEMA,
+    LINEAGE_SCHEMA,
     collect_report_payloads,
     dataset_info_path,
     lineage_path,
@@ -392,7 +393,7 @@ class OutputBuilder:
             "visuals": self.visuals,
             "lineage": {
                 "path": "reports/lineage.json.gz",
-                "schema_version": 2,
+                "schema_version": LINEAGE_SCHEMA,
                 "records": len(self.records),
             },
             "audits": audits,

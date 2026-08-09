@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 
 from .artifacts import (
     DATASET_INFO_SCHEMA,
+    LINEAGE_SCHEMA,
     collect_report_payloads,
     dataset_info_path,
     lineage_path,
@@ -191,7 +192,7 @@ def _update_root(
             "environment": environment,
             "lineage": {
                 "path": "reports/lineage.json.gz",
-                "schema_version": 2,
+                "schema_version": LINEAGE_SCHEMA,
                 "records": len(records),
             },
             "audits": audits,

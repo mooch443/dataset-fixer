@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 
 from .artifacts import (
     DATASET_INFO_SCHEMA,
+    LINEAGE_SCHEMA,
     collect_report_payloads,
     dataset_info_path,
     lineage_path,
@@ -294,7 +295,7 @@ def export_semantic_masks(
             "visuals": visuals,
             "lineage": {
                 "path": "reports/lineage.json.gz",
-                "schema_version": 2,
+                "schema_version": LINEAGE_SCHEMA,
                 "records": len(records),
             },
             "audits": audits,
@@ -480,5 +481,4 @@ def _validate_semantic_tree(staging: Path, records: list[dict[str, Any]]) -> Non
                 },
             )
         )
-
 

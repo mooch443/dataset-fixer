@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -1284,36 +1285,63 @@ def _predict_nnunet_sahi(
         stitch_probability_tiles,
     )
 
-    resolved = resolve_sahi_settings(settings, resolution=resolution)
-    manifests = {
-        value.image_id: build_tile_manifest(
-            width=value.width,
-            height=value.height,
-            settings=resolved,
+    if progress:
+        checkpoints = ", ".join(str(path) for path in model.checkpoint_files)
+        print(
+            "nnU-Net execution: in-process Python API for SAHI (no CLI command)\n"
+            f"  model_folder: {model.model_folder}\n"
+            f"  folds: {', '.join(model.folds)}\n"
+            f"  checkpoint: {model.checkpoint}\n"
+            f"  checkpoint_files: {checkpoints}\n"
+            f"  device: {device}\n"
+            f"  batch_size: {batch_size}\n"
+            f"  workers: {model.workers}\n"
+            f"  TTA: {'enabled' if model.nnunet_tta else 'disabled'}"
         )
-        for value in inputs
-    }
-    total_tiles = sum(len(manifests[value.image_id]) for value in inputs)
-    session = model._runtime_model(
-        (
-            "nnunet-sahi",
-            device,
-            tuple(model.folds),
-            model.checkpoint,
-            model.workers,
-            batch_size,
-            model.nnunet_tta,
-        ),
-        lambda: load_session(
-            model_folder=model.model_folder,
-            folds=model.folds,
-            checkpoint=model.checkpoint,
-            device=device,
-            workers=model.workers,
-            batch_size=batch_size,
-            use_tta=model.nnunet_tta,
-        ),
+    setup_progress = tqdm(
+        total=2,
+        desc=f"Preparing {model.name}",
+        unit="phase",
+        disable=not progress,
     )
+    try:
+        resolved = resolve_sahi_settings(settings, resolution=resolution)
+        manifests = {
+            value.image_id: build_tile_manifest(
+                width=value.width,
+                height=value.height,
+                settings=resolved,
+            )
+            for value in inputs
+        }
+        total_tiles = sum(len(manifests[value.image_id]) for value in inputs)
+        setup_progress.update(1)
+        set_description = getattr(setup_progress, "set_description", None)
+        if set_description is not None:
+            set_description(f"Loading {model.name} checkpoint")
+        session = model._runtime_model(
+            (
+                "nnunet-sahi",
+                device,
+                tuple(model.folds),
+                model.checkpoint,
+                model.workers,
+                batch_size,
+                model.nnunet_tta,
+            ),
+            lambda: load_session(
+                model_folder=model.model_folder,
+                folds=model.folds,
+                checkpoint=model.checkpoint,
+                device=device,
+                workers=model.workers,
+                batch_size=batch_size,
+                use_tta=model.nnunet_tta,
+            ),
+        )
+        setup_progress.update(1)
+    finally:
+        setup_progress.close()
     telemetry = EngineTelemetry(
         device=device,
         plan_batch_size=session.plan_batch_size,
@@ -1790,18 +1818,23 @@ def _freeze_cohort(
                 )
             )
         with Image.open(image_path) as opened_image, Image.open(mask_path) as opened_mask:
-            image = opened_image.convert("RGB")
-            mask = opened_mask.convert("L")
-            if image.size != mask.size:
+            image_size = opened_image.size
+            if opened_mask.mode != "L":
                 raise DatasetValidationError(
-                    f"Semantic mask dimensions {mask.size} do not match image dimensions {image.size}: {mask_path}"
+                    f"Semantic mask must be single-channel L: {mask_path}: {opened_mask.mode}"
                 )
-            values = set(mask.getdata())
+            if image_size != opened_mask.size:
+                raise DatasetValidationError(
+                    f"Semantic mask dimensions {opened_mask.size} do not match image "
+                    f"dimensions {image_size}: {mask_path}"
+                )
+            histogram = opened_mask.histogram()
+            values = {value for value, count in enumerate(histogram) if count}
             if not values <= {0, 1, 255}:
                 raise DatasetValidationError(
                     f"Semantic mask contains values outside 0/1/255: {mask_path}: {sorted(values)[:10]}"
                 )
-            width, height = image.size
+            width, height = image_size
         image_sha = sha256_file(image_path)
         mask_sha = sha256_file(mask_path)
         case = _SemanticCase(
@@ -2058,7 +2091,7 @@ def _write_cohort(
 
 def _run_command(command: list[str], *, progress: bool = False) -> None:
     if progress:
-        print(f"Running {command[0]}…")
+        print(f"Running nnU-Net command: {shlex.join(command)}")
     try:
         subprocess.run(
             command,

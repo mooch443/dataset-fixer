@@ -161,6 +161,68 @@ def test_semantic_mask_export_is_task_restricted_and_virtual_until_export(
     assert any(path.is_file() for path in exported.mask_dirs["train"].rglob("*.png"))
 
 
+def test_semantic_open_indexes_headers_without_decoding_pixels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from PIL.PngImagePlugin import PngImageFile
+
+    source = make_yolo_dataset(
+        tmp_path / "header-only-source",
+        task="segment",
+        train_rows=["0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"],
+        val_rows=[""],
+    )
+    exported = Dataset.open(source, task="segment", progress=False).export(
+        destination=tmp_path / "header-only-masks",
+        format="semantic_masks",
+        visualize=False,
+        progress=False,
+    )
+
+    def reject_pixel_decode(self, *args, **kwargs):
+        raise AssertionError("semantic Dataset.open decoded image pixels")
+
+    monkeypatch.setattr(PngImageFile, "load", reject_pixel_decode)
+    reopened = Dataset.open(exported.location, progress=False)
+    assert len(reopened._samples) == 2
+    assert "empty=1" in repr(reopened)
+
+
+def test_semantic_open_defers_lineage_until_provenance_is_requested(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dataset_fixer.dataset as dataset_module
+
+    source = make_yolo_dataset(
+        tmp_path / "lazy-lineage-source",
+        task="segment",
+        train_rows=["0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"],
+        val_rows=[""],
+    )
+    exported = Dataset.open(source, task="segment", progress=False).export(
+        destination=tmp_path / "lazy-lineage-masks",
+        format="semantic_masks",
+        visualize=False,
+        progress=False,
+    )
+    original = dataset_module.iter_lineage
+    calls = 0
+
+    def tracked(path):
+        nonlocal calls
+        calls += 1
+        yield from original(path)
+
+    monkeypatch.setattr(dataset_module, "iter_lineage", tracked)
+    reopened = Dataset.open(exported.location, progress=False)
+    assert calls == 0
+    assert reopened._provenance_deferred
+    assert len(reopened.provenance) == len(reopened._samples)
+    assert calls == 1
+
+
 def test_semantic_mask_dataset_open_skips_invalid_pairs_and_closes_audit_figure(
     tmp_path: Path,
 ) -> None:
