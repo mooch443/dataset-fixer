@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ from dataset_fixer import Dataset, DatasetValidationError, Geometry, Model
 from dataset_fixer.bundle import Config, Outcome, create
 from dataset_fixer.convert import Kind, prepare
 from dataset_fixer.model_sources import _download_wandb_file
-from dataset_fixer.sources import extract_archive
+from dataset_fixer.sources import extract_archive, local_source
 from dataset_fixer.wandb import configure, upload
 from conftest import make_yolo_dataset
 
@@ -49,6 +50,79 @@ def test_dataset_open_infers_and_reuses_zip(tmp_path: Path, capsys: pytest.Captu
     assert first.splits == dataset.splits
     assert second.location == first.location
     assert "Cache hit: extracted semantic.zip" in capsys.readouterr().out
+
+
+def test_extracted_source_index_skips_copy_and_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = tmp_path / "cache"
+    monkeypatch.setattr("dataset_fixer.sources.cache_root", lambda: cache)
+    archive = tmp_path / "dataset.zip"
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("dataset/data.yaml", "path: .\n")
+
+    first = extract_archive(archive, category="indexed", progress=False)
+    monkeypatch.setattr(
+        "dataset_fixer.sources.local_source",
+        lambda *args, **kwargs: pytest.fail("copied an already indexed archive"),
+    )
+    monkeypatch.setattr(
+        "dataset_fixer.sources.sha256_progress",
+        lambda *args, **kwargs: pytest.fail("hashed an already indexed archive"),
+    )
+
+    second = extract_archive(archive, category="indexed", progress=False)
+    assert second.root == first.root
+    assert second.sha256 == first.sha256
+
+
+def test_extracted_source_index_invalidates_when_archive_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = tmp_path / "cache"
+    monkeypatch.setattr("dataset_fixer.sources.cache_root", lambda: cache)
+    archive = tmp_path / "dataset.zip"
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("dataset/data.yaml", "path: .\n")
+    first = extract_archive(archive, category="indexed", progress=False)
+
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("dataset/data.yaml", "path: changed\n")
+        zipped.writestr("dataset/new.txt", "new archive content")
+    second = extract_archive(archive, category="indexed", progress=False)
+
+    assert second.sha256 != first.sha256
+    assert second.root != first.root
+
+
+def test_drive_cache_accepts_legacy_inode_metadata_without_copying(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = tmp_path / "cache"
+    monkeypatch.setattr("dataset_fixer.sources.cache_root", lambda: cache)
+    monkeypatch.setattr("dataset_fixer.sources._is_colab_drive_file", lambda path: True)
+    source = tmp_path / "dataset.zip"
+    source.write_bytes(b"cached archive")
+    legacy = cache / "drive" / "legacy-inode-key" / source.name
+    legacy.parent.mkdir(parents=True)
+    shutil.copy2(source, legacy)
+    source_stat = source.stat()
+    legacy.with_suffix(legacy.suffix + ".source.json").write_text(
+        json.dumps(
+            {
+                "path": str(source.resolve()),
+                "size": source_stat.st_size,
+                "mtime_ns": source_stat.st_mtime_ns,
+                "inode": 123456,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert local_source(source, progress=False) == legacy
 
 
 def test_safe_zip_rejects_traversal_and_does_not_publish_partial_cache(tmp_path: Path) -> None:

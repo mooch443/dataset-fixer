@@ -55,8 +55,23 @@ def _source_identity(path: Path) -> dict[str, Any]:
         "path": str(path.resolve()),
         "size": stat_result.st_size,
         "mtime_ns": stat_result.st_mtime_ns,
-        "inode": getattr(stat_result, "st_ino", None),
     }
+
+
+def _same_source_identity(value: Any, expected: dict[str, Any]) -> bool:
+    """Compare stable source fields while accepting legacy inode metadata."""
+
+    return isinstance(value, dict) and all(
+        value.get(key) == raw for key, raw in expected.items()
+    )
+
+
+def _is_colab_drive_file(path: Path) -> bool:
+    return (
+        in_colab()
+        and path.is_file()
+        and (path == Path("/content/drive") or Path("/content/drive") in path.parents)
+    )
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -106,11 +121,7 @@ def local_source(path: str | Path, *, progress: bool = True) -> Path:
     source = Path(path).expanduser().resolve()
     if not source.exists():
         raise FileNotFoundError(source)
-    if not (
-        in_colab()
-        and source.is_file()
-        and (source == Path("/content/drive") or Path("/content/drive") in source.parents)
-    ):
+    if not _is_colab_drive_file(source):
         return source
 
     identity = _source_identity(source)
@@ -119,15 +130,28 @@ def local_source(path: str | Path, *, progress: bool = True) -> Path:
     ).hexdigest()[:20]
     destination = cache_root() / "drive" / identity_hash / source.name
     metadata_path = destination.with_suffix(destination.suffix + ".source.json")
-    if destination.is_file() and metadata_path.is_file():
+    candidates = [destination]
+    candidates.extend(
+        directory / source.name
+        for directory in sorted((cache_root() / "drive").glob("*"))
+        if directory.is_dir()
+        if directory / source.name != destination
+    )
+    for candidate in candidates:
+        candidate_metadata = candidate.with_suffix(candidate.suffix + ".source.json")
+        if not candidate.is_file() or not candidate_metadata.is_file():
+            continue
         try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata = json.loads(candidate_metadata.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            metadata = None
-        if metadata == identity and destination.stat().st_size == identity["size"]:
+            continue
+        if (
+            _same_source_identity(metadata, identity)
+            and candidate.stat().st_size == identity["size"]
+        ):
             if progress:
                 print(f"Cache hit: local copy of {source.name}")
-            return destination
+            return candidate
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -190,6 +214,52 @@ class ExtractedArchive:
     sha256: str
 
 
+def _source_index_path(source: Path, category: str) -> Path:
+    source_key = hashlib.sha256(str(source.resolve()).encode("utf-8")).hexdigest()
+    return cache_root() / category / "sources" / f"{source_key}.json"
+
+
+def _indexed_extraction(
+    source: Path,
+    category: str,
+    *,
+    progress: bool,
+) -> ExtractedArchive | None:
+    index = _source_index_path(source, category)
+    if not index.is_file():
+        return None
+    try:
+        value = json.loads(index.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    identity = _source_identity(source)
+    if not _same_source_identity(value.get("source"), identity):
+        return None
+    digest = str(value.get("sha256") or "")
+    if len(digest) != 64:
+        return None
+    destination = cache_root() / category / "extracted" / digest
+    marker = destination / ".complete.json"
+    if not marker.is_file():
+        return None
+    try:
+        complete = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if complete.get("sha256") != digest:
+        return None
+    if progress:
+        print(f"Cache hit: extracted {source.name} (source metadata unchanged)")
+    return ExtractedArchive(source, destination, digest)
+
+
+def _record_extraction(source: Path, category: str, digest: str) -> None:
+    _atomic_json(
+        _source_index_path(source, category),
+        {"source": _source_identity(source), "sha256": digest},
+    )
+
+
 def extract_archive(
     archive: str | Path,
     *,
@@ -198,7 +268,15 @@ def extract_archive(
 ) -> ExtractedArchive:
     """Safely and atomically extract a ZIP into the automatic cache."""
 
-    source = local_source(archive, progress=progress)
+    requested = Path(archive).expanduser().resolve()
+    if not requested.is_file() or requested.suffix.lower() != ".zip":
+        raise DatasetValidationError(
+            ValidationIssue("Source is not a ZIP archive", value=str(requested))
+        )
+    indexed = _indexed_extraction(requested, category, progress=progress)
+    if indexed is not None:
+        return indexed
+    source = local_source(requested, progress=progress)
     if not source.is_file() or source.suffix.lower() != ".zip":
         raise DatasetValidationError(
             ValidationIssue("Source is not a ZIP archive", value=str(source))
@@ -212,6 +290,7 @@ def extract_archive(
         except (OSError, json.JSONDecodeError):
             value = {}
         if value.get("sha256") == digest:
+            _record_extraction(requested, category, digest)
             if progress:
                 print(f"Cache hit: extracted {source.name}")
             return ExtractedArchive(source, destination, digest)
@@ -249,6 +328,7 @@ def extract_archive(
             # directory is owned by the content-addressed cache.
             shutil.rmtree(destination)
         temporary.replace(destination)
+        _record_extraction(requested, category, digest)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise

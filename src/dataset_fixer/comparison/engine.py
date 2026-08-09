@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..errors import DatasetValidationError, ValidationIssue
 from ..sahi_support import reject_legacy_sahi_settings, resolve_sahi_settings
-from ..utils import environment_snapshot, package_versions, settings_fingerprint, to_jsonable
+from ..utils import environment_snapshot, settings_fingerprint, to_jsonable
 from .cache import (
     build_staging_dir,
     cache_key,
@@ -66,8 +66,6 @@ def _compare_models(
         system = {
             "resolution": spec.resolution,
             "backend": model_backends[spec.name],
-            "device": spec.resolved_model.device,
-            "batch_size": spec.resolved_model.batch_size,
             "confidence": spec.resolved_model.confidence,
             "postprocess": spec.resolved_model.postprocess,
         }
@@ -111,7 +109,6 @@ def _compare_models(
                         "name": spec.name,
                         "sha256": model_hashes[spec.name],
                         "resolution": spec.resolution,
-                        "batch_size": spec.resolved_model.batch_size,
                         "settings": spec.inference_overrides,
                     }
                     for spec in specs
@@ -144,7 +141,6 @@ def _compare_models(
         dataset_location=None if destination else dataset.location,
     )
     cache_root = default_cache_root(dataset.location)
-    package_versions_snapshot = package_versions()
     print(
         f"Comparing {len(specs)} models on frozen {cohort.split!r} cohort "
         f"({len(cohort.records)} images, fingerprint {cohort.fingerprint[:12]})\nDestination: {target}\n"
@@ -366,18 +362,18 @@ def _evaluate_model(
             "confidence": confidence,
             "postprocess": postprocess,
             "protocol": protocol,
-            "device": device,
             "settings": settings,
-            "versions": package_versions(),
         }
     )
 
     def get_predictions(active: Cohort, active_posts: tuple[float, ...]) -> tuple[dict[float, dict[str, list[Prediction]]], dict[str, Any], dict[str, float]]:
+        # Execution choices such as device and batch size are deliberately not
+        # part of this payload. They change how inference runs, not its logical
+        # model/dataset/prediction identity.
         payload = {
             "model_sha256": model_sha, "cohort_fingerprint": active.fingerprint, "task": active.task,
-            "classes": active.classes, "backend": backend, "versions": package_versions(),
+            "classes": active.classes, "backend": backend,
             "resolution": spec.resolution, "confidence_floor": floor, "postprocess_thresholds": active_posts,
-            "device": device, "batch_size": spec.resolved_model.batch_size,
             "settings": settings,
         }
         prediction_identity = {

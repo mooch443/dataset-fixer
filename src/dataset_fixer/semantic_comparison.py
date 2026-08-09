@@ -32,7 +32,6 @@ from .utils import (
     IMAGE_SUFFIXES,
     environment_snapshot,
     normalize_split,
-    package_versions,
     settings_fingerprint,
     sha256_file,
     to_jsonable,
@@ -155,7 +154,23 @@ def compare_nnunet_models(
         ],
     }
     fingerprint = settings_fingerprint(
-        {**to_jsonable(resolved_settings), "cohort_fingerprint": cohort_fingerprint}
+        {
+            "schema": SEMANTIC_REPORT_SCHEMA,
+            "cohort_fingerprint": cohort_fingerprint,
+            "models": [
+                {
+                    "name": spec.name,
+                    "model_sha256": spec.digest,
+                    "backend": model_backends[spec.name],
+                    "folds": spec.folds,
+                    "checkpoint": spec.checkpoint,
+                    "upscale_factor": spec.upscale_factor,
+                    "resolution": spec.resolution or 480,
+                    "sahi": resolved_sahi_by_model.get(spec.name),
+                }
+                for spec in specs
+            ],
+        }
     )
     target = (
         Path(destination).expanduser().resolve()
@@ -211,22 +226,19 @@ def compare_nnunet_models(
         model_inputs = _model_inputs_from_cases(cases)
         for model_index, spec in enumerate(specs):
             selected_backend = model_backends[spec.name]
-            cache_identity = cache_key(
-                {
-                    "schema": SEMANTIC_EVALUATION_CACHE_SCHEMA,
-                    "space": "nnunet-semantic",
-                    "cohort": cohort_fingerprint,
-                    "model_sha256": spec.digest,
-                    "backend": selected_backend,
-                    "folds": spec.folds,
-                    "checkpoint": spec.checkpoint,
-                    "upscale_factor": spec.upscale_factor,
-                    "device": resolved_devices[spec.name],
-                    "resolution": spec.resolution or 480,
-                    "sahi": resolved_sahi_by_model.get(spec.name),
-                    "versions": package_versions(),
-                }
-            )
+            cache_payload = {
+                "schema": SEMANTIC_EVALUATION_CACHE_SCHEMA,
+                "space": "nnunet-semantic",
+                "cohort": cohort_fingerprint,
+                "model_sha256": spec.digest,
+                "backend": selected_backend,
+                "folds": spec.folds,
+                "checkpoint": spec.checkpoint,
+                "upscale_factor": spec.upscale_factor,
+                "resolution": spec.resolution or 480,
+                "sahi": resolved_sahi_by_model.get(spec.name),
+            }
+            cache_identity = cache_key(cache_payload)
             cache_dir = default_cache_root(export.location) / "semantic" / cache_identity
             cached = _load_semantic_cache(
                 cache_dir, cases, progress=progress, model_name=spec.name
@@ -312,6 +324,7 @@ def compare_nnunet_models(
                         "native_summary": native_summary,
                         "inference_seconds": inference_seconds,
                         "execution": execution,
+                        "cache_identity": cache_payload,
                     },
                     progress=progress,
                     model_name=spec.name,
@@ -515,11 +528,9 @@ def compare_semantic_models(
     model_systems = {
         model.name: {
             "backend": model.inference,
-            "device": resolved_devices[model.name],
             "resolution": model.resolution or 480,
             "confidence": model.confidence if model.kind == "ultralytics" else None,
             "postprocess": model.postprocess if model.kind == "ultralytics" else None,
-            "batch_size": model.batch_size,
             "sahi": resolved_sahi_by_model.get(model.name),
         }
         for model in models
@@ -570,7 +581,28 @@ def compare_semantic_models(
         ],
     }
     fingerprint = settings_fingerprint(
-        {**to_jsonable(resolved_settings), "cohort_fingerprint": cohort_fingerprint}
+        {
+            "schema": SEMANTIC_REPORT_SCHEMA,
+            "cohort_fingerprint": cohort_fingerprint,
+            "models": [
+                {
+                    "name": model.name,
+                    "model_sha256": model.digest,
+                    "kind": model.kind,
+                    "task": model.task,
+                    "folds": model.folds,
+                    "checkpoint": model.checkpoint,
+                    "upscale_factor": model.upscale_factor,
+                    "inference": model.inference,
+                    "resolution": model.resolution or 480,
+                    "confidence": model.confidence,
+                    "postprocess": model.postprocess,
+                    "settings": model.settings,
+                    "sahi": resolved_sahi_by_model.get(model.name),
+                }
+                for model in models
+            ],
+        }
     )
     target = (
         Path(destination).expanduser().resolve()
@@ -630,28 +662,21 @@ def compare_semantic_models(
                         "postprocess": float(postprocess),
                     }
                 )
-            cache_identity = cache_key(
-                {
-                    "schema": SEMANTIC_EVALUATION_CACHE_SCHEMA,
-                    "space": "binary-semantic",
-                    "cohort": cohort_fingerprint,
-                    "model_sha256": model.digest,
-                    "kind": model.kind,
-                    "task": model.task,
-                    "model_settings": model.settings,
-                    "folds": model.folds,
-                    "checkpoint": model.checkpoint,
-                    "upscale_factor": model.upscale_factor,
-                    "workers": model.workers,
-                    "batch_size": model.batch_size,
-                    "settings": {
-                        key: value
-                        for key, value in predict_options.items()
-                        if key != "progress"
-                    },
-                    "versions": package_versions(),
-                }
-            )
+            cache_payload = {
+                "schema": SEMANTIC_EVALUATION_CACHE_SCHEMA,
+                "space": "binary-semantic",
+                "cohort": cohort_fingerprint,
+                "model_sha256": model.digest,
+                "kind": model.kind,
+                "task": model.task,
+                "folds": model.folds,
+                "checkpoint": model.checkpoint,
+                "upscale_factor": model.upscale_factor,
+                "inference": model.inference,
+                "resolution": model.resolution or 480,
+                "settings": model.settings,
+            }
+            cache_identity = cache_key(cache_payload)
             cache_dir = default_cache_root(export.location) / "semantic" / cache_identity
             cached = _load_semantic_cache(
                 cache_dir, cases, progress=progress, model_name=model.name
@@ -704,6 +729,7 @@ def compare_semantic_models(
                         "backend": prediction_backend,
                         "inference_seconds": inference_seconds,
                         "warnings": model_warnings,
+                        "cache_identity": cache_payload,
                     },
                     progress=progress,
                     model_name=model.name,

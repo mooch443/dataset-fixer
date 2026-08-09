@@ -1514,10 +1514,11 @@ class ModelCollection:
 
         Verified per-model predictions and metrics are cached below
         ``<dataset>/.cache/evaluations/`` using the dataset cohort, model
-        content, adapter settings, batching, device, and dependency versions.
-        A matching rerun reuses those results even when a different report
-        destination is requested. Complete default reports are stored below
-        ``<dataset>/evaluations/``.
+        content, and output-affecting prediction/SAHI settings. Execution-only
+        choices such as device, worker count, batch size, and installed package
+        versions do not invalidate predictions. A matching rerun reuses those
+        results even when a different report destination is requested.
+        Complete default reports are stored below ``<dataset>/evaluations/``.
 
         Parameters:
             source: Fixed, on-disk :class:`Dataset` to evaluate.

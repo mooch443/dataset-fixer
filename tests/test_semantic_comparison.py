@@ -1080,6 +1080,20 @@ def test_repeating_a_sahi_comparison_reuses_cached_predictions_and_metrics(
     assert len(session.batch_sizes) == inference_calls
     assert again.ranking[0]["score"] == pytest.approx(first.ranking[0]["score"])
 
+    # Device, worker count, and batching change execution only. They must not
+    # create another prediction identity for the same model and cohort.
+    changed_execution = models.configure(
+        {"sliced": {"device": "cpu", "workers": 3, "batch_size": 1}}
+    )
+    execution_rerun = changed_execution.compare(
+        exported,
+        progress=False,
+        destination=tmp_path / "sliced-execution-changed",
+    )
+    assert all(row["cache"] == "hit" for row in execution_rerun.ranking)
+    assert len(session.batch_sizes) == inference_calls, "re-ran network inference"
+    assert len(commands) == evaluations, "re-ran the official evaluator"
+
 
 def test_changing_a_sahi_setting_invalidates_the_cached_prediction(
     tmp_path: Path,

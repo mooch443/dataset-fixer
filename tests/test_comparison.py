@@ -482,14 +482,17 @@ def test_model_collection_compare_atomic_result(
     assert direct_result.settings["models"]["direct"]["backend"] == "native"
     assert fake_inference.calls == 1, "renaming identical model bytes invalidated the cache"
 
-    changed_batch = models.configure({"baseline": {"batch_size": 2}})
-    changed_batch.compare(
+    changed_execution = models.configure(
+        {"baseline": {"batch_size": 2, "device": "cpu", "workers": 3}}
+    )
+    execution_result = changed_execution.compare(
         dataset,
         split="val",
         progress=False,
         destination=tmp_path / "comparison-changed-batch",
     )
-    assert fake_inference.calls == 2, "batch setting was omitted from prediction identity"
+    assert fake_inference.calls == 1, "execution-only settings invalidated predictions"
+    assert execution_result.cache_statistics["prediction_hits"] == 1
 
 
 def test_comparison_visuals_have_data_and_metadata_sidecars(
