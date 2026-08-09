@@ -221,7 +221,7 @@ def test_model_collection_rejects_removed_shared_configuration(
         models.compare(object(), baseline="candidate")
     with pytest.raises(TypeError, match="unexpected keyword argument 'inference'"):
         Model.load_many({"candidate": checkpoint}, inference="sahi")
-    with pytest.raises(DatasetValidationError, match="missing path"):
+    with pytest.raises(DatasetValidationError, match="missing source/path"):
         Model.load_many({"candidate": {"model_folder": checkpoint}})
 
 

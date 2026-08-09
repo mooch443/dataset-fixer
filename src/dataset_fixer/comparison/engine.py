@@ -52,7 +52,6 @@ def _compare_models(
     seed = 42
     bootstrap_resamples = 10_000
     specs = parse_models(models)
-    baseline = specs[0].name
     cohort = freeze_cohort(dataset, split)
     model_backends = {
         spec.name: resolve_backend(
@@ -90,9 +89,8 @@ def _compare_models(
         )
 
     resolved_settings = {
-        "report_schema": 5,
+        "report_schema": 6,
         "split": cohort.split,
-        "baseline": baseline,
         "protocol": protocol,
         "training_provenance": "verify-when-configured",
         "comparison_unit": comparison_unit,
@@ -104,7 +102,7 @@ def _compare_models(
     fingerprint = settings_fingerprint(
         to_jsonable(
             {
-                "schema": 4,
+                "schema": 5,
                 "cohort": cohort.fingerprint,
                 "models": [
                     {
@@ -135,7 +133,7 @@ def _compare_models(
         and (not save_prediction_plots or (target / "predictions").is_dir())
     ):
         cached_manifest = json.loads(existing_result.read_text(encoding="utf-8"))
-        if cached_manifest.get("schema") == 5:
+        if cached_manifest.get("schema") == 6:
             print(f"Reusing complete comparison: {target}")
             return _result_from_manifest(target, cached_manifest)
     temporary = build_staging_dir(
@@ -232,7 +230,7 @@ def _compare_models(
             paired = list(cached_statistics["paired"])
         else:
             paired = paired_statistics(
-                best_rows, baseline, resamples=bootstrap_resamples, seed=seed
+                best_rows, resamples=bootstrap_resamples, seed=seed
             )
             save_evaluation_cache(
                 cache_root,
@@ -286,7 +284,7 @@ def _compare_models(
             "fresh_inference": sum(value.get("source") == "fresh" for value in cache_audit.values()),
         }
         manifest = {
-            "schema": 5,
+            "schema": 6,
             "kind": "model-comparison",
             "dataset": {"name": dataset.name, "location": str(dataset.location), "task": cohort.task},
             "cohort_fingerprint": cohort.fingerprint,

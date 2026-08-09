@@ -510,13 +510,7 @@ comparison = models.compare(
     split="val",
 )
 
-# Semantic-mask comparisons can treat every model equally and report every
-# unordered paired difference instead of selecting a reference model.
-equal_comparison = models.compare(
-    dataset,  # a semantic-mask Dataset
-    split="val",
-    paired_comparisons="all",
-)
+# Every comparison reports all unordered model pairs automatically.
 
 # SAHI belongs to each model specification, not the comparison call.
 sliced_models = Model.load_many({
@@ -533,11 +527,10 @@ sliced = sliced_models.compare(dataset, split="val")
 ```
 
 `models.compare()` has no shared inference, resolution, threshold, protocol,
-comparison-space, comparison-unit, or baseline options. Each model carries its
-own configuration, the dataset/task pair determines the canonical metric
-space, and reference-mode comparisons use the first loaded model for paired
-differences. Semantic-mask comparisons may instead set
-`paired_comparisons="all"` to compute every unordered pair with no reference.
+comparison-space, comparison-unit, or model-reference options. Each model
+carries its own configuration, the dataset/task pair determines the canonical
+metric space, and every unordered model pair is evaluated. A single-model run
+has no pairwise statistics.
 The report labels candidates as model variants only when their inference
 systems match; otherwise it labels them as distinct systems automatically.
 
@@ -568,6 +561,52 @@ bytes, backend, resolved model inference/SAHI settings, metric protocol, and rel
 dependency versions. Repeating the same comparison performs no inference or
 evaluation; changing one model recomputes only that model. Caching is always
 enabled and has no public switch.
+
+Dataset ZIPs are accepted directly by the unchanged `Dataset.open()` API.
+Likewise, `Model.load_many()` accepts local `.pt` files, nnU-Net folders,
+portable bundle ZIPs, `wandb:entity/project/run-id` references, full W&B run
+URLs, model objects, and mappings. Drive inputs are copied to local Colab
+storage, downloads and safe extraction are atomic, and unchanged inputs are
+reused from the automatic cache. Standalone checkpoints with unproven training
+geometry still load; configure only the missing values after resolving names:
+
+```python
+models = Model.load_many(MODEL_SOURCES)
+models = models.configure({
+    "standalone-yolox": {
+        "task": "semantic",
+        "native_tile_size": 128,
+        "upscale_factor": 2,
+        "inference": "sahi",
+        "device": "cuda",
+    }
+})
+```
+
+Training preparation and portable output use focused subpackages:
+
+```python
+from dataset_fixer.convert import Kind, prepare
+from dataset_fixer.bundle import Config, Outcome, create
+from dataset_fixer.wandb import configure, upload
+
+prepared = prepare(dataset, Kind.YOLO_SEM, native_tile_size=128, upscale_factor=2)
+config = Config(
+    name="islands-sem",
+    framework="ultralytics",
+    task="semantic",
+    geometry=prepared.geometry,
+    dataset=prepared,
+)
+configure(existing_run, config)  # never initializes or logs in
+bundle = create(config, Outcome(checkpoint="runs/segment/train/weights/best.pt"))
+bundle = upload(existing_run, bundle)  # local ZIP survives every outcome
+```
+
+`prepare()` records exact interpolation and label mapping, requires an explicit
+threshold for binary JPEG recovery, never derives polygons from semantic masks,
+and content-addresses all generated data. `bundle.create()` always creates the
+ZIP in local storage. Neither helper uploads or copies a bundle to Google Drive.
 
 The returned `ComparisonResult` reports factual state: the cohort fingerprint,
 cohort verification, training overlap, provenance completeness, cache
@@ -656,6 +695,7 @@ The intentionally small public API is:
 - `Model.predict`
 - `Model.compare`
 - `Model.load_many`
+- `ModelCollection.configure`
 - `ModelCollection.predict`
 - `ModelCollection.compare`
 

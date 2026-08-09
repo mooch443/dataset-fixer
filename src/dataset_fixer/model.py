@@ -14,6 +14,7 @@ import yaml
 from PIL import Image
 
 from .errors import DatasetValidationError, ValidationIssue
+from .geometry import Geometry
 from .utils import IMAGE_SUFFIXES, sha256_file, slugify, to_jsonable
 
 ModelKind = Literal["ultralytics", "nnunet"]
@@ -356,7 +357,10 @@ class Model:
         device: Default inference device.
         folds: nnU-Net folds selected for prediction.
         checkpoint: nnU-Net checkpoint filename within each fold.
-        upscale_factor: nnU-Net input adapter scale used during training.
+        native_tile_size: Source tile size used to create training samples.
+        upscale_factor: Input adapter scale used during training. ``None``
+            preserves unknown standalone-checkpoint geometry.
+        input_size: Adapter/model input size after upscaling.
         workers: nnU-Net CPU worker count for preprocessing and probability
             conversion. This is not the neural-network batch size, which is
             derived from the model's own plan and the inference device.
@@ -388,7 +392,9 @@ class Model:
         device: str | None = None,
         folds: tuple[int | str, ...] = (0,),
         checkpoint: str = "checkpoint_final.pth",
-        upscale_factor: int = 1,
+        native_tile_size: int | tuple[int, int] | None = None,
+        upscale_factor: int | None = None,
+        input_size: int | tuple[int, int] | None = None,
         workers: int = 2,
         confidence: float = 0.25,
         postprocess: float = 0.7,
@@ -418,22 +424,32 @@ class Model:
             raise ValueError("Model name must be non-empty")
         if inference not in {"native", "sahi"}:
             raise ValueError("inference must be 'native' or 'sahi'; 'auto' was removed")
+        try:
+            geometry = Geometry.create(
+                native_tile_size=native_tile_size,
+                upscale_factor=upscale_factor,
+                input_size=input_size if input_size is not None else resolution,
+                source=parsed_name,
+            )
+        except ValueError as exc:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    str(exc),
+                    source=parsed_name,
+                    value={
+                        "native_tile_size": native_tile_size,
+                        "upscale_factor": upscale_factor,
+                        "input_size": input_size,
+                    },
+                )
+            ) from exc
+        if resolution is None and geometry.input_size is not None:
+            if geometry.input_size[0] == geometry.input_size[1]:
+                resolution = geometry.input_size[0]
         if resolution is not None and (
             isinstance(resolution, bool) or int(resolution) <= 0
         ):
             raise ValueError("resolution must be a positive integer")
-        if (
-            isinstance(upscale_factor, bool)
-            or not isinstance(upscale_factor, int)
-            or upscale_factor <= 0
-        ):
-            raise DatasetValidationError(
-                ValidationIssue(
-                    "Model upscale_factor must be a positive integer",
-                    source=parsed_name,
-                    value=upscale_factor,
-                )
-            )
         if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
             raise ValueError("workers must be a positive integer")
 
@@ -445,6 +461,11 @@ class Model:
         self._inference = inference
         self._device = device
         self._settings = dict(settings or {})
+        if geometry.native_tile_size is not None:
+            if sahi_slice_height is None:
+                sahi_slice_height = geometry.native_tile_size[0]
+            if sahi_slice_width is None:
+                sahi_slice_width = geometry.native_tile_size[1]
         explicit_settings = {
             "confidence": confidence,
             "postprocess": postprocess,
@@ -509,7 +530,8 @@ class Model:
                 "Threshold sweeps were removed; configure one fixed value per model: "
                 f"{migration}"
             )
-        self._upscale_factor = upscale_factor
+        self._geometry = geometry
+        self._upscale_factor = geometry.upscale_factor or 1
         self._workers = workers
         self._folds: tuple[str, ...] = ()
         self._checkpoint = checkpoint
@@ -724,9 +746,27 @@ class Model:
 
     @property
     def upscale_factor(self) -> int:
-        """nnU-Net input adapter scale."""
+        """Input adapter scale; defaults to one when geometry is unknown."""
 
         return self._upscale_factor
+
+    @property
+    def geometry(self) -> Geometry:
+        """Normalized training/evaluation geometry known for this model."""
+
+        return self._geometry
+
+    @property
+    def native_tile_size(self) -> tuple[int, int] | None:
+        """Source tile size used during training, when proven."""
+
+        return self.geometry.native_tile_size
+
+    @property
+    def input_size(self) -> tuple[int, int] | None:
+        """Adapter/model input size after preprocessing, when known."""
+
+        return self.geometry.input_size
 
     @property
     def workers(self) -> int:
@@ -778,10 +818,49 @@ class Model:
             "checkpoint_sha256": (
                 self.checkpoint_sha256 if self.kind == "nnunet" else None
             ),
-            "upscale_factor": self.upscale_factor if self.kind == "nnunet" else None,
+            "geometry": self.geometry.as_dict(),
+            "native_tile_size": self.native_tile_size,
+            "upscale_factor": self.geometry.upscale_factor,
+            "input_size": self.input_size,
             "workers": self.workers if self.kind == "nnunet" else None,
             "settings": to_jsonable(self.settings),
         }
+
+    def _configured_copy(
+        self,
+        *,
+        name: str | None = None,
+        overrides: Mapping[str, Any] | None = None,
+    ) -> "Model":
+        """Clone this lazy model without sharing or initializing its runtime."""
+
+        values = dict(overrides or {})
+        settings = {**self.settings, **dict(values.pop("settings", {}) or {})}
+        native = values.pop("native_tile_size", self.geometry.native_tile_size)
+        factor = values.pop("upscale_factor", self.geometry.upscale_factor)
+        model_input = values.pop(
+            "input_size",
+            values.pop("model_input_size", self.geometry.input_size),
+        )
+        defaults: dict[str, Any] = {
+            "kind": self.kind,
+            "task": self.task,
+            "resolution": self.resolution,
+            "training_dataset": self.training_dataset,
+            "inference": self.inference,
+            "device": self.device,
+            "folds": self.folds or (0,),
+            "checkpoint": self.checkpoint,
+            "native_tile_size": native,
+            "upscale_factor": factor,
+            "input_size": model_input,
+            "workers": self.workers,
+            "confidence": self.confidence,
+            "postprocess": self.postprocess,
+            "settings": settings,
+        }
+        defaults.update(values)
+        return Model(self.path, name=name or self.name, **defaults)
 
     def predict(
         self,
@@ -1000,7 +1079,6 @@ class Model:
         *,
         split: Literal["train", "val", "test"] = "val",
         save_prediction_plots: bool = False,
-        paired_comparisons: Literal["reference", "all"] = "reference",
         progress: bool = True,
         destination: str | Path | None = None,
     ) -> Any:
@@ -1013,8 +1091,6 @@ class Model:
                 ``predictions/`` for the cases the report keeps in
                 ``worst_cases``. Cases with neither a reference nor a
                 prediction are skipped, since their panels are empty.
-            paired_comparisons: Use the first model as the paired-difference
-                reference, or compute every unordered pair without a reference.
             progress: Show package-managed progress bars.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.
@@ -1028,7 +1104,6 @@ class Model:
             source,
             split=split,
             save_prediction_plots=save_prediction_plots,
-            paired_comparisons=paired_comparisons,
             progress=progress,
             destination=destination,
         )
@@ -1084,10 +1159,10 @@ class Model:
         """Normalize paths/configurations into an ordered model collection.
 
         Parameters:
-            models: A model, model path, sequence of either, or ordered
-                name-to-model mapping. Mapping specifications must contain a
-                ``path`` and put every model-specific option in that same
-                specification; no collection-wide defaults are applied.
+            models: A model, local checkpoint/folder/bundle, W&B run reference,
+                sequence of sources, source specification, or ordered
+                name-to-source mapping. Source specifications accept either
+                ``source`` or the legacy ``path`` key.
 
         Returns:
             An unbound :class:`ModelCollection` preserving input order.
@@ -1100,7 +1175,10 @@ class Model:
         if isinstance(models, (str, Path)):
             items = [(None, models)]
         elif isinstance(models, Mapping):
-            items = list(models.items())
+            if "source" in models or "path" in models:
+                items = [(models.get("name"), models)]
+            else:
+                items = list(models.items())
         elif isinstance(models, Sequence):
             items = [(None, value) for value in models]
         else:
@@ -1117,37 +1195,41 @@ class Model:
                 if raw_name is None or str(raw_name) == value.name:
                     model = value
                 else:
-                    model = Model(
-                        value.path,
-                        name=str(raw_name),
-                        kind=value.kind,
-                        task=value.task,
-                        resolution=value.resolution,
-                        training_dataset=value.training_dataset,
-                        inference=value.inference,
-                        device=value.device,
-                        folds=value.folds or (0,),
-                        checkpoint=value.checkpoint,
-                        upscale_factor=value.upscale_factor,
-                        workers=value.workers,
-                        confidence=value.confidence,
-                        postprocess=value.postprocess,
-                        settings=value.settings,
-                    )
+                    model = value._configured_copy(name=str(raw_name))
             else:
                 if isinstance(value, Mapping):
                     configuration = dict(value)
-                    raw_source = configuration.pop("path", None)
+                    raw_source = configuration.pop(
+                        "source", configuration.pop("path", None)
+                    )
+                    explicit_name = configuration.pop("name", None)
+                    run_file = configuration.pop(
+                        "run_file", configuration.pop("bundle_file", None)
+                    )
                 else:
                     configuration = {}
                     raw_source = value
+                    explicit_name = None
+                    run_file = None
                 if raw_source is None:
                     raise DatasetValidationError(
                         ValidationIssue(
-                            "Model specification is missing path",
+                            "Model specification is missing source/path",
                             source=str(raw_name) if raw_name is not None else None,
                         )
                     )
+                from .model_sources import resolve_model_source
+
+                resolved_source = resolve_model_source(
+                    raw_source,
+                    name=(
+                        str(raw_name)
+                        if raw_name is not None
+                        else str(explicit_name) if explicit_name is not None else None
+                    ),
+                    run_file=run_file,
+                    progress=True,
+                )
                 known = {
                     "kind",
                     "task",
@@ -1157,7 +1239,10 @@ class Model:
                     "device",
                     "folds",
                     "checkpoint",
+                    "native_tile_size",
                     "upscale_factor",
+                    "input_size",
+                    "model_input_size",
                     "workers",
                     "confidence",
                     "postprocess",
@@ -1179,11 +1264,26 @@ class Model:
                         if key not in known
                     }
                 )
+                constructor = dict(resolved_source.options)
+                constructor.update(configuration)
+                constructor.setdefault(
+                    "native_tile_size", resolved_source.geometry.native_tile_size
+                )
+                constructor.setdefault(
+                    "upscale_factor", resolved_source.geometry.upscale_factor
+                )
+                constructor.setdefault("input_size", resolved_source.geometry.input_size)
                 model = Model(
-                    raw_source,
-                    name=str(raw_name) if raw_name is not None else None,
+                    resolved_source.path,
+                    name=(
+                        str(raw_name)
+                        if raw_name is not None
+                        else str(explicit_name)
+                        if explicit_name is not None
+                        else resolved_source.name
+                    ),
                     settings=adapter_settings,
-                    **configuration,
+                    **constructor,
                 )
             if model.name in seen_names or model.slug in seen_slugs:
                 raise DatasetValidationError(
@@ -1238,6 +1338,72 @@ class ModelCollection:
                 return model
         raise KeyError(f"Unknown model {value!r}")
 
+    def configure(self, mapping: Mapping[str, Mapping[str, Any]]) -> "ModelCollection":
+        """Return an immutable per-model configuration update.
+
+        Names are resolved after loading, making this suitable for standalone
+        checkpoints whose display names were inferred from a file or W&B run.
+        Unmentioned models are retained as the same objects.
+
+        Parameters:
+            mapping: Resolved model names mapped to device, inference, worker,
+                SAHI, task, or geometry overrides.
+
+        Returns:
+            A new collection. The original collection and models are unchanged.
+        """
+
+        if not isinstance(mapping, Mapping):
+            raise TypeError("configuration must map resolved model names to mappings")
+        unknown = sorted(set(mapping) - set(self.names))
+        if unknown:
+            raise KeyError(
+                f"Unknown model name(s): {', '.join(map(str, unknown))}; "
+                f"available: {', '.join(self.names)}"
+            )
+        allowed = {
+            "task",
+            "resolution",
+            "training_dataset",
+            "inference",
+            "device",
+            "folds",
+            "checkpoint",
+            "native_tile_size",
+            "upscale_factor",
+            "input_size",
+            "model_input_size",
+            "workers",
+            "confidence",
+            "postprocess",
+            "sahi_slice_height",
+            "sahi_slice_width",
+            "sahi_overlap",
+            "sahi_overlap_height_ratio",
+            "sahi_overlap_width_ratio",
+            "sahi_postprocess_type",
+            "sahi_postprocess_match_metric",
+            "sahi_postprocess_class_agnostic",
+            "sahi_model_type",
+            "settings",
+        }
+        configured: list[Model] = []
+        for model in self.models:
+            if model.name not in mapping:
+                configured.append(model)
+                continue
+            overrides = mapping[model.name]
+            if not isinstance(overrides, Mapping):
+                raise TypeError(f"Configuration for {model.name!r} must be a mapping")
+            unexpected = sorted(set(overrides) - allowed)
+            if unexpected:
+                raise ValueError(
+                    f"Unsupported configuration for {model.name!r}: "
+                    + ", ".join(unexpected)
+                )
+            configured.append(model._configured_copy(overrides=overrides))
+        return ModelCollection(tuple(configured))
+
     def predict(
         self,
         source: Any,
@@ -1268,7 +1434,6 @@ class ModelCollection:
         *,
         split: Literal["train", "val", "test"] = "val",
         save_prediction_plots: bool = False,
-        paired_comparisons: Literal["reference", "all"] = "reference",
         progress: bool = True,
         destination: str | Path | None = None,
     ) -> Any:
@@ -1282,9 +1447,6 @@ class ModelCollection:
                 ``worst_cases``, with at most two model panels per row.
                 Cases with neither a reference nor a prediction are
                 skipped, since their panels are empty.
-            paired_comparisons: ``"reference"`` computes paired differences
-                from the first model. ``"all"`` treats every model equally and
-                computes every unordered model pair.
             progress: Show package-managed progress bars.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.
@@ -1300,12 +1462,13 @@ class ModelCollection:
 
         if not isinstance(active, Dataset):
             raise TypeError("Model comparison requires a Dataset")
-        if paired_comparisons not in {"reference", "all"}:
-            raise ValueError("paired_comparisons must be 'reference' or 'all'")
         if active._plan:
             raise DatasetValidationError(
                 "Model comparison requires a fixed on-disk cohort; call dataset.export(...) first"
             )
+        from .geometry import validate_collection_geometry
+
+        validate_collection_geometry(active, self, split=split)
 
         if isinstance(active, Dataset) and active.format == "semantic_masks":
             model_tasks = {model.task for model in self.models}
@@ -1334,7 +1497,6 @@ class ModelCollection:
                     self,
                     split=split,
                     save_prediction_plots=save_prediction_plots,
-                    paired_comparisons=paired_comparisons,
                     progress=progress,
                     destination=destination,
                 )
@@ -1345,7 +1507,6 @@ class ModelCollection:
                 self,
                 split=split,
                 save_prediction_plots=save_prediction_plots,
-                paired_comparisons=paired_comparisons,
                 progress=progress,
                 destination=destination,
             )
@@ -1356,10 +1517,6 @@ class ModelCollection:
                     value=[model.name for model in self.models if model.kind != "ultralytics"],
                     suggestion="compare nnU-Net folders against a semantic-mask Dataset",
                 )
-            )
-        if paired_comparisons != "reference":
-            raise ValueError(
-                "paired_comparisons='all' currently requires a semantic-mask dataset"
             )
         known_tasks = {model.task for model in self.models if model.task is not None}
         if len(known_tasks) > 1:

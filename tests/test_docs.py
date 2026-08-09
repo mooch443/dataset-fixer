@@ -86,6 +86,7 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
     assert "save_prediction_plots" in comparison_signature
     for removed in (
         "baseline",
+        "paired_comparisons",
         "comparison_space",
         "inference",
         "confidence",
@@ -132,6 +133,11 @@ def test_public_model_api_documents_every_parameter() -> None:
             ModelCollection.compare,
             inspect.signature(ModelCollection.compare),
             inspect.getdoc(ModelCollection.compare),
+        ),
+        (
+            ModelCollection.configure,
+            inspect.signature(ModelCollection.configure),
+            inspect.getdoc(ModelCollection.configure),
         ),
         (
             ModelCollection.visualize,

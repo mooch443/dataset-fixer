@@ -395,13 +395,58 @@ def load_session(
 
 
 def require_nnunet() -> None:
+    """Privately import-probe the coherent Python 3.12 nnU-Net stack."""
+
+    import importlib
+    import importlib.metadata
     import importlib.util
 
+    if getattr(require_nnunet, "_succeeded", False):
+        return
     if importlib.util.find_spec("nnunetv2") is None:
         raise ImportError(
             "nnU-Net prediction was requested but nnunetv2 is not installed; "
             "install dataset-fixer[nnunet]"
         )
+    packages = {
+        "numpy": "numpy",
+        "scipy": "scipy",
+        "scikit-image": "skimage",
+        "batchgeneratorsv2": "batchgeneratorsv2",
+        "nnunetv2": "nnunetv2",
+    }
+    reinstall = (
+        "python -m pip install --upgrade --force-reinstall --no-deps "
+        "\"numpy>=2.5.1,<2.6\" \"scipy>=1.18,<1.19\" "
+        "\"scikit-image>=0.26,<0.27\" \"batchgeneratorsv2>=0.3.2,<0.4\" "
+        "\"nnunetv2==2.8.1\""
+    )
+    try:
+        for module in packages.values():
+            importlib.import_module(module)
+        # Trainer discovery imports the same morphology/scientific path that
+        # exposed the Colab NumPy ``_blas_supports_fpe`` ABI mismatch.
+        importlib.import_module(
+            "nnunetv2.training.nnUNetTrainer.nnUNetTrainer"
+        )
+    except Exception as exc:
+        versions = []
+        for distribution in packages:
+            try:
+                version = importlib.metadata.version(distribution)
+            except importlib.metadata.PackageNotFoundError:
+                version = "missing"
+            versions.append(f"{distribution}={version}")
+        restart = (
+            " After reinstalling packages in Colab, restart the runtime manually; "
+            "the active kernel cannot safely reload this scientific stack."
+        )
+        raise RuntimeError(
+            "The nnU-Net scientific stack cannot be imported coherently "
+            f"({', '.join(versions)}). Reinstall with:\n{reinstall}.{restart} "
+            f"Original error: {type(exc).__name__}: {exc}"
+        ) from exc
+    setattr(require_nnunet, "_succeeded", True)
 
 
 def _is_out_of_memory(error: BaseException) -> bool:

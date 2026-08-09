@@ -28,6 +28,13 @@ from dataset_fixer.semantic_comparison import (
 from conftest import make_yolo_dataset
 
 
+@pytest.fixture(autouse=True)
+def _stub_nnunet_dependency_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These adapter tests fake nnU-Net commands/sessions, not its installation."""
+
+    monkeypatch.setattr("dataset_fixer.nnunet_engine.require_nnunet", lambda: None)
+
+
 def _semantic_export(tmp_path: Path) -> Dataset:
     source = make_yolo_dataset(
         tmp_path / "segments",
@@ -902,7 +909,6 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     assert result.ranking[0]["upscale_factor"] == 2
     assert result.ranking[1]["upscale_factor"] == 1
     assert len(result.ranking[0]["model_sha256"]) == 64
-    assert result.baseline == "perfect"
     assert len(commands) == 6
     assert all(options["capture_output"] is True for options in command_options)
     predict = commands[0]
@@ -943,16 +949,14 @@ def test_semantic_export_compares_official_nnunet_model_folders(
 
     equal = models.compare(
         exported,
-        paired_comparisons="all",
         progress=False,
         destination=tmp_path / "comparison-all-pairs",
     )
     equal_manifest = json.loads(
         (equal.location / "reports" / "result.json").read_text()
     )
-    assert equal.baseline is None
-    assert equal_manifest["baseline"] is None
-    assert equal_manifest["settings"]["paired_comparisons"] == "all"
+    assert "baseline" not in equal_manifest
+    assert "paired_comparisons" not in equal_manifest["settings"]
     assert equal_manifest["paired_statistics"]
     assert "baseline" not in equal_manifest["paired_statistics"][0]
     assert equal_manifest["paired_statistics"][0]["model_a"] == "perfect"

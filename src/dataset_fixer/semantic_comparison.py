@@ -42,7 +42,7 @@ from .utils import (
 # Schema versions. These were bumped together when nnU-Net SAHI inference moved
 # from sequential CLI tile processing to in-process minibatched prediction, so
 # results produced by the old engine can never be mistaken for new ones.
-SEMANTIC_REPORT_SCHEMA = 9
+SEMANTIC_REPORT_SCHEMA = 10
 SEMANTIC_PREDICTION_SCHEMA = 2
 SEMANTIC_EVALUATION_CACHE_SCHEMA = 2
 
@@ -75,7 +75,6 @@ def compare_nnunet_models(
     *,
     split: str,
     save_prediction_plots: bool,
-    paired_comparisons: str,
     progress: bool,
     destination: str | Path | None,
 ) -> SemanticComparisonResult:
@@ -114,7 +113,6 @@ def compare_nnunet_models(
         if len({settings_fingerprint(value) for value in model_systems.values()}) == 1
         else "system"
     )
-    baseline = specs[0].name if paired_comparisons == "reference" else None
     cases, cohort_fingerprint = _freeze_cohort(export, split)
 
     resolved_settings = {
@@ -135,8 +133,6 @@ def compare_nnunet_models(
             )
         ),
         "split": split,
-        "baseline": baseline,
-        "paired_comparisons": paired_comparisons,
         "bootstrap_resamples": bootstrap_resamples,
         "seed": seed,
         "model_backends": model_backends,
@@ -383,19 +379,10 @@ def compare_nnunet_models(
         if cached_statistics is not None and isinstance(cached_statistics.get("paired"), list):
             paired = list(cached_statistics["paired"])
         else:
-            paired = (
-                _paired_statistics(
-                    model_rows,
-                    baseline,
-                    resamples=bootstrap_resamples,
-                    seed=seed,
-                )
-                if baseline is not None
-                else _all_pairwise_statistics(
-                    model_rows,
-                    resamples=bootstrap_resamples,
-                    seed=seed,
-                )
+            paired = _all_pairwise_statistics(
+                model_rows,
+                resamples=bootstrap_resamples,
+                seed=seed,
             )
             save_evaluation_cache(
                 statistics_cache,
@@ -443,7 +430,6 @@ def compare_nnunet_models(
             "cohort_verified": True,
             "split": split,
             "cases": len(cases),
-            "baseline": baseline,
             "settings": resolved_settings,
             "settings_fingerprint": fingerprint,
             "ranking": ranking,
@@ -471,11 +457,7 @@ def compare_nnunet_models(
         shutil.rmtree(temporary, ignore_errors=True)
         raise
 
-    pairing = (
-        f"reference: {baseline}"
-        if baseline is not None
-        else "paired comparisons: all unordered pairs"
-    )
+    pairing = "paired comparisons: all unordered pairs" if len(specs) > 1 else "single-model evaluation"
     print(
         f"Semantic model comparison complete: {target}\n"
         f"Cohort verified: yes; cases: {len(cases)}; {pairing}"
@@ -486,7 +468,6 @@ def compare_nnunet_models(
         cohort_fingerprint=cohort_fingerprint,
         cohort_verified=True,
         split=split,
-        baseline=baseline,
         settings=resolved_settings,
         limitations=tuple(limitations),
     )
@@ -498,7 +479,6 @@ def compare_semantic_models(
     *,
     split: str,
     save_prediction_plots: bool,
-    paired_comparisons: str,
     progress: bool,
     destination: str | Path | None,
 ) -> SemanticComparisonResult:
@@ -511,7 +491,6 @@ def compare_semantic_models(
         raise ValueError(
             f"Unknown semantic-mask split {split!r}; available splits are {export.splits}"
         )
-    baseline = models.models[0].name if paired_comparisons == "reference" else None
     resolved_devices = {
         model.name: model._resolved_device()
         for model in models
@@ -562,8 +541,6 @@ def compare_semantic_models(
         "comparison_space": "semantic",
         "canonical_projection": "binary-foreground-union",
         "split": split,
-        "baseline": baseline,
-        "paired_comparisons": paired_comparisons,
         "comparison_unit": comparison_unit,
         "sahi_models": resolved_sahi_by_model,
         "model_systems": model_systems,
@@ -771,19 +748,10 @@ def compare_semantic_models(
         if cached_statistics is not None and isinstance(cached_statistics.get("paired"), list):
             paired = list(cached_statistics["paired"])
         else:
-            paired = (
-                _paired_statistics(
-                    model_rows,
-                    baseline,
-                    resamples=bootstrap_resamples,
-                    seed=seed,
-                )
-                if baseline is not None
-                else _all_pairwise_statistics(
-                    model_rows,
-                    resamples=bootstrap_resamples,
-                    seed=seed,
-                )
+            paired = _all_pairwise_statistics(
+                model_rows,
+                resamples=bootstrap_resamples,
+                seed=seed,
             )
             save_evaluation_cache(
                 statistics_cache,
@@ -839,7 +807,6 @@ def compare_semantic_models(
             "cohort_verified": True,
             "split": split,
             "cases": len(cases),
-            "baseline": baseline,
             "settings": resolved_settings,
             "settings_fingerprint": fingerprint,
             "ranking": ranking,
@@ -867,11 +834,7 @@ def compare_semantic_models(
         shutil.rmtree(temporary, ignore_errors=True)
         raise
 
-    pairing = (
-        f"reference: {baseline}"
-        if baseline is not None
-        else "paired comparisons: all unordered pairs"
-    )
+    pairing = "paired comparisons: all unordered pairs" if len(models) > 1 else "single-model evaluation"
     print(
         f"Semantic model comparison complete: {target}\n"
         f"Cohort verified: yes; cases: {len(cases)}; {pairing}; "
@@ -883,7 +846,6 @@ def compare_semantic_models(
         cohort_fingerprint=cohort_fingerprint,
         cohort_verified=True,
         split=split,
-        baseline=baseline,
         settings=resolved_settings,
         limitations=tuple(limitations),
     )
@@ -1013,6 +975,9 @@ def predict_nnunet_model(
 
     if model.kind != "nnunet":
         raise TypeError("predict_nnunet_model requires Model(kind='nnunet')")
+    from .nnunet_engine import require_nnunet
+
+    require_nnunet()
     if device not in {"cpu", "cuda", "mps"}:
         raise ValueError("nnU-Net device must be 'cpu', 'cuda', or 'mps'")
     if inference not in {"native", "sahi"}:
@@ -2082,74 +2047,6 @@ def _bootstrap_interval(
     return float(np.quantile(sampled, 0.025)), float(np.quantile(sampled, 0.975))
 
 
-def _paired_statistics(
-    rows_by_model: dict[str, list[dict[str, Any]]],
-    baseline: str,
-    *,
-    resamples: int,
-    seed: int,
-) -> list[dict[str, Any]]:
-    baseline_scores = {
-        row["case_id"]: row["dice"]
-        for row in rows_by_model[baseline]
-        if math.isfinite(row["dice"])
-    }
-    rng = np.random.default_rng(seed)
-    output: list[dict[str, Any]] = []
-    raw_p: list[float] = []
-    for name, rows in rows_by_model.items():
-        if name == baseline:
-            continue
-        scores = {
-            row["case_id"]: row["dice"]
-            for row in rows
-            if math.isfinite(row["dice"])
-        }
-        keys = sorted(set(baseline_scores) & set(scores))
-        differences = np.asarray(
-            [scores[key] - baseline_scores[key] for key in keys],
-            dtype=float,
-        )
-        if not len(differences):
-            continue
-        samples = rng.choice(
-            differences,
-            size=(resamples, len(differences)),
-            replace=True,
-        ).mean(axis=1)
-        signs = rng.choice((-1.0, 1.0), size=(resamples, len(differences)))
-        randomized = (differences * signs).mean(axis=1)
-        p_value = float(
-            (np.sum(np.abs(randomized) >= abs(differences.mean())) + 1)
-            / (resamples + 1)
-        )
-        raw_p.append(p_value)
-        output.append(
-            {
-                "model": name,
-                "baseline": baseline,
-                "metric": "canonical.per_case.Dice",
-                "difference": float(differences.mean()),
-                "ci_low": float(np.quantile(samples, 0.025)),
-                "ci_high": float(np.quantile(samples, 0.975)),
-                "p_value": p_value,
-                "paired_cases": len(differences),
-                "wins": int(np.sum(differences > 0)),
-                "ties": int(np.sum(differences == 0)),
-                "losses": int(np.sum(differences < 0)),
-            }
-        )
-    order = sorted(range(len(raw_p)), key=lambda index: raw_p[index])
-    adjusted = [0.0] * len(raw_p)
-    running = 0.0
-    for rank, index in enumerate(order):
-        running = max(running, min(1.0, raw_p[index] * (len(raw_p) - rank)))
-        adjusted[index] = running
-    for row, value in zip(output, adjusted):
-        row["p_value_holm"] = value
-    return output
-
-
 def _all_pairwise_statistics(
     rows_by_model: dict[str, list[dict[str, Any]]],
     *,
@@ -2416,11 +2313,6 @@ def _semantic_result_from_manifest(
         cohort_fingerprint=str(manifest.get("cohort_fingerprint") or ""),
         cohort_verified=bool(manifest.get("cohort_verified")),
         split=str(manifest.get("split") or "val"),
-        baseline=(
-            str(manifest["baseline"])
-            if manifest.get("baseline") is not None
-            else None
-        ),
         settings=dict(manifest.get("settings") or {}),
         limitations=tuple(str(value) for value in manifest.get("limitations") or ()),
     )

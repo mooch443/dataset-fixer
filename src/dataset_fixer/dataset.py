@@ -174,7 +174,11 @@ class Dataset:
             A materialized, validated dataset index.
         """
 
-        requested = Path(location).expanduser().resolve()
+        # ZIP handling belongs to the internal source resolver so this public
+        # signature remains identical for directories, manifests, and archives.
+        from .sources import resolve_dataset_source
+
+        requested = resolve_dataset_source(location, progress=progress)
         errors = errors.lower()
         if errors not in {"raise", "skip"}:
             raise ValueError("errors must be 'raise' or 'skip'")

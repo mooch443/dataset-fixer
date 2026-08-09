@@ -218,39 +218,50 @@ def compute_ap_metrics(cohort: Cohort, predictions: dict[str, list[Prediction]])
 
 
 def paired_statistics(
-    rows_by_model: dict[str, list[dict[str, Any]]], baseline: str, *, resamples: int = 10_000, seed: int = 42
+    rows_by_model: dict[str, list[dict[str, Any]]], *, resamples: int = 10_000, seed: int = 42
 ) -> list[dict[str, Any]]:
-    if baseline not in rows_by_model:
-        raise ValueError(f"Unknown baseline {baseline!r}")
-    base = _cluster_scores(rows_by_model[baseline])
+    """Compute every unordered model pair with no designated model reference."""
+
     rng = np.random.default_rng(seed)
     output: list[dict[str, Any]] = []
     raw_p: list[float] = []
-    for name, rows in rows_by_model.items():
-        if name == baseline:
-            continue
-        scores = _cluster_scores(rows)
-        keys = sorted(set(base) & set(scores))
-        differences = np.asarray([scores[key] - base[key] for key in keys], dtype=float)
-        if not len(differences):
-            continue
-        samples = rng.choice(differences, size=(resamples, len(differences)), replace=True).mean(axis=1)
-        signs = rng.choice((-1.0, 1.0), size=(resamples, len(differences)))
-        randomized = (differences * signs).mean(axis=1)
-        p = float((np.sum(np.abs(randomized) >= abs(differences.mean())) + 1) / (resamples + 1))
-        raw_p.append(p)
-        output.append(
-            {
-                "model": name,
-                "baseline": baseline,
-                "metric": "ultimate_original_macro_f1",
-                "difference": float(differences.mean()),
-                "ci_low": float(np.quantile(samples, 0.025)),
-                "ci_high": float(np.quantile(samples, 0.975)),
-                "p_value": p,
-                "independent_clusters": len(keys),
-            }
-        )
+    scores_by_model = {
+        name: _cluster_scores(rows) for name, rows in rows_by_model.items()
+    }
+    names = list(rows_by_model)
+    for left_index, model_a in enumerate(names):
+        for model_b in names[left_index + 1 :]:
+            scores_a = scores_by_model[model_a]
+            scores_b = scores_by_model[model_b]
+            keys = sorted(set(scores_a) & set(scores_b))
+            differences = np.asarray(
+                [scores_b[key] - scores_a[key] for key in keys], dtype=float
+            )
+            if not len(differences):
+                continue
+            samples = rng.choice(
+                differences, size=(resamples, len(differences)), replace=True
+            ).mean(axis=1)
+            signs = rng.choice((-1.0, 1.0), size=(resamples, len(differences)))
+            randomized = (differences * signs).mean(axis=1)
+            p = float(
+                (np.sum(np.abs(randomized) >= abs(differences.mean())) + 1)
+                / (resamples + 1)
+            )
+            raw_p.append(p)
+            output.append(
+                {
+                    "model_a": model_a,
+                    "model_b": model_b,
+                    "metric": "ultimate_original_macro_f1",
+                    "difference_b_minus_a": float(differences.mean()),
+                    "difference": float(differences.mean()),
+                    "ci_low": float(np.quantile(samples, 0.025)),
+                    "ci_high": float(np.quantile(samples, 0.975)),
+                    "p_value": p,
+                    "independent_clusters": len(keys),
+                }
+            )
     order = sorted(range(len(raw_p)), key=lambda index: raw_p[index])
     adjusted = [0.0] * len(raw_p)
     running = 0.0

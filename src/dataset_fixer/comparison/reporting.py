@@ -260,8 +260,8 @@ def _paired_figure(root: Path, rows: list[dict[str, Any]], meta: dict[str, Any])
         y = np.arange(len(rows)); values = [r["difference"] for r in rows]
         errors = np.vstack((np.asarray(values)-np.asarray([r["ci_low"] for r in rows]), np.asarray([r["ci_high"] for r in rows])-np.asarray(values)))
         ax.errorbar(values, y, xerr=errors, fmt="o", color=COLORS[1], capsize=4)
-        ax.set_yticks(y, [r["model"] for r in rows]); ax.axvline(0, color="black", lw=1)
-    ax.set_title("Paired differences from baseline"); ax.set_xlabel("Difference in ultimate-original macro F1"); ax.grid(axis="x", alpha=.2)
+        ax.set_yticks(y, [f"{r['model_b']} − {r['model_a']}" for r in rows]); ax.axvline(0, color="black", lw=1)
+    ax.set_title("All paired model differences"); ax.set_xlabel("Model B − model A in ultimate-original macro F1"); ax.grid(axis="x", alpha=.2)
     return _save_figure(root, "paired_differences", fig, rows, meta)
 
 

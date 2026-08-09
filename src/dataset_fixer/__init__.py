@@ -3,6 +3,7 @@
 from .dataset import Dataset
 from .comparison.types import ComparisonResult
 from .errors import DatasetValidationError
+from .geometry import Geometry
 from .model import ImagePrediction, Model, ModelCollection, ModelInput, PredictionResult
 from .models import SemanticComparisonResult, Task
 from .tracing import DatasetTrace, DatasetTraceNode, SampleTrace
@@ -19,6 +20,7 @@ __all__ = [
     "DatasetTrace",
     "DatasetTraceNode",
     "ImagePrediction",
+    "Geometry",
     "Model",
     "ModelCollection",
     "ModelInput",
