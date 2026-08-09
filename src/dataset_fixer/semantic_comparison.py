@@ -1212,9 +1212,13 @@ def predict_nnunet_model(
                 "-nps",
                 str(model.workers),
                 "--save_probabilities",
+                "--disable_progress_bar",
                 *([] if model.nnunet_tta else ["--disable_tta"]),
             ],
             progress=progress,
+            progress_total=len(inputs),
+            progress_directory=native_predictions,
+            progress_description="nnU-Net native prediction",
         )
         _assert_exact_model_predictions(native_predictions, inputs, model.name)
         records: list[ImagePrediction] = []
@@ -2234,19 +2238,34 @@ def _write_cohort(
             )
 
 
-def _run_command(command: list[str], *, progress: bool = False) -> None:
+def _run_command(
+    command: list[str],
+    *,
+    progress: bool = False,
+    progress_total: int | None = None,
+    progress_directory: Path | None = None,
+    progress_description: str = "nnU-Net command",
+) -> None:
     if progress:
         print(f"Running nnU-Net command: {shlex.join(command)}")
     try:
-        subprocess.run(
-            command,
-            check=True,
-            text=True,
-            # nnU-Net prints several lines and nested progress bars for every
-            # case. Capturing keeps large evaluations readable while retaining
-            # stdout/stderr for the failure diagnostic below.
-            capture_output=not progress,
-        )
+        if progress and progress_total is not None and progress_directory is not None:
+            _run_command_with_output_progress(
+                command,
+                total=progress_total,
+                output_directory=progress_directory,
+                description=progress_description,
+            )
+        else:
+            subprocess.run(
+                command,
+                check=True,
+                text=True,
+                # nnU-Net prints several lines and nested progress bars for every
+                # case. Capturing keeps non-interactive evaluations readable while
+                # retaining stdout/stderr for the failure diagnostic below.
+                capture_output=not progress,
+            )
     except FileNotFoundError as exc:
         raise ImportError(
             f"Official nnU-Net command is unavailable: {command[0]}. "
@@ -2258,6 +2277,90 @@ def _run_command(command: list[str], *, progress: bool = False) -> None:
         if detail:
             message += f"\n{detail[-4000:]}"
         raise RuntimeError(message) from exc
+
+
+def _run_command_with_output_progress(
+    command: list[str],
+    *,
+    total: int,
+    output_directory: Path,
+    description: str,
+) -> None:
+    """Replace nnU-Net's per-case chatter with one exported-case progress bar."""
+
+    total = max(0, int(total))
+    progress_bar = tqdm(
+        total=total,
+        desc=description,
+        unit="case",
+        dynamic_ncols=True,
+    )
+    stop = threading.Event()
+    completed = 0
+
+    def monitor_outputs() -> None:
+        nonlocal completed
+        while True:
+            available = min(
+                total,
+                sum(1 for path in output_directory.glob("*.png") if path.is_file()),
+            )
+            if available > completed:
+                progress_bar.update(available - completed)
+                completed = available
+            if stop.wait(0.1):
+                # One final scan catches outputs published between the last
+                # interval and process completion.
+                available = min(
+                    total,
+                    sum(
+                        1
+                        for path in output_directory.glob("*.png")
+                        if path.is_file()
+                    ),
+                )
+                if available > completed:
+                    progress_bar.update(available - completed)
+                    completed = available
+                return
+
+    monitor = threading.Thread(
+        target=monitor_outputs,
+        name="dataset-fixer-nnunet-native-progress",
+        daemon=True,
+    )
+    monitor.start()
+    succeeded = False
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="dataset-fixer-nnunet-command-log-"
+        ) as temporary:
+            log_path = Path(temporary) / "nnunet.log"
+            try:
+                with log_path.open("w", encoding="utf-8") as log:
+                    subprocess.run(
+                        command,
+                        check=True,
+                        text=True,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        capture_output=False,
+                    )
+                succeeded = True
+            except subprocess.CalledProcessError as exc:
+                exc.stdout = log_path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                raise
+    finally:
+        stop.set()
+        monitor.join()
+        if succeeded and completed < total:
+            # A mocked command or an unusual exporter may finish without PNGs
+            # appearing incrementally. Successful completion is authoritative.
+            progress_bar.update(total - completed)
+        progress_bar.close()
 
 
 def _assert_exact_predictions(

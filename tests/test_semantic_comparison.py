@@ -26,6 +26,7 @@ from dataset_fixer.semantic_comparison import (
     _all_pairwise_statistics,
     _canonicalize_predictions,
     _project_semantic_predictions,
+    _run_command,
     _select_visual_cases,
 )
 from dataset_fixer.utils import package_versions
@@ -84,6 +85,49 @@ def _nnunet_model(root: Path) -> Path:
     fold.mkdir()
     (fold / "checkpoint_final.pth").write_bytes(f"checkpoint:{root.name}".encode())
     return root
+
+
+def test_nnunet_command_progress_suppresses_per_case_chatter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    predictions = tmp_path / "predictions"
+    predictions.mkdir()
+
+    def noisy_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        stream = kwargs["stdout"]
+        for index in range(2):
+            stream.write(
+                f"Predicting val_{index:06d}:\n"
+                "perform_everything_on_device: False\n"
+                "sending off prediction to background worker for resampling and export\n"
+                f"done with val_{index:06d}\n"
+            )
+            Image.new("L", (1, 1), 0).save(
+                predictions / f"val_{index:06d}.png"
+            )
+        stream.flush()
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(
+        "dataset_fixer.semantic_comparison.subprocess.run",
+        noisy_run,
+    )
+    _run_command(
+        ["nnUNetv2_predict_from_modelfolder", "--example"],
+        progress=True,
+        progress_total=2,
+        progress_directory=predictions,
+        progress_description="nnU-Net native prediction",
+    )
+
+    output = capsys.readouterr()
+    assert "Running nnU-Net command:" in output.out
+    assert "Predicting val_" not in output.out
+    assert "sending off prediction" not in output.out
+    assert "nnU-Net native prediction" in output.err
+    assert "2/2" in output.err
 
 
 def test_all_pairwise_statistics_have_no_baseline() -> None:
@@ -1152,6 +1196,7 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     assert predict[predict.index("-chk") + 1] == "checkpoint_final.pth"
     assert predict[predict.index("-device") + 1] == models["perfect"]._resolved_device()
     assert "--save_probabilities" in predict
+    assert "--disable_progress_bar" in predict
     assert "--disable_tta" in predict
     weak_predict = next(
         command
