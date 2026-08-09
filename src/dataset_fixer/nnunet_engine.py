@@ -422,11 +422,11 @@ def require_nnunet() -> None:
         "batchgeneratorsv2": "batchgeneratorsv2",
         "nnunetv2": "nnunetv2",
     }
-    reinstall = (
-        "python -m pip install --upgrade --upgrade-strategy only-if-needed "
-        "\"numpy>=2.5.1,<2.6\" \"scipy>=1.18,<1.19\" "
-        "\"scikit-image>=0.26,<0.27\" \"batchgeneratorsv2>=0.3.2,<0.4\" "
-        "\"nnunetv2==2.8.1\""
+    install = (
+        "python -m pip install "
+        "\"numpy>=1.24\" \"scipy>=1.11.4\" "
+        "\"scikit-image>=0.19.3\" \"batchgeneratorsv2>=0.3.2\" "
+        "\"nnunetv2>=2.8.1,<3\""
     )
     try:
         for module in packages.values():
@@ -450,7 +450,8 @@ def require_nnunet() -> None:
         )
         raise RuntimeError(
             "The nnU-Net scientific stack cannot be imported coherently "
-            f"({', '.join(versions)}). Reinstall with:\n{reinstall}.{restart} "
+            f"({', '.join(versions)}). Install a compatible stack with:\n"
+            f"{install}.{restart} "
             f"Original error: {type(exc).__name__}: {exc}"
         ) from exc
     setattr(require_nnunet, "_succeeded", True)
