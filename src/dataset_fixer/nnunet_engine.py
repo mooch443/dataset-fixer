@@ -17,6 +17,9 @@ of one patch. Only floating-point summation order may differ.
 
 from __future__ import annotations
 
+import re
+import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +32,9 @@ from .errors import DatasetValidationError, ValidationIssue
 
 ACCELERATOR_BATCH_CEILING = 16
 CPU_BATCH_CEILING = 4
+
+_TRAINING_LENGTH_TRAINER = re.compile(r"^nnUNetTrainer_([1-9][0-9]*)epochs$")
+_TRAINER_RESOLUTION_LOCK = threading.Lock()
 
 _OUT_OF_MEMORY_MARKERS = (
     "out of memory",
@@ -121,10 +127,11 @@ class NnUNetSession:
             verbose_preprocessing=False,
             allow_tqdm=False,
         )
-        predictor.initialize_from_trained_model_folder(
-            str(model_folder),
-            [int(fold) if fold != "all" else fold for fold in self.folds],
-            checkpoint_name=checkpoint,
+        _initialize_predictor_from_trained_model_folder(
+            predictor,
+            model_folder=model_folder,
+            folds=self.folds,
+            checkpoint=checkpoint,
         )
         self._predictor = predictor
         self._network_on_device = False
@@ -375,6 +382,70 @@ class NnUNetSession:
                 on_batch(size)
             start += size
         return torch.cat(outputs, dim=0) if len(outputs) > 1 else outputs[0]
+
+
+def _initialize_predictor_from_trained_model_folder(
+    predictor: Any,
+    *,
+    model_folder: Path,
+    folds: Sequence[str],
+    checkpoint: str,
+) -> None:
+    """Initialize nnU-Net while supporting missing epoch-only trainer aliases.
+
+    Training-length subclasses such as ``nnUNetTrainer_184epochs`` commonly
+    override only ``num_epochs`` and inherit the base network builder. nnU-Net
+    nevertheless requires that class to be importable during inference. If the
+    exact class is unavailable, provide the base builder under that name for
+    initialization; checkpoint weights are still loaded strictly by nnU-Net.
+    All other custom trainers retain nnU-Net's normal resolution/error path.
+    """
+
+    from nnunetv2.inference import predict_from_raw_data
+    from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+
+    original_resolver = predict_from_raw_data.recursive_find_trainer_class_by_name
+
+    def resolve_trainer(trainer_name: str) -> type[Any]:
+        try:
+            return original_resolver(trainer_name)
+        except RuntimeError as exc:
+            match = _TRAINING_LENGTH_TRAINER.fullmatch(trainer_name)
+            if match is None or "Could not find requested nnunet trainer" not in str(exc):
+                raise
+            epochs = int(match.group(1))
+            fallback = type(
+                trainer_name,
+                (nnUNetTrainer,),
+                {
+                    "__module__": __name__,
+                    "dataset_fixer_training_epochs": epochs,
+                },
+            )
+            warnings.warn(
+                f"Custom nnU-Net trainer {trainer_name!r} is unavailable; using "
+                "the inherited nnUNetTrainer network builder for inference. "
+                f"The {epochs}-epoch override affects training duration only, and "
+                "nnU-Net will still load checkpoint weights strictly. Custom "
+                "trainers that change build_network_architecture must be installed "
+                "and exposed through nnUNet_extTrainer.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            return fallback
+
+    # nnUNetPredictor imported the resolver into its module namespace. Patch it
+    # only for the serialized initialization section and always restore it.
+    with _TRAINER_RESOLUTION_LOCK:
+        predict_from_raw_data.recursive_find_trainer_class_by_name = resolve_trainer
+        try:
+            predictor.initialize_from_trained_model_folder(
+                str(model_folder),
+                [int(fold) if fold != "all" else fold for fold in folds],
+                checkpoint_name=checkpoint,
+            )
+        finally:
+            predict_from_raw_data.recursive_find_trainer_class_by_name = original_resolver
 
 
 def load_session(

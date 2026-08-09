@@ -8,6 +8,8 @@ covered separately against a real checkpoint.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -17,6 +19,7 @@ from dataset_fixer.nnunet_engine import (
     CPU_BATCH_CEILING,
     EngineTelemetry,
     NnUNetSession,
+    _initialize_predictor_from_trained_model_folder,
     _is_out_of_memory,
 )
 
@@ -47,6 +50,27 @@ class StubPredictor:
             (x.shape[0], self.classes, *x.shape[2:]),
             dtype=torch.float32,
         )
+
+
+class TrainerResolvingPredictor:
+    def __init__(self, trainer_name: str) -> None:
+        self.trainer_name = trainer_name
+        self.trainer_class = None
+        self.initialization = None
+
+    def initialize_from_trained_model_folder(
+        self,
+        model_folder: str,
+        folds: list[int | str],
+        *,
+        checkpoint_name: str,
+    ) -> None:
+        from nnunetv2.inference import predict_from_raw_data
+
+        self.trainer_class = predict_from_raw_data.recursive_find_trainer_class_by_name(
+            self.trainer_name
+        )
+        self.initialization = (model_folder, folds, checkpoint_name)
 
 
 def _session(
@@ -84,6 +108,70 @@ def _session(
 
     session._load_fold = load_fold
     return session
+
+
+def test_missing_training_length_trainer_uses_base_inference_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nnunetv2.inference import predict_from_raw_data
+    from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+
+    def missing(trainer_name: str):
+        raise RuntimeError(f"Could not find requested nnunet trainer {trainer_name}")
+
+    monkeypatch.setattr(
+        predict_from_raw_data,
+        "recursive_find_trainer_class_by_name",
+        missing,
+    )
+    predictor = TrainerResolvingPredictor("nnUNetTrainer_184epochs")
+
+    with pytest.warns(RuntimeWarning, match="training duration only"):
+        _initialize_predictor_from_trained_model_folder(
+            predictor,
+            model_folder=Path("/models/custom"),
+            folds=("0", "all"),
+            checkpoint="checkpoint_best.pth",
+        )
+
+    trainer = predictor.trainer_class
+    assert trainer is not None
+    assert trainer.__name__ == "nnUNetTrainer_184epochs"
+    assert issubclass(trainer, nnUNetTrainer)
+    assert trainer.build_network_architecture is nnUNetTrainer.build_network_architecture
+    assert trainer.dataset_fixer_training_epochs == 184
+    assert predictor.initialization == (
+        "/models/custom",
+        [0, "all"],
+        "checkpoint_best.pth",
+    )
+    assert predict_from_raw_data.recursive_find_trainer_class_by_name is missing
+
+
+def test_missing_architecture_customizing_trainer_keeps_official_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nnunetv2.inference import predict_from_raw_data
+
+    def missing(trainer_name: str):
+        raise RuntimeError(f"Could not find requested nnunet trainer {trainer_name}")
+
+    monkeypatch.setattr(
+        predict_from_raw_data,
+        "recursive_find_trainer_class_by_name",
+        missing,
+    )
+    predictor = TrainerResolvingPredictor("MyCustomArchitectureTrainer")
+
+    with pytest.raises(RuntimeError, match="MyCustomArchitectureTrainer"):
+        _initialize_predictor_from_trained_model_folder(
+            predictor,
+            model_folder=Path("/models/custom"),
+            folds=("0",),
+            checkpoint="checkpoint_best.pth",
+        )
+
+    assert predict_from_raw_data.recursive_find_trainer_class_by_name is missing
 
 
 def _tiles(count: int, *, channels: int = 3, size: int = 8) -> list[np.ndarray]:
