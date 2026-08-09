@@ -6,6 +6,7 @@ import math
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -16,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from PIL import Image, ImageDraw
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from .comparison.cache import (
     build_staging_dir,
@@ -1303,6 +1304,8 @@ def _predict_nnunet_sahi(
         total=len(inputs),
         desc="Planning nnU-Net SAHI tiles",
         unit="image",
+        file=sys.stdout,
+        dynamic_ncols=True,
         disable=not progress,
     )
     try:
@@ -1327,6 +1330,8 @@ def _predict_nnunet_sahi(
     checkpoint_progress = tqdm(
         desc="Loading nnU-Net checkpoint",
         unit="s",
+        file=sys.stdout,
+        dynamic_ncols=True,
         disable=not progress,
     )
     refresh = getattr(checkpoint_progress, "refresh", None)
@@ -1406,6 +1411,8 @@ def _predict_nnunet_sahi(
     inference_started = time.perf_counter()
     completed_tiles = 0
     last_text_report = inference_started
+    warmup_completed_tiles = 0
+    steady_state_started: float | None = None
     if progress:
         print(
             f"nnU-Net SAHI inference: 0/{total_tiles:,} tiles across "
@@ -1416,22 +1423,34 @@ def _predict_nnunet_sahi(
         total=total_tiles,
         desc=f"{model.name} SAHI tiles",
         unit="tile",
+        file=sys.stdout,
+        dynamic_ncols=True,
         disable=not progress,
     )
     source_progress = tqdm(
         total=len(inputs),
         desc=f"{model.name} SAHI images",
         unit="image",
+        file=sys.stdout,
+        dynamic_ncols=True,
         disable=not progress,
     )
+
+    def write_progress(message: str) -> None:
+        writer = getattr(tile_progress, "write", None)
+        if writer is not None:
+            writer(message, file=sys.stdout)
+        else:
+            print(message, flush=True)
+
     try:
         for group_index, group in enumerate(groups, start=1):
             group_tiles = sum(len(manifests[value.image_id]) for value in group)
             if progress and group_index == 1:
-                print(
+                write_progress(
                     f"Preparing first work group on CPU: {len(group):,} source "
-                    f"image(s), {group_tiles:,} tiles.",
-                    flush=True,
+                    f"image(s), {group_tiles:,} tiles. This is the CUDA warm-up "
+                    "group and is excluded from the steady-state ETA."
                 )
             started = time.perf_counter()
             spans: dict[str, tuple[int, int]] = {}
@@ -1449,10 +1468,9 @@ def _predict_nnunet_sahi(
             preprocess_seconds = time.perf_counter() - started
             telemetry.preprocess_seconds += preprocess_seconds
             if progress and group_index == 1:
-                print(
+                write_progress(
                     f"First work group preprocessed in {preprocess_seconds:.1f}s; "
-                    "sending tiles to CUDA.",
-                    flush=True,
+                    "sending tiles to CUDA."
                 )
 
             # Folds are outermost inside predict_logits, so a multi-fold model
@@ -1469,12 +1487,11 @@ def _predict_nnunet_sahi(
                 detail = " ".join(error.split())
                 if len(detail) > 500:
                     detail = detail[:497] + "..."
-                print(
+                write_progress(
                     f"CUDA OOM during nnU-Net forward at batch {attempted}; "
                     f"cleared temporary CUDA allocations and retrying with batch "
                     f"{retry} (OOM retry {retry_number}).\n"
-                    f"  CUDA error: {detail}",
-                    flush=True,
+                    f"  CUDA error: {detail}"
                 )
 
             for indices in _equal_shape_batches(
@@ -1523,16 +1540,34 @@ def _predict_nnunet_sahi(
             telemetry.stitch_seconds += stitch_seconds
             del probabilities
             now = time.perf_counter()
+            if group_index == 1:
+                warmup_completed_tiles = completed_tiles
+                steady_state_started = now
+                last_text_report = now
+                if progress:
+                    write_progress(
+                        f"nnU-Net CUDA warm-up complete: {completed_tiles:,} tiles; "
+                        f"CPU prep {preprocess_seconds:.1f}s, GPU {inference_seconds:.1f}s, "
+                        f"CPU post {conversion_seconds + stitch_seconds:.1f}s; "
+                        f"effective batch {session.resolved_batch_size}, OOM retries "
+                        f"{session.oom_retries}. Steady-state ETA will follow."
+                    )
+                    if completed_tiles == total_tiles:
+                        write_progress(
+                            f"nnU-Net SAHI progress: {completed_tiles:,}/{total_tiles:,} "
+                            "tiles (100.0%); run completed within the warm-up group."
+                        )
+                continue
             if (
                 progress
                 and (
-                    group_index == 1
-                    or now - last_text_report >= 15
+                    now - last_text_report >= 15
                     or completed_tiles == total_tiles
                 )
             ):
-                elapsed = max(now - inference_started, 1e-9)
-                rate = completed_tiles / elapsed
+                elapsed = max(now - (steady_state_started or inference_started), 1e-9)
+                measured_tiles = completed_tiles - warmup_completed_tiles
+                rate = measured_tiles / elapsed
                 remaining = (
                     (total_tiles - completed_tiles) / rate if rate > 0 else math.inf
                 )
@@ -1541,15 +1576,14 @@ def _predict_nnunet_sahi(
                     if math.isfinite(remaining)
                     else "unknown"
                 )
-                print(
+                write_progress(
                     f"nnU-Net SAHI progress: {completed_tiles:,}/{total_tiles:,} "
                     f"tiles ({completed_tiles / total_tiles:.1%}), "
                     f"{rate:.2f} tile/s, ETA {eta}; group {group_index:,}/"
                     f"{len(groups):,} phases: CPU prep {preprocess_seconds:.1f}s, "
                     f"GPU {inference_seconds:.1f}s, CPU post "
                     f"{conversion_seconds + stitch_seconds:.1f}s; effective batch "
-                    f"{session.resolved_batch_size}, OOM retries {session.oom_retries}.",
-                    flush=True,
+                    f"{session.resolved_batch_size}, OOM retries {session.oom_retries}."
                 )
                 last_text_report = now
     finally:
