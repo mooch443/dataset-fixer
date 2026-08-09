@@ -25,7 +25,9 @@ from dataset_fixer.semantic_comparison import (
     _SemanticCase,
     _all_pairwise_statistics,
     _canonicalize_predictions,
+    _multiline_model_title,
     _project_semantic_predictions,
+    _ranking_plot_label,
     _run_command,
     _select_visual_cases,
 )
@@ -85,6 +87,44 @@ def _nnunet_model(root: Path) -> Path:
     fold.mkdir()
     (fold / "checkpoint_final.pth").write_bytes(f"checkpoint:{root.name}".encode())
     return root
+
+
+def test_ranking_plot_label_breaks_canonical_name_without_wandb_prefix() -> None:
+    label = _ranking_plot_label(
+        {
+            "model": (
+                "islands-128-08.08.2026-merged-1class_masks"
+                "__gnsuhtfc__yolo26x-sem__512px"
+            ),
+            "model_source": (
+                "wandb:max-planck-institute-for-animal-behavior/"
+                "schools-segmentation/gnsuhtfc"
+            ),
+        }
+    )
+
+    assert label == (
+        "islands-128-08.08.2026-merged-1class_masks\n"
+        "gnsuhtfc__yolo26x-sem__512px"
+    )
+    assert "wandb:" not in label
+
+
+def test_semantic_grid_model_title_wraps_canonical_identity() -> None:
+    title = _multiline_model_title(
+        (
+            "islands-128-08.08.2026-merged-1class_masks"
+            "__gnsuhtfc__yolo26x-sem__512px"
+        ),
+        30,
+    )
+
+    assert title == (
+        "islands-128-08.08.2026-merged-\n"
+        "1class_masks\n"
+        "gnsuhtfc\n"
+        "yolo26x-sem · 512px"
+    )
 
 
 def test_nnunet_command_progress_suppresses_per_case_chatter(
@@ -832,7 +872,7 @@ def test_loaded_semantic_models_visualize_only_sampled_cases_with_shared_mask_gr
     assert len(figure.axes) == 11  # filenames, one shared heading row, and panels
     headings = [text.get_text() for text in figure.axes[1].texts]
     assert headings[:2] == ["Original", "GT"]
-    assert "…" in headings[2]
+    assert "\n" in headings[2]
     assert figure.axes[4].get_xlabel().startswith("Dice=")
     assert np.asarray(figure.axes[4].images[0].get_array()).ndim == 2
     assert figure.axes[6].texts[0].get_text().endswith(".jpg")

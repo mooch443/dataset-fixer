@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 from collections import Counter
@@ -43,10 +44,10 @@ from .utils import (
 )
 
 
-# Schema versions. These were bumped together when nnU-Net SAHI inference moved
-# from sequential CLI tile processing to in-process minibatched prediction, so
-# results produced by the old engine can never be mistaken for new ones.
-SEMANTIC_REPORT_SCHEMA = 10
+# Report presentation evolves independently from prediction/evaluation cache
+# identity. A report bump redraws output from completed caches without forcing
+# model inference to run again.
+SEMANTIC_REPORT_SCHEMA = 11
 SEMANTIC_PREDICTION_SCHEMA = 2
 SEMANTIC_EVALUATION_CACHE_SCHEMA = 2
 
@@ -402,6 +403,7 @@ def compare_nnunet_models(
             ranking.append(
                 {
                     "model": spec.name,
+                    **_model_report_fields(spec),
                     "backend": selected_backend,
                     "adapter": "nnunetv2-official",
                     "metric": "canonical.foreground_mean.Dice",
@@ -863,6 +865,7 @@ def compare_semantic_models(
             ranking.append(
                 {
                     "model": model.name,
+                    **_model_report_fields(model),
                     "model_kind": model.kind,
                     "native_task": native_task,
                     "backend": prediction_backend,
@@ -2645,6 +2648,51 @@ def _sortable_score(value: Any) -> float:
     return parsed if math.isfinite(parsed) else -math.inf
 
 
+def _model_report_fields(model: Model) -> dict[str, Any]:
+    resolution = model.effective_resolution
+    if resolution is None:
+        resolution_label = "unknown"
+        resolution_size = None
+    elif resolution[0] == resolution[1]:
+        resolution_label = f"{resolution[0]}px"
+        resolution_size = list(resolution)
+    else:
+        resolution_label = f"{resolution[1]}x{resolution[0]}px"
+        resolution_size = list(resolution)
+    checkpoint_hash = model.checkpoint_sha256 or model.digest
+    return {
+        "model_source": model.source_key,
+        "source_dataset_zip": model.source_dataset_zip,
+        "model_type": model.model_type,
+        "effective_prediction_resolution": resolution_label,
+        "effective_prediction_size": resolution_size,
+        "checkpoint_sha256": checkpoint_hash,
+        "checkpoint_sha256_short": checkpoint_hash[:8],
+        "model_sha256_short": model.digest[:8],
+    }
+
+
+def _shorten_plot_text(value: str, limit: int = 64) -> str:
+    if len(value) <= limit:
+        return value
+    left = (limit - 1) // 2
+    right = limit - left - 1
+    return f"{value[:left]}…{value[-right:]}"
+
+
+def _ranking_plot_label(row: Mapping[str, Any]) -> str:
+    name = str(row.get("model") or row.get("model_source") or "model")
+    parts = name.split("__")
+    if len(parts) >= 2:
+        return "\n".join(
+            (
+                _shorten_plot_text(parts[0]),
+                _shorten_plot_text("__".join(parts[1:])),
+            )
+        )
+    return _shorten_plot_text(name)
+
+
 def _render_ranking(
     root: Path,
     ranking: list[dict[str, Any]],
@@ -2655,13 +2703,17 @@ def _render_ranking(
     import matplotlib.pyplot as plt
 
     ordered = list(reversed(ranking))
-    figure, axis = plt.subplots(figsize=(8, max(3.5, 0.7 * len(ordered) + 1.5)))
-    names = [row["model"] for row in ordered]
+    figure, axis = plt.subplots(
+        figsize=(11.5, max(4.0, 1.05 * len(ordered) + 1.5))
+    )
+    names = [_ranking_plot_label(row) for row in ordered]
     scores = [
         float(row["dice"]) if math.isfinite(float(row["dice"])) else 0.0
         for row in ordered
     ]
-    axis.barh(names, scores, color="#0072B2")
+    positions = np.arange(len(ordered))
+    axis.barh(positions, scores, color="#0072B2")
+    axis.set_yticks(positions, names, fontsize=8.5, linespacing=1.15)
     axis.set_xlim(0, 1)
     axis.set_xlabel(xlabel)
     axis.set_title(title)
@@ -2764,7 +2816,8 @@ def _render_semantic_prediction_grids(
             metric = row_lookup[name][case.case_id]
             axes[row, column].imshow(overlay.astype(np.uint8))
             axes[row, column].set_title(
-                f"{name}\nDice={_format_metric(metric['dice'])} · "
+                f"{_multiline_model_title(name, 36)}\n"
+                f"Dice={_format_metric(metric['dice'])} · "
                 f"IoU={_format_metric(metric['iou'])}"
             )
             axes[row, column].axis("off")
@@ -3184,10 +3237,21 @@ def _render_semantic_grid(
         name: {row["case_id"]: row for row in rows}
         for name, rows in rows_by_model.items()
     }
+    column_titles = [
+        "Original",
+        "GT",
+        *[
+            _multiline_model_title(name, model_title_length)
+            for name in model_names
+        ],
+    ]
+    heading_lines = max(title.count("\n") + 1 for title in column_titles)
     panel_count = 2 + len(model_names)
     grid_rows = math.ceil(len(cases) / examples_per_row)
     group_width = panel_size * panel_count
-    group_height = panel_size + 0.48
+    image_title_height = 0.28
+    heading_height = max(0.3, 0.18 * heading_lines)
+    group_height = panel_size + image_title_height + heading_height
     figure = plt.figure(
         figsize=(
             group_width * examples_per_row,
@@ -3206,22 +3270,13 @@ def _render_semantic_grid(
         wspace=0.08,
         hspace=0.18,
     )
-    column_titles = [
-        "Original",
-        "GT",
-        *[
-            _shorten_middle(name, model_title_length)
-            for name in model_names
-        ],
-    ]
-
     for index, case in enumerate(cases):
         grid_row = index // examples_per_row
         grid_column = index % examples_per_row
         cell = outer[grid_row, grid_column].subgridspec(
             3,
             panel_count,
-            height_ratios=(0.07, 0.07, 0.86),
+            height_ratios=(image_title_height, heading_height, panel_size),
             hspace=0.01,
             wspace=0.07,
         )
@@ -3247,7 +3302,8 @@ def _render_semantic_grid(
                     heading,
                     ha="center",
                     va="center",
-                    fontsize=9,
+                    fontsize=8,
+                    linespacing=1.15,
                 )
 
         with Image.open(case.image_path) as opened_image:
@@ -3306,6 +3362,32 @@ def _shorten_middle(value: str, maximum: int) -> str:
     left = (maximum - 1) // 2
     right = maximum - 1 - left
     return f"{value[:left]}…{value[-right:]}"
+
+
+def _multiline_model_title(value: str, line_width: int) -> str:
+    """Format canonical model identities as readable narrow-column titles."""
+
+    parts = value.split("__")
+    if len(parts) >= 4:
+        lines = textwrap.wrap(
+            parts[0],
+            width=line_width,
+            break_long_words=True,
+            break_on_hyphens=True,
+        )
+        lines.append(parts[1])
+        lines.append(" · ".join(parts[2:]))
+    else:
+        lines = textwrap.wrap(
+            value,
+            width=line_width,
+            break_long_words=True,
+            break_on_hyphens=True,
+        )
+    if len(lines) > 5:
+        remainder = "".join(lines[4:])
+        lines = [*lines[:4], _shorten_middle(remainder, line_width)]
+    return "\n".join(lines)
 
 
 def _format_metric(value: Any) -> str:

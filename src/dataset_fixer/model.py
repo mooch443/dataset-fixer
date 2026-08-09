@@ -375,6 +375,12 @@ class Model:
         task: Optional task override. nnU-Net is always semantic segmentation;
             Ultralytics task metadata is read from adjacent ``args.yaml`` when
             available and otherwise resolved lazily by Ultralytics.
+        source_key: Stable external source identity retained in reports. W&B
+            references use ``wandb:entity/project/run-id``.
+        model_type: Compact architecture identifier such as ``yolo26x-sem``
+            or ``nnunet-m``.
+        source_dataset_zip: Portable training-dataset archive name used in
+            automatically generated W&B model names.
         resolution: Default Ultralytics image size.
         training_dataset: Optional training-data provenance path.
         inference: Default Ultralytics inference mode.
@@ -415,6 +421,9 @@ class Model:
         name: str | None = None,
         kind: Literal["auto", "ultralytics", "nnunet"] = "auto",
         task: ModelTask | None = None,
+        source_key: str | None = None,
+        model_type: str | None = None,
+        source_dataset_zip: str | None = None,
         resolution: int | None = None,
         training_dataset: str | Path | None = None,
         inference: Literal["native", "sahi"] = "native",
@@ -498,6 +507,13 @@ class Model:
         self._name = parsed_name
         self._slug = slugify(parsed_name)
         self._kind: ModelKind = resolved_kind
+        self._source_key = str(source_key or source)
+        self._model_type = str(model_type or "").strip() or (
+            "nnunet" if resolved_kind == "nnunet" else "ultralytics"
+        )
+        self._source_dataset_zip = (
+            Path(str(source_dataset_zip)).name if source_dataset_zip else None
+        )
         self._resolution = int(resolution) if resolution is not None else None
         self._inference = inference
         self._device = device
@@ -685,6 +701,24 @@ class Model:
         return self._slug
 
     @property
+    def source_key(self) -> str:
+        """Stable source reference used to load this model."""
+
+        return self._source_key
+
+    @property
+    def model_type(self) -> str:
+        """Compact architecture identifier used in reports."""
+
+        return self._model_type
+
+    @property
+    def source_dataset_zip(self) -> str | None:
+        """Portable source training-dataset archive name, when recorded."""
+
+        return self._source_dataset_zip
+
+    @property
     def path(self) -> Path:
         """Resolved checkpoint or trained-model folder."""
 
@@ -812,6 +846,16 @@ class Model:
         return self.geometry.input_size
 
     @property
+    def effective_resolution(self) -> tuple[int, int] | None:
+        """Model input height/width used for prediction, when known."""
+
+        if self.input_size is not None:
+            return self.input_size
+        if self.resolution is not None:
+            return (self.resolution, self.resolution)
+        return None
+
+    @property
     def workers(self) -> int:
         """Default nnU-Net worker count."""
 
@@ -856,6 +900,9 @@ class Model:
 
         return {
             "name": self.name,
+            "source_key": self.source_key,
+            "model_type": self.model_type,
+            "source_dataset_zip": self.source_dataset_zip,
             "kind": self.kind,
             "task": self.task,
             "path": str(self.path),
@@ -877,6 +924,7 @@ class Model:
             "native_tile_size": self.native_tile_size,
             "upscale_factor": self.geometry.upscale_factor,
             "input_size": self.input_size,
+            "effective_resolution": self.effective_resolution,
             "batch_size": self.batch_size,
             "workers": self.workers if self.kind == "nnunet" else None,
             **({"nnunet_tta": self.nnunet_tta} if self.kind == "nnunet" else {}),
@@ -902,6 +950,9 @@ class Model:
         defaults: dict[str, Any] = {
             "kind": self.kind,
             "task": self.task,
+            "source_key": self.source_key,
+            "model_type": self.model_type,
+            "source_dataset_zip": self.source_dataset_zip,
             "resolution": self.resolution,
             "training_dataset": self.training_dataset,
             "inference": self.inference,
@@ -920,6 +971,32 @@ class Model:
         }
         defaults.update(values)
         return Model(self.path, name=name or self.name, **defaults)
+
+    def _apply_automatic_name(self) -> None:
+        """Build a compact dataset/run/architecture/resolution identity."""
+
+        resolution = self.effective_resolution
+        if resolution is None:
+            resolution_label = "unknown-resolution"
+        elif resolution[0] == resolution[1]:
+            resolution_label = f"{resolution[0]}px"
+        else:
+            resolution_label = f"{resolution[1]}x{resolution[0]}px"
+        run_id = self.source_key.rsplit("/", 1)[-1]
+        dataset_prefix = (
+            Path(self.source_dataset_zip).stem
+            if self.source_dataset_zip
+            else "unknown-dataset"
+        )
+        self._name = "__".join(
+            (
+                slugify(dataset_prefix),
+                slugify(run_id),
+                slugify(self.model_type),
+                resolution_label,
+            )
+        )
+        self._slug = slugify(self._name)
 
     def predict(
         self,
@@ -1317,6 +1394,9 @@ class Model:
                 known = {
                     "kind",
                     "task",
+                    "source_key",
+                    "model_type",
+                    "source_dataset_zip",
                     "resolution",
                     "training_dataset",
                     "inference",
@@ -1359,6 +1439,9 @@ class Model:
                     "upscale_factor", resolved_source.geometry.upscale_factor
                 )
                 constructor.setdefault("input_size", resolved_source.geometry.input_size)
+                constructor.setdefault(
+                    "source_key", resolved_source.source or str(raw_source)
+                )
                 model = Model(
                     resolved_source.path,
                     name=(
@@ -1371,6 +1454,12 @@ class Model:
                     settings=adapter_settings,
                     **constructor,
                 )
+                if (
+                    raw_name is None
+                    and explicit_name is None
+                    and model.source_key.startswith("wandb:")
+                ):
+                    model._apply_automatic_name()
             if model.name in seen_names or model.slug in seen_slugs:
                 raise DatasetValidationError(
                     ValidationIssue(
@@ -1672,7 +1761,7 @@ class ModelCollection:
             include_empty: Permit samples whose reference mask is empty.
             seed: Deterministic sampling seed.
             panel_size: Width and height, in inches, of each grid panel.
-            model_title_length: Maximum displayed model-name length.
+            model_title_length: Maximum characters per displayed model-title line.
             image_title_length: Maximum displayed source-path length.
             progress: Show package-managed progress bars.
             destination: Optional PNG output path or directory.

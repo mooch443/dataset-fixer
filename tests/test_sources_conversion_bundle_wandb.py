@@ -13,7 +13,11 @@ from PIL import Image
 from dataset_fixer import Dataset, DatasetValidationError, Geometry, Model
 from dataset_fixer.bundle import Config, Outcome, create
 from dataset_fixer.convert import Kind, prepare
-from dataset_fixer.model_sources import _download_wandb_file
+from dataset_fixer.model_sources import (
+    _download_wandb_file,
+    _model_type,
+    _source_dataset_zip,
+)
 from dataset_fixer.sources import extract_archive, local_source
 from dataset_fixer.wandb import configure, upload
 from conftest import make_yolo_dataset
@@ -408,6 +412,87 @@ def test_new_bundle_round_trip_loads_geometry(tmp_path: Path) -> None:
     assert len(bundle.sha256) == 64
     assert loaded.names == ("island-sem",)
     assert loaded[0].geometry == Geometry((128, 128), 2, (256, 256))
+
+
+def test_wandb_model_name_uses_dataset_run_model_and_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"selected-weights")
+    config = Config(
+        name="long human-authored run name that must not become the model name",
+        framework="ultralytics",
+        task="semantic",
+        geometry=Geometry.create(native_tile_size=128, upscale_factor=4),
+        dataset={
+            "source_dataset_zip": "islands-128-08.08.2026-merged-1class_masks.zip",
+            "content_sha256": "dataset-content",
+        },
+        model={"base_model": "yolo26x-sem.pt"},
+    )
+    bundle = create(
+        config,
+        Outcome(checkpoint=checkpoint),
+        destination=tmp_path / "bundle",
+        progress=False,
+    )
+    source = (
+        "wandb:max-planck-institute-for-animal-behavior/"
+        "schools-segmentation/gnsuhtfc"
+    )
+    run = SimpleNamespace(display_name="an extremely long W&B display name")
+    monkeypatch.setattr(
+        "dataset_fixer.model_sources._download_wandb",
+        lambda *_args, **_kwargs: (bundle.path, run),
+    )
+
+    model = Model.load_many([source])[0]
+
+    assert model.name == (
+        "islands-128-08.08.2026-merged-1class_masks"
+        "__gnsuhtfc__yolo26x-sem__512px"
+    )
+    assert model.source_key == source
+    assert model.source_dataset_zip == (
+        "islands-128-08.08.2026-merged-1class_masks.zip"
+    )
+    assert model.model_type == "yolo26x-sem"
+    assert model.effective_resolution == (512, 512)
+    assert model.digest not in model.name
+    assert "max-planck-institute" not in model.name
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ("resenc_m", "nnunet-m"),
+        ("nnUNetResEncUNetMPlans", "nnunet-m"),
+        ("nnUNetPlannerResEncL", "nnunet-l"),
+        ("resenc_capped", "nnunet-capped"),
+        ("nnUNetResEncUNetPlans", "nnunet-resenc"),
+    ],
+)
+def test_nnunet_model_type_normalizes_old_and_new_metadata(
+    metadata: str,
+    expected: str,
+) -> None:
+    assert _model_type(metadata, kind="nnunet", task="semantic") == expected
+
+
+def test_old_nnunet_bundle_source_dataset_zip_is_portable() -> None:
+    assert _source_dataset_zip(
+        {
+            "dataset": {
+                "dataset_signature": {
+                    "source": (
+                        "/content/drive/MyDrive/islands/"
+                        "islands-128-08.08.2026-merged-1class_masks.zip"
+                    )
+                }
+            }
+        }
+    ) == "islands-128-08.08.2026-merged-1class_masks.zip"
 
 
 class _Config(dict):

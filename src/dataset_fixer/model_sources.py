@@ -8,7 +8,7 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlparse
@@ -94,6 +94,82 @@ def _task(value: Any) -> str | None:
     return aliases.get(normalized, normalized)
 
 
+def _model_type(value: Any, *, kind: str, task: str | None = None) -> str:
+    """Normalize bundle/checkpoint architecture metadata for report labels."""
+
+    raw = str(value or "").strip().lower().replace("_", "-")
+    if kind == "nnunet":
+        aliases = {
+            "resenc-m": "nnunet-m",
+            "resenc-l": "nnunet-l",
+            "resenc-xl": "nnunet-xl",
+            "resenc-capped": "nnunet-capped",
+            "plain": "nnunet-plain",
+        }
+        if raw in aliases:
+            return aliases[raw]
+        compact = re.sub(r"[^a-z0-9]+", "", raw)
+        if "resenccapped" in compact:
+            return "nnunet-capped"
+        for size in ("xl", "l", "m"):
+            if re.search(rf"resenc(?:unet)?{size}(?:plans|$)", compact):
+                return f"nnunet-{size}"
+        if "resenc" in compact:
+            return "nnunet-resenc"
+        if "plainconv" in compact or compact == "plain":
+            return "nnunet-plain"
+        if raw.startswith("nnunet-"):
+            return raw
+        return f"nnunet-{raw}" if raw else "nnunet"
+
+    stem = Path(raw.removeprefix("ultralytics:")).stem
+    matches = re.findall(
+        r"(?:yolox|yolo(?:\d+)?[nslmx]?)(?:-(?:sem|seg))?",
+        stem,
+    )
+    normalized = matches[-1] if matches else stem
+    if normalized in {"best", "last", "model", "weights", "checkpoint"}:
+        normalized = ""
+    if normalized and not normalized.endswith(("-sem", "-seg")):
+        if task in {"semantic", "semantic_segment"}:
+            normalized += "-sem"
+        elif task == "segment":
+            normalized += "-seg"
+    if normalized:
+        return normalized
+    return "ultralytics-sem" if task in {"semantic", "semantic_segment"} else "ultralytics-seg"
+
+
+def _source_dataset_zip(*values: Mapping[str, Any]) -> str | None:
+    """Return a portable training-dataset archive name from model metadata."""
+
+    candidates: list[Any] = []
+    for value in values:
+        dataset = dict(value.get("dataset") or {})
+        signature = dict(dataset.get("dataset_signature") or {})
+        source_dataset = dict(dataset.get("source_dataset") or {})
+        run = dict(value.get("run") or {})
+        stable_state = dict(run.get("stable_run_state") or {})
+        top_level_stable_state = dict(value.get("stable_run_state") or {})
+        candidates.extend(
+            (
+                dataset.get("source_dataset_zip"),
+                signature.get("source"),
+                dataset.get("source_archive"),
+                source_dataset.get("path"),
+                stable_state.get("source_dataset_zip"),
+                top_level_stable_state.get("source_dataset_zip"),
+                value.get("source_dataset_zip"),
+                value.get("source_archive"),
+                dataset.get("name"),
+            )
+        )
+    selected = first_value(*candidates)
+    if selected is None:
+        return None
+    return Path(str(selected)).name
+
+
 def _manifest_geometry(manifest: Mapping[str, Any], source: str) -> Geometry:
     geometry = dict(manifest.get("geometry") or {})
     dataset = dict(manifest.get("dataset") or {})
@@ -174,6 +250,9 @@ def _resolve_bundle(path: Path, *, name: str | None, progress: bool) -> Resolved
         path.stem,
     )
     options: dict[str, Any] = {}
+    source_dataset_zip = _source_dataset_zip(manifest)
+    if source_dataset_zip is not None:
+        options["source_dataset_zip"] = source_dataset_zip
 
     is_nnunet = bundle_format == "dataset-fixer-nnunet-model-folder-v1" or str(
         first_value(model_metadata.get("framework"), manifest.get("framework"), "")
@@ -216,6 +295,17 @@ def _resolve_bundle(path: Path, *, name: str | None, progress: bool) -> Resolved
         options.update(
             kind="nnunet",
             task="semantic",
+            model_type=_model_type(
+                first_value(
+                    model_metadata.get("model_preset"),
+                    model_metadata.get("plans"),
+                    model_metadata.get("planner"),
+                    manifest.get("model_preset"),
+                    model_root.name,
+                ),
+                kind="nnunet",
+                task="semantic",
+            ),
             folds=folds,
             checkpoint=checkpoint,
         )
@@ -233,7 +323,22 @@ def _resolve_bundle(path: Path, *, name: str | None, progress: bool) -> Resolved
             candidates = [value for value in manifest_root.rglob("best.pt") if value.is_file()]
         source_path = _one(candidates, "Ultralytics checkpoint")
         _validate_checkpoint(source_path, manifest, progress=progress)
-        options.update(kind="ultralytics", task=_task(model_metadata.get("task")))
+        resolved_task = _task(model_metadata.get("task"))
+        options.update(
+            kind="ultralytics",
+            task=resolved_task,
+            model_type=_model_type(
+                first_value(
+                    model_metadata.get("model_weights"),
+                    model_metadata.get("initialization_source"),
+                    model_metadata.get("base_model"),
+                    dict(manifest.get("training") or {}).get("base_model"),
+                    source_path.stem,
+                ),
+                kind="ultralytics",
+                task=resolved_task,
+            ),
+        )
         if geometry.input_size is not None:
             if geometry.input_size[0] == geometry.input_size[1]:
                 options["resolution"] = geometry.input_size[0]
@@ -495,8 +600,28 @@ def _resolve_checkpoint(
             )
         )
     options: dict[str, Any] = {"kind": "ultralytics"}
+    source_dataset_zip = _source_dataset_zip(metadata, run_config)
+    if source_dataset_zip is not None:
+        options["source_dataset_zip"] = source_dataset_zip
     if task:
         options["task"] = task
+    model_metadata = dict(metadata.get("model") or {})
+    run_train_args = dict(run_config.get("train_args") or {})
+    options["model_type"] = _model_type(
+        first_value(
+            model_metadata.get("model_weights"),
+            model_metadata.get("initialization_source"),
+            model_metadata.get("base_model"),
+            train_args.get("model"),
+            model_args.get("model"),
+            run_train_args.get("model"),
+            run_config.get("model_weights"),
+            run_config.get("base_model"),
+            path.stem,
+        ),
+        kind="ultralytics",
+        task=task,
+    )
     if geometry.input_size and geometry.input_size[0] == geometry.input_size[1]:
         options["resolution"] = geometry.input_size[0]
     display = first_value(name, getattr(run, "display_name", None), path.stem)
@@ -522,42 +647,83 @@ def resolve_model_source(
     raw = str(source)
     run = None
     if raw.startswith("wandb:") or "wandb.ai/" in raw:
-        path, run = _download_wandb(raw, requested=run_file, progress=progress)
+        source_key = f"wandb:{normalize_wandb_run(raw)}"
+        path, run = _download_wandb(source_key, requested=run_file, progress=progress)
+        resolved_name = name or source_key
     else:
+        source_key = raw
         path = local_source(Path(source), progress=progress)
+        resolved_name = name
     if path.is_dir():
         if path.name.startswith("fold_") and not (path / "plans.json").is_file():
             parent = path.parent
             if (parent / "dataset.json").is_file() and (parent / "plans.json").is_file():
                 fold = path.name.removeprefix("fold_")
+                metadata = (
+                    _read_json(parent / "model_metadata.json")
+                    if (parent / "model_metadata.json").is_file()
+                    else {}
+                )
                 return ResolvedModelSource(
                     parent,
-                    str(name or parent.name),
+                    str(resolved_name or parent.name),
                     options={
                         "kind": "nnunet",
                         "task": "semantic",
+                        "model_type": _model_type(
+                            first_value(
+                                metadata.get("model_preset"),
+                                dict(metadata.get("model") or {}).get("model_preset"),
+                                dict(metadata.get("model") or {}).get("plans"),
+                                parent.name,
+                            ),
+                            kind="nnunet",
+                            task="semantic",
+                        ),
+                        **(
+                            {"source_dataset_zip": source_dataset_zip}
+                            if (
+                                source_dataset_zip := _source_dataset_zip(metadata)
+                            ) is not None
+                            else {}
+                        ),
                         "folds": (fold,),
                     },
-                    geometry=from_metadata(
-                        _read_json(parent / "model_metadata.json")
-                        if (parent / "model_metadata.json").is_file()
-                        else {},
-                        source=str(parent),
-                    ),
-                    source=raw,
+                    geometry=from_metadata(metadata, source=str(parent)),
+                    source=source_key,
                 )
         if (path / "dataset.json").is_file() and (path / "plans.json").is_file():
+            metadata = (
+                _read_json(path / "model_metadata.json")
+                if (path / "model_metadata.json").is_file()
+                else {}
+            )
             return ResolvedModelSource(
                 path,
-                str(name or path.name),
-                options={"kind": "nnunet", "task": "semantic"},
-                geometry=from_metadata(
-                    _read_json(path / "model_metadata.json")
-                    if (path / "model_metadata.json").is_file()
-                    else {},
-                    source=str(path),
-                ),
-                source=raw,
+                str(resolved_name or path.name),
+                options={
+                    "kind": "nnunet",
+                    "task": "semantic",
+                    "model_type": _model_type(
+                        first_value(
+                            metadata.get("model_preset"),
+                            dict(metadata.get("model") or {}).get("model_preset"),
+                            dict(metadata.get("model") or {}).get("plans"),
+                            path.name,
+                        ),
+                        kind="nnunet",
+                        task="semantic",
+                    ),
+                    **(
+                        {"source_dataset_zip": source_dataset_zip}
+                        if (
+                            source_dataset_zip := _source_dataset_zip(metadata)
+                        ) is not None
+                        else {}
+                    ),
+                },
+                geometry=from_metadata(metadata, source=str(path)),
+                source=source_key,
             )
         raise DatasetValidationError(
             ValidationIssue(
@@ -567,9 +733,16 @@ def resolve_model_source(
             )
         )
     if path.suffix.lower() == ".zip":
-        return _resolve_bundle(path, name=name, progress=progress)
+        resolved = _resolve_bundle(path, name=resolved_name, progress=progress)
+        return replace(resolved, source=source_key)
     if path.suffix.lower() == ".pt":
-        return _resolve_checkpoint(path, name=name, run=run, progress=progress)
+        resolved = _resolve_checkpoint(
+            path,
+            name=resolved_name,
+            run=run,
+            progress=progress,
+        )
+        return replace(resolved, source=source_key)
     raise DatasetValidationError(
         ValidationIssue(
             "Unsupported model source",
