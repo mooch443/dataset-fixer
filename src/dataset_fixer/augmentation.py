@@ -880,7 +880,7 @@ def _albumentations():
     except ImportError as exc:
         raise ImportError(
             "Dataset.augment() and Dataset.tile(crop_transforms=...) require Albumentations; install it with "
-            "`pip install 'dataset-fixer[augment]'`"
+            "reinstall dataset-fixer"
         ) from exc
     return A
 

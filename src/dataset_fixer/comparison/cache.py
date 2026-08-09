@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from ..errors import DatasetValidationError, ValidationIssue
 from ..utils import sha256_file, to_jsonable
@@ -188,6 +189,8 @@ def load_package_cache(
     root: Path,
     cohort: Cohort,
     thresholds: tuple[float, ...],
+    *,
+    progress: bool = False,
 ) -> tuple[dict[float, dict[str, list[Prediction]]], int, bool]:
     manifest_path = root / "cache-manifest.json"
     if not manifest_path.is_file():
@@ -200,22 +203,32 @@ def load_package_cache(
         return {}, 0, False
     loaded: dict[float, dict[str, list[Prediction]]] = {}
     shards = 0
-    for threshold in thresholds:
-        by_image: dict[str, list[Prediction]] = {}
-        for record in cohort.records:
-            path = root / "images" / record.image_id / f"predictions-{token(threshold)}.npz"
-            if not path.is_file():
-                break
-            try:
-                with np.load(path, allow_pickle=False) as data:
-                    values = _predictions_from_arrays(data, path)
-                    _validate_cached_predictions(values, record, cohort, path)
-                    by_image[record.image_id] = values
-            except Exception:
-                break
-            shards += 1
-        if len(by_image) == len(cohort.records):
-            loaded[float(threshold)] = by_image
+    cache_progress = tqdm(
+        total=len(thresholds) * len(cohort.records),
+        desc="Loading prediction cache",
+        unit="shard",
+        disable=not progress,
+    )
+    try:
+        for threshold in thresholds:
+            by_image: dict[str, list[Prediction]] = {}
+            for record in cohort.records:
+                path = root / "images" / record.image_id / f"predictions-{token(threshold)}.npz"
+                if not path.is_file():
+                    break
+                try:
+                    with np.load(path, allow_pickle=False) as data:
+                        values = _predictions_from_arrays(data, path)
+                        _validate_cached_predictions(values, record, cohort, path)
+                        by_image[record.image_id] = values
+                except Exception:
+                    break
+                shards += 1
+                cache_progress.update(1)
+            if len(by_image) == len(cohort.records):
+                loaded[float(threshold)] = by_image
+    finally:
+        cache_progress.close()
     complete = (
         set(loaded) == {float(value) for value in thresholds}
         and (root / "complete.json").is_file()
@@ -228,6 +241,8 @@ def save_package_cache(
     cohort: Cohort,
     payload: dict[str, Any],
     predictions: dict[float, dict[str, list[Prediction]]],
+    *,
+    progress: bool = False,
 ) -> None:
     root.mkdir(parents=True, exist_ok=True)
     _write_json_atomic(
@@ -239,20 +254,30 @@ def save_package_cache(
             "created_at_unix": time.time(),
         },
     )
-    for threshold, by_image in predictions.items():
-        for record in cohort.records:
-            if record.image_id not in by_image:
-                raise DatasetValidationError("Cannot cache incomplete model predictions")
-            output = root / "images" / record.image_id / f"predictions-{token(threshold)}.npz"
-            output.parent.mkdir(parents=True, exist_ok=True)
-            arrays = _prediction_arrays(by_image[record.image_id])
-            with tempfile.NamedTemporaryFile(dir=output.parent, suffix=".npz", delete=False) as handle:
-                temporary = Path(handle.name)
-            try:
-                np.savez_compressed(temporary, **arrays)
-                temporary.replace(output)
-            finally:
-                temporary.unlink(missing_ok=True)
+    cache_progress = tqdm(
+        total=len(predictions) * len(cohort.records),
+        desc="Saving prediction cache",
+        unit="shard",
+        disable=not progress,
+    )
+    try:
+        for threshold, by_image in predictions.items():
+            for record in cohort.records:
+                if record.image_id not in by_image:
+                    raise DatasetValidationError("Cannot cache incomplete model predictions")
+                output = root / "images" / record.image_id / f"predictions-{token(threshold)}.npz"
+                output.parent.mkdir(parents=True, exist_ok=True)
+                arrays = _prediction_arrays(by_image[record.image_id])
+                with tempfile.NamedTemporaryFile(dir=output.parent, suffix=".npz", delete=False) as handle:
+                    temporary = Path(handle.name)
+                try:
+                    np.savez_compressed(temporary, **arrays)
+                    temporary.replace(output)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                cache_progress.update(1)
+    finally:
+        cache_progress.close()
     _write_json_atomic(
         root / "complete.json",
         {

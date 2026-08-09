@@ -23,6 +23,7 @@ from dataset_fixer.semantic_comparison import (
     _SemanticCase,
     _all_pairwise_statistics,
     _canonicalize_predictions,
+    _project_semantic_predictions,
     _select_visual_cases,
 )
 from conftest import make_yolo_dataset
@@ -108,6 +109,55 @@ def test_all_pairwise_statistics_have_no_baseline() -> None:
     }
     assert all("baseline" not in row for row in paired)
     assert all("p_value_holm" in row for row in paired)
+
+
+def test_invalid_instance_polygons_become_cached_style_warnings(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "image.png"
+    mask = tmp_path / "mask.png"
+    Image.new("RGB", (8, 8), "white").save(image)
+    Image.new("L", (8, 8), 0).save(mask)
+    case = _SemanticCase(
+        case_id="val_000000",
+        relative_path=Path("image.png"),
+        image_path=image,
+        mask_path=mask,
+        width=8,
+        height=8,
+        image_sha256="a" * 64,
+        mask_sha256="b" * 64,
+    )
+    record = ImagePrediction(
+        image_id=case.case_id,
+        image_path=image,
+        relative_path="image.png",
+        width=8,
+        height=8,
+        objects=(
+            Prediction(
+                class_id=0,
+                score=0.9,
+                polygons=[[(1, 1), (6, 1), (6, 6)], [(0, 0), (1, 1)]],
+            ),
+            Prediction(class_id=0, score=0.8, polygons=None),
+        ),
+    )
+
+    projected, projection, warnings = _project_semantic_predictions(
+        (record,), "segment", [case], "segmenter", confidence=0.25
+    )
+
+    assert projection == "polygon-foreground-union"
+    assert projected[0].mask.any()
+    assert [warning["action"] for warning in warnings] == [
+        "skipped-object",
+        "skipped-object",
+    ]
+    assert {warning["reason"] for warning in warnings} == {
+        "fewer than three polygon points",
+        "no polygon returned by segmentation model",
+    }
 
 
 class FakeSession:
@@ -444,6 +494,11 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
                                 (left, bottom - 1),
                             ],
                         ),
+                        Prediction(
+                            class_id=0,
+                            score=0.9,
+                            polygon=[(left, top), (right - 1, bottom - 1)],
+                        ),
                     )
                 records.append(
                     ImagePrediction(
@@ -493,9 +548,12 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
     assert by_name["yolo-semantic"]["native_task"] == "semantic_segment"
     assert by_name["yolo-semantic"]["projection"] == "native-semantic-mask"
     assert by_name["yolo-seg"]["micro_dice"] == pytest.approx(1.0)
+    assert by_name["yolo-seg"]["warning_count"] == 2
     manifest = json.loads((destination / "reports" / "result.json").read_text())
     assert manifest["backend"] == "common-semantic-mask"
     assert manifest["negotiated_comparison_space"] == "semantic"
+    assert len(manifest["warnings"]) == 2
+    assert all(warning["action"] == "skipped-object" for warning in manifest["warnings"])
     assert set(manifest["settings"]["sahi_models"]) == {
         "yolo-seg",
         "yolo-semantic",
@@ -910,7 +968,7 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     assert result.ranking[1]["upscale_factor"] == 1
     assert len(result.ranking[0]["model_sha256"]) == 64
     assert len(commands) == 6
-    assert all(options["capture_output"] is True for options in command_options)
+    assert all(options["capture_output"] is False for options in command_options)
     predict = commands[0]
     assert predict[0] == "nnUNetv2_predict_from_modelfolder"
     assert predict[predict.index("-m") + 1] == str(perfect)

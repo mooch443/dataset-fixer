@@ -97,6 +97,7 @@ class NnUNetSession:
         checkpoint: str,
         device: str,
         workers: int,
+        batch_size: int = -1,
         use_tta: bool = True,
     ) -> None:
         import torch
@@ -137,7 +138,11 @@ class NnUNetSession:
         ceiling = (
             ACCELERATOR_BATCH_CEILING if device in {"cuda", "mps"} else CPU_BATCH_CEILING
         )
-        self.requested_batch_size = max(1, min(self.plan_batch_size, ceiling))
+        self.requested_batch_size = (
+            max(1, min(self.plan_batch_size, ceiling))
+            if batch_size == -1
+            else max(1, int(batch_size))
+        )
         self.resolved_batch_size = self.requested_batch_size
         self.oom_retries = 0
 
@@ -379,6 +384,7 @@ def load_session(
     checkpoint: str,
     device: str,
     workers: int,
+    batch_size: int = -1,
     use_tta: bool = True,
 ) -> NnUNetSession:
     """Load one nnU-Net model for a whole prediction run."""
@@ -390,6 +396,7 @@ def load_session(
         checkpoint=checkpoint,
         device=device,
         workers=workers,
+        batch_size=batch_size,
         use_tta=use_tta,
     )
 
@@ -406,7 +413,7 @@ def require_nnunet() -> None:
     if importlib.util.find_spec("nnunetv2") is None:
         raise ImportError(
             "nnU-Net prediction was requested but nnunetv2 is not installed; "
-            "install dataset-fixer[nnunet]"
+            "reinstall dataset-fixer"
         )
     packages = {
         "numpy": "numpy",

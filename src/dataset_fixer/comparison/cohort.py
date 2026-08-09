@@ -9,6 +9,7 @@ from ..errors import DatasetValidationError, ValidationIssue
 from ..models import Annotation, Sample
 from ..utils import normalize_split, sha256_file, to_jsonable
 from .types import Cohort, CohortRecord, ModelSpec
+from tqdm.auto import tqdm
 
 if TYPE_CHECKING:
     from ..dataset import Dataset
@@ -27,7 +28,7 @@ def annotation_dict(annotation: Annotation) -> dict[str, Any]:
     }
 
 
-def freeze_cohort(dataset: "Dataset", split: str) -> Cohort:
+def freeze_cohort(dataset: "Dataset", split: str, *, progress: bool = False) -> Cohort:
     split = normalize_split(split)
     samples = sorted(
         (sample for sample in dataset._samples if sample.split == split),
@@ -38,7 +39,12 @@ def freeze_cohort(dataset: "Dataset", split: str) -> Cohort:
             ValidationIssue("Comparison split is missing or empty", value=split, expected="a non-empty split")
         )
     records: list[CohortRecord] = []
-    for sample in samples:
+    for sample in tqdm(
+        samples,
+        desc="Freezing evaluation cohort",
+        unit="image",
+        disable=not progress,
+    ):
         annotations = tuple(to_jsonable(annotation_dict(annotation)) for annotation in sample.annotations)
         encoded = json.dumps(annotations, sort_keys=True, separators=(",", ":")).encode()
         image_hash = sample.source_sha256 or sha256_file(sample.image_path)

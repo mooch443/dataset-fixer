@@ -20,6 +20,7 @@ from .utils import IMAGE_SUFFIXES, sha256_file, slugify, to_jsonable
 ModelKind = Literal["ultralytics", "nnunet"]
 PredictionTask = Literal["detect", "segment", "pose", "polo", "semantic_segment"]
 ModelTask = PredictionTask | Literal["auto", "locate", "semantic"]
+_MAX_INFERENCE_BATCH_SIZE = 128
 
 
 def _default_nnunet_device() -> Literal["cpu", "cuda", "mps"]:
@@ -361,6 +362,8 @@ class Model:
         upscale_factor: Input adapter scale used during training. ``None``
             preserves unknown standalone-checkpoint geometry.
         input_size: Adapter/model input size after upscaling.
+        batch_size: Inference batch size. ``-1`` probes a large batch and
+            halves it on accelerator out-of-memory errors until it fits.
         workers: nnU-Net CPU worker count for preprocessing and probability
             conversion. This is not the neural-network batch size, which is
             derived from the model's own plan and the inference device.
@@ -395,6 +398,7 @@ class Model:
         native_tile_size: int | tuple[int, int] | None = None,
         upscale_factor: int | None = None,
         input_size: int | tuple[int, int] | None = None,
+        batch_size: int = -1,
         workers: int = 2,
         confidence: float = 0.25,
         postprocess: float = 0.7,
@@ -452,6 +456,14 @@ class Model:
             raise ValueError("resolution must be a positive integer")
         if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
             raise ValueError("workers must be a positive integer")
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or batch_size == 0
+            or batch_size < -1
+            or batch_size > _MAX_INFERENCE_BATCH_SIZE
+        ):
+            raise ValueError("batch_size must be -1 or an integer from 1 through 128")
 
         self._path = path
         self._name = parsed_name
@@ -532,6 +544,7 @@ class Model:
             )
         self._geometry = geometry
         self._upscale_factor = geometry.upscale_factor or 1
+        self._batch_size = batch_size
         self._workers = workers
         self._folds: tuple[str, ...] = ()
         self._checkpoint = checkpoint
@@ -775,6 +788,12 @@ class Model:
         return self._workers
 
     @property
+    def batch_size(self) -> int:
+        """Requested inference batch size; ``-1`` enables adaptive sizing."""
+
+        return self._batch_size
+
+    @property
     def settings(self) -> dict[str, Any]:
         """Copy of additional adapter defaults."""
 
@@ -822,6 +841,7 @@ class Model:
             "native_tile_size": self.native_tile_size,
             "upscale_factor": self.geometry.upscale_factor,
             "input_size": self.input_size,
+            "batch_size": self.batch_size,
             "workers": self.workers if self.kind == "nnunet" else None,
             "settings": to_jsonable(self.settings),
         }
@@ -854,6 +874,7 @@ class Model:
             "native_tile_size": native,
             "upscale_factor": factor,
             "input_size": model_input,
+            "batch_size": self.batch_size,
             "workers": self.workers,
             "confidence": self.confidence,
             "postprocess": self.postprocess,
@@ -872,6 +893,7 @@ class Model:
         confidence: float | None = None,
         postprocess: float | None = None,
         device: str | None = None,
+        batch_size: int | None = None,
         progress: bool = True,
         destination: str | Path | None = None,
         settings: Mapping[str, Any] | None = None,
@@ -901,6 +923,8 @@ class Model:
             postprocess: Native IoU or SAHI match-threshold override. If
                 omitted, use the model's ``postprocess`` setting, then ``0.7``.
             device: Device override.
+            batch_size: Inference batch override. ``-1`` adaptively retries
+                accelerator OOM failures with smaller batches.
             progress: Show package-managed progress bars.
             destination: Optional new/empty directory receiving saved output.
             settings: Additional per-call adapter overrides.
@@ -936,10 +960,21 @@ class Model:
             raise ValueError("confidence must be finite and in [0, 1]")
         if not math.isfinite(effective_postprocess) or not 0 <= effective_postprocess <= 1:
             raise ValueError("postprocess must be finite and in [0, 1]")
-        inputs, source_task = normalize_model_inputs(source, split=split)
+        inputs, source_task = normalize_model_inputs(
+            source, split=split, progress=progress
+        )
         if not inputs:
             raise ValueError("Prediction source contains no supported images")
         selected_device = self._resolved_device(device)
+        effective_batch_size = self.batch_size if batch_size is None else batch_size
+        if (
+            isinstance(effective_batch_size, bool)
+            or not isinstance(effective_batch_size, int)
+            or effective_batch_size == 0
+            or effective_batch_size < -1
+            or effective_batch_size > _MAX_INFERENCE_BATCH_SIZE
+        ):
+            raise ValueError("batch_size must be -1 or an integer from 1 through 128")
         explicit_sahi = {
             "sahi_overlap": sahi_overlap,
             "sahi_postprocess_type": sahi_postprocess_type,
@@ -984,6 +1019,7 @@ class Model:
                 inference=selected_backend,
                 resolution=effective_resolution,
                 settings={**combined_settings, **resolved_sahi.as_dict()},
+                batch_size=effective_batch_size,
             )
             backend = selected_backend
             task: PredictionTask = "semantic_segment"
@@ -996,6 +1032,7 @@ class Model:
                 "checkpoint": self.checkpoint,
                 "upscale_factor": self.upscale_factor,
                 "workers": self.workers,
+                "batch_size": effective_batch_size,
                 "inference": selected_backend,
                 **(resolved_sahi.as_dict() if selected_backend == "sahi" else {}),
                 **{
@@ -1011,7 +1048,7 @@ class Model:
                 source_task if source_task != "semantic_segment" else None
             )
             selected_backend = resolve_backend(requested, known_task or "detect")
-            by_id, resolved_task = predict_model_inputs(
+            by_id, resolved_task, inference_telemetry = predict_model_inputs(
                 self,
                 inputs,
                 task=known_task,
@@ -1022,6 +1059,7 @@ class Model:
                 device=selected_device,
                 progress=progress,
                 settings={**combined_settings, **resolved_sahi.as_dict()},
+                batch_size=effective_batch_size,
             )
             self._resolved_task = resolved_task
             task = resolved_task
@@ -1057,6 +1095,8 @@ class Model:
                 "resolution": effective_resolution,
                 "confidence": effective_confidence,
                 "postprocess": effective_postprocess,
+                "batch_size": effective_batch_size,
+                **inference_telemetry,
                 **combined_settings,
                 **(resolved_sahi.as_dict() if selected_backend == "sahi" else {}),
             }
@@ -1243,6 +1283,7 @@ class Model:
                     "upscale_factor",
                     "input_size",
                     "model_input_size",
+                    "batch_size",
                     "workers",
                     "confidence",
                     "postprocess",
@@ -1374,6 +1415,7 @@ class ModelCollection:
             "input_size",
             "model_input_size",
             "workers",
+            "batch_size",
             "confidence",
             "postprocess",
             "sahi_slice_height",
@@ -1615,6 +1657,7 @@ def normalize_model_inputs(
     source: Any,
     *,
     split: str | None,
+    progress: bool = False,
 ) -> tuple[tuple[ModelInput, ...], PredictionTask | None]:
     """Normalize public prediction sources without reading their annotations."""
 
@@ -1634,7 +1677,7 @@ def normalize_model_inputs(
             )
         from .semantic_comparison import _freeze_cohort
 
-        cases, _ = _freeze_cohort(source, selected_split)
+        cases, _ = _freeze_cohort(source, selected_split, progress=progress)
         return (
             tuple(
                 ModelInput(

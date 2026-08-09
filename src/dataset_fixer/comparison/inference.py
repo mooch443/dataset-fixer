@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import math
 import time
 from collections.abc import Callable
@@ -25,8 +26,8 @@ if TYPE_CHECKING:
     from ..model import Model, ModelInput, PredictionTask
 
 
-_ULTRALYTICS_SAHI_BATCH_PIXELS = 4 * 1024 * 1024
-_ULTRALYTICS_SAHI_MAX_BATCH_SIZE = 32
+_ULTRALYTICS_AUTO_BATCH_PIXELS = 64 * 1024 * 1024
+_ULTRALYTICS_AUTO_BATCH_MAX = 128
 
 
 def resolve_backend(requested: str, task: str) -> str:
@@ -34,7 +35,7 @@ def resolve_backend(requested: str, task: str) -> str:
     if requested not in {"native", "sahi"}:
         raise ValueError("inference must be 'native' or 'sahi'; 'auto' was removed")
     if requested == "sahi" and not sahi_available():
-        raise ImportError("SAHI inference was requested but SAHI is not installed; install dataset-fixer[sahi]")
+        raise ImportError("SAHI inference was requested but SAHI is unavailable; reinstall dataset-fixer")
     return requested
 
 
@@ -114,11 +115,16 @@ def predict_model_inputs(
     device: str | None,
     progress: bool,
     settings: dict[str, Any],
-) -> tuple[dict[str, list[Prediction] | np.ndarray], "PredictionTask"]:
+    batch_size: int,
+) -> tuple[
+    dict[str, list[Prediction] | np.ndarray],
+    "PredictionTask",
+    dict[str, Any],
+]:
     """Adapter entry point used by the public :class:`Model` API."""
 
     if backend == "sahi":
-        values, resolved_task = _predict_sahi_inputs(
+        return _predict_sahi_inputs(
             model,
             inputs,
             task=task,
@@ -128,8 +134,8 @@ def predict_model_inputs(
             device=device,
             progress=progress,
             settings=settings,
+            batch_size=batch_size,
         )
-        return values, resolved_task
     return _predict_native_inputs(
         model,
         inputs,
@@ -140,6 +146,7 @@ def predict_model_inputs(
         device=device,
         progress=progress,
         settings=settings,
+        batch_size=batch_size,
     )
 
 
@@ -154,13 +161,20 @@ def _predict_native_inputs(
     device: str | None,
     progress: bool,
     settings: dict[str, Any],
-) -> tuple[dict[str, list[Prediction] | np.ndarray], "PredictionTask"]:
+    batch_size: int,
+) -> tuple[
+    dict[str, list[Prediction] | np.ndarray],
+    "PredictionTask",
+    dict[str, Any],
+]:
     try:
         from ultralytics import YOLO
     except ImportError as exc:
-        raise ImportError("Native inference requires Ultralytics; install dataset-fixer[comparison]") from exc
+        raise ImportError("Native inference requires Ultralytics; reinstall dataset-fixer") from exc
+    runtime_key = ("ultralytics", device or "auto")
+    reused_runtime = runtime_key in model._runtime
     loaded = model._runtime_model(
-        ("ultralytics-native",),
+        runtime_key,
         lambda: YOLO(str(model.path)),
     )
     detected_task = task or model.task or getattr(loaded, "task", None)
@@ -190,33 +204,39 @@ def _predict_native_inputs(
     if settings.get("precision") == "half":
         kwargs["half"] = True
     output: dict[str, list[Prediction] | np.ndarray] = {}
-    iterator = tqdm(
-        inputs,
+    progress_bar = tqdm(
         total=len(inputs),
         desc=f"{model.name} native {threshold:g}",
+        unit="image",
         disable=not progress,
     )
-    for record in iterator:
-        # Ultralytics converts a list of path strings to image arrays internally and
-        # then reports synthetic paths such as ``image0.jpg``. Inference one image
-        # at a time so result identity remains independently verifiable instead of
-        # trusting positional ordering from a batched loader.
-        results = loaded.predict(source=str(record.image_path), **kwargs)
-        if len(results) != 1:
+    batch_key = ("ultralytics-batch", "native", device or "auto", int(resolution))
+    preferred_batch = model._runtime.get(batch_key) if batch_size == -1 else None
+
+    def predict_batch(batch: list["ModelInput"]) -> list[Any]:
+        paths = [str(record.image_path) for record in batch]
+        source: str | list[str] = paths[0] if len(paths) == 1 else paths
+        results = list(loaded.predict(source=source, **kwargs))
+        if len(results) != len(batch):
             raise DatasetValidationError(
                 ValidationIssue(
-                    "Native inference did not return exactly one result for a cohort image",
-                    source=f"{model.name}: {record.image_path}",
+                    "Native inference did not return exactly one ordered result per cohort image",
+                    source=model.name,
                     value=len(results),
-                    expected="exactly one result",
+                    expected=f"exactly {len(batch)} results",
                 )
             )
-        result = results[0]
-        result_path = getattr(result, "path", None)
-        if result_path is not None:
+        for record, result in zip(batch, results):
+            result_path = getattr(result, "path", None)
+            # Ultralytics preserves real path sources. Array-backed exporters
+            # may report synthetic paths; only validate paths that resolve to
+            # an existing file so positional batching remains supported.
+            if result_path is None:
+                continue
             from pathlib import Path
 
-            if Path(result_path).expanduser().resolve() != record.image_path:
+            reported = Path(str(result_path)).expanduser()
+            if reported.exists() and reported.resolve() != record.image_path:
                 raise DatasetValidationError(
                     ValidationIssue(
                         "Native inference reordered or substituted a cohort image",
@@ -225,15 +245,37 @@ def _predict_native_inputs(
                         expected=str(record.image_path),
                     )
                 )
-        if detected_task == "semantic_segment":
-            output[record.image_id] = _semantic_class_map(
-                result,
-                expected_shape=(record.height, record.width),
-                source=f"{model.name}: {record.relative_path}",
-            )
-        else:
-            output[record.image_id] = _parse_native_result(result, detected_task)
-    return output, detected_task  # type: ignore[return-value]
+        return results
+
+    def consume_batch(batch: list["ModelInput"], results: list[Any]) -> None:
+        for record, result in zip(batch, results):
+            if detected_task == "semantic_segment":
+                output[record.image_id] = _semantic_class_map(
+                    result,
+                    expected_shape=(record.height, record.width),
+                    source=f"{model.name}: {record.relative_path}",
+                )
+            else:
+                output[record.image_id] = _parse_native_result(result, detected_task)
+
+    try:
+        telemetry = _adaptive_batches(
+            list(inputs),
+            predict_batch,
+            consume_batch,
+            requested=batch_size,
+            device=device,
+            resolution=resolution,
+            progress_bar=progress_bar,
+            source=model.name,
+            preferred=preferred_batch,
+        )
+    finally:
+        progress_bar.close()
+    telemetry["runtime_reused"] = reused_runtime
+    if batch_size == -1:
+        model._runtime[batch_key] = telemetry["resolved_batch_size"]
+    return output, detected_task, telemetry  # type: ignore[return-value]
 
 
 def _parse_native_result(result: Any, task: str) -> list[Prediction]:
@@ -285,6 +327,122 @@ def _parse_native_result(result: Any, task: str) -> list[Prediction]:
     return output
 
 
+def _adaptive_batches(
+    items: list[Any],
+    predict: Callable[[list[Any]], list[Any]],
+    consume: Callable[[list[Any], list[Any]], None],
+    *,
+    requested: int,
+    device: str | None,
+    resolution: int,
+    progress_bar: Any,
+    source: str,
+    preferred: int | None = None,
+) -> dict[str, Any]:
+    """Run ordered official-API batches with recoverable OOM backoff.
+
+    Ultralytics documents ``batch=-1`` for training AutoBatch, not prediction.
+    Prediction therefore probes a resolution-aware cohort batch here and
+    halves only the failed chunk. Successful chunks are immediately converted
+    to lightweight package records so result tensors do not accumulate on the
+    accelerator.
+    """
+
+    if requested == -1:
+        size = (
+            min(len(items), int(preferred))
+            if preferred is not None
+            else min(
+                len(items),
+                _ULTRALYTICS_AUTO_BATCH_MAX,
+                max(
+                    1,
+                    _ULTRALYTICS_AUTO_BATCH_PIXELS
+                    // max(1, resolution * resolution),
+                ),
+            )
+        )
+        if str(device).lower() == "cpu":
+            size = min(size, 32)
+    else:
+        size = min(len(items), requested, _ULTRALYTICS_AUTO_BATCH_MAX)
+    size = max(1, size)
+    initial = size
+    retries = 0
+    offset = 0
+    while offset < len(items):
+        active = items[offset : offset + size]
+        try:
+            results = predict(active)
+            consume(active, results)
+            del results
+        except BaseException as error:
+            if not _is_out_of_memory(error):
+                raise
+            retries += 1
+            _clear_accelerator_memory(device)
+            if size <= 1:
+                raise DatasetValidationError(
+                    ValidationIssue(
+                        "Inference exhausted accelerator memory at batch size 1",
+                        source=source,
+                        value=str(error),
+                        suggestion=(
+                            "use a smaller model/input size or select a device with more memory"
+                        ),
+                    )
+                ) from error
+            size = max(1, size // 2)
+            continue
+        offset += len(active)
+        progress_bar.update(len(active))
+    return {
+        "requested_batch_size": requested,
+        "initial_batch_size": initial,
+        "resolved_batch_size": size,
+        "oom_retries": retries,
+        "inference_device": device,
+    }
+
+
+def _is_out_of_memory(error: BaseException) -> bool:
+    current: BaseException | None = error
+    while current is not None:
+        name = type(current).__name__.lower()
+        message = str(current).lower()
+        if "outofmemory" in name or any(
+            marker in message
+            for marker in (
+                "out of memory",
+                "mps backend out of memory",
+                "failed to allocate",
+                "cannot allocate memory",
+                "can't allocate memory",
+                "insufficient memory",
+            )
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _clear_accelerator_memory(device: str | None) -> None:
+    gc.collect()
+    try:
+        import torch
+    except ImportError:
+        return
+    selected = str(device or "").lower()
+    if selected in {"", "cuda"} and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    mps = getattr(torch, "mps", None)
+    if selected in {"", "mps"} and mps is not None and hasattr(mps, "empty_cache"):
+        try:
+            mps.empty_cache()
+        except RuntimeError:
+            pass
+
+
 def _run_sahi(
     spec: ModelSpec,
     cohort: Cohort,
@@ -318,12 +476,17 @@ def _predict_sahi_inputs(
     device: str | None,
     progress: bool,
     settings: dict[str, Any],
-) -> tuple[dict[str, list[Prediction] | np.ndarray], "PredictionTask"]:
+    batch_size: int,
+) -> tuple[
+    dict[str, list[Prediction] | np.ndarray],
+    "PredictionTask",
+    dict[str, Any],
+]:
     try:
         from ultralytics import YOLO
     except ImportError as exc:
         raise ImportError(
-            "SAHI inference for supported models requires dataset-fixer[sahi]"
+            "SAHI inference for supported models requires dataset-fixer"
         ) from exc
     resolved = resolve_sahi_settings(settings, resolution=resolution)
     if resolved.model_type.lower() not in {
@@ -338,8 +501,10 @@ def _predict_sahi_inputs(
             "('ultralytics', 'polo', 'polo26', 'polov8', or 'locate')"
         )
     canonical_task = _canonical_task(task)
+    runtime_key = ("ultralytics", device or "auto")
+    reused_runtime = runtime_key in source_model._runtime
     loaded = source_model._runtime_model(
-        ("ultralytics-sahi", device or "cpu", int(resolution)),
+        runtime_key,
         lambda: YOLO(str(source_model.path)),
     )
     detected_task = canonical_task or _canonical_task(getattr(loaded, "task", None))
@@ -353,36 +518,56 @@ def _predict_sahi_inputs(
             )
         )
     output: dict[str, list[Prediction] | np.ndarray] = {}
-    iterator = tqdm(
-        inputs,
-        desc=f"{source_model.name} SAHI {threshold:g}",
-        disable=not progress,
-    )
-    for record in iterator:
-        with Image.open(record.image_path) as opened:
-            source_image = opened.convert("RGB")
-        if source_image.size != (record.width, record.height):
-            raise DatasetValidationError(
-                f"Prediction input dimensions changed while slicing {record.image_path}"
-            )
-        manifest = build_tile_manifest(
+    manifests = {
+        record.image_id: build_tile_manifest(
             width=record.width,
             height=record.height,
             settings=resolved,
         )
-        raw_objects: list[Prediction] = []
-        semantic_tiles: list[tuple[SahiTile, np.ndarray]] = []
-        batch_size = max(
-            1,
-            min(
-                _ULTRALYTICS_SAHI_MAX_BATCH_SIZE,
-                _ULTRALYTICS_SAHI_BATCH_PIXELS // max(1, resolution * resolution),
-            ),
-        )
-        for offset in range(0, len(manifest), batch_size):
-            tile_batch = manifest[offset : offset + batch_size]
-            crops = [source_image.crop(tile.box) for tile in tile_batch]
-            results = _predict_ultralytics_tiles(
+        for record in inputs
+    }
+    descriptors = [
+        (record, tile)
+        for record in inputs
+        for tile in manifests[record.image_id]
+    ]
+    raw_by_image: dict[str, list[Prediction]] = {
+        record.image_id: [] for record in inputs
+    }
+    semantic_by_image: dict[str, list[tuple[SahiTile, np.ndarray]]] = {
+        record.image_id: [] for record in inputs
+    }
+    tile_progress = tqdm(
+        total=len(descriptors),
+        desc=f"{source_model.name} SAHI tiles",
+        unit="tile",
+        disable=not progress,
+    )
+    batch_key = (
+        "ultralytics-batch",
+        "sahi",
+        device or "auto",
+        int(resolution),
+    )
+    preferred_batch = (
+        source_model._runtime.get(batch_key) if batch_size == -1 else None
+    )
+
+    def predict_tiles(batch: list[tuple["ModelInput", SahiTile]]) -> list[Any]:
+        images: dict[str, Image.Image] = {}
+        crops: list[Image.Image] = []
+        try:
+            for record, tile in batch:
+                if record.image_id not in images:
+                    with Image.open(record.image_path) as opened:
+                        source_image = opened.convert("RGB")
+                    if source_image.size != (record.width, record.height):
+                        raise DatasetValidationError(
+                            f"Prediction input dimensions changed while slicing {record.image_path}"
+                        )
+                    images[record.image_id] = source_image
+                crops.append(images[record.image_id].crop(tile.box))
+            return _predict_ultralytics_tiles(
                 loaded,
                 crops,
                 resolution=resolution,
@@ -390,38 +575,72 @@ def _predict_sahi_inputs(
                 postprocess=threshold,
                 device=device,
                 settings=settings,
-                source=f"{source_model.name}:{record.relative_path}:tiles-{offset}-{offset + len(tile_batch) - 1}",
+                source=f"{source_model.name}:SAHI-tile-batch",
             )
-            for tile, result in zip(tile_batch, results):
-                if detected_task == "semantic_segment":
-                    semantic_tiles.append(
-                        (
-                            tile,
-                            _semantic_probabilities(
-                                result,
-                                expected_shape=(tile.height, tile.width),
-                                num_classes=_model_class_count(loaded),
-                                source=f"{source_model.name}:{record.relative_path}:tile-{tile.index}",
-                            ),
-                        )
-                    )
-                    continue
-                tile_objects = _parse_native_result(result, detected_task)
-                raw_objects.extend(
-                    _shift_tile_prediction(
-                        value,
+        finally:
+            for image in crops:
+                image.close()
+            for image in images.values():
+                image.close()
+
+    def consume_tiles(
+        batch: list[tuple["ModelInput", SahiTile]],
+        results: list[Any],
+    ) -> None:
+        for (record, tile), result in zip(batch, results):
+            if detected_task == "semantic_segment":
+                semantic_by_image[record.image_id].append(
+                    (
                         tile,
-                        loaded,
-                        full_width=record.width,
-                        full_height=record.height,
+                        _semantic_probabilities(
+                            result,
+                            expected_shape=(tile.height, tile.width),
+                            num_classes=_model_class_count(loaded),
+                            source=f"{source_model.name}:{record.relative_path}:tile-{tile.index}",
+                        ),
                     )
-                    for value in tile_objects
                 )
+                continue
+            tile_objects = _parse_native_result(result, detected_task)
+            raw_by_image[record.image_id].extend(
+                _shift_tile_prediction(
+                    value,
+                    tile,
+                    loaded,
+                    full_width=record.width,
+                    full_height=record.height,
+                )
+                for value in tile_objects
+            )
+
+    try:
+        telemetry = _adaptive_batches(
+            descriptors,
+            predict_tiles,
+            consume_tiles,
+            requested=batch_size,
+            device=device,
+            resolution=resolution,
+            progress_bar=tile_progress,
+            source=source_model.name,
+            preferred=preferred_batch,
+        )
+    finally:
+        tile_progress.close()
+
+    image_progress = tqdm(
+        inputs,
+        desc=f"{source_model.name} SAHI images",
+        unit="image",
+        disable=not progress,
+    )
+    for record in image_progress:
+        raw_objects = raw_by_image[record.image_id]
         if detected_task == "semantic_segment":
             probabilities = stitch_probability_tiles(
                 width=record.width,
                 height=record.height,
-                tiles=semantic_tiles,
+                tiles=semantic_by_image[record.image_id],
             )
             output[record.image_id] = np.argmax(probabilities, axis=0).astype(
                 _class_map_dtype(probabilities.shape[0])
@@ -442,7 +661,12 @@ def _predict_sahi_inputs(
                 threshold=threshold,
                 settings=resolved,
             )
-    return output, detected_task  # type: ignore[return-value]
+    telemetry["runtime_reused"] = reused_runtime
+    if batch_size == -1:
+        source_model._runtime[batch_key] = telemetry["resolved_batch_size"]
+    telemetry["sahi_tiles"] = len(descriptors)
+    telemetry["sahi_cross_image_batching"] = True
+    return output, detected_task, telemetry  # type: ignore[return-value]
 
 
 def _sahi_prediction(
@@ -611,7 +835,7 @@ def _postprocess_object_predictions(
         )
         from sahi.prediction import ObjectPrediction
     except ImportError as exc:
-        raise ImportError("SAHI inference requires dataset-fixer[sahi]") from exc
+        raise ImportError("SAHI inference requires SAHI; reinstall dataset-fixer") from exc
     classes = {
         "GREEDYNMM": GreedyNMMPostprocess,
         "NMM": NMMPostprocess,

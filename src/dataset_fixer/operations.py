@@ -476,7 +476,7 @@ def _make_representable(annotation: Annotation, allow_lossy: bool, builder: Outp
             import numpy as np
             from pycocotools import mask as mask_utils
         except ImportError as exc:
-            raise ImportError("RLE conversion requires dataset-fixer[coco-rle] and OpenCV") from exc
+            raise ImportError("RLE conversion requires pycocotools and OpenCV; reinstall dataset-fixer") from exc
         decoded = mask_utils.decode(annotation.rle).astype("uint8")
         contours, _ = cv2.findContours(decoded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         valid = [contour.reshape(-1, 2) for contour in contours if contour.size >= 6]

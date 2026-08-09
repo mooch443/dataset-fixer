@@ -20,7 +20,7 @@ from dataset_fixer.comparison.cache import (
     save_package_cache,
 )
 from dataset_fixer.comparison.cohort import freeze_cohort
-from dataset_fixer.comparison.inference import _run_native, resolve_backend
+from dataset_fixer.comparison.inference import _adaptive_batches, _run_native, resolve_backend
 from dataset_fixer.comparison.metrics import evaluate_configuration, optimal_match
 from dataset_fixer.comparison.types import ModelSpec, Prediction
 from PIL import Image
@@ -102,24 +102,115 @@ def test_native_inference_verifies_each_image_identity(
     cohort = freeze_cohort(Dataset.open(detect_dataset, task="detect", progress=False), "val")
     checkpoint = tmp_path / "model.pt"
     checkpoint.write_bytes(b"checkpoint")
-    calls: list[str] = []
+    calls: list[list[str]] = []
 
     class FakeYOLO:
         def __init__(self, path: str) -> None:
             assert path == str(checkpoint)
 
         def predict(self, *, source, **kwargs):
-            assert isinstance(source, str), "cohort images must be inferred independently"
-            calls.append(source)
+            sources = [source] if isinstance(source, str) else list(source)
+            calls.append(sources)
             boxes = types.SimpleNamespace(xyxy=[], conf=[], cls=[])
-            return [types.SimpleNamespace(path=source, boxes=boxes, masks=None, keypoints=None)]
+            return [
+                types.SimpleNamespace(path=value, boxes=boxes, masks=None, keypoints=None)
+                for value in sources
+            ]
 
     monkeypatch.setitem(sys.modules, "ultralytics", types.SimpleNamespace(YOLO=FakeYOLO))
     predictions = _run_native(
         ModelSpec("model", checkpoint), cohort, 0.5, 0.1, None, False, {}
     )
-    assert calls == [str(record.image_path) for record in cohort.records]
+    assert calls == [[str(record.image_path) for record in cohort.records]]
     assert list(predictions) == [record.image_id for record in cohort.records]
+
+
+def test_native_inference_batches_honors_device_backs_off_and_reuses_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    images = []
+    for index in range(5):
+        path = tmp_path / f"image-{index}.png"
+        Image.new("RGB", (16, 16), "white").save(path)
+        images.append(path)
+    initializations = 0
+    calls: list[int] = []
+
+    class FakeYOLO:
+        task = "detect"
+
+        def __init__(self, path: str) -> None:
+            nonlocal initializations
+            assert path == str(checkpoint)
+            initializations += 1
+
+        def predict(self, *, source, **kwargs):
+            assert kwargs["device"] == "mps"
+            sources = [source] if isinstance(source, str) else list(source)
+            calls.append(len(sources))
+            if len(sources) > 2:
+                raise RuntimeError("MPS backend out of memory")
+            boxes = types.SimpleNamespace(xyxy=[], conf=[], cls=[])
+            return [
+                types.SimpleNamespace(path=value, boxes=boxes, masks=None, keypoints=None)
+                for value in sources
+            ]
+
+    monkeypatch.setitem(sys.modules, "ultralytics", types.SimpleNamespace(YOLO=FakeYOLO))
+    model = Model(
+        checkpoint,
+        task="detect",
+        resolution=128,
+        device="mps",
+        batch_size=-1,
+    )
+    first = model.predict(images, progress=False)
+    second = model.predict(images, progress=False)
+
+    assert initializations == 1
+    assert calls == [5, 2, 2, 1, 2, 2, 1]
+    assert first.settings["requested_batch_size"] == -1
+    assert first.settings["resolved_batch_size"] == 2
+    assert first.settings["oom_retries"] == 1
+    assert first.settings["runtime_reused"] is False
+    assert second.settings["runtime_reused"] is True
+    assert second.settings["oom_retries"] == 0
+
+
+def test_adaptive_inference_never_exceeds_128_items() -> None:
+    sizes: list[int] = []
+    consumed: list[int] = []
+
+    class Progress:
+        def update(self, count: int) -> None:
+            consumed.append(count)
+
+    telemetry = _adaptive_batches(
+        list(range(300)),
+        lambda batch: sizes.append(len(batch)) or list(batch),
+        lambda _batch, _results: None,
+        requested=-1,
+        device="cuda",
+        resolution=128,
+        progress_bar=Progress(),
+        source="test",
+    )
+
+    assert sizes == [128, 128, 44]
+    assert consumed == sizes
+    assert telemetry["initial_batch_size"] == 128
+    assert telemetry["resolved_batch_size"] == 128
+
+
+def test_model_rejects_batch_sizes_over_128(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+
+    with pytest.raises(ValueError, match="1 through 128"):
+        Model(checkpoint, task="detect", batch_size=129)
 
 
 def test_generic_model_auto_detects_and_predicts_supported_images(

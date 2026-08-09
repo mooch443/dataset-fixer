@@ -78,7 +78,7 @@ def require_sahi() -> None:
     if not sahi_available():
         raise ImportError(
             "SAHI inference was requested but SAHI is not installed; "
-            "install dataset-fixer[sahi]"
+            "reinstall dataset-fixer"
         )
 
 

@@ -113,7 +113,7 @@ def compare_nnunet_models(
         if len({settings_fingerprint(value) for value in model_systems.values()}) == 1
         else "system"
     )
-    cases, cohort_fingerprint = _freeze_cohort(export, split)
+    cases, cohort_fingerprint = _freeze_cohort(export, split, progress=progress)
 
     resolved_settings = {
         "backend": (
@@ -227,7 +227,9 @@ def compare_nnunet_models(
                 }
             )
             cache_dir = default_cache_root(export.location) / "semantic" / cache_identity
-            cached = _load_semantic_cache(cache_dir, cases)
+            cached = _load_semantic_cache(
+                cache_dir, cases, progress=progress, model_name=spec.name
+            )
             if cached is not None and all(
                 key in cached for key in ("summary", "native_summary", "native_rows")
             ):
@@ -272,6 +274,8 @@ def compare_nnunet_models(
                     prediction_result.records,
                     prediction_dir,
                     native_prediction_dir,
+                    progress=progress,
+                    description=f"Saving {spec.name} predictions",
                 )
                 _assert_exact_predictions(native_prediction_dir, cases, spec.name)
                 _run_command(
@@ -280,7 +284,8 @@ def compare_nnunet_models(
                         "-djfile", str(spec.model_folder / "dataset.json"),
                         "-pfile", str(spec.model_folder / "plans.json"),
                         "-o", str(native_summary_path), "-np", str(spec.workers),
-                    ]
+                    ],
+                    progress=progress,
                 )
                 native_summary = _load_official_summary(native_summary_path, spec.name)
                 native_rows = _per_case_rows(native_summary, cases, spec.name)
@@ -291,7 +296,8 @@ def compare_nnunet_models(
                         "-djfile", str(spec.model_folder / "dataset.json"),
                         "-pfile", str(spec.model_folder / "plans.json"),
                         "-o", str(summary_path), "-np", str(spec.workers),
-                    ]
+                    ],
+                    progress=progress,
                 )
                 summary = _load_official_summary(summary_path, spec.name)
                 rows = _per_case_rows(summary, cases, spec.name)
@@ -306,6 +312,8 @@ def compare_nnunet_models(
                         "inference_seconds": inference_seconds,
                         "execution": execution,
                     },
+                    progress=progress,
+                    model_name=spec.name,
                 )
                 prediction_dir = cache_dir / "predictions"
                 cache_status = "fresh"
@@ -510,6 +518,7 @@ def compare_semantic_models(
             "resolution": model.resolution or 480,
             "confidence": model.confidence if model.kind == "ultralytics" else None,
             "postprocess": model.postprocess if model.kind == "ultralytics" else None,
+            "batch_size": model.batch_size,
             "sahi": resolved_sahi_by_model.get(model.name),
         }
         for model in models
@@ -534,7 +543,7 @@ def compare_semantic_models(
             )
         )
 
-    cases, cohort_fingerprint = _freeze_cohort(export, split)
+    cases, cohort_fingerprint = _freeze_cohort(export, split, progress=progress)
     resolved_settings = {
         "backend": "common-semantic-mask",
         "report_schema": SEMANTIC_REPORT_SCHEMA,
@@ -601,6 +610,7 @@ def compare_semantic_models(
         model_rows: dict[str, list[dict[str, Any]]] = {}
         prediction_dirs: dict[str, Path] = {}
         ranking: list[dict[str, Any]] = []
+        projection_warnings: list[dict[str, Any]] = []
         for model_index, model in enumerate(models):
             confidence = model.confidence
             postprocess = model.postprocess
@@ -609,6 +619,7 @@ def compare_semantic_models(
                 "progress": progress,
                 "inference": model.inference,
                 "resolution": model.resolution or 480,
+                "batch_size": model.batch_size,
             }
             if model.kind == "ultralytics":
                 predict_options.update(
@@ -630,6 +641,7 @@ def compare_semantic_models(
                     "checkpoint": model.checkpoint,
                     "upscale_factor": model.upscale_factor,
                     "workers": model.workers,
+                    "batch_size": model.batch_size,
                     "settings": {
                         key: value
                         for key, value in predict_options.items()
@@ -639,8 +651,12 @@ def compare_semantic_models(
                 }
             )
             cache_dir = default_cache_root(export.location) / "semantic" / cache_identity
-            cached = _load_semantic_cache(cache_dir, cases)
+            cached = _load_semantic_cache(
+                cache_dir, cases, progress=progress, model_name=model.name
+            )
             if cached is not None:
+                if progress:
+                    print(f"Cache hit: {model.name} ({len(cases)} semantic masks)")
                 prediction_dir = cache_dir / "predictions"
                 rows = [
                     {**row, "model": model.name}
@@ -650,21 +666,29 @@ def compare_semantic_models(
                 native_task = str(cached["native_task"])
                 prediction_backend = str(cached["backend"])
                 inference_seconds = float(cached.get("inference_seconds", 0.0))
+                model_warnings = list(cached.get("warnings") or [])
                 cache_status = "hit"
             else:
                 prediction_dir = temporary / "working" / "predictions" / model.slug
                 prediction_dir.mkdir(parents=True, exist_ok=True)
                 prediction_result = model.predict(model_inputs, **predict_options)
-                projected, projection = _project_semantic_predictions(
+                projected, projection, model_warnings = _project_semantic_predictions(
                     prediction_result.records,
                     prediction_result.task,
                     cases,
                     model.name,
                     confidence=float(confidence),
                 )
-                _write_semantic_prediction_masks(projected, prediction_dir)
+                _write_semantic_prediction_masks(
+                    projected,
+                    prediction_dir,
+                    progress=progress,
+                    description=f"Saving {model.name} predictions",
+                )
                 _assert_exact_predictions(prediction_dir, cases, model.name)
-                rows = _sample_metric_rows(cases, prediction_dir, model.name)
+                rows = _sample_metric_rows(
+                    cases, prediction_dir, model.name, progress=progress
+                )
                 native_task = prediction_result.task
                 prediction_backend = prediction_result.backend
                 inference_seconds = prediction_result.inference_seconds
@@ -677,10 +701,14 @@ def compare_semantic_models(
                         "native_task": native_task,
                         "backend": prediction_backend,
                         "inference_seconds": inference_seconds,
+                        "warnings": model_warnings,
                     },
+                    progress=progress,
+                    model_name=model.name,
                 )
                 prediction_dir = cache_dir / "predictions"
                 cache_status = "fresh"
+            projection_warnings.extend(model_warnings)
             prediction_dirs[model.name] = prediction_dir
             model_rows[model.name] = rows
             finite_dice = [row["dice"] for row in rows if math.isfinite(row["dice"])]
@@ -734,6 +762,7 @@ def compare_semantic_models(
                     "model_sha256": model.digest,
                     "inference_seconds": inference_seconds,
                     "cache": cache_status,
+                    "warning_count": len(model_warnings),
                     "throughput_cases_per_second": (
                         len(cases) / inference_seconds
                         if inference_seconds > 0
@@ -812,6 +841,7 @@ def compare_semantic_models(
             "ranking": ranking,
             "paired_statistics": paired,
             "limitations": limitations,
+            "warnings": projection_warnings,
             "worst_cases": worst_cases,
             "reports": {
                 "plots": "reports/plots.png",
@@ -840,6 +870,11 @@ def compare_semantic_models(
         f"Cohort verified: yes; cases: {len(cases)}; {pairing}; "
         "comparison space: semantic"
     )
+    if projection_warnings:
+        print(
+            f"Warnings: skipped {len(projection_warnings)} invalid segmentation "
+            f"object(s); details: {target / 'reports' / 'result.json'}"
+        )
     return SemanticComparisonResult(
         location=target,
         ranking=tuple(ranking),
@@ -858,7 +893,7 @@ def _project_semantic_predictions(
     model_name: str,
     *,
     confidence: float,
-) -> tuple[tuple[ImagePrediction, ...], str]:
+) -> tuple[tuple[ImagePrediction, ...], str, list[dict[str, Any]]]:
     expected_ids = [case.case_id for case in cases]
     actual_ids = [record.image_id for record in records]
     if actual_ids != expected_ids:
@@ -899,7 +934,7 @@ def _project_semantic_predictions(
                     metadata={**record.metadata, "semantic_projection": "native-semantic-mask"},
                 )
             )
-        return tuple(projected), "native-semantic-mask"
+        return tuple(projected), "native-semantic-mask", []
     if task != "segment":
         raise DatasetValidationError(
             ValidationIssue(
@@ -909,6 +944,7 @@ def _project_semantic_predictions(
                 expected="segment or semantic_segment",
             )
         )
+    warnings: list[dict[str, Any]] = []
     for record, case in zip(records, cases):
         if (record.width, record.height) != (case.width, case.height):
             raise DatasetValidationError(
@@ -923,28 +959,41 @@ def _project_semantic_predictions(
             polygons = prediction.polygons or (
                 [prediction.polygon] if prediction.polygon is not None else []
             )
-            if not polygons or any(len(polygon) < 3 for polygon in polygons):
-                raise DatasetValidationError(
-                    ValidationIssue(
-                        "YOLO segmentation prediction has no usable polygon",
-                        source=f"{model_name}:{case.relative_path}",
-                        line=index,
-                        expected="at least three polygon points",
-                    )
-                )
-            if any(
-                not math.isfinite(float(x)) or not math.isfinite(float(y))
-                for polygon in polygons
-                for x, y in polygon
-            ):
-                raise DatasetValidationError(
-                    ValidationIssue(
-                        "YOLO segmentation polygon contains non-finite coordinates",
-                        source=f"{model_name}:{case.relative_path}",
-                        line=index,
-                    )
-                )
+            usable: list[list[tuple[float, float]]] = []
             for polygon in polygons:
+                reason = None
+                if len(polygon) < 3:
+                    reason = "fewer than three polygon points"
+                elif any(
+                    not math.isfinite(float(x)) or not math.isfinite(float(y))
+                    for x, y in polygon
+                ):
+                    reason = "non-finite polygon coordinates"
+                if reason is not None:
+                    warnings.append(
+                        {
+                            "model": model_name,
+                            "case_id": case.case_id,
+                            "relative_path": case.relative_path.as_posix(),
+                            "object_index": index,
+                            "reason": reason,
+                            "action": "skipped-object",
+                        }
+                    )
+                    continue
+                usable.append(polygon)
+            if not polygons:
+                warnings.append(
+                    {
+                        "model": model_name,
+                        "case_id": case.case_id,
+                        "relative_path": case.relative_path.as_posix(),
+                        "object_index": index,
+                        "reason": "no polygon returned by segmentation model",
+                        "action": "skipped-object",
+                    }
+                )
+            for polygon in usable:
                 draw.polygon([(float(x), float(y)) for x, y in polygon], fill=1)
         projected.append(
             ImagePrediction(
@@ -957,7 +1006,7 @@ def _project_semantic_predictions(
                 metadata={"semantic_projection": "polygon-foreground-union"},
             )
         )
-    return tuple(projected), "polygon-foreground-union"
+    return tuple(projected), "polygon-foreground-union", warnings
 
 
 def predict_nnunet_model(
@@ -970,6 +1019,7 @@ def predict_nnunet_model(
     inference: str = "native",
     resolution: int = 480,
     settings: dict[str, Any] | None = None,
+    batch_size: int = -1,
 ) -> tuple[ImagePrediction, ...]:
     """Run the official nnU-Net adapter for :meth:`Model.predict`."""
 
@@ -993,6 +1043,7 @@ def predict_nnunet_model(
             keep_native=keep_native,
             resolution=resolution,
             settings=dict(settings or {}),
+            batch_size=batch_size,
         )
     _require_official_commands("nnUNetv2_predict_from_modelfolder")
     with tempfile.TemporaryDirectory(prefix="dataset-fixer-nnunet-predict-") as temporary:
@@ -1032,7 +1083,8 @@ def predict_nnunet_model(
                 "-nps",
                 str(model.workers),
                 "--save_probabilities",
-            ]
+            ],
+            progress=progress,
         )
         _assert_exact_model_predictions(native_predictions, inputs, model.name)
         records: list[ImagePrediction] = []
@@ -1090,6 +1142,7 @@ def _predict_nnunet_sahi(
     keep_native: bool,
     resolution: int,
     settings: dict[str, Any],
+    batch_size: int,
 ) -> tuple[ImagePrediction, ...]:
     """Predict SAHI tiles in process, as real network minibatches.
 
@@ -1115,12 +1168,23 @@ def _predict_nnunet_sahi(
         for value in inputs
     }
     total_tiles = sum(len(manifests[value.image_id]) for value in inputs)
-    session = load_session(
-        model_folder=model.model_folder,
-        folds=model.folds,
-        checkpoint=model.checkpoint,
-        device=device,
-        workers=model.workers,
+    session = model._runtime_model(
+        (
+            "nnunet-sahi",
+            device,
+            tuple(model.folds),
+            model.checkpoint,
+            model.workers,
+            batch_size,
+        ),
+        lambda: load_session(
+            model_folder=model.model_folder,
+            folds=model.folds,
+            checkpoint=model.checkpoint,
+            device=device,
+            workers=model.workers,
+            batch_size=batch_size,
+        ),
     )
     telemetry = EngineTelemetry(
         device=device,
@@ -1470,7 +1534,7 @@ def visualize_nnunet_models(
     if any(spec.inference != "sahi" for spec in cohort.models):
         _require_official_commands("nnUNetv2_predict_from_modelfolder")
 
-    cases, _ = _freeze_cohort(export, split)
+    cases, _ = _freeze_cohort(export, split, progress=progress)
     selected = _select_visual_cases(
         cases,
         samples=samples,
@@ -1494,12 +1558,15 @@ def visualize_nnunet_models(
             _write_semantic_prediction_masks(
                 result.records,
                 predictions,
+                progress=progress,
+                description=f"Saving {spec.name} predictions",
             )
             prediction_dirs[spec.name] = predictions
             rows_by_model[spec.name] = _sample_metric_rows(
                 selected,
                 predictions,
                 spec.name,
+                progress=progress,
             )
 
         figure = _render_semantic_grid(
@@ -1553,6 +1620,8 @@ def _require_official_commands(*commands: str) -> None:
 def _freeze_cohort(
     export: "Dataset",
     split: str,
+    *,
+    progress: bool = False,
 ) -> tuple[list[_SemanticCase], str]:
     image_root = export.image_dirs[split]
     mask_root = export.mask_dirs[split]
@@ -1574,6 +1643,12 @@ def _freeze_cohort(
     expected_masks: set[Path] = set()
     digest = hashlib.sha256()
     digest.update(f"semantic-mask-cohort-v2:{split}:canonical-export".encode("utf-8"))
+    cohort_progress = tqdm(
+        total=len(images),
+        desc="Freezing semantic cohort",
+        unit="cohort image",
+        disable=not progress,
+    )
     for index, image_path in enumerate(images):
         relative = image_path.relative_to(image_root)
         mask_path = mask_root / relative.with_suffix(".png")
@@ -1615,6 +1690,8 @@ def _freeze_cohort(
         digest.update(relative.as_posix().encode("utf-8"))
         digest.update(image_sha.encode("ascii"))
         digest.update(mask_sha.encode("ascii"))
+        cohort_progress.update(1)
+    cohort_progress.close()
     actual_masks = {
         path.resolve()
         for path in mask_root.rglob("*.png")
@@ -1697,11 +1774,19 @@ def _write_semantic_prediction_masks(
     records: tuple[ImagePrediction, ...],
     canonical_dir: Path,
     native_dir: Path | None = None,
+    *,
+    progress: bool = False,
+    description: str = "Saving semantic predictions",
 ) -> None:
     canonical_dir.mkdir(parents=True, exist_ok=True)
     if native_dir is not None:
         native_dir.mkdir(parents=True, exist_ok=True)
-    for record in records:
+    for record in tqdm(
+        records,
+        desc=description,
+        unit="mask",
+        disable=not progress,
+    ):
         if record.mask is None:
             raise DatasetValidationError(
                 f"Semantic prediction {record.image_id!r} has no canonical mask"
@@ -1818,7 +1903,9 @@ def _write_cohort(
             )
 
 
-def _run_command(command: list[str]) -> None:
+def _run_command(command: list[str], *, progress: bool = False) -> None:
+    if progress:
+        print(f"Running {command[0]}…")
     try:
         subprocess.run(
             command,
@@ -1827,7 +1914,7 @@ def _run_command(command: list[str]) -> None:
             # nnU-Net prints several lines and nested progress bars for every
             # case. Capturing keeps large evaluations readable while retaining
             # stdout/stderr for the failure diagnostic below.
-            capture_output=True,
+            capture_output=not progress,
         )
     except FileNotFoundError as exc:
         raise ImportError(
@@ -2321,13 +2408,26 @@ def _semantic_result_from_manifest(
 def _load_semantic_cache(
     cache_dir: Path,
     cases: list[_SemanticCase],
+    *,
+    progress: bool = False,
+    model_name: str | None = None,
 ) -> dict[str, Any] | None:
     metadata = cache_dir / "evaluation.json"
     predictions = cache_dir / "predictions"
     if not metadata.is_file() or not predictions.is_dir():
         return None
     expected = {f"{case.case_id}.png" for case in cases}
-    actual = {path.name for path in predictions.glob("*.png") if path.is_file()}
+    paths = list(predictions.glob("*.png"))
+    actual = {
+        path.name
+        for path in tqdm(
+            paths,
+            desc=f"Loading {model_name or 'semantic'} cache",
+            unit="mask",
+            disable=not progress,
+        )
+        if path.is_file()
+    }
     if actual != expected:
         return None
     try:
@@ -2348,6 +2448,9 @@ def _save_semantic_cache(
     cache_dir: Path,
     prediction_dir: Path,
     metadata: dict[str, Any],
+    *,
+    progress: bool = False,
+    model_name: str | None = None,
 ) -> None:
     if (cache_dir / "evaluation.json").is_file():
         return
@@ -2356,7 +2459,18 @@ def _save_semantic_cache(
         tempfile.mkdtemp(prefix=f".{cache_dir.name}.building-", dir=cache_dir.parent)
     )
     try:
-        shutil.copytree(prediction_dir, staging / "predictions")
+        staged_predictions = staging / "predictions"
+        staged_predictions.mkdir(parents=True)
+        prediction_paths = sorted(
+            path for path in prediction_dir.glob("*.png") if path.is_file()
+        )
+        for path in tqdm(
+            prediction_paths,
+            desc=f"Caching {model_name or 'semantic'} predictions",
+            unit="mask",
+            disable=not progress,
+        ):
+            shutil.copy2(path, staged_predictions / path.name)
         write_json(
             staging / "evaluation.json",
             {"schema": SEMANTIC_EVALUATION_CACHE_SCHEMA, **metadata},
@@ -2398,9 +2512,16 @@ def _sample_metric_rows(
     cases: list[_SemanticCase],
     prediction_dir: Path,
     model_name: str,
+    *,
+    progress: bool = False,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for case in cases:
+    for case in tqdm(
+        cases,
+        desc=f"Scoring {model_name}",
+        unit="case",
+        disable=not progress,
+    ):
         with Image.open(case.mask_path) as opened_mask:
             truth = np.asarray(opened_mask.convert("L")) > 0
         prediction_path = prediction_dir / f"{case.case_id}.png"

@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+from tqdm.auto import tqdm
 
 from .errors import DatasetValidationError, ValidationIssue
 from .geometry import Geometry, first_value, from_metadata
@@ -24,6 +27,7 @@ SUPPORTED_BUNDLE_FORMATS = {
     "ultralytics-yolo26-sem-reproducibility-bundle-v1",
     "ultralytics-yolo26-instance-seg-reproducibility-bundle-v1",
 }
+_DOWNLOAD_CHUNK = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -315,7 +319,7 @@ def _download_wandb(
         sdk = importlib.import_module("wandb")
     except ImportError as exc:
         raise ImportError(
-            "Loading wandb: model sources requires the optional 'wandb' package"
+            "Loading wandb: model sources requires W&B; reinstall dataset-fixer"
         ) from exc
     run_path = normalize_wandb_run(reference)
     run = sdk.Api().run(run_path)
@@ -343,17 +347,12 @@ def _download_wandb(
     root.mkdir(parents=True, exist_ok=True)
     temporary_root = Path(tempfile.mkdtemp(prefix=".download-", dir=root))
     try:
-        if progress:
-            size = identity.get("size")
-            size_text = f" ({int(size):,} bytes)" if size is not None else ""
-            print(f"Downloading W&B file {remote.name}{size_text} ...")
-        downloaded = remote.download(root=str(temporary_root), exist_ok=True)
-        try:
-            downloaded_path = Path(downloaded.name).resolve()
-        finally:
-            close = getattr(downloaded, "close", None)
-            if callable(close):
-                close()
+        downloaded_path = _download_wandb_file(
+            remote,
+            temporary_root,
+            expected_size=identity.get("size"),
+            progress=progress,
+        )
         if not downloaded_path.is_file():
             raise RuntimeError(f"W&B download did not create a file: {downloaded_path}")
         descriptor, temporary_name = tempfile.mkstemp(
@@ -370,6 +369,64 @@ def _download_wandb(
 
         shutil.rmtree(temporary_root, ignore_errors=True)
     return destination, run
+
+
+def _download_wandb_file(
+    remote: Any,
+    root: Path,
+    *,
+    expected_size: int | None,
+    progress: bool,
+) -> Path:
+    """Stream a signed W&B file URL with byte progress when available."""
+
+    direct_url = str(getattr(remote, "url", "") or "").strip()
+    target = root / Path(str(remote.name)).name
+    if direct_url:
+        try:
+            request = Request(direct_url, headers={"User-Agent": "dataset-fixer"})
+            with urlopen(request, timeout=60) as response, target.open("wb") as handle, tqdm(
+                total=(
+                    int(expected_size)
+                    if expected_size is not None
+                    else int(response.headers.get("Content-Length") or 0) or None
+                ),
+                desc=f"Downloading W&B file {remote.name}",
+                unit="B",
+                unit_scale=True,
+                disable=not progress,
+            ) as bar:
+                for chunk in iter(lambda: response.read(_DOWNLOAD_CHUNK), b""):
+                    handle.write(chunk)
+                    bar.update(len(chunk))
+                handle.flush()
+                os.fsync(handle.fileno())
+            if expected_size is not None and target.stat().st_size != int(expected_size):
+                raise OSError(
+                    f"W&B file size changed during download: expected {expected_size}, "
+                    f"received {target.stat().st_size}"
+                )
+            return target.resolve()
+        except Exception:
+            target.unlink(missing_ok=True)
+            if progress:
+                print(
+                    "Direct W&B byte-progress download was unavailable; "
+                    "using the authenticated SDK downloader."
+                )
+
+    if progress and not direct_url:
+        print(
+            f"Downloading W&B file {remote.name} with the authenticated SDK "
+            "(byte progress is unavailable for this file)."
+        )
+    downloaded = remote.download(root=str(root), exist_ok=True)
+    try:
+        return Path(downloaded.name).resolve()
+    finally:
+        close = getattr(downloaded, "close", None)
+        if callable(close):
+            close()
 
 
 def _checkpoint_metadata(path: Path) -> dict[str, Any]:

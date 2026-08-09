@@ -300,5 +300,5 @@ def test_native_ultralytics_semantic_preserves_multiclass_masks(
 
 def test_missing_sahi_fails_without_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("dataset_fixer.comparison.inference.sahi_available", lambda: False)
-    with pytest.raises(ImportError, match=r"dataset-fixer\[sahi\]"):
+    with pytest.raises(ImportError, match=r"reinstall dataset-fixer"):
         resolve_backend("sahi", "detect")

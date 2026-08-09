@@ -52,7 +52,7 @@ def _compare_models(
     seed = 42
     bootstrap_resamples = 10_000
     specs = parse_models(models)
-    cohort = freeze_cohort(dataset, split)
+    cohort = freeze_cohort(dataset, split, progress=progress)
     model_backends = {
         spec.name: resolve_backend(
             str(spec.inference_overrides.get("inference", "native")), cohort.task
@@ -66,6 +66,8 @@ def _compare_models(
         system = {
             "resolution": spec.resolution,
             "backend": model_backends[spec.name],
+            "device": spec.resolved_model.device,
+            "batch_size": spec.resolved_model.batch_size,
             "confidence": spec.resolved_model.confidence,
             "postprocess": spec.resolved_model.postprocess,
         }
@@ -109,6 +111,7 @@ def _compare_models(
                         "name": spec.name,
                         "sha256": model_hashes[spec.name],
                         "resolution": spec.resolution,
+                        "batch_size": spec.resolved_model.batch_size,
                         "settings": spec.inference_overrides,
                     }
                     for spec in specs
@@ -374,7 +377,8 @@ def _evaluate_model(
             "model_sha256": model_sha, "cohort_fingerprint": active.fingerprint, "task": active.task,
             "classes": active.classes, "backend": backend, "versions": package_versions(),
             "resolution": spec.resolution, "confidence_floor": floor, "postprocess_thresholds": active_posts,
-            "device": device, "settings": settings,
+            "device": device, "batch_size": spec.resolved_model.batch_size,
+            "settings": settings,
         }
         prediction_identity = {
             key: value
@@ -385,18 +389,49 @@ def _evaluate_model(
         loaded: dict[float, dict[str, list[Prediction]]] = {}
         shards = 0
         source = "fresh"
-        loaded, shards, complete = load_package_cache(root, active, active_posts)
+        loaded, shards, complete = load_package_cache(
+            root, active, active_posts, progress=progress
+        )
         if complete:
             source = "package"
+            if progress:
+                print(f"Cache hit: {spec.name} ({shards} prediction shards)")
+        checkpointed = dict(loaded)
+
+        def checkpoint_threshold(
+            threshold: float,
+            values: dict[str, list[Prediction]],
+        ) -> None:
+            checkpointed[float(threshold)] = values
+            save_package_cache(
+                root,
+                active,
+                payload,
+                checkpointed,
+                progress=progress,
+            )
+
         start = time.perf_counter()
         predictions, timings = run_inference(
             spec, active, backend=backend, thresholds=active_posts, confidence_floor=floor, device=device,
             progress=progress, settings=settings, existing=loaded,
-            on_threshold=(lambda threshold, values: save_package_cache(root, active, payload, {**loaded, threshold: values})),
+            on_threshold=checkpoint_threshold,
         )
         inference_seconds = time.perf_counter() - start if source == "fresh" or len(loaded) < len(active_posts) else 0.0
-        save_package_cache(root, active, payload, predictions)
-        verified_loaded, verified_shards, verified = load_package_cache(root, active, active_posts)
+        if not complete and set(checkpointed) != {
+            float(value) for value in active_posts
+        }:
+            # Third-party/test inference adapters may not invoke the checkpoint
+            # callback. Persist the completed result before metric/report work.
+            save_package_cache(
+                root, active, payload, predictions, progress=progress
+            )
+        if complete:
+            verified_loaded, verified_shards, verified = loaded, shards, True
+        else:
+            verified_loaded, verified_shards, verified = load_package_cache(
+                root, active, active_posts, progress=progress
+            )
         if not verified or set(verified_loaded) != set(map(float, active_posts)):
             raise DatasetValidationError("Package prediction cache failed post-write verification")
         shards = verified_shards

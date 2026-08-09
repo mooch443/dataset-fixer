@@ -103,8 +103,7 @@ classes. Pass `merge_into=` with a surviving class name or integer ID to retain
 those annotations under that class; surviving class IDs are still compacted in
 the exported dataset.
 
-Albumentations is optional. Install it with
-`pip install "dataset-fixer[augment]"`, then pass either a transform sequence,
+Albumentations is installed with `pip install dataset-fixer`; pass either a transform sequence,
 an `A.Compose`, or an `A.to_dict()` result:
 
 ```python
@@ -386,8 +385,7 @@ name. Model panels show masks only, with Dice and IoU beneath them. The
 not expose model-loading or model-comparison methods; load models with
 `Model.load_many(...)` and call `models.compare(masks, ...)`.
 
-Install the optional official backend with
-`pip install 'dataset-fixer[nnunet]'`. Comparison calls
+The official backend is included by `pip install dataset-fixer`. Comparison calls
 `nnUNetv2_predict_from_modelfolder` for whole-image prediction and
 `nnUNetv2_evaluate_folder` for every reported metric, verifies
 that every model predicted the exact same image set, and ranks the official
@@ -395,8 +393,9 @@ foreground Dice/IoU results. Sliced (`inference="sahi"`) nnU-Net prediction
 runs in process instead, against the same official preprocessing and
 probability-conversion APIs. A model's `workers` setting is the CPU worker
 count for preprocessing and probability conversion; it is not the neural
-network batch size, which is derived from the model's own plan capped at 16 on
-an accelerator and 4 on CPU, halving only on a recognized out-of-memory error.
+network batch size. With `batch_size=-1`, nnU-Net derives that from its plan,
+caps the initial probe at 16 on an accelerator or 4 on CPU, and halves only on
+a recognized out-of-memory error; a positive value sets the initial request.
 The resolved batch size, retries, tile count, per-phase timings, device, and
 execution engine are recorded in prediction and comparison manifests.
 When `device` is omitted, nnU-Net execution uses
@@ -449,6 +448,7 @@ detector = Model(
     "/models/best.pt",
     name="detector",
     resolution=640,
+    batch_size=-1,
 )
 predictions = detector.predict(
     "/data/example.jpg",
@@ -474,6 +474,13 @@ models populate each record's `objects`; semantic models populate `mask`.
 utilities. Direct `Model.predict` defaults to native prediction. Configure a
 model with `inference="sahi"` to opt it into tiled inference; no
 availability-based selection or fallback is performed.
+
+Inference defaults to `batch_size=-1`. Ultralytics native inputs and SAHI
+tiles are sent through the official prediction API in cohort-wide batches;
+recognized CUDA/MPS out-of-memory failures halve only the failed batch and the
+resolved size is reused. A positive batch size fixes the initial requested
+size. Both automatic and explicit batches are capped at 128. Loaded weights
+are retained per model and device until `model.unload()`.
 
 Use `Model.load_many(...)` to normalize an ordered model collection once. The
 collection accepts a dataset/export at operation time and exposes `predict`,
@@ -549,10 +556,10 @@ manifest, overlap, mirroring TTA, upscale adapter, feathered probability
 stitching, and argmax-after-stitch behavior are unchanged, and the official
 evaluator CLI still produces every reported metric. All SAHI-only options use
 the `sahi_` prefix; the removed unprefixed names and `inference="auto"` are
-rejected. Install optional integrations with:
+rejected. Install the complete runtime with:
 
 ```shell
-pip install 'dataset-fixer[comparison,sahi]'
+pip install dataset-fixer
 ```
 
 Predictions and completed per-model evaluations are cached independently in
@@ -579,6 +586,7 @@ models = models.configure({
         "upscale_factor": 2,
         "inference": "sahi",
         "device": "cuda",
+        "batch_size": -1,
     }
 })
 ```
@@ -704,8 +712,8 @@ Operation-specific previews and audits are controlled with each method's
 
 ## Development
 
-The GitHub Actions pipeline tests Python 3.10–3.13, exercises the optional
-comparison and SAHI dependency set, builds the wheel and source distribution,
+The GitHub Actions pipeline tests supported Python versions and the complete
+runtime dependency set, builds the wheel and source distribution,
 checks package metadata, and smoke-tests installation from the wheel.
 
 ## License

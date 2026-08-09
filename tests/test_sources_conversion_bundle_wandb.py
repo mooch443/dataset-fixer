@@ -12,6 +12,7 @@ from PIL import Image
 from dataset_fixer import Dataset, DatasetValidationError, Geometry, Model
 from dataset_fixer.bundle import Config, Outcome, create
 from dataset_fixer.convert import Kind, prepare
+from dataset_fixer.model_sources import _download_wandb_file
 from dataset_fixer.sources import extract_archive
 from dataset_fixer.wandb import configure, upload
 from conftest import make_yolo_dataset
@@ -60,6 +61,48 @@ def test_safe_zip_rejects_traversal_and_does_not_publish_partial_cache(tmp_path:
     assert not (tmp_path / "escape.txt").exists()
 
 
+def test_wandb_signed_url_download_reports_byte_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"wandb-model-bytes" * 1024
+    source = tmp_path / "remote.pt"
+    source.write_bytes(payload)
+    seen = {"total": None, "bytes": 0}
+
+    class RecordingBar:
+        def __init__(self, **kwargs: object) -> None:
+            seen["total"] = kwargs.get("total")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def update(self, count: int) -> None:
+            seen["bytes"] += count
+
+    monkeypatch.setattr("dataset_fixer.model_sources.tqdm", RecordingBar)
+    remote = SimpleNamespace(
+        name="best.pt",
+        url=source.as_uri(),
+        download=lambda **_: pytest.fail("SDK fallback should not be used"),
+    )
+    root = tmp_path / "downloads"
+    root.mkdir()
+
+    downloaded = _download_wandb_file(
+        remote,
+        root,
+        expected_size=len(payload),
+        progress=True,
+    )
+
+    assert downloaded.read_bytes() == payload
+    assert seen == {"total": len(payload), "bytes": len(payload)}
+
+
 def test_model_load_many_standalone_and_immutable_configure(tmp_path: Path) -> None:
     checkpoint = tmp_path / "standalone-yolox.pt"
     checkpoint.write_bytes(b"checkpoint")
@@ -73,6 +116,7 @@ def test_model_load_many_standalone_and_immutable_configure(tmp_path: Path) -> N
                 "upscale_factor": 2,
                 "inference": "sahi",
                 "device": "cuda",
+                "batch_size": 8,
                 "workers": 4,
             }
         }
@@ -84,6 +128,8 @@ def test_model_load_many_standalone_and_immutable_configure(tmp_path: Path) -> N
     assert configured[0].geometry == Geometry((128, 128), 2, (256, 256))
     assert configured[0].settings["sahi_slice_height"] == 128
     assert configured[0].device == "cuda"
+    assert original[0].batch_size == -1
+    assert configured[0].batch_size == 8
     with pytest.raises(KeyError, match="Unknown model"):
         original.configure({"missing": {"device": "cpu"}})
     with pytest.raises(DatasetValidationError, match="Contradictory model geometry"):
