@@ -25,7 +25,15 @@ class Task(str, Enum):
         | "Task"
         | None,
     ) -> "Task | None":
-        """Normalize a task value or supported convenience alias."""
+        """Normalize a task value or supported convenience alias.
+
+        Parameters:
+            value: Task enum, canonical task string, convenience alias, or
+                ``None``.
+
+        Returns:
+            The normalized task, or ``None`` when no task was supplied.
+        """
         if value is None or isinstance(value, cls):
             return value
         aliases = {"bbox": "detect", "boxes": "detect", "keypoints": "pose", "locate": "polo", "point": "polo"}
@@ -96,7 +104,17 @@ class DatasetMetadata:
 
 @dataclass(frozen=True)
 class SemanticComparisonResult:
-    """Model comparison outcome for a frozen semantic-mask cohort."""
+    """Model comparison outcome for a frozen semantic-mask cohort.
+
+    Parameters:
+        location: Directory containing the report and comparison artifacts.
+        ranking: Ordered per-model semantic metric summaries.
+        cohort_fingerprint: Content identity of the frozen evaluation cohort.
+        cohort_verified: Whether cohort inputs passed integrity verification.
+        split: Evaluated dataset split.
+        settings: Exact comparison and inference configuration.
+        limitations: Caveats that should accompany interpretation.
+    """
 
     location: Path
     ranking: tuple[dict[str, Any], ...]

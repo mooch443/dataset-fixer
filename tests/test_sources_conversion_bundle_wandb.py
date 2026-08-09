@@ -180,26 +180,44 @@ def test_prepare_thresholds_jpeg_resizes_and_reuses(tmp_path: Path) -> None:
     first = prepare(
         dataset,
         Kind.YOLO_SEM,
+        name="semantic-run-a",
         native_tile_size=32,
         upscale_factor=2,
         destination=tmp_path / "prepared",
         workers=1,
         mask_threshold=128,
+        base_model="yolo26m-sem.pt",
+        epochs=5,
+        device="cpu",
         progress=False,
     )
     second = prepare(
         dataset,
         Kind.YOLO_SEM,
+        name="semantic-run-b",
         native_tile_size=32,
         upscale_factor=2,
         destination=tmp_path / "prepared",
         workers=1,
         mask_threshold=128,
+        base_model="yolo26m-sem.pt",
+        epochs=10,
+        device="cuda",
         progress=False,
     )
 
     assert first.geometry.input_size == (64, 64)
     assert second.reused
+    assert first.config is not None
+    assert first.config.framework == "ultralytics"
+    assert first.config.task == "semantic"
+    assert first.config.model["base_model"] == "yolo26m-sem.pt"
+    assert first.config.training["imgsz"] == 64
+    assert first.config.training["epochs"] == 5
+    assert second.config is not None
+    assert second.config.name == "semantic-run-b"
+    assert second.config.training["epochs"] == 10
+    assert second.config.training["device"] == "cuda"
     prepared_masks = sorted((first.location / "masks").rglob("*.png"))
     assert prepared_masks
     with Image.open(prepared_masks[0]) as opened:
@@ -208,6 +226,79 @@ def test_prepare_thresholds_jpeg_resizes_and_reuses(tmp_path: Path) -> None:
     cases = json.loads(first.paths["cases"].read_text(encoding="utf-8"))
     jpeg_record = next(value for value in cases if value["source_mask"].endswith(".jpg"))
     assert jpeg_record["mask_source"]["threshold"] == 128
+
+
+def test_prepare_returns_complete_nnunet_bundle_config(tmp_path: Path) -> None:
+    dataset = _semantic_dataset(tmp_path, size=(32, 32))
+
+    data_only = prepare(
+        dataset,
+        Kind.NNUNET,
+        native_tile_size=32,
+        upscale_factor=2,
+        destination=tmp_path / "prepared-nnunet",
+        workers=1,
+        preprocess=False,
+        planner="nnUNetPlannerResEncM",
+        progress=False,
+    )
+    plan_directory = (
+        data_only.paths["preprocessed_root"] / str(data_only.backend["dataset_name"])
+    )
+    plan_directory.mkdir(parents=True, exist_ok=True)
+    (plan_directory / "nnUNetResEncUNetMPlans.json").write_text(
+        json.dumps({"plans_name": "nnUNetResEncUNetMPlans"}),
+        encoding="utf-8",
+    )
+
+    prepared = prepare(
+        dataset,
+        Kind.NNUNET,
+        name="nnunet-resenc-m-64px-2x",
+        native_tile_size=32,
+        upscale_factor=2,
+        destination=tmp_path / "prepared-nnunet",
+        workers=1,
+        preprocess=False,
+        planner="nnUNetPlannerResEncM",
+        trainer="nnUNetTrainer_100epochs",
+        configuration="2d",
+        fold=1,
+        epochs=100,
+        checkpoint_name="checkpoint_final.pth",
+        device="cpu",
+        progress=False,
+    )
+
+    assert prepared.reused
+    assert prepared.config is not None
+    assert prepared.config.framework == "nnunetv2"
+    assert prepared.config.task == "semantic"
+    assert prepared.config.geometry.input_size == (64, 64)
+    assert prepared.config.model == {
+        "name": "nnunet-resenc-m-64px-2x",
+        "planner": "nnUNetPlannerResEncM",
+        "plans": "nnUNetResEncUNetMPlans",
+        "trainer": "nnUNetTrainer_100epochs",
+        "configuration": "2d",
+        "fold": 1,
+        "checkpoint": "checkpoint_final.pth",
+    }
+    assert prepared.config.training["epochs"] == 100
+    assert prepared.config.training["device"] == "cpu"
+
+
+def test_prepare_requires_name_for_run_specific_configuration(tmp_path: Path) -> None:
+    dataset = _semantic_dataset(tmp_path, size=(32, 32))
+
+    with pytest.raises(ValueError, match="requires name"):
+        prepare(
+            dataset,
+            Kind.YOLO_SEM,
+            destination=tmp_path / "prepared-without-name",
+            base_model="yolo26m-sem.pt",
+            progress=False,
+        )
 
 
 def test_yolo_seg_never_converts_semantic_masks_to_polygons(tmp_path: Path) -> None:
@@ -264,7 +355,13 @@ def test_wandb_helpers_configure_upload_and_preserve_local_failures(tmp_path: Pa
     bundle = create(config, Outcome(checkpoint=checkpoint), destination=tmp_path / "bundle", progress=False)
     run = SimpleNamespace(id="run", config=_Config(), tags=("existing",), summary={})
     run.update = lambda: None
-    run.upload_file = lambda path: SimpleNamespace(url="https://example.invalid/file")
+    upload_call: dict[str, str] = {}
+
+    def upload_file(path: str, root: str = ".") -> SimpleNamespace:
+        upload_call.update(path=path, root=root)
+        return SimpleNamespace(url="https://example.invalid/file")
+
+    run.upload_file = upload_file
 
     assert configure(run, config) is run
     assert run.config["native_tile_size"] == [128, 128]
@@ -273,6 +370,7 @@ def test_wandb_helpers_configure_upload_and_preserve_local_failures(tmp_path: Pa
     uploaded = upload(run, bundle)
     assert uploaded.uploaded
     assert uploaded.path == bundle.path and uploaded.path.is_file()
+    assert upload_call == {"path": str(bundle.path), "root": str(bundle.path.parent)}
     assert run.summary["evaluation_bundle"] == bundle.path.name
 
     failed_run = SimpleNamespace(id="run", summary={})

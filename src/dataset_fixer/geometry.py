@@ -43,7 +43,13 @@ def normalize_factor(value: Any, *, field: str = "upscale_factor") -> int | None
 
 @dataclass(frozen=True)
 class Geometry:
-    """Normalized source-tile, scale, and adapter-input geometry."""
+    """Normalized source-tile, scale, and adapter-input geometry.
+
+    Parameters:
+        native_tile_size: Source tile height and width before upscaling.
+        upscale_factor: Integer scale applied to the source tiles.
+        input_size: Adapter/model input height and width.
+    """
 
     native_tile_size: Size | None = None
     upscale_factor: int | None = None
@@ -58,6 +64,18 @@ class Geometry:
         input_size: Any = None,
         source: str | None = None,
     ) -> "Geometry":
+        """Normalize geometry values and infer one missing field when possible.
+
+        Parameters:
+            native_tile_size: Source tile edge or two-item size before scaling.
+            upscale_factor: Positive integer source-to-input scale.
+            input_size: Model input edge or two-item size.
+            source: Optional source name included in validation errors.
+
+        Returns:
+            Consistent normalized geometry.
+        """
+
         native = normalize_size(native_tile_size, field="native_tile_size")
         factor = normalize_factor(upscale_factor)
         model_input = normalize_size(input_size, field="input_size")

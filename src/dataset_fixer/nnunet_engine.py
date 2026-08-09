@@ -423,7 +423,7 @@ def require_nnunet() -> None:
         "nnunetv2": "nnunetv2",
     }
     reinstall = (
-        "python -m pip install --upgrade --force-reinstall --no-deps "
+        "python -m pip install --upgrade --upgrade-strategy only-if-needed "
         "\"numpy>=2.5.1,<2.6\" \"scipy>=1.18,<1.19\" "
         "\"scikit-image>=0.26,<0.27\" \"batchgeneratorsv2>=0.3.2,<0.4\" "
         "\"nnunetv2==2.8.1\""
@@ -445,8 +445,8 @@ def require_nnunet() -> None:
                 version = "missing"
             versions.append(f"{distribution}={version}")
         restart = (
-            " After reinstalling packages in Colab, restart the runtime manually; "
-            "the active kernel cannot safely reload this scientific stack."
+            " In Colab, start a fresh runtime and run the installation cell before "
+            "importing NumPy, SciPy, scikit-image, batchgeneratorsv2, or nnU-Net."
         )
         raise RuntimeError(
             "The nnU-Net scientific stack cannot be imported coherently "

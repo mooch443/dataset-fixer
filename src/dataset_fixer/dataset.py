@@ -46,7 +46,34 @@ from .validation_audit import ValidationFailureExample, build_load_validation_au
 from .visualization import visualize_samples, visualize_semantic_masks
 
 class Dataset:
-    """A validated dataset or immutable virtual transformation pipeline."""
+    """A validated dataset or immutable virtual transformation pipeline.
+
+    Parameters:
+        location: Physical dataset root.
+        name: Human-readable dataset name.
+        task: Validated annotation task.
+        metadata: Class, channel, and task-specific metadata.
+        samples: Validated samples belonging to the dataset.
+        manifest: Parsed dataset manifest and history.
+        data_yaml: Resolved YOLO data configuration, when present.
+        source_format: Detected source layout identifier.
+        warnings: Non-fatal validation messages collected while loading.
+        base: Parent virtual dataset when this value represents a planned
+            transformation.
+        plan: Immutable operations awaiting export.
+        projection_exact: Whether the in-memory sample projection exactly
+            represents the planned output.
+        planned_splits: Splits retained by the virtual operation pipeline.
+        errors: Validation policy for recoverable sample-level failures.
+        validation_audit: Structured record of skipped validation failures.
+        validation_audit_visualization: Optional visualization of validation
+            failures.
+        provenance: Per-sample source and transformation metadata.
+        image_dirs: Explicit image directory for each split.
+        mask_dirs: Explicit semantic-mask directory for each split.
+        mask_paths: Exact image-to-semantic-mask mapping.
+        mask_statistics: Cached semantic-mask value statistics by image.
+    """
 
     def __init__(
         self,
@@ -805,6 +832,8 @@ class Dataset:
                 to the same value for a uniform target.
 
         Common parameters:
+            mode: ``"grid"`` for deterministic source windows or
+                ``"coverage"`` for randomized object-coverage crops.
             name: Optional name for the virtual derivative.
             splits: Splits included in the tiled output; defaults to every
                 available split. Unselected splits are omitted.

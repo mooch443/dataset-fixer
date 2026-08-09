@@ -44,8 +44,14 @@ def _default_nnunet_device() -> Literal["cpu", "cuda", "mps"]:
 class ModelInput:
     """One image supplied to :meth:`Model.predict`.
 
-    ``image_id`` is stable within a prediction request. ``mask_path`` is
-    optional and is used only by evaluation code; prediction never reads it.
+    Parameters:
+        image_id: Identifier stable within one prediction request.
+        image_path: Resolved input image path.
+        width: Input image width in pixels.
+        height: Input image height in pixels.
+        relative_path: Cohort-relative input image path.
+        mask_path: Optional ground-truth mask used only by evaluation code;
+            prediction never reads it.
     """
 
     image_id: str
@@ -60,9 +66,16 @@ class ModelInput:
 class ImagePrediction:
     """Predictions associated with one input image.
 
-    Instance-style tasks populate ``objects`` with the package's existing
-    ``Prediction`` values. Semantic models populate ``mask`` and, when
-    requested internally, ``native_mask``.
+    Parameters:
+        image_id: Identifier copied from the corresponding model input.
+        image_path: Resolved input image path.
+        relative_path: Cohort-relative input image path.
+        width: Output-space image width in pixels.
+        height: Output-space image height in pixels.
+        objects: Object predictions for instance-style tasks.
+        mask: Projected semantic prediction in output-image space.
+        native_mask: Optional prediction in native adapter output space.
+        metadata: Backend-specific non-tensor prediction metadata.
     """
 
     image_id: str
@@ -86,7 +99,17 @@ class ImagePrediction:
 
 @dataclass(frozen=True)
 class PredictionResult:
-    """Ordered, model-independent output returned by :meth:`Model.predict`."""
+    """Ordered, model-independent output returned by :meth:`Model.predict`.
+
+    Parameters:
+        model_name: Resolved display name of the predicting model.
+        model_kind: Adapter family used for inference.
+        task: Normalized prediction task.
+        backend: Concrete inference backend identifier.
+        records: Predictions in the same order as the model inputs.
+        inference_seconds: Measured prediction wall time.
+        settings: Effective device, batching, and inference configuration.
+    """
 
     model_name: str
     model_kind: ModelKind
@@ -910,6 +933,11 @@ class Model:
     ) -> PredictionResult:
         """Predict images, directories, datasets, exports, or frozen inputs.
 
+        This is the shared inference entry point used by manual prediction,
+        collection prediction, and comparison. Heavyweight runtimes and a
+        successfully resolved adaptive batch size are retained on this model
+        instance until :meth:`unload` is called.
+
         Parameters:
             source: Image path, image directory, sequence of paths or
                 :class:`ModelInput` values, a :class:`Dataset`, or an internal
@@ -1455,6 +1483,9 @@ class ModelCollection:
     ) -> dict[str, PredictionResult]:
         """Run every independently configured model on the same inputs.
 
+        Each item delegates to :meth:`Model.predict`; this collection method
+        does not maintain a second inference or batching implementation.
+
         Parameters:
             source: Any source accepted by :meth:`Model.predict`.
             split: Dataset split. Direct image inputs ignore this value.
@@ -1480,6 +1511,13 @@ class ModelCollection:
         destination: str | Path | None = None,
     ) -> Any:
         """Compare the configured models on one frozen dataset cohort.
+
+        Verified per-model predictions and metrics are cached below
+        ``<dataset>/.cache/evaluations/`` using the dataset cohort, model
+        content, adapter settings, batching, device, and dependency versions.
+        A matching rerun reuses those results even when a different report
+        destination is requested. Complete default reports are stored below
+        ``<dataset>/evaluations/``.
 
         Parameters:
             source: Fixed, on-disk :class:`Dataset` to evaluate.

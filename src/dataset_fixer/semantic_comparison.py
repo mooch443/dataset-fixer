@@ -174,6 +174,7 @@ def compare_nnunet_models(
     ):
         cached_manifest = json.loads(existing.read_text(encoding="utf-8"))
         if cached_manifest.get("schema") == SEMANTIC_REPORT_SCHEMA:
+            print(f"Reusing complete comparison: {target}")
             return _semantic_result_from_manifest(target, cached_manifest)
     temporary = build_staging_dir(
         target,
@@ -588,6 +589,7 @@ def compare_semantic_models(
     ):
         cached_manifest = json.loads(existing.read_text(encoding="utf-8"))
         if cached_manifest.get("schema") == SEMANTIC_REPORT_SCHEMA:
+            print(f"Reusing complete comparison: {target}")
             return _semantic_result_from_manifest(target, cached_manifest)
     temporary = build_staging_dir(
         target,

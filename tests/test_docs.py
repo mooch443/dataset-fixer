@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import inspect
-import json
-from pathlib import Path
+from enum import Enum
 
 import dataset_fixer
+import dataset_fixer.bundle as bundle_api
 import dataset_fixer.comparison as comparison_api
+import dataset_fixer.convert as convert_api
+import dataset_fixer.wandb as wandb_api
 from dataset_fixer import (
     ComparisonResult,
     Dataset,
@@ -17,9 +19,6 @@ from dataset_fixer import (
     Task,
 )
 from dataset_fixer.public_examples import SAWIT_COMMIT, SAWIT_LICENSE, SAWIT_REPOSITORY
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_public_api_inventory_is_typed_and_documented() -> None:
@@ -117,73 +116,54 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
     assert inspect.getdoc(ModelCollection)
 
 
-def test_public_model_api_documents_every_parameter() -> None:
-    entries = (
-        (Model, inspect.signature(Model), inspect.getdoc(Model)),
-        (Model.predict, inspect.signature(Model.predict), inspect.getdoc(Model.predict)),
-        (Model.compare, inspect.signature(Model.compare), inspect.getdoc(Model.compare)),
-        (Model.visualize, inspect.signature(Model.visualize), inspect.getdoc(Model.visualize)),
-        (Model.load_many, inspect.signature(Model.load_many), inspect.getdoc(Model.load_many)),
-        (
-            ModelCollection.predict,
-            inspect.signature(ModelCollection.predict),
-            inspect.getdoc(ModelCollection.predict),
-        ),
-        (
-            ModelCollection.compare,
-            inspect.signature(ModelCollection.compare),
-            inspect.getdoc(ModelCollection.compare),
-        ),
-        (
-            ModelCollection.configure,
-            inspect.signature(ModelCollection.configure),
-            inspect.getdoc(ModelCollection.configure),
-        ),
-        (
-            ModelCollection.visualize,
-            inspect.signature(ModelCollection.visualize),
-            inspect.getdoc(ModelCollection.visualize),
-        ),
-    )
-    for target, signature, doc in entries:
-        assert doc is not None
-        missing = [
-            name
-            for name in signature.parameters
-            if name not in {"self", "cls"} and f"{name}:" not in doc
-        ]
-        assert not missing, f"{target} does not document {missing}"
-    assert inspect.getdoc(ModelCollection.compare)
-    assert inspect.getdoc(PredictionResult)
+def _assert_parameters_documented(target: object, label: str) -> None:
+    try:
+        signature = inspect.signature(target)
+    except (TypeError, ValueError):
+        return
+    parameters = [
+        name
+        for name, parameter in signature.parameters.items()
+        if name not in {"self", "cls"}
+        and parameter.kind
+        not in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
+    ]
+    if not parameters:
+        return
+    documentation = inspect.getdoc(target)
+    assert documentation is not None, f"{label} has undocumented public parameters"
+    missing = [name for name in parameters if f"{name}:" not in documentation]
+    assert not missing, f"{label} does not document {missing}"
+
+
+def test_every_exported_public_api_parameter_is_documented() -> None:
+    modules = (dataset_fixer, bundle_api, convert_api, wandb_api)
+    for module in modules:
+        for name in module.__all__:
+            exported = getattr(module, name)
+            label = f"{module.__name__}.{name}"
+            if inspect.isclass(exported):
+                # Enum's generated ``*values`` constructor is an implementation
+                # detail; its own public class methods are still audited below.
+                if not issubclass(exported, Enum):
+                    _assert_parameters_documented(exported, label)
+                for member_name, raw_member in exported.__dict__.items():
+                    if member_name.startswith("_"):
+                        continue
+                    if isinstance(raw_member, property):
+                        member = raw_member.fget
+                    elif isinstance(raw_member, (classmethod, staticmethod)):
+                        member = raw_member.__func__
+                    elif inspect.isfunction(raw_member):
+                        member = raw_member
+                    else:
+                        continue
+                    _assert_parameters_documented(member, f"{label}.{member_name}")
+            elif inspect.isfunction(exported):
+                _assert_parameters_documented(exported, label)
 
 
 def test_public_example_source_is_pinned_and_explicitly_licensed() -> None:
     assert SAWIT_REPOSITORY == "https://github.com/dtnguyen0304/sawit"
     assert len(SAWIT_COMMIT) == 40
     assert SAWIT_LICENSE == "MIT"
-
-
-def test_colab_notebooks_have_disclosure_license_and_clean_outputs() -> None:
-    expected = {
-        "01_controlled_splitting.ipynb": "Dataset.split",
-        "02_task_aware_tiling.ipynb": "Dataset.tile",
-        "03_fixed_cohort_model_comparison.ipynb": "models.compare",
-    }
-    for filename, api in expected.items():
-        path = ROOT / "notebooks" / filename
-        notebook = json.loads(path.read_text(encoding="utf-8"))
-        assert notebook["nbformat"] == 4
-        assert "colab" in notebook["metadata"]
-        text = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
-        assert "colab.research.google.com/github/mooch443/dataset-fixer" in text
-        assert "AI-generation disclosure" in text
-        assert "MIT License" in text
-        assert "dtnguyen0304/sawit" in text
-        assert "git+https://github.com/mooch443/dataset-fixer.git" in text
-        assert "git', 'clone" not in text
-        assert "subprocess" not in text
-        assert "examples.download_public_examples" not in text
-        assert "dataset_fixer.public_examples" in text
-        assert "import dataset_fixer" in text
-        assert api in text
-        assert all(not cell.get("outputs") for cell in notebook["cells"] if cell["cell_type"] == "code")

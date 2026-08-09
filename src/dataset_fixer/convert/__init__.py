@@ -9,10 +9,10 @@ import shutil
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 import numpy as np
 import yaml
@@ -23,6 +23,9 @@ from ..errors import DatasetValidationError, ValidationIssue
 from ..geometry import Geometry, normalize_size
 from ..sources import cache_root, fingerprint_files
 from ..utils import slugify, to_jsonable
+
+if TYPE_CHECKING:
+    from ..bundle import Config
 
 
 class Kind(str, Enum):
@@ -35,7 +38,22 @@ class Kind(str, Enum):
 
 @dataclass(frozen=True)
 class Prepared:
-    """Typed identity and paths for one reusable prepared dataset."""
+    """Typed identity and paths for one reusable prepared dataset.
+
+    Parameters:
+        kind: Backend preparation target.
+        location: Content-addressed preparation root.
+        geometry: Source-tile, scale, and training-input geometry.
+        content_sha256: Preparation identity derived from inputs and settings.
+        paths: Named backend-specific output paths.
+        hashes: Digests for generated configuration and manifest files.
+        split_statistics: Per-split image and annotation counts.
+        manifests: Generated preparation manifests.
+        backend: Backend-specific configuration and label mapping.
+        config: Complete model-bundle configuration when ``prepare()`` was
+            given a model name and training choices.
+        reused: Whether an existing content-addressed preparation was reused.
+    """
 
     kind: Kind
     location: Path
@@ -46,6 +64,7 @@ class Prepared:
     split_statistics: Mapping[str, Mapping[str, int]]
     manifests: tuple[Path, ...]
     backend: Mapping[str, Any] = field(default_factory=dict)
+    config: Config | None = field(default=None, compare=False)
     reused: bool = False
 
     @property
@@ -88,6 +107,147 @@ def _prepared_from_manifest(path: Path, *, reused: bool) -> Prepared:
         backend=backend,
         reused=reused,
     )
+
+
+def _nnunet_plans(prepared: Prepared, explicit: str | None) -> str | None:
+    """Resolve the generated nnU-Net plans identifier without importing nnU-Net."""
+
+    if explicit:
+        return explicit
+    recorded = prepared.backend.get("plans")
+    if recorded:
+        return str(recorded)
+    preprocessed_root = prepared.paths.get("preprocessed_root")
+    dataset_name = prepared.backend.get("dataset_name")
+    if preprocessed_root is None or not dataset_name:
+        return None
+    candidates: set[str] = set()
+    for path in (Path(preprocessed_root) / str(dataset_name)).glob("*.json"):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(value, Mapping) and value.get("plans_name"):
+            candidates.add(str(value["plans_name"]))
+    if len(candidates) == 1:
+        return candidates.pop()
+    return None
+
+
+def _attach_config(
+    prepared: Prepared,
+    *,
+    name: str | None,
+    base_model: str | Path | None,
+    trainer: str | None,
+    plans: str | None,
+    configuration: str | None,
+    fold: int | None,
+    epochs: int | None,
+    checkpoint_name: str | None,
+    workers: int,
+    device: str | None,
+) -> Prepared:
+    """Attach run-specific bundle metadata without changing dataset identity."""
+
+    requested = (base_model, trainer, plans, configuration, fold, epochs, checkpoint_name, device)
+    if name is None:
+        if any(value is not None for value in requested):
+            raise ValueError("prepare() requires name when training configuration is supplied")
+        return prepared
+    if not str(name).strip():
+        raise ValueError("name must not be empty")
+    if epochs is not None and (
+        isinstance(epochs, bool) or not isinstance(epochs, int) or epochs <= 0
+    ):
+        raise ValueError("epochs must be a positive integer")
+    if fold is not None and (
+        isinstance(fold, bool) or not isinstance(fold, int) or fold < 0
+    ):
+        raise ValueError("fold must be a non-negative integer")
+
+    from ..bundle import Config
+
+    input_size = prepared.geometry.input_size
+    serialized_input_size: int | list[int] | None = None
+    if input_size is not None:
+        serialized_input_size = (
+            input_size[0] if input_size[0] == input_size[1] else list(input_size)
+        )
+    model: dict[str, Any] = {"name": str(name)}
+    training: dict[str, Any] = {"workers": workers}
+    if epochs is not None:
+        training["epochs"] = int(epochs)
+    if device is not None:
+        training["device"] = str(device)
+
+    if prepared.kind in {Kind.YOLO_SEM, Kind.YOLO_SEG}:
+        unsupported = {
+            "plans": plans,
+            "configuration": configuration,
+            "fold": fold,
+        }
+        supplied = [key for key, value in unsupported.items() if value is not None]
+        if supplied:
+            raise ValueError(
+                f"YOLO preparation does not accept nnU-Net options: {', '.join(supplied)}"
+            )
+        resolved_trainer = trainer or "ultralytics.YOLO"
+        model.update({"base_model": str(base_model)} if base_model is not None else {})
+        if checkpoint_name is not None:
+            model["checkpoint"] = checkpoint_name
+        training.update({"trainer": resolved_trainer})
+        if base_model is not None:
+            training["base_model"] = str(base_model)
+        if serialized_input_size is not None:
+            training["imgsz"] = serialized_input_size
+        framework = "ultralytics"
+        task = "semantic" if prepared.kind == Kind.YOLO_SEM else "segment"
+    else:
+        if base_model is not None:
+            raise ValueError("nnU-Net preparation does not accept base_model")
+        resolved_plans = _nnunet_plans(prepared, plans)
+        if resolved_plans is None:
+            raise ValueError(
+                "Could not infer nnU-Net plans; run preprocessing or supply plans explicitly"
+            )
+        resolved_trainer = trainer or "nnUNetTrainer"
+        resolved_configuration = configuration or "2d"
+        resolved_fold = 0 if fold is None else int(fold)
+        resolved_checkpoint = checkpoint_name or "checkpoint_final.pth"
+        planner = prepared.backend.get("planner")
+        model.update(
+            {
+                "planner": planner,
+                "plans": resolved_plans,
+                "trainer": resolved_trainer,
+                "configuration": resolved_configuration,
+                "fold": resolved_fold,
+                "checkpoint": resolved_checkpoint,
+            }
+        )
+        training.update(
+            {
+                "trainer": resolved_trainer,
+                "planner": planner,
+                "plans": resolved_plans,
+                "configuration": resolved_configuration,
+                "fold": resolved_fold,
+            }
+        )
+        framework = "nnunetv2"
+        task = "semantic"
+
+    config = Config(
+        name=str(name),
+        framework=framework,
+        task=task,
+        geometry=prepared.geometry,
+        dataset=prepared,
+        model=model,
+        training=training,
+    )
+    return replace(prepared, config=config)
 
 
 def _dataset_files(dataset: Any) -> tuple[list[Path], dict[Path, Path]]:
@@ -484,6 +644,7 @@ def prepare(
     dataset: Any,
     kind: Kind,
     *,
+    name: str | None = None,
     native_tile_size: int | tuple[int, int] | None = None,
     upscale_factor: int = 1,
     destination: str | Path | None = None,
@@ -492,6 +653,14 @@ def prepare(
     preprocess: bool = True,
     dataset_id: int | None = None,
     planner: str | None = None,
+    base_model: str | Path | None = None,
+    trainer: str | None = None,
+    plans: str | None = None,
+    configuration: str | None = None,
+    fold: int | None = None,
+    epochs: int | None = None,
+    checkpoint_name: str | None = None,
+    device: str | None = None,
     progress: bool = True,
 ) -> Prepared:
     """Prepare one dataset for a selected backend using a reusable identity.
@@ -499,6 +668,39 @@ def prepare(
     JPEG binary masks use the explicitly recorded ``mask_threshold``.  Lossless
     masks preserve class values until the target backend's required 0/1 label
     encoding is applied.  Semantic masks are never converted to instances.
+
+    Parameters:
+        dataset: Open dataset or any source accepted by :meth:`Dataset.open`.
+        kind: Backend preparation target.
+        name: Model and run name. When supplied, the result includes a complete
+            :class:`dataset_fixer.bundle.Config` as ``prepared.config``.
+        native_tile_size: Source tile edge or two-item size before upscaling.
+        upscale_factor: Positive integer source-to-training scale.
+        destination: Explicit preparation root. The automatic content cache is
+            used when omitted.
+        workers: Parallel image conversion worker count.
+        mask_threshold: Inclusive threshold used when converting lossy binary
+            JPEG masks to exact labels.
+        preprocess: Run nnU-Net planning and preprocessing for ``Kind.NNUNET``.
+        dataset_id: Optional nnU-Net dataset number; a deterministic number is
+            derived when omitted.
+        planner: Optional nnU-Net experiment planner class name.
+        base_model: YOLO base checkpoint or architecture identifier.
+        trainer: Training implementation. YOLO defaults to
+            ``ultralytics.YOLO`` and nnU-Net defaults to ``nnUNetTrainer``.
+        plans: nnU-Net plans identifier. It is inferred from generated plans
+            when omitted.
+        configuration: nnU-Net configuration such as ``"2d"``.
+        fold: nnU-Net validation fold, defaulting to zero for configured runs.
+        epochs: Training epoch count recorded in bundle and W&B metadata.
+        checkpoint_name: Expected checkpoint name. nnU-Net defaults to
+            ``checkpoint_final.pth``.
+        device: Training device recorded in bundle and W&B metadata.
+        progress: Show hashing, conversion, and preprocessing progress.
+
+    Returns:
+        Typed paths, identity, statistics, backend configuration, and—when a
+        model name is supplied—the complete run-specific bundle configuration.
     """
 
     from ..dataset import Dataset
@@ -517,6 +719,28 @@ def prepare(
         raise ValueError("workers must be a positive integer")
     if isinstance(mask_threshold, bool) or not 0 <= int(mask_threshold) <= 255:
         raise ValueError("mask_threshold must be an integer in [0, 255]")
+    if target_kind != Kind.NNUNET and planner is not None:
+        raise ValueError("planner is supported only for nnU-Net preparation")
+    run_specific = (
+        base_model,
+        trainer,
+        plans,
+        configuration,
+        fold,
+        epochs,
+        checkpoint_name,
+        device,
+    )
+    if name is None and any(value is not None for value in run_specific):
+        raise ValueError("prepare() requires name when training configuration is supplied")
+    if epochs is not None and (
+        isinstance(epochs, bool) or not isinstance(epochs, int) or epochs <= 0
+    ):
+        raise ValueError("epochs must be a positive integer")
+    if fold is not None and (
+        isinstance(fold, bool) or not isinstance(fold, int) or fold < 0
+    ):
+        raise ValueError("fold must be a non-negative integer")
     native = normalize_size(native_tile_size, field="native_tile_size")
     if native is None:
         sizes = {(sample.height, sample.width) for sample in dataset._samples}
@@ -553,7 +777,19 @@ def prepare(
             )
         if progress:
             print(f"Cache hit: prepared {target_kind.value} dataset at {root}")
-        return existing
+        return _attach_config(
+            existing,
+            name=name,
+            base_model=base_model,
+            trainer=trainer,
+            plans=plans,
+            configuration=configuration,
+            fold=fold,
+            epochs=epochs,
+            checkpoint_name=checkpoint_name,
+            workers=workers,
+            device=device,
+        )
     if root.exists():
         raise FileExistsError(f"Preparation destination is non-empty or incomplete: {root}")
     root.parent.mkdir(parents=True, exist_ok=True)
@@ -614,7 +850,20 @@ def prepare(
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-    return _prepared_from_manifest(root / "preparation.json", reused=False)
+    prepared = _prepared_from_manifest(root / "preparation.json", reused=False)
+    return _attach_config(
+        prepared,
+        name=name,
+        base_model=base_model,
+        trainer=trainer,
+        plans=plans,
+        configuration=configuration,
+        fold=fold,
+        epochs=epochs,
+        checkpoint_name=checkpoint_name,
+        workers=workers,
+        device=device,
+    )
 
 
 __all__ = ["Kind", "Prepared", "prepare"]

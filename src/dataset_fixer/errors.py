@@ -27,7 +27,12 @@ class ValidationIssue:
 
 
 class DatasetValidationError(ValueError):
-    """Raised when a dataset is unsafe or incompatible before any training starts."""
+    """Raised when data or model geometry is unsafe or incompatible.
+
+    Parameters:
+        issues: One message, one structured validation issue, or a list of
+            structured issues to include in the exception.
+    """
 
     def __init__(self, issues: str | ValidationIssue | list[ValidationIssue]):
         if isinstance(issues, str):
@@ -38,4 +43,3 @@ class DatasetValidationError(ValueError):
             self.issues = issues
         body = "\n".join(f"  {i + 1}. {issue.format()}" for i, issue in enumerate(self.issues))
         super().__init__(f"Dataset validation failed with {len(self.issues)} error(s):\n{body}")
-

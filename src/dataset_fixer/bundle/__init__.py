@@ -22,7 +22,19 @@ from ..utils import slugify, to_jsonable
 
 @dataclass(frozen=True)
 class Config:
-    """Framework-neutral inputs recorded in a model bundle."""
+    """Framework-neutral inputs recorded in a model bundle.
+
+    Parameters:
+        name: Stable model display name used for the bundle file.
+        framework: Training/inference framework identifier.
+        task: Normalized model task.
+        geometry: Source-tile, scale, and model-input geometry.
+        dataset: Prepared dataset identity or equivalent manifest mapping.
+        model: Framework-specific model configuration.
+        training: Searchable training hyperparameters.
+        run: Optional external training-run identity.
+        files: Additional files mapped from archive names to local paths.
+    """
 
     name: str
     framework: str
@@ -37,7 +49,16 @@ class Config:
 
 @dataclass(frozen=True)
 class Outcome:
-    """Selected checkpoint and optional training/evaluation results."""
+    """Selected checkpoint and optional training/evaluation results.
+
+    Parameters:
+        checkpoint: Selected local checkpoint file or model directory.
+        metrics: Final training or evaluation metrics.
+        selected_epoch: Epoch that produced the selected checkpoint.
+        selection_metric: Metric used to select the checkpoint.
+        selection_value: Value of the checkpoint-selection metric.
+        files: Additional result files mapped from archive names to paths.
+    """
 
     checkpoint: str | Path | None = None
     metrics: Mapping[str, Any] = field(default_factory=dict)
@@ -49,7 +70,18 @@ class Outcome:
 
 @dataclass(frozen=True)
 class Bundle:
-    """Local bundle identity, contents, and optional remote upload outcome."""
+    """Local bundle identity, contents, and optional remote upload outcome.
+
+    Parameters:
+        path: Local ZIP path, which remains available after upload attempts.
+        size: ZIP size in bytes.
+        sha256: SHA-256 digest of the ZIP.
+        manifest: Parsed model-bundle manifest.
+        files: Archive member names included in the ZIP.
+        uploaded: Whether a remote upload completed successfully.
+        remote_url: Remote file URL when supplied by the service.
+        warnings: Non-fatal upload or publication messages.
+    """
 
     path: Path
     size: int
@@ -130,7 +162,18 @@ def create(
     destination: str | Path | None = None,
     progress: bool = True,
 ) -> Bundle:
-    """Create a local, checksummed ZIP using the shared model-bundle manifest."""
+    """Create a local, checksummed ZIP using the shared model-bundle manifest.
+
+    Parameters:
+        config: Framework-neutral model, dataset, and training configuration.
+        outcome: Optional selected checkpoint and result metadata.
+        destination: Output ZIP path or directory. The automatic cache is used
+            when omitted.
+        progress: Show hashing and ZIP creation progress.
+
+    Returns:
+        The immutable local bundle identity and manifest.
+    """
 
     if not isinstance(config, Config):
         raise TypeError("config must be bundle.Config")

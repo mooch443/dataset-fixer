@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import warnings
 from dataclasses import replace
 from pathlib import Path
@@ -72,7 +73,15 @@ def _values(config: Config | Mapping[str, Any]) -> tuple[dict[str, Any], list[st
 
 
 def configure(run: Any, config: Config | Mapping[str, Any]) -> Any:
-    """Write the same searchable config keys and tags for every training task."""
+    """Write the same searchable config keys and tags for every training task.
+
+    Parameters:
+        run: Existing active W&B run or public API run object.
+        config: Bundle configuration or equivalent top-level values.
+
+    Returns:
+        The configured run object.
+    """
 
     if run is None:
         raise ValueError("wandb.configure() requires an explicit existing run")
@@ -123,6 +132,14 @@ def upload(
 
     Missing runs and all authentication/network failures leave the ZIP intact
     and return a :class:`Bundle` describing the local result.
+
+    Parameters:
+        run: Explicit existing W&B run, or ``None`` to use ``wandb.run``.
+        bundle: Local bundle returned by :func:`dataset_fixer.bundle.create`.
+        outcome: Optional result metadata written after a successful upload.
+
+    Returns:
+        A bundle retaining its local path and recording any remote outcome.
     """
 
     if not isinstance(bundle, Bundle):
@@ -140,7 +157,16 @@ def upload(
         remote_url = None
         upload_file = getattr(selected, "upload_file", None)
         if callable(upload_file):
-            remote = upload_file(str(bundle.path))
+            try:
+                supports_root = "root" in inspect.signature(upload_file).parameters
+            except (TypeError, ValueError):
+                supports_root = False
+            if supports_root:
+                # Public API runs need ``root`` to preserve the bundle's
+                # basename as the remote file name.
+                remote = upload_file(str(bundle.path), root=str(bundle.path.parent))
+            else:
+                remote = upload_file(str(bundle.path))
             remote_url = getattr(remote, "url", None)
         else:
             save = getattr(selected, "save", None)

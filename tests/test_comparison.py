@@ -180,6 +180,53 @@ def test_native_inference_batches_honors_device_backs_off_and_reuses_runtime(
     assert second.settings["oom_retries"] == 0
 
 
+def test_collection_predict_uses_each_models_shared_batching_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoints = [tmp_path / "first.pt", tmp_path / "second.pt"]
+    for checkpoint in checkpoints:
+        checkpoint.write_bytes(checkpoint.stem.encode())
+    images = []
+    for index in range(5):
+        path = tmp_path / f"manual-{index}.png"
+        Image.new("RGB", (16, 16), "white").save(path)
+        images.append(path)
+    initializations: dict[str, int] = {}
+    calls: dict[str, list[int]] = {}
+
+    class FakeYOLO:
+        task = "detect"
+
+        def __init__(self, path: str) -> None:
+            self.name = Path(path).stem
+            initializations[self.name] = initializations.get(self.name, 0) + 1
+
+        def predict(self, *, source, **_kwargs):
+            sources = [source] if isinstance(source, str) else list(source)
+            calls.setdefault(self.name, []).append(len(sources))
+            boxes = types.SimpleNamespace(xyxy=[], conf=[], cls=[])
+            return [
+                types.SimpleNamespace(path=value, boxes=boxes, masks=None, keypoints=None)
+                for value in sources
+            ]
+
+    monkeypatch.setitem(sys.modules, "ultralytics", types.SimpleNamespace(YOLO=FakeYOLO))
+    models = Model.load_many(
+        {
+            "first": {"path": checkpoints[0], "task": "detect", "batch_size": 2},
+            "second": {"path": checkpoints[1], "task": "detect", "batch_size": 3},
+        }
+    )
+
+    results = models.predict(images, progress=False)
+
+    assert tuple(results) == models.names
+    assert calls == {"first": [2, 2, 1], "second": [3, 2]}
+    assert initializations == {"first": 1, "second": 1}
+    assert all(len(result.records) == len(images) for result in results.values())
+
+
 def test_adaptive_inference_never_exceeds_128_items() -> None:
     sizes: list[int] = []
     consumed: list[int] = []
@@ -347,17 +394,22 @@ def test_model_collection_compare_atomic_result(
     checkpoint = tmp_path / "model.pt"
     checkpoint.write_bytes(b"checkpoint")
 
-    def fake_inference(spec, cohort, *, thresholds, **kwargs):
-        fake_inference.calls += 1
-        values = {}
+    def fake_inference(spec, cohort, *, thresholds, existing=None, on_threshold=None, **kwargs):
+        values = dict(existing or {})
         for threshold in thresholds:
-            values[float(threshold)] = {
+            threshold = float(threshold)
+            if threshold in values:
+                continue
+            fake_inference.calls += 1
+            values[threshold] = {
                 record.image_id: [
                     Prediction(int(annotation["class_id"]), .95, bbox=tuple(annotation["bbox"]))
                     for annotation in record.annotations
                 ]
                 for record in cohort.records
             }
+            if on_threshold is not None:
+                on_threshold(threshold, values[threshold])
         return values, {"fake": 0.01}
     fake_inference.calls = 0
 
@@ -388,6 +440,8 @@ def test_model_collection_compare_atomic_result(
     assert not list(destination.rglob("*.csv"))
     assert not list(destination.rglob("*.jsonl"))
     assert (dataset.location / ".cache" / "evaluations").is_dir()
+    prediction_cache = dataset.location / ".cache" / "evaluations" / "predictions"
+    assert list(prediction_cache.glob("*/cache-manifest.json"))
     assert not list(tmp_path.glob(".comparison.building-*"))
 
     models.compare(
@@ -397,6 +451,19 @@ def test_model_collection_compare_atomic_result(
         destination=destination,
     )
     assert fake_inference.calls == 1
+
+    cached_elsewhere = models.compare(
+        dataset,
+        split="val",
+        progress=False,
+        destination=tmp_path / "comparison-from-dataset-cache",
+    )
+    assert (
+        cached_elsewhere.cache_statistics["models"]["baseline"]["root"]
+        == result.cache_statistics["models"]["baseline"]["root"]
+    )
+    assert fake_inference.calls == 1
+    assert cached_elsewhere.cache_statistics["prediction_hits"] == 1
 
     direct = Model(
         checkpoint,
@@ -413,6 +480,16 @@ def test_model_collection_compare_atomic_result(
     )
     assert direct_result.ranking[0]["model"] == "direct"
     assert direct_result.settings["models"]["direct"]["backend"] == "native"
+    assert fake_inference.calls == 1, "renaming identical model bytes invalidated the cache"
+
+    changed_batch = models.configure({"baseline": {"batch_size": 2}})
+    changed_batch.compare(
+        dataset,
+        split="val",
+        progress=False,
+        destination=tmp_path / "comparison-changed-batch",
+    )
+    assert fake_inference.calls == 2, "batch setting was omitted from prediction identity"
 
 
 def test_comparison_visuals_have_data_and_metadata_sidecars(

@@ -14,7 +14,17 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class DatasetTraceNode:
-    """One physical dataset in a current-to-source lineage chain."""
+    """One physical dataset in a current-to-source lineage chain.
+
+    Parameters:
+        dataset_id: Content identity recorded by the dataset manifest.
+        name: Human-readable dataset name.
+        path: Resolved or expected physical dataset path.
+        present: Whether that path is currently accessible.
+        generated: Whether dataset-fixer generated this dataset.
+        samples: Recorded sample count, when known.
+        resolved_by: Evidence used to resolve the physical path.
+    """
 
     dataset_id: str | None
     name: str
@@ -27,7 +37,20 @@ class DatasetTraceNode:
 
 @dataclass(frozen=True)
 class SampleTrace:
-    """Exact source mapping for one physically present output sample."""
+    """Exact source mapping for one physically present output sample.
+
+    Parameters:
+        output_image: Dataset-relative output image path.
+        parent_image: Recorded image path in the immediate parent dataset.
+        original_image: Recorded path in the earliest known source dataset.
+        resolved_parent_image: Accessible immediate-parent image, when found.
+        resolved_original_image: Accessible original image, when found.
+        parent_sha256: Recorded immediate-parent image digest.
+        original_sha256: Recorded original image digest.
+        tile_index: Source tile index, when this sample is a tile.
+        crop: Recorded crop coordinates or crop metadata.
+        transformation_chain: Ordered transformations from source to output.
+    """
 
     output_image: str
     parent_image: str | None
@@ -43,7 +66,12 @@ class SampleTrace:
 
 @dataclass(frozen=True)
 class DatasetTrace:
-    """Resolved dataset ancestry plus exact sample and tile mappings."""
+    """Resolved dataset ancestry plus exact sample and tile mappings.
+
+    Parameters:
+        datasets: Physical datasets ordered from current output to source.
+        samples: Exact source mappings for present output samples.
+    """
 
     datasets: tuple[DatasetTraceNode, ...]
     samples: tuple[SampleTrace, ...]
@@ -57,6 +85,15 @@ class DatasetTrace:
         return all(node.present for node in self.datasets)
 
     def for_sample(self, relative_path: str | Path) -> SampleTrace:
+        """Return the unique trace matching an output path or basename.
+
+        Parameters:
+            relative_path: Dataset-relative output path or unique basename.
+
+        Returns:
+            The matching sample trace.
+        """
+
         requested = Path(relative_path).as_posix()
         matches = [
             sample
