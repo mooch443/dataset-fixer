@@ -45,6 +45,8 @@ _OUT_OF_MEMORY_MARKERS = (
     "mps backend out of memory",
 )
 
+_PREPROCESS_PADDING_SLICER = "_dataset_fixer_preprocess_padding_slicer"
+
 
 @dataclass
 class EngineTelemetry:
@@ -165,6 +167,8 @@ class NnUNetSession:
     def preprocess(self, image: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
         """Run nnU-Net's official preprocessing for one natural-image tile."""
 
+        from acvl_utils.cropping_and_padding.padding import pad_nd_image
+
         array = np.asarray(image)
         if array.ndim != 3 or array.shape[2] not in (3, 4):
             raise DatasetValidationError(
@@ -187,7 +191,26 @@ class NnUNetSession:
             self._predictor.configuration_manager,
             self._predictor.dataset_json,
         )
-        return prepared, properties
+        # The official preprocessor crops every tile to its nonzero bounding
+        # box. Natural-image tiles with identical source dimensions can thus
+        # acquire hundreds of content-dependent tensor shapes, which prevents
+        # them from sharing a GPU minibatch. nnU-Net would independently pad
+        # each of those tensors to the network patch size immediately before
+        # prediction anyway. Do that here instead, remember how to remove the
+        # padding, and allow the scheduler to batch the resulting tensors.
+        padded, revert_padding = pad_nd_image(
+            prepared,
+            self.patch_size,
+            "constant",
+            {"constant_values": 0},
+            True,
+            None,
+        )
+        if tuple(padded.shape) != tuple(prepared.shape):
+            properties[_PREPROCESS_PADDING_SLICER] = tuple(
+                (int(value.start), int(value.stop)) for value in revert_padding
+            )
+        return np.asarray(padded, dtype=np.float32), properties
 
     def preprocess_many(
         self,
@@ -299,6 +322,15 @@ class NnUNetSession:
         from nnunetv2.inference.export_prediction import (
             convert_predicted_logits_to_segmentation_with_correct_shape,
         )
+
+        properties = dict(properties)
+        padding_slicer = properties.pop(_PREPROCESS_PADDING_SLICER, None)
+        if padding_slicer is not None:
+            # The input-channel axis becomes the output-class axis, so retain
+            # the full class dimension and apply the remaining reverse-padding
+            # slices to synthetic-z and spatial dimensions.
+            reverse = tuple(slice(start, stop) for start, stop in padding_slicer)
+            logits = logits[(slice(None), *reverse[1:])]
 
         _, probabilities = convert_predicted_logits_to_segmentation_with_correct_shape(
             logits,

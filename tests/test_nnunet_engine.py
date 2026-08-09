@@ -218,6 +218,68 @@ def test_differently_shaped_tiles_are_rejected_rather_than_silently_padded() -> 
         session.predict_logits(mixed)
 
 
+def test_preprocessing_padding_consolidates_shapes_and_is_removed_before_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CroppingPreprocessor:
+        def __init__(self, *, verbose: bool) -> None:
+            assert not verbose
+
+        def run_case_npy(self, data, seg, properties, *args):
+            properties = {
+                **properties,
+                "shape_before_cropping": (1, 8, 8),
+                "shape_after_cropping_and_before_resampling": (1, 5, 7),
+                "bbox_used_for_cropping": [[0, 1], [1, 6], [0, 7]],
+            }
+            return data[:, :, 1:6, :7], seg, properties
+
+    predictor = StubPredictor()
+    predictor.configuration_manager = type(
+        "ConfigurationManager",
+        (),
+        {"preprocessor_class": CroppingPreprocessor},
+    )()
+    predictor.plans_manager = object()
+    predictor.dataset_json = {}
+    predictor.label_manager = object()
+    session = _session(predictor)
+
+    prepared, properties = session.preprocess(
+        np.ones((8, 8, 3), dtype=np.uint8)
+    )
+
+    assert prepared.shape == (3, 1, 8, 8)
+    assert properties["_dataset_fixer_preprocess_padding_slicer"] == (
+        (0, 3),
+        (0, 1),
+        (1, 6),
+        (0, 7),
+    )
+
+    captured: dict[str, object] = {}
+
+    def convert(logits, *args, **kwargs):
+        captured["shape"] = tuple(logits.shape)
+        captured["properties"] = args[3]
+        return np.zeros((1, 8, 8), dtype=np.uint8), np.zeros(
+            (2, 1, 8, 8), dtype=np.float32
+        )
+
+    monkeypatch.setattr(
+        "nnunetv2.inference.export_prediction."
+        "convert_predicted_logits_to_segmentation_with_correct_shape",
+        convert,
+    )
+    session.to_probabilities(
+        torch.zeros((2, 1, 8, 8), dtype=torch.float32),
+        properties,
+    )
+
+    assert captured["shape"] == (2, 1, 5, 7)
+    assert "_dataset_fixer_preprocess_padding_slicer" not in captured["properties"]
+
+
 def test_out_of_memory_halves_the_batch_and_retries_down_to_one() -> None:
     predictor = StubPredictor()
     session = _session(predictor, batch_size=8)
