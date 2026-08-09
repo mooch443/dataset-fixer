@@ -21,6 +21,7 @@ from dataset_fixer.comparison.types import Prediction
 from dataset_fixer.semantic_comparison import (
     SEMANTIC_REPORT_SCHEMA,
     _SemanticCase,
+    _all_pairwise_statistics,
     _canonicalize_predictions,
     _select_visual_cases,
 )
@@ -72,6 +73,34 @@ def _nnunet_model(root: Path) -> Path:
     fold.mkdir()
     (fold / "checkpoint_final.pth").write_bytes(f"checkpoint:{root.name}".encode())
     return root
+
+
+def test_all_pairwise_statistics_have_no_baseline() -> None:
+    rows = {
+        "alpha": [
+            {"case_id": "a", "dice": 0.2},
+            {"case_id": "b", "dice": 0.5},
+        ],
+        "beta": [
+            {"case_id": "a", "dice": 0.4},
+            {"case_id": "b", "dice": 0.5},
+        ],
+        "gamma": [
+            {"case_id": "a", "dice": 0.1},
+            {"case_id": "b", "dice": 0.3},
+        ],
+    }
+
+    paired = _all_pairwise_statistics(rows, resamples=200, seed=42)
+
+    assert len(paired) == 3
+    assert {(row["model_a"], row["model_b"]) for row in paired} == {
+        ("alpha", "beta"),
+        ("alpha", "gamma"),
+        ("beta", "gamma"),
+    }
+    assert all("baseline" not in row for row in paired)
+    assert all("p_value_holm" in row for row in paired)
 
 
 class FakeSession:
@@ -911,6 +940,24 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     )
     assert len(commands) == command_count
     assert all(row["cache"] == "hit" for row in cached.ranking)
+
+    equal = models.compare(
+        exported,
+        paired_comparisons="all",
+        progress=False,
+        destination=tmp_path / "comparison-all-pairs",
+    )
+    equal_manifest = json.loads(
+        (equal.location / "reports" / "result.json").read_text()
+    )
+    assert equal.baseline is None
+    assert equal_manifest["baseline"] is None
+    assert equal_manifest["settings"]["paired_comparisons"] == "all"
+    assert equal_manifest["paired_statistics"]
+    assert "baseline" not in equal_manifest["paired_statistics"][0]
+    assert equal_manifest["paired_statistics"][0]["model_a"] == "perfect"
+    assert equal_manifest["paired_statistics"][0]["model_b"] == "weak"
+    assert len(commands) == command_count
 
 
 def test_repeating_a_sahi_comparison_reuses_cached_predictions_and_metrics(

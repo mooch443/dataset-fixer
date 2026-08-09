@@ -1000,6 +1000,7 @@ class Model:
         *,
         split: Literal["train", "val", "test"] = "val",
         save_prediction_plots: bool = False,
+        paired_comparisons: Literal["reference", "all"] = "reference",
         progress: bool = True,
         destination: str | Path | None = None,
     ) -> Any:
@@ -1012,6 +1013,8 @@ class Model:
                 ``predictions/`` for the cases the report keeps in
                 ``worst_cases``. Cases with neither a reference nor a
                 prediction are skipped, since their panels are empty.
+            paired_comparisons: Use the first model as the paired-difference
+                reference, or compute every unordered pair without a reference.
             progress: Show package-managed progress bars.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.
@@ -1025,6 +1028,7 @@ class Model:
             source,
             split=split,
             save_prediction_plots=save_prediction_plots,
+            paired_comparisons=paired_comparisons,
             progress=progress,
             destination=destination,
         )
@@ -1264,6 +1268,7 @@ class ModelCollection:
         *,
         split: Literal["train", "val", "test"] = "val",
         save_prediction_plots: bool = False,
+        paired_comparisons: Literal["reference", "all"] = "reference",
         progress: bool = True,
         destination: str | Path | None = None,
     ) -> Any:
@@ -1277,6 +1282,9 @@ class ModelCollection:
                 ``worst_cases``, with at most two model panels per row.
                 Cases with neither a reference nor a prediction are
                 skipped, since their panels are empty.
+            paired_comparisons: ``"reference"`` computes paired differences
+                from the first model. ``"all"`` treats every model equally and
+                computes every unordered model pair.
             progress: Show package-managed progress bars.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.
@@ -1284,8 +1292,7 @@ class ModelCollection:
         Returns:
             A task-appropriate comparison result. Comparison space is inferred
             from the dataset and model tasks; all inference settings come from
-            each :class:`Model`. The first loaded model is the fixed reference
-            for paired differences.
+            each :class:`Model`.
         """
 
         active = source
@@ -1293,6 +1300,8 @@ class ModelCollection:
 
         if not isinstance(active, Dataset):
             raise TypeError("Model comparison requires a Dataset")
+        if paired_comparisons not in {"reference", "all"}:
+            raise ValueError("paired_comparisons must be 'reference' or 'all'")
         if active._plan:
             raise DatasetValidationError(
                 "Model comparison requires a fixed on-disk cohort; call dataset.export(...) first"
@@ -1325,6 +1334,7 @@ class ModelCollection:
                     self,
                     split=split,
                     save_prediction_plots=save_prediction_plots,
+                    paired_comparisons=paired_comparisons,
                     progress=progress,
                     destination=destination,
                 )
@@ -1335,6 +1345,7 @@ class ModelCollection:
                 self,
                 split=split,
                 save_prediction_plots=save_prediction_plots,
+                paired_comparisons=paired_comparisons,
                 progress=progress,
                 destination=destination,
             )
@@ -1345,6 +1356,10 @@ class ModelCollection:
                     value=[model.name for model in self.models if model.kind != "ultralytics"],
                     suggestion="compare nnU-Net folders against a semantic-mask Dataset",
                 )
+            )
+        if paired_comparisons != "reference":
+            raise ValueError(
+                "paired_comparisons='all' currently requires a semantic-mask dataset"
             )
         known_tasks = {model.task for model in self.models if model.task is not None}
         if len(known_tasks) > 1:

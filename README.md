@@ -510,6 +510,14 @@ comparison = models.compare(
     split="val",
 )
 
+# Semantic-mask comparisons can treat every model equally and report every
+# unordered paired difference instead of selecting a reference model.
+equal_comparison = models.compare(
+    dataset,  # a semantic-mask Dataset
+    split="val",
+    paired_comparisons="all",
+)
+
 # SAHI belongs to each model specification, not the comparison call.
 sliced_models = Model.load_many({
     "sahi-512": {
@@ -527,7 +535,9 @@ sliced = sliced_models.compare(dataset, split="val")
 `models.compare()` has no shared inference, resolution, threshold, protocol,
 comparison-space, comparison-unit, or baseline options. Each model carries its
 own configuration, the dataset/task pair determines the canonical metric
-space, and the first loaded model is the fixed paired-difference reference.
+space, and reference-mode comparisons use the first loaded model for paired
+differences. Semantic-mask comparisons may instead set
+`paired_comparisons="all"` to compute every unordered pair with no reference.
 The report labels candidates as model variants only when their inference
 systems match; otherwise it labels them as distinct systems automatically.
 

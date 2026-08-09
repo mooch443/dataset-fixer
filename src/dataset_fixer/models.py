@@ -103,7 +103,7 @@ class SemanticComparisonResult:
     cohort_fingerprint: str
     cohort_verified: bool
     split: str
-    baseline: str
+    baseline: str | None
     settings: dict[str, Any]
     limitations: tuple[str, ...]
 
