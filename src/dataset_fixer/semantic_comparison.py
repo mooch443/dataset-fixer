@@ -1422,27 +1422,15 @@ def _predict_nnunet_sahi(
         )
     tile_progress = tqdm(
         total=total_tiles,
-        desc=f"{model.name} SAHI tiles",
+        desc="nnU-Net SAHI tiles",
         unit="tile",
-        file=sys.stdout,
-        dynamic_ncols=True,
-        disable=not progress,
-    )
-    source_progress = tqdm(
-        total=len(inputs),
-        desc=f"{model.name} SAHI images",
-        unit="image",
-        file=sys.stdout,
+        file=sys.stderr,
         dynamic_ncols=True,
         disable=not progress,
     )
 
     def write_progress(message: str) -> None:
-        writer = getattr(tile_progress, "write", None)
-        if writer is not None:
-            writer(message, file=sys.stdout)
-        else:
-            print(message, flush=True)
+        print(message, flush=True)
 
     try:
         for group_index, group in enumerate(groups, start=1):
@@ -1538,7 +1526,6 @@ def _predict_nnunet_sahi(
                 )
                 # Release each completed source image promptly.
                 probabilities[first:last] = [None] * (last - first)
-                source_progress.update(1)
             stitch_seconds = time.perf_counter() - started
             telemetry.stitch_seconds += stitch_seconds
             del probabilities
@@ -1594,7 +1581,6 @@ def _predict_nnunet_sahi(
                 last_text_report = now
     finally:
         tile_progress.close()
-        source_progress.close()
         telemetry.weight_loads = session.weight_loads
         telemetry.forward_passes = session.forward_passes
         session.release()
