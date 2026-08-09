@@ -390,6 +390,9 @@ class Model:
         workers: nnU-Net CPU worker count for preprocessing and probability
             conversion. This is not the neural-network batch size, which is
             derived from the model's own plan and the inference device.
+        nnunet_tta: Whether nnU-Net inference averages mirrored test-time
+            augmentations. Disabled by default because it multiplies inference
+            work by up to four for a 2D model.
         confidence: Default prediction confidence floor.
         postprocess: Default native IoU or SAHI match threshold.
         sahi_slice_height: SAHI tile height in canonical source pixels.
@@ -423,6 +426,7 @@ class Model:
         input_size: int | tuple[int, int] | None = None,
         batch_size: int = -1,
         workers: int = 2,
+        nnunet_tta: bool = False,
         confidence: float = 0.25,
         postprocess: float = 0.7,
         sahi_slice_height: int | None = None,
@@ -479,6 +483,8 @@ class Model:
             raise ValueError("resolution must be a positive integer")
         if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
             raise ValueError("workers must be a positive integer")
+        if not isinstance(nnunet_tta, bool):
+            raise ValueError("nnunet_tta must be a boolean")
         if (
             isinstance(batch_size, bool)
             or not isinstance(batch_size, int)
@@ -569,6 +575,7 @@ class Model:
         self._upscale_factor = geometry.upscale_factor or 1
         self._batch_size = batch_size
         self._workers = workers
+        self._nnunet_tta = nnunet_tta
         self._folds: tuple[str, ...] = ()
         self._checkpoint = checkpoint
         self._checkpoint_files: tuple[Path, ...] = ()
@@ -817,6 +824,12 @@ class Model:
         return self._batch_size
 
     @property
+    def nnunet_tta(self) -> bool:
+        """Whether nnU-Net inference averages mirrored test-time inputs."""
+
+        return self._nnunet_tta
+
+    @property
     def settings(self) -> dict[str, Any]:
         """Copy of additional adapter defaults."""
 
@@ -866,6 +879,7 @@ class Model:
             "input_size": self.input_size,
             "batch_size": self.batch_size,
             "workers": self.workers if self.kind == "nnunet" else None,
+            **({"nnunet_tta": self.nnunet_tta} if self.kind == "nnunet" else {}),
             "settings": to_jsonable(self.settings),
         }
 
@@ -899,6 +913,7 @@ class Model:
             "input_size": model_input,
             "batch_size": self.batch_size,
             "workers": self.workers,
+            "nnunet_tta": self.nnunet_tta,
             "confidence": self.confidence,
             "postprocess": self.postprocess,
             "settings": settings,
@@ -1061,6 +1076,7 @@ class Model:
                 "upscale_factor": self.upscale_factor,
                 "workers": self.workers,
                 "batch_size": effective_batch_size,
+                "nnunet_tta": self.nnunet_tta,
                 "inference": selected_backend,
                 **(resolved_sahi.as_dict() if selected_backend == "sahi" else {}),
                 **{
@@ -1313,6 +1329,7 @@ class Model:
                     "model_input_size",
                     "batch_size",
                     "workers",
+                    "nnunet_tta",
                     "confidence",
                     "postprocess",
                     "sahi_slice_height",
@@ -1444,6 +1461,7 @@ class ModelCollection:
             "model_input_size",
             "workers",
             "batch_size",
+            "nnunet_tta",
             "confidence",
             "postprocess",
             "sahi_slice_height",

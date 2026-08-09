@@ -61,7 +61,7 @@ class EngineTelemetry:
     folds: tuple[str, ...] = ()
     weight_loads: int = 0
     forward_passes: int = 0
-    tta: bool = True
+    tta: bool = False
     workers: int = 1
     preprocess_seconds: float = 0.0
     inference_seconds: float = 0.0
@@ -104,7 +104,7 @@ class NnUNetSession:
         device: str,
         workers: int,
         batch_size: int = -1,
-        use_tta: bool = True,
+        use_tta: bool = False,
     ) -> None:
         import torch
         from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
@@ -456,7 +456,7 @@ def load_session(
     device: str,
     workers: int,
     batch_size: int = -1,
-    use_tta: bool = True,
+    use_tta: bool = False,
 ) -> NnUNetSession:
     """Load one nnU-Net model for a whole prediction run."""
 

@@ -180,7 +180,7 @@ class FakeSession:
         self.requested_batch_size = requested_batch_size
         self.resolved_batch_size = requested_batch_size
         self.oom_retries = 0
-        self.use_tta = True
+        self.use_tta = False
         self.workers = workers
         self.weight_loads = 0
         self.forward_passes = 0
@@ -449,6 +449,7 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
                 "path": nnunet_path,
                 "device": "cpu",
                 "workers": 1,
+                "nnunet_tta": True,
                 "inference": "sahi",
                 "sahi_slice_height": 24,
                 "sahi_slice_width": 20,
@@ -590,6 +591,11 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
             "inference": model.inference,
             "resolution": model.resolution or 480,
             "settings": model.settings,
+            **(
+                {"nnunet_tta": model.nnunet_tta}
+                if model.kind == "nnunet"
+                else {}
+            ),
         }
         current_dir = cache_root / cache_key(current_payload)
         current_dirs.append(current_dir)
@@ -923,6 +929,37 @@ def test_nnunet_sahi_runs_in_process_without_the_prediction_cli(
 
     assert result.backend == "sahi"
     assert len(result.records) == 2
+    assert result.settings["nnunet_tta"] is False
+
+
+def test_nnunet_sahi_tta_can_be_enabled_from_model_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("sahi")
+    exported = _semantic_export(tmp_path)
+    folder = _nnunet_model(tmp_path / "tta-model")
+    session = _install_fake_session(monkeypatch)
+    models = Model.load_many({"nnunet": {"path": folder, "upscale_factor": 1}})
+
+    assert models["nnunet"].nnunet_tta is False
+    with pytest.raises(ValueError, match="nnunet_tta must be a boolean"):
+        models.configure({"nnunet": {"nnunet_tta": "false"}})
+    configured = models.configure({"nnunet": {"nnunet_tta": True}})
+    result = configured["nnunet"].predict(
+        exported,
+        split="val",
+        inference="sahi",
+        sahi_slice_height=16,
+        sahi_slice_width=16,
+        sahi_overlap=0.25,
+        progress=False,
+    )
+
+    assert configured["nnunet"].nnunet_tta is True
+    assert configured["nnunet"].describe()["nnunet_tta"] is True
+    assert session.use_tta is True
+    assert result.settings["nnunet_tta"] is True
 
 
 def test_nnunet_sahi_groups_equally_shaped_tiles_into_real_minibatches(
@@ -1034,9 +1071,14 @@ def _install_fake_session(
     **kwargs: object,
 ) -> FakeSession:
     session = FakeSession(**kwargs)
+
+    def load_fake_session(**options: object) -> FakeSession:
+        session.use_tta = bool(options.get("use_tta", False))
+        return session
+
     monkeypatch.setattr(
         "dataset_fixer.nnunet_engine.load_session",
-        lambda **_: session,
+        load_fake_session,
     )
     return session
 
@@ -1073,6 +1115,7 @@ def test_semantic_export_compares_official_nnunet_model_folders(
                 "path": weak,
                 "upscale_factor": 1,
                 "workers": 1,
+                "nnunet_tta": True,
             },
         }
     )
@@ -1099,6 +1142,14 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     assert predict[predict.index("-chk") + 1] == "checkpoint_final.pth"
     assert predict[predict.index("-device") + 1] == models["perfect"]._resolved_device()
     assert "--save_probabilities" in predict
+    assert "--disable_tta" in predict
+    weak_predict = next(
+        command
+        for command in commands
+        if command[0] == "nnUNetv2_predict_from_modelfolder"
+        and command[command.index("-m") + 1] == str(weak)
+    )
+    assert "--disable_tta" not in weak_predict
     assert not (destination / "cohort").exists()
     assert not (destination / "predictions").exists()
     assert not list(destination.rglob("*.csv"))
@@ -1216,6 +1267,28 @@ def test_repeating_a_sahi_comparison_reuses_cached_predictions_and_metrics(
     assert all(row["cache"] == "hit" for row in execution_rerun.ranking)
     assert len(session.batch_sizes) == inference_calls, "re-ran network inference"
     assert len(commands) == evaluations, "re-ran the official evaluator"
+
+    # TTA changes model predictions and therefore owns a separate cache. Going
+    # back to non-TTA must still recover the original completed cache.
+    tta_models = models.configure({"sliced": {"nnunet_tta": True}})
+    tta_result = tta_models.compare(
+        exported,
+        progress=False,
+        # Reusing an explicit destination must still validate the complete
+        # report's settings fingerprint before short-circuiting.
+        destination=tmp_path / "sliced-b",
+    )
+    assert all(row["cache"] == "fresh" for row in tta_result.ranking)
+    tta_inference_calls = len(session.batch_sizes)
+    assert tta_inference_calls > inference_calls
+
+    non_tta_again = models.compare(
+        exported,
+        progress=False,
+        destination=tmp_path / "sliced-b",
+    )
+    assert all(row["cache"] == "hit" for row in non_tta_again.ranking)
+    assert len(session.batch_sizes) == tta_inference_calls
 
 
 def test_changing_a_sahi_setting_invalidates_the_cached_prediction(

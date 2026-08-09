@@ -105,6 +105,7 @@ def compare_nnunet_models(
             "resolution": spec.resolution or 480,
             "sahi": resolved_sahi_by_model.get(spec.name),
             "upscale_factor": spec.upscale_factor,
+            "nnunet_tta": spec.nnunet_tta,
         }
         for spec in specs
     }
@@ -150,6 +151,7 @@ def compare_nnunet_models(
                 "upscale_factor": spec.upscale_factor,
                 "device": resolved_devices[spec.name],
                 "workers": spec.workers,
+                "nnunet_tta": spec.nnunet_tta,
             }
             for spec in specs
         ],
@@ -167,6 +169,7 @@ def compare_nnunet_models(
                     "checkpoint": spec.checkpoint,
                     "upscale_factor": spec.upscale_factor,
                     "resolution": spec.resolution or 480,
+                    "nnunet_tta": spec.nnunet_tta,
                     "sahi": resolved_sahi_by_model.get(spec.name),
                 }
                 for spec in specs
@@ -189,7 +192,10 @@ def compare_nnunet_models(
         and (not save_prediction_plots or (target / "predictions").is_dir())
     ):
         cached_manifest = json.loads(existing.read_text(encoding="utf-8"))
-        if cached_manifest.get("schema") == SEMANTIC_REPORT_SCHEMA:
+        if (
+            cached_manifest.get("schema") == SEMANTIC_REPORT_SCHEMA
+            and cached_manifest.get("settings_fingerprint") == fingerprint
+        ):
             print(f"Reusing complete comparison: {target}")
             return _semantic_result_from_manifest(target, cached_manifest)
     temporary = build_staging_dir(
@@ -237,11 +243,13 @@ def compare_nnunet_models(
                 "checkpoint": spec.checkpoint,
                 "upscale_factor": spec.upscale_factor,
                 "resolution": spec.resolution or 480,
+                "nnunet_tta": spec.nnunet_tta,
                 "sahi": resolved_sahi_by_model.get(spec.name),
             }
             cache_identity = cache_key(cache_payload)
-            cache_dir = default_cache_root(export.location) / "semantic" / cache_identity
-            legacy_cache_dir = default_cache_root(export.location) / "semantic" / cache_key(
+            semantic_cache_root = default_cache_root(export.location) / "semantic"
+            cache_dir = semantic_cache_root / cache_identity
+            legacy_cache_dir = semantic_cache_root / cache_key(
                 {
                     "schema": SEMANTIC_EVALUATION_CACHE_SCHEMA,
                     "space": "nnunet-semantic",
@@ -257,9 +265,19 @@ def compare_nnunet_models(
                     "versions": package_versions(),
                 }
             )
+            compatible_legacy_dirs: tuple[Path, ...] = ()
+            if spec.nnunet_tta:
+                # nnU-Net TTA was always enabled before it became explicit.
+                # Those caches are valid only for an explicit TTA request.
+                prior_tta_payload = dict(cache_payload)
+                prior_tta_payload.pop("nnunet_tta")
+                compatible_legacy_dirs = (
+                    semantic_cache_root / cache_key(prior_tta_payload),
+                    legacy_cache_dir,
+                )
             cache_dir, cached = _load_compatible_semantic_cache(
                 cache_dir,
-                (legacy_cache_dir,),
+                compatible_legacy_dirs,
                 cases,
                 cache_identity=cache_payload,
                 required_fields=("summary", "native_summary", "native_rows"),
@@ -401,6 +419,7 @@ def compare_nnunet_models(
                     "model_sha256": spec.digest,
                     "model_folder": str(spec.model_folder),
                     "upscale_factor": spec.upscale_factor,
+                    "nnunet_tta": spec.nnunet_tta,
                     "evaluation_resolution": "canonical-export",
                     "projection": (
                         "sahi-feathered-probability-area-pool-argmax"
@@ -554,6 +573,7 @@ def compare_semantic_models(
             "resolution": model.resolution or 480,
             "confidence": model.confidence if model.kind == "ultralytics" else None,
             "postprocess": model.postprocess if model.kind == "ultralytics" else None,
+            "nnunet_tta": model.nnunet_tta if model.kind == "nnunet" else None,
             "sahi": resolved_sahi_by_model.get(model.name),
         }
         for model in models
@@ -621,6 +641,11 @@ def compare_semantic_models(
                     "confidence": model.confidence,
                     "postprocess": model.postprocess,
                     "settings": model.settings,
+                    **(
+                        {"nnunet_tta": model.nnunet_tta}
+                        if model.kind == "nnunet"
+                        else {}
+                    ),
                     "sahi": resolved_sahi_by_model.get(model.name),
                 }
                 for model in models
@@ -643,7 +668,10 @@ def compare_semantic_models(
         and (not save_prediction_plots or (target / "predictions").is_dir())
     ):
         cached_manifest = json.loads(existing.read_text(encoding="utf-8"))
-        if cached_manifest.get("schema") == SEMANTIC_REPORT_SCHEMA:
+        if (
+            cached_manifest.get("schema") == SEMANTIC_REPORT_SCHEMA
+            and cached_manifest.get("settings_fingerprint") == fingerprint
+        ):
             print(f"Reusing complete comparison: {target}")
             return _semantic_result_from_manifest(target, cached_manifest)
     temporary = build_staging_dir(
@@ -698,10 +726,16 @@ def compare_semantic_models(
                 "inference": model.inference,
                 "resolution": model.resolution or 480,
                 "settings": model.settings,
+                **(
+                    {"nnunet_tta": model.nnunet_tta}
+                    if model.kind == "nnunet"
+                    else {}
+                ),
             }
             cache_identity = cache_key(cache_payload)
-            cache_dir = default_cache_root(export.location) / "semantic" / cache_identity
-            legacy_cache_dir = default_cache_root(export.location) / "semantic" / cache_key(
+            semantic_cache_root = default_cache_root(export.location) / "semantic"
+            cache_dir = semantic_cache_root / cache_identity
+            legacy_cache_dir = semantic_cache_root / cache_key(
                 {
                     "schema": SEMANTIC_EVALUATION_CACHE_SCHEMA,
                     "space": "binary-semantic",
@@ -718,14 +752,29 @@ def compare_semantic_models(
                     "settings": {
                         key: value
                         for key, value in predict_options.items()
-                        if key != "progress"
+                        if key not in {"progress", "nnunet_tta"}
                     },
                     "versions": package_versions(),
                 }
             )
+            compatible_legacy_dirs: tuple[Path, ...]
+            if model.kind != "nnunet":
+                compatible_legacy_dirs = (legacy_cache_dir,)
+            elif model.nnunet_tta:
+                # Prior releases always enabled nnU-Net TTA but did not record
+                # that fact in the identity. They are compatible only when the
+                # caller explicitly requests the historical TTA behavior.
+                prior_tta_payload = dict(cache_payload)
+                prior_tta_payload.pop("nnunet_tta")
+                compatible_legacy_dirs = (
+                    semantic_cache_root / cache_key(prior_tta_payload),
+                    legacy_cache_dir,
+                )
+            else:
+                compatible_legacy_dirs = ()
             cache_dir, cached = _load_compatible_semantic_cache(
                 cache_dir,
-                (legacy_cache_dir,),
+                compatible_legacy_dirs,
                 cases,
                 cache_identity=cache_payload,
                 required_fields=("projection", "native_task", "backend"),
@@ -1159,6 +1208,7 @@ def predict_nnunet_model(
                 "-nps",
                 str(model.workers),
                 "--save_probabilities",
+                *([] if model.nnunet_tta else ["--disable_tta"]),
             ],
             progress=progress,
         )
@@ -1252,6 +1302,7 @@ def _predict_nnunet_sahi(
             model.checkpoint,
             model.workers,
             batch_size,
+            model.nnunet_tta,
         ),
         lambda: load_session(
             model_folder=model.model_folder,
@@ -1260,6 +1311,7 @@ def _predict_nnunet_sahi(
             device=device,
             workers=model.workers,
             batch_size=batch_size,
+            use_tta=model.nnunet_tta,
         ),
     )
     telemetry = EngineTelemetry(
