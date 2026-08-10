@@ -59,7 +59,13 @@ def _split_image_values(value: Prepared | Mapping[str, Any]) -> dict[str, int]:
     statistics = value.split_statistics if isinstance(value, Prepared) else value.get(
         "split_statistics", {}
     )
-    aliases = {"train": "train", "val": "val", "valid": "val", "validation": "val", "test": "test"}
+    aliases = {
+        "train": "train",
+        "val": "val",
+        "valid": "val",
+        "validation": "val",
+        "test": "test",
+    }
     result: dict[str, int] = {}
     for split, raw in dict(statistics or {}).items():
         canonical = aliases.get(str(split).lower())
@@ -108,8 +114,15 @@ def _native_training_aliases(value: Mapping[str, Any]) -> dict[str, Any]:
             selected = _nested(value, *path)
             if selected is None:
                 continue
-            if field == "batch_size" and (isinstance(selected, bool) or int(selected) <= 0):
-                continue
+            if field == "batch_size":
+                if isinstance(selected, bool):
+                    continue
+                try:
+                    selected = int(selected)
+                except (TypeError, ValueError):
+                    continue
+                if selected <= 0:
+                    continue
             aliases[field] = selected
             break
     return aliases
