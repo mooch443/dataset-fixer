@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -21,9 +22,14 @@ from dataset_fixer.comparison.cache import (
 )
 from dataset_fixer.comparison.cohort import freeze_cohort
 from dataset_fixer.comparison.inference import _adaptive_batches, _run_native, resolve_backend
-from dataset_fixer.comparison.metrics import evaluate_configuration, optimal_match
-from dataset_fixer.comparison.types import ModelSpec, Prediction
+from dataset_fixer.comparison.metrics import (
+    evaluate_configuration,
+    optimal_match,
+    segmentation_binary_metric_breakdown,
+)
+from dataset_fixer.comparison.types import Cohort, CohortRecord, ModelSpec, Prediction
 from PIL import Image
+from conftest import make_yolo_dataset
 
 
 def test_cohort_is_ordered_and_content_addressed(detect_dataset: Path) -> None:
@@ -87,6 +93,78 @@ def test_class_aware_optimal_matching_and_metrics(detect_dataset: Path) -> None:
     metrics = evaluate_configuration(cohort, predictions, 0.5)
     assert metrics["summary"]["map50_95"] == pytest.approx(1.0)
     assert metrics["summary"]["f1"] == pytest.approx(1.0)
+
+
+def test_instance_segmentation_breakdown_uses_final_foreground_union_masks(
+    tmp_path: Path,
+) -> None:
+    positive = CohortRecord(
+        image_id="positive",
+        image_path=tmp_path / "positive.png",
+        relative_path="positive.png",
+        split="val",
+        width=6,
+        height=6,
+        image_sha256="image-positive",
+        annotation_sha256="annotation-positive",
+        original_id="original-positive",
+        annotations=(
+            {
+                "class_id": 0,
+                "polygon": [(1, 1), (3, 1), (3, 3), (1, 3)],
+            },
+        ),
+    )
+    empty = CohortRecord(
+        image_id="empty",
+        image_path=tmp_path / "empty.png",
+        relative_path="empty.png",
+        split="val",
+        width=6,
+        height=6,
+        image_sha256="image-empty",
+        annotation_sha256="annotation-empty",
+        original_id="original-empty",
+        annotations=(),
+    )
+    cohort = Cohort(
+        split="val",
+        fingerprint="cohort",
+        records=(positive, empty),
+        task="segment",
+        classes={0: "school"},
+        metadata={},
+    )
+    predictions = {
+        "positive": [
+            Prediction(
+                class_id=0,
+                score=0.9,
+                polygon=[(1, 1), (3, 1), (3, 3), (1, 3)],
+            )
+        ],
+        "empty": [
+            Prediction(
+                class_id=0,
+                score=0.9,
+                polygon=[(0, 0), (1, 0), (1, 1), (0, 1)],
+            )
+        ],
+    }
+
+    metrics = segmentation_binary_metric_breakdown(cohort, predictions, 0.5)
+
+    assert metrics["dice"] == pytest.approx(0.5)
+    assert metrics["iou"] == pytest.approx(0.5)
+    assert metrics["positive_case_dice"] == pytest.approx(1.0)
+    assert metrics["positive_case_iou"] == pytest.approx(1.0)
+    assert metrics["positive_cases"] == 1
+    assert metrics["positive_detected_cases"] == 1
+    assert metrics["empty_cases"] == 1
+    assert metrics["empty_false_positive_cases"] == 1
+    assert metrics["empty_image_specificity"] == pytest.approx(0.0)
+    assert metrics["empty_false_positive_pixels"] == 4
+    assert metrics["empty_mean_false_positive_pixels"] == pytest.approx(4.0)
 
 
 def test_inference_is_explicit_and_pose_supports_sahi(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -589,6 +667,79 @@ def test_model_collection_compare_atomic_result(
     )
     assert fake_inference.calls == 1, "execution-only settings invalidated predictions"
     assert execution_result.cache_statistics["prediction_hits"] == 1
+
+
+def test_segment_comparison_adds_postprocessed_binary_breakdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "segments",
+        task="segment",
+        names=["school"],
+        train_rows=["0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"],
+        val_rows=["0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8", ""],
+        size=(16, 16),
+    )
+    dataset = Dataset.open(source, task="segment", progress=False)
+    checkpoint = tmp_path / "segment.pt"
+    checkpoint.write_bytes(b"segment checkpoint")
+
+    def fake_inference(
+        spec,
+        cohort,
+        *,
+        thresholds,
+        existing=None,
+        on_threshold=None,
+        **kwargs,
+    ):
+        values = dict(existing or {})
+        for threshold in thresholds:
+            threshold = float(threshold)
+            if threshold in values:
+                continue
+            values[threshold] = {
+                record.image_id: [
+                    Prediction(
+                        class_id=int(annotation["class_id"]),
+                        score=0.9,
+                        bbox=tuple(annotation["bbox"]),
+                        polygon=[tuple(point) for point in annotation["polygon"]],
+                    )
+                    for annotation in record.annotations
+                ]
+                for record in cohort.records
+            }
+            if on_threshold is not None:
+                on_threshold(threshold, values[threshold])
+        return values, {"fake": 0.01}
+
+    monkeypatch.setattr("dataset_fixer.comparison.engine.run_inference", fake_inference)
+    models = Model.load_many(
+        {
+            "segmenter": {
+                "path": checkpoint,
+                "task": "segment",
+                "confidence": 0.5,
+                "postprocess": 0.5,
+            }
+        }
+    )
+    destination = tmp_path / "segment-comparison"
+
+    result = models.compare(dataset, progress=False, destination=destination)
+
+    row = result.ranking[0]
+    assert row["heldout_projection"] == "instance-polygon-foreground-union"
+    assert row["dice"] == pytest.approx(1.0)
+    assert row["positive_case_dice"] == pytest.approx(1.0)
+    assert row["positive_cases"] == 1
+    assert row["empty_cases"] == 1
+    assert row["empty_image_specificity"] == pytest.approx(1.0)
+    manifest = json.loads((destination / "reports" / "result.json").read_text())
+    assert manifest["schema"] == 7
+    assert manifest["ranking"][0]["positive_micro_iou"] == pytest.approx(1.0)
 
 
 def test_comparison_visuals_have_data_and_metadata_sidecars(

@@ -21,7 +21,12 @@ from .cache import (
 )
 from .cohort import check_training_provenance, freeze_cohort
 from .inference import resolve_backend, run_inference
-from .metrics import bootstrap_metric, evaluate_configuration, paired_statistics
+from .metrics import (
+    bootstrap_metric,
+    evaluate_configuration,
+    paired_statistics,
+    segmentation_binary_metric_breakdown,
+)
 from .reporting import (
     combine_report_plots,
     render_figures,
@@ -34,6 +39,9 @@ from .types import Cohort, ComparisonResult, ModelSpec, Prediction
 
 if TYPE_CHECKING:
     from ..dataset import Dataset
+
+
+_MODEL_COMPARISON_REPORT_SCHEMA = 7
 
 
 def _compare_models(
@@ -96,7 +104,7 @@ def _compare_models(
         )
 
     resolved_settings = {
-        "report_schema": 6,
+        "report_schema": _MODEL_COMPARISON_REPORT_SCHEMA,
         "split": cohort.split,
         "protocol": protocol,
         "training_provenance": "verify-when-configured",
@@ -118,7 +126,7 @@ def _compare_models(
     fingerprint = settings_fingerprint(
         to_jsonable(
             {
-                "schema": 5,
+                "schema": 6,
                 "cohort": cohort.fingerprint,
                 "models": [
                     {
@@ -149,7 +157,7 @@ def _compare_models(
         and (not save_prediction_plots or (target / "predictions").is_dir())
     ):
         cached_manifest = json.loads(existing_result.read_text(encoding="utf-8"))
-        if cached_manifest.get("schema") == 6:
+        if cached_manifest.get("schema") == _MODEL_COMPARISON_REPORT_SCHEMA:
             print(f"Reusing complete comparison: {target}")
             return _result_from_manifest(target, cached_manifest)
     temporary = build_staging_dir(
@@ -207,6 +215,15 @@ def _compare_models(
                     best["per_image"], resamples=bootstrap_resamples, seed=seed
                 )
             duration = float(output["timing"].get("inference_seconds", 0))
+            heldout_breakdown = (
+                segmentation_binary_metric_breakdown(
+                    cohort,
+                    output["predictions"][output["best_postprocess"]],
+                    output["best_confidence"],
+                )
+                if cohort.task == "segment"
+                else {}
+            )
             rank_row = {
                 "model": spec.name,
                 "configuration": f"{spec.name}@{spec.resolution}/{output['backend']}",
@@ -229,7 +246,10 @@ def _compare_models(
                 "inference_seconds": duration,
                 "throughput_images_per_second": len(cohort.records) / duration if duration > 0 else None,
                 "protocol_label": protocol,
+                **heldout_breakdown,
             }
+            if heldout_breakdown:
+                rank_row["heldout_projection"] = "instance-polygon-foreground-union"
             ranking.append(rank_row)
             best_rows[spec.name] = best["per_image"]
             per_image.extend({"model": spec.name, **row} for row in best["per_image"])
@@ -299,7 +319,7 @@ def _compare_models(
             "fresh_inference": sum(value.get("source") == "fresh" for value in cache_audit.values()),
         }
         manifest = {
-            "schema": 6,
+            "schema": _MODEL_COMPARISON_REPORT_SCHEMA,
             "kind": "model-comparison",
             "dataset": {"name": dataset.name, "location": str(dataset.location), "task": cohort.task},
             "cohort_fingerprint": cohort.fingerprint,

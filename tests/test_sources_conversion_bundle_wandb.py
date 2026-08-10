@@ -732,7 +732,18 @@ def test_wandb_helpers_configure_upload_and_preserve_local_failures(tmp_path: Pa
     assert missing.path.is_file()
 
 
-def test_wandb_upload_publishes_complete_heldout_breakdown(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("report_kind", "report_dataset"),
+    [
+        ("semantic-mask-model-comparison", {}),
+        ("model-comparison", {"task": "segment"}),
+    ],
+)
+def test_wandb_upload_publishes_complete_heldout_breakdown(
+    tmp_path: Path,
+    report_kind: str,
+    report_dataset: dict[str, str],
+) -> None:
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"weights")
     report = tmp_path / "evaluations" / "completed-report"
@@ -767,7 +778,8 @@ def test_wandb_upload_publishes_complete_heldout_breakdown(tmp_path: Path) -> No
         json.dumps(
             {
                 "schema": 12,
-                "kind": "semantic-mask-model-comparison",
+                "kind": report_kind,
+                "dataset": report_dataset,
                 "cohort_verified": True,
                 "completed_at_unix": 123.0,
                 "ranking": [{"model": "trained-model", **metric_values}],

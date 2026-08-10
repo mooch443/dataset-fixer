@@ -28,6 +28,7 @@ from .comparison.cache import (
     load_evaluation_cache,
     save_evaluation_cache,
 )
+from .comparison.metrics import binary_metric_breakdown
 from .comparison.reporting import write_json
 from .errors import DatasetValidationError, ValidationIssue
 from .model import ImagePrediction, Model, ModelCollection, ModelInput
@@ -3500,15 +3501,6 @@ def _binary_mask_metrics(
     }
 
 
-def _safe_ratio(numerator: float, denominator: float) -> float:
-    return numerator / denominator if denominator else math.nan
-
-
-def _mean_finite(rows: list[dict[str, Any]], key: str) -> float:
-    values = [float(row[key]) for row in rows if math.isfinite(float(row[key]))]
-    return float(np.mean(values)) if values else math.nan
-
-
 def _binary_metric_breakdown(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Summarize final source-image masks without letting background dominate.
 
@@ -3516,76 +3508,7 @@ def _binary_metric_breakdown(rows: list[dict[str, Any]]) -> dict[str, Any]:
     reconstructed mask per source image. SAHI tiles are therefore never metric
     samples in this function.
     """
-
-    positive_rows = [row for row in rows if float(row["n_ref"]) > 0]
-    empty_rows = [row for row in rows if float(row["n_ref"]) == 0]
-
-    def totals(selected: list[dict[str, Any]]) -> tuple[int, int, int]:
-        return (
-            sum(int(row["tp"]) for row in selected),
-            sum(int(row["fp"]) for row in selected),
-            sum(int(row["fn"]) for row in selected),
-        )
-
-    tp, fp, fn = totals(rows)
-    positive_tp, positive_fp, positive_fn = totals(positive_rows)
-    empty_false_positive_rows = [
-        row for row in empty_rows if float(row["n_pred"]) > 0
-    ]
-    positive_missed_rows = [
-        row for row in positive_rows if float(row["n_pred"]) == 0
-    ]
-    empty_false_positive_pixels = sum(
-        int(row["fp"]) for row in empty_rows
-    )
-
-    return {
-        "micro_dice": _safe_ratio(2 * tp, 2 * tp + fp + fn),
-        "micro_iou": _safe_ratio(tp, tp + fp + fn),
-        "foreground_precision": _safe_ratio(tp, tp + fp),
-        "foreground_recall": _safe_ratio(tp, tp + fn),
-        "positive_case_dice": _mean_finite(positive_rows, "dice"),
-        "positive_case_iou": _mean_finite(positive_rows, "iou"),
-        "positive_micro_dice": _safe_ratio(
-            2 * positive_tp,
-            2 * positive_tp + positive_fp + positive_fn,
-        ),
-        "positive_micro_iou": _safe_ratio(
-            positive_tp,
-            positive_tp + positive_fp + positive_fn,
-        ),
-        "positive_foreground_precision": _safe_ratio(
-            positive_tp,
-            positive_tp + positive_fp,
-        ),
-        "positive_foreground_recall": _safe_ratio(
-            positive_tp,
-            positive_tp + positive_fn,
-        ),
-        "positive_cases": len(positive_rows),
-        "positive_detected_cases": len(positive_rows) - len(positive_missed_rows),
-        "positive_missed_cases": len(positive_missed_rows),
-        "positive_image_recall": _safe_ratio(
-            len(positive_rows) - len(positive_missed_rows),
-            len(positive_rows),
-        ),
-        "empty_cases": len(empty_rows),
-        "empty_correct_cases": len(empty_rows) - len(empty_false_positive_rows),
-        "empty_false_positive_cases": len(empty_false_positive_rows),
-        "empty_image_specificity": _safe_ratio(
-            len(empty_rows) - len(empty_false_positive_rows),
-            len(empty_rows),
-        ),
-        "empty_image_false_positive_rate": _safe_ratio(
-            len(empty_false_positive_rows),
-            len(empty_rows),
-        ),
-        "empty_false_positive_pixels": empty_false_positive_pixels,
-        "empty_mean_false_positive_pixels": _safe_ratio(
-            empty_false_positive_pixels,
-            len(empty_rows),
-        ),
-    }
+    return binary_metric_breakdown(rows)
 
 
 def _render_semantic_grid(

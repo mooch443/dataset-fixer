@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
+from PIL import Image, ImageDraw
 
+from ..errors import DatasetValidationError
 from .types import Cohort, Prediction
 
 
@@ -111,6 +114,166 @@ def evaluate_configuration(
             }
         )
     return {"summary": summary, "per_image": rows, "per_class": per_class, "pr": ap["pr"]}
+
+
+def binary_metric_breakdown(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize final binary source-image masks without background dominance."""
+
+    positive_rows = [row for row in rows if float(row["n_ref"]) > 0]
+    empty_rows = [row for row in rows if float(row["n_ref"]) == 0]
+
+    def totals(selected: list[dict[str, Any]]) -> tuple[int, int, int]:
+        return (
+            sum(int(row["tp"]) for row in selected),
+            sum(int(row["fp"]) for row in selected),
+            sum(int(row["fn"]) for row in selected),
+        )
+
+    def ratio(numerator: float, denominator: float) -> float:
+        return numerator / denominator if denominator else math.nan
+
+    tp, fp, fn = totals(rows)
+    positive_tp, positive_fp, positive_fn = totals(positive_rows)
+    empty_false_positive_rows = [
+        row for row in empty_rows if float(row["n_pred"]) > 0
+    ]
+    positive_missed_rows = [
+        row for row in positive_rows if float(row["n_pred"]) == 0
+    ]
+    empty_false_positive_pixels = sum(int(row["fp"]) for row in empty_rows)
+
+    return {
+        "micro_dice": ratio(2 * tp, 2 * tp + fp + fn),
+        "micro_iou": ratio(tp, tp + fp + fn),
+        "foreground_precision": ratio(tp, tp + fp),
+        "foreground_recall": ratio(tp, tp + fn),
+        "positive_case_dice": _safe_mean([row["dice"] for row in positive_rows]),
+        "positive_case_iou": _safe_mean([row["iou"] for row in positive_rows]),
+        "positive_micro_dice": ratio(
+            2 * positive_tp,
+            2 * positive_tp + positive_fp + positive_fn,
+        ),
+        "positive_micro_iou": ratio(
+            positive_tp,
+            positive_tp + positive_fp + positive_fn,
+        ),
+        "positive_foreground_precision": ratio(
+            positive_tp,
+            positive_tp + positive_fp,
+        ),
+        "positive_foreground_recall": ratio(
+            positive_tp,
+            positive_tp + positive_fn,
+        ),
+        "positive_cases": len(positive_rows),
+        "positive_detected_cases": len(positive_rows) - len(positive_missed_rows),
+        "positive_missed_cases": len(positive_missed_rows),
+        "positive_image_recall": ratio(
+            len(positive_rows) - len(positive_missed_rows),
+            len(positive_rows),
+        ),
+        "empty_cases": len(empty_rows),
+        "empty_correct_cases": len(empty_rows) - len(empty_false_positive_rows),
+        "empty_false_positive_cases": len(empty_false_positive_rows),
+        "empty_image_specificity": ratio(
+            len(empty_rows) - len(empty_false_positive_rows),
+            len(empty_rows),
+        ),
+        "empty_image_false_positive_rate": ratio(
+            len(empty_false_positive_rows),
+            len(empty_rows),
+        ),
+        "empty_false_positive_pixels": empty_false_positive_pixels,
+        "empty_mean_false_positive_pixels": ratio(
+            empty_false_positive_pixels,
+            len(empty_rows),
+        ),
+    }
+
+
+def segmentation_binary_metric_breakdown(
+    cohort: Cohort,
+    predictions: dict[str, list[Prediction]],
+    confidence: float,
+) -> dict[str, Any]:
+    """Score final instance-segmentation polygons as foreground-union masks."""
+
+    if cohort.task != "segment":
+        raise ValueError("Binary segmentation breakdown requires a segment cohort")
+    rows: list[dict[str, Any]] = []
+    for record in cohort.records:
+        truth = _polygon_union_mask(
+            record.width,
+            record.height,
+            record.annotations,
+            source=f"ground truth {record.relative_path}",
+            strict=True,
+        )
+        selected = [
+            prediction
+            for prediction in predictions[record.image_id]
+            if prediction.score >= confidence
+        ]
+        prediction = _polygon_union_mask(
+            record.width,
+            record.height,
+            selected,
+            source=f"prediction {record.relative_path}",
+            strict=False,
+        )
+        tp = int(np.sum(truth & prediction))
+        fp = int(np.sum(~truth & prediction))
+        fn = int(np.sum(truth & ~prediction))
+        dice_denominator = 2 * tp + fp + fn
+        iou_denominator = tp + fp + fn
+        rows.append(
+            {
+                "dice": 2 * tp / dice_denominator if dice_denominator else math.nan,
+                "iou": tp / iou_denominator if iou_denominator else math.nan,
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "n_ref": int(np.sum(truth)),
+                "n_pred": int(np.sum(prediction)),
+            }
+        )
+    return {
+        "dice": _safe_mean([row["dice"] for row in rows]),
+        "iou": _safe_mean([row["iou"] for row in rows]),
+        **binary_metric_breakdown(rows),
+    }
+
+
+def _polygon_union_mask(
+    width: int,
+    height: int,
+    objects: Any,
+    *,
+    source: str,
+    strict: bool,
+) -> np.ndarray:
+    canvas = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(canvas)
+    for item in objects:
+        if isinstance(item, Mapping):
+            polygon = item.get("polygon")
+            polygons = item.get("polygons") or ([polygon] if polygon else [])
+        else:
+            polygon = item.polygon
+            polygons = item.polygons or ([polygon] if polygon else [])
+        for points in polygons:
+            valid = len(points) >= 3 and all(
+                math.isfinite(float(x)) and math.isfinite(float(y))
+                for x, y in points
+            )
+            if not valid:
+                if strict:
+                    raise DatasetValidationError(
+                        f"Cannot rasterize invalid segmentation polygon from {source}"
+                    )
+                continue
+            draw.polygon([(float(x), float(y)) for x, y in points], fill=1)
+    return np.asarray(canvas, dtype=np.uint8) > 0
 
 
 def optimal_match(

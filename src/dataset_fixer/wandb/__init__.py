@@ -335,8 +335,15 @@ def _heldout_breakdown_values(
 
     if not isinstance(manifest, Mapping):
         return {}, f"invalid comparison manifest in {result_file}"
-    if manifest.get("kind") != "semantic-mask-model-comparison":
-        return {}, f"not a semantic comparison report: {result_file}"
+    kind = manifest.get("kind")
+    dataset = manifest.get("dataset")
+    native_segment_report = (
+        kind == "model-comparison"
+        and isinstance(dataset, Mapping)
+        and dataset.get("task") == "segment"
+    )
+    if kind != "semantic-mask-model-comparison" and not native_segment_report:
+        return {}, f"report has no binary segmentation comparison space: {result_file}"
     if manifest.get("cohort_verified") is not True or manifest.get("completed_at_unix") is None:
         return {}, f"comparison report is not marked complete and cohort-verified: {result_file}"
 
