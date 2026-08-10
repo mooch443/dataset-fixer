@@ -29,6 +29,17 @@ from .comparison.cache import (
     save_evaluation_cache,
 )
 from .comparison.metrics import binary_metric_breakdown
+from .comparison.object_sizes import (
+    evaluate_object_size_model,
+    object_size_report_artifacts_exist,
+    prepare_object_size_reference,
+    render_large_object_examples,
+    render_object_size_breakdown,
+    render_segmentation_metric_breakdown,
+    select_large_examples,
+    semantic_components_for_cases,
+    unavailable_object_size_summary,
+)
 from .comparison.reporting import write_json
 from .errors import DatasetValidationError, ValidationIssue
 from .model import ImagePrediction, Model, ModelCollection, ModelInput
@@ -48,7 +59,7 @@ from .utils import (
 # Report presentation evolves independently from prediction/evaluation cache
 # identity. A report bump redraws output from completed caches without forcing
 # model inference to run again.
-SEMANTIC_REPORT_SCHEMA = 12
+SEMANTIC_REPORT_SCHEMA = 13
 SEMANTIC_PREDICTION_SCHEMA = 2
 SEMANTIC_EVALUATION_CACHE_SCHEMA = 2
 
@@ -104,6 +115,18 @@ _METRIC_DEFINITIONS = {
     "empty_mean_false_positive_pixels": (
         "Mean number of predicted foreground pixels per empty-reference source image."
     ),
+    "small_object_dice": (
+        "Macro object Dice for reference-defined small objects (area <= held-out p10), "
+        "including unmatched references and predictions as zero."
+    ),
+    "medium_object_dice": (
+        "Macro object Dice for reference-defined medium objects (held-out p10 < area < p90), "
+        "including unmatched references and predictions as zero."
+    ),
+    "large_object_dice": (
+        "Macro object Dice for reference-defined large objects (area >= held-out p90), "
+        "including unmatched references and predictions as zero."
+    ),
 }
 
 
@@ -124,13 +147,18 @@ if TYPE_CHECKING:
 
 
 def _comparison_source_size_policy(export: "Dataset", errors: str) -> dict[str, Any]:
+    maximum = to_jsonable(getattr(export, "_geometry_maximum_size", None))
+    if getattr(export, "_geometry_all_sahi", False):
+        oversized = "retain-for-sahi-slicing"
+    elif maximum is None:
+        oversized = "retain"
+    else:
+        oversized = "skip" if errors == "skip" else "raise"
     return {
         "errors": errors,
-        "maximum_size": to_jsonable(
-            getattr(export, "_geometry_maximum_size", None)
-        ),
+        "maximum_size": maximum,
         "smaller_or_equal": "retain",
-        "oversized": "skip" if errors == "skip" else "raise",
+        "oversized": oversized,
         "skipped_inputs": list(getattr(export, "_geometry_skip_audit", ())),
     }
 
@@ -266,6 +294,7 @@ def compare_nnunet_models(
         if (
             cached_manifest.get("schema") == SEMANTIC_REPORT_SCHEMA
             and cached_manifest.get("settings_fingerprint") == fingerprint
+            and object_size_report_artifacts_exist(target, cached_manifest)
         ):
             print(f"Reusing complete comparison: {target}")
             return _semantic_result_from_manifest(target, cached_manifest)
@@ -544,6 +573,24 @@ def compare_nnunet_models(
         per_case = [row for name in [spec.name for spec in specs] for row in model_rows[name]]
         reports = temporary / "reports"
         reports.mkdir(parents=True, exist_ok=True)
+        (
+            object_size_analysis,
+            object_size_breakdown_path,
+            large_object_examples,
+        ) = _analyze_semantic_object_sizes(
+            cases,
+            prediction_dirs,
+            ranking,
+            reports,
+        )
+        if object_size_analysis["status"] == "skipped":
+            skip_reason = str(object_size_analysis["reason"])
+            limitations.append(skip_reason)
+            print(f"Object-size analysis skipped: {skip_reason}")
+        object_size_analysis["examples"] = large_object_examples
+        large_object_example_paths = [
+            str(example["path"]) for example in large_object_examples
+        ]
         _render_ranking(reports, ranking)
         _render_metric_breakdown(reports, ranking)
         _render_qualitative(reports, cases, prediction_dirs, model_rows, seed=seed)
@@ -582,12 +629,15 @@ def compare_nnunet_models(
             "settings_fingerprint": fingerprint,
             "ranking": ranking,
             "metric_definitions": _METRIC_DEFINITIONS,
+            "object_size_analysis": object_size_analysis,
             "paired_statistics": paired,
             "limitations": limitations,
             "worst_cases": worst_cases,
             "reports": {
                 "plots": "reports/plots.png",
                 "metric_breakdown": "reports/metric-breakdown.png",
+                "object_size_breakdown": object_size_breakdown_path,
+                "large_object_examples": large_object_example_paths,
                 "comparison": "reports/comparison.png",
                 "prediction_plots": prediction_paths,
             },
@@ -612,6 +662,11 @@ def compare_nnunet_models(
         f"Semantic model comparison complete: {target}\n"
         f"Cohort verified: yes; cases: {len(cases)}; {pairing}"
     )
+    if object_size_analysis["status"] == "complete":
+        print(
+            f"Object-size report: {target / 'reports' / 'object-size-breakdown.png'}\n"
+            f"Large-object examples: {len(large_object_example_paths)}"
+        )
     return SemanticComparisonResult(
         location=target,
         ranking=tuple(ranking),
@@ -762,6 +817,7 @@ def compare_semantic_models(
         if (
             cached_manifest.get("schema") == SEMANTIC_REPORT_SCHEMA
             and cached_manifest.get("settings_fingerprint") == fingerprint
+            and object_size_report_artifacts_exist(target, cached_manifest)
         ):
             print(f"Reusing complete comparison: {target}")
             return _semantic_result_from_manifest(target, cached_manifest)
@@ -1016,6 +1072,24 @@ def compare_semantic_models(
         ]
         reports = temporary / "reports"
         reports.mkdir(parents=True, exist_ok=True)
+        (
+            object_size_analysis,
+            object_size_breakdown_path,
+            large_object_examples,
+        ) = _analyze_semantic_object_sizes(
+            cases,
+            prediction_dirs,
+            ranking,
+            reports,
+        )
+        if object_size_analysis["status"] == "skipped":
+            skip_reason = str(object_size_analysis["reason"])
+            limitations.append(skip_reason)
+            print(f"Object-size analysis skipped: {skip_reason}")
+        object_size_analysis["examples"] = large_object_examples
+        large_object_example_paths = [
+            str(example["path"]) for example in large_object_examples
+        ]
         _render_ranking(
             reports,
             ranking,
@@ -1061,6 +1135,7 @@ def compare_semantic_models(
             "settings_fingerprint": fingerprint,
             "ranking": ranking,
             "metric_definitions": _METRIC_DEFINITIONS,
+            "object_size_analysis": object_size_analysis,
             "paired_statistics": paired,
             "limitations": limitations,
             "warnings": projection_warnings,
@@ -1068,6 +1143,8 @@ def compare_semantic_models(
             "reports": {
                 "plots": "reports/plots.png",
                 "metric_breakdown": "reports/metric-breakdown.png",
+                "object_size_breakdown": object_size_breakdown_path,
+                "large_object_examples": large_object_example_paths,
                 "comparison": "reports/comparison.png",
                 "prediction_plots": prediction_paths,
             },
@@ -1093,6 +1170,11 @@ def compare_semantic_models(
         f"Cohort verified: yes; cases: {len(cases)}; {pairing}; "
         "comparison space: semantic"
     )
+    if object_size_analysis["status"] == "complete":
+        print(
+            f"Object-size report: {target / 'reports' / 'object-size-breakdown.png'}\n"
+            f"Large-object examples: {len(large_object_example_paths)}"
+        )
     if projection_warnings:
         print(
             f"Warnings: skipped {len(projection_warnings)} invalid segmentation "
@@ -2844,83 +2926,75 @@ def _render_ranking(
     return [str(path.relative_to(root))]
 
 
+def _analyze_semantic_object_sizes(
+    cases: list[_SemanticCase],
+    prediction_dirs: Mapping[str, Path],
+    ranking: list[dict[str, Any]],
+    reports: Path,
+) -> tuple[dict[str, Any], str | None, list[dict[str, Any]]]:
+    """Score final full-image masks by reference-defined object area."""
+
+    reference = prepare_object_size_reference(
+        semantic_components_for_cases(cases, prefix="reference")
+    )
+    if reference.status != "complete":
+        for row in ranking:
+            row.update(unavailable_object_size_summary())
+        return reference.metadata(), None, []
+
+    predictions: dict[str, dict[str, tuple[Any, ...]]] = {}
+    results = {}
+    for row in ranking:
+        model_name = str(row["model"])
+        model_predictions = semantic_components_for_cases(
+            cases,
+            prediction_directory=prediction_dirs[model_name],
+            prefix=f"prediction-{model_name}",
+        )
+        predictions[model_name] = model_predictions
+        result = evaluate_object_size_model(reference, model_predictions)
+        results[model_name] = result
+        row.update(result.summary)
+
+    size_path = render_object_size_breakdown(
+        reports,
+        ranking,
+        reference,
+        labels={
+            str(row["model"]): _ranking_plot_label(row)
+            for row in ranking
+        },
+    )
+    selections = select_large_examples(reference, results)
+    examples = render_large_object_examples(
+        reports,
+        selections,
+        predictions,
+        results,
+        {
+            str(row["model"]): str(row.get("backend") or "unknown")
+            for row in ranking
+        },
+    )
+    relative_size_path = (
+        str(size_path.relative_to(reports.parent)) if size_path is not None else None
+    )
+    return reference.metadata(), relative_size_path, examples
+
+
 def _render_metric_breakdown(
     root: Path,
     ranking: list[dict[str, Any]],
 ) -> Path:
-    """Render complementary overlap and empty-image behavior side by side."""
-
-    import matplotlib.pyplot as plt
-
-    columns = (
-        ("dice", "All defined images\nmean Dice"),
-        ("micro_dice", "All pixels pooled\nforeground Dice"),
-        ("micro_iou", "All pixels pooled\nforeground IoU"),
-        ("positive_case_dice", "Positive images only\nmean Dice"),
-        ("positive_micro_dice", "Positive images only\npooled Dice"),
-        ("positive_micro_iou", "Positive images only\npooled IoU"),
-        ("positive_image_recall", "Positive images\nany-prediction rate"),
-        ("empty_image_specificity", "Empty images\nno-prediction rate"),
-    )
-    values = np.asarray(
-        [
-            [float(row.get(key, math.nan)) for key, _ in columns]
+    return render_segmentation_metric_breakdown(
+        root,
+        ranking,
+        title="Semantic metric breakdown — final reconstructed source images",
+        labels={
+            str(row["model"]): _ranking_plot_label(row)
             for row in ranking
-        ],
-        dtype=float,
+        },
     )
-    masked = np.ma.masked_invalid(values)
-    figure, axis = plt.subplots(
-        figsize=(19.5, max(4.5, 0.9 * len(ranking) + 2.3))
-    )
-    colormap = plt.get_cmap("viridis").with_extremes(bad="#D9D9D9")
-    image = axis.imshow(masked, vmin=0, vmax=1, cmap=colormap, aspect="auto")
-    axis.set_xticks(
-        np.arange(len(columns)),
-        [label for _, label in columns],
-        fontsize=9,
-    )
-    axis.set_yticks(
-        np.arange(len(ranking)),
-        [_ranking_plot_label(row) for row in ranking],
-        fontsize=8.5,
-        linespacing=1.15,
-    )
-    axis.tick_params(axis="x", bottom=False, top=True, labelbottom=False, labeltop=True)
-    for row_index in range(values.shape[0]):
-        for column_index in range(values.shape[1]):
-            value = values[row_index, column_index]
-            label = f"{value:.3f}" if math.isfinite(value) else "n/a"
-            axis.text(
-                column_index,
-                row_index,
-                label,
-                ha="center",
-                va="center",
-                color="white" if math.isfinite(value) and value < 0.65 else "black",
-                fontsize=8.5,
-            )
-    axis.set_title(
-        "Semantic metric breakdown — final reconstructed source images",
-        pad=48,
-    )
-    colorbar = figure.colorbar(image, ax=axis, fraction=0.025, pad=0.02)
-    colorbar.set_label("Higher is better")
-    figure.text(
-        0.5,
-        0.01,
-        (
-            "Empty-only Dice/IoU is undefined, so empty images are represented by the "
-            "fraction with no predicted foreground."
-        ),
-        ha="center",
-        fontsize=8.5,
-    )
-    figure.tight_layout(rect=(0, 0.04, 1, 1))
-    path = root / "metric-breakdown.png"
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
-    plt.close(figure)
-    return path
 
 
 def _render_qualitative(

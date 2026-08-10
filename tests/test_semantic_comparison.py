@@ -774,7 +774,18 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
     assert all(model.settings["sahi_slice_height"] == 24 for model in models)
     assert (destination / "reports" / "plots.png").is_file()
     assert (destination / "reports" / "metric-breakdown.png").is_file()
+    assert (destination / "reports" / "object-size-breakdown.png").is_file()
     assert (destination / "reports" / "comparison.png").is_file()
+    assert manifest["object_size_analysis"]["status"] == "complete"
+    assert manifest["object_size_analysis"]["connectivity"] == 8
+    assert manifest["object_size_analysis"]["matching_class_policy"] == (
+        "binary-foreground"
+    )
+    assert all(
+        row["small_object_dice"] == pytest.approx(1.0)
+        for row in manifest["ranking"]
+    )
+    assert "positive_micro_iou" in manifest["ranking"][0]
     assert not list(destination.rglob("*.jsonl"))
     calls_after_first = len(prediction_options)
 
@@ -1431,6 +1442,11 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     assert manifest["case_composition"] == {"positive": 2, "empty": 0, "total": 2}
     assert "micro_iou" in manifest["metric_definitions"]
     assert manifest["reports"]["metric_breakdown"] == "reports/metric-breakdown.png"
+    assert manifest["reports"]["object_size_breakdown"] == (
+        "reports/object-size-breakdown.png"
+    )
+    assert manifest["object_size_analysis"]["status"] == "complete"
+    assert "small_object_dice" in manifest["metric_definitions"]
     assert "upscale_factor" not in manifest["settings"]
     assert [model["upscale_factor"] for model in manifest["settings"]["models"]] == [2, 1]
     assert result.ranking[0]["projection"] == "probability-area-pool-argmax"
@@ -1439,6 +1455,21 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     assert result.ranking[0]["native_dice"] == pytest.approx(1.0)
     assert manifest["worst_cases"]
     command_count = len(commands)
+    manifest["schema"] = 12
+    (destination / "reports" / "result.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    regenerated = models.compare(
+        exported,
+        progress=False,
+        destination=destination,
+    )
+    assert len(commands) == command_count
+    assert all(row["cache"] == "hit" for row in regenerated.ranking)
+    assert json.loads(
+        (destination / "reports" / "result.json").read_text()
+    )["schema"] == SEMANTIC_REPORT_SCHEMA
+
     cached = models.compare(
         exported,
         progress=False,

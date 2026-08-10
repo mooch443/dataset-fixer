@@ -16,6 +16,7 @@ from dataset_fixer import (
     ModelCollection,
     PredictionResult,
 )
+from dataset_fixer.geometry import validate_collection_geometry
 from dataset_fixer.comparison.cache import (
     load_package_cache,
     save_package_cache,
@@ -310,6 +311,114 @@ def test_prediction_size_policy_retains_smaller_and_skips_only_oversized(
     assert policy["smaller_or_equal"] == "retain"
     assert policy["oversized"] == "skip"
     assert policy["skipped_inputs"][0]["source"] == str(images[2].resolve())
+
+
+def test_sahi_accepts_oversized_full_images_but_native_still_rejects_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "sahi-size-policy.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    image = tmp_path / "full-image.png"
+    Image.new("RGB", (300, 200), "white").save(image)
+    model = Model(
+        checkpoint,
+        task="detect",
+        native_tile_size=128,
+        upscale_factor=1,
+        inference="sahi",
+    )
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.inference.sahi_available", lambda: True
+    )
+
+    def fake_predict(_model, inputs, **options):
+        assert options["backend"] == "sahi"
+        return (
+            {value.image_id: [] for value in inputs},
+            "detect",
+            {"reconstructed_source_images": len(inputs)},
+        )
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.inference.predict_model_inputs", fake_predict
+    )
+
+    with pytest.raises(DatasetValidationError, match="exceeds native_tile_size"):
+        model.predict(image, inference="native", progress=False)
+    result = model.predict(image, progress=False)
+
+    assert len(result.records) == 1
+    assert (result.records[0].width, result.records[0].height) == (300, 200)
+    assert result.settings["source_size_policy"]["maximum_size"] is None
+    assert result.settings["source_size_policy"]["oversized"] == (
+        "retain-for-sahi-slicing"
+    )
+    assert result.settings["source_size_policy"]["skipped_inputs"] == []
+
+
+def test_mixed_native_and_sahi_collection_keeps_native_shared_size_limit(
+    detect_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+    val_samples = [sample for sample in dataset._samples if sample.split == "val"]
+    val_sample = val_samples[0]
+    with Image.open(val_sample.image_path) as opened:
+        opened.resize((256, 256)).save(val_sample.image_path)
+    val_sample.width = val_sample.height = 256
+    for smaller in val_samples[1:]:
+        with Image.open(smaller.image_path) as opened:
+            opened.resize((100, 100)).save(smaller.image_path)
+        smaller.width = smaller.height = 100
+    dataset.manifest["geometry"] = {
+        "native_tile_size": 128,
+        "tiled": False,
+    }
+    checkpoints = [tmp_path / "native.pt", tmp_path / "sahi.pt"]
+    for checkpoint in checkpoints:
+        checkpoint.write_bytes(checkpoint.stem.encode())
+    sahi_only = Model.load_many(
+        {
+            "sahi": {
+                "path": checkpoints[1],
+                "task": "detect",
+                "native_tile_size": 128,
+                "upscale_factor": 1,
+                "inference": "sahi",
+            }
+        }
+    )
+    mixed = Model.load_many(
+        {
+            "native": {
+                "path": checkpoints[0],
+                "task": "detect",
+                "native_tile_size": 128,
+                "upscale_factor": 1,
+                "inference": "native",
+            },
+            "sahi": {
+                "path": checkpoints[1],
+                "task": "detect",
+                "native_tile_size": 128,
+                "upscale_factor": 1,
+                "inference": "sahi",
+            },
+        }
+    )
+
+    sahi_active = validate_collection_geometry(
+        dataset, sahi_only, split="val", errors="skip"
+    )
+    mixed_active = validate_collection_geometry(
+        dataset, mixed, split="val", errors="skip"
+    )
+
+    assert not sahi_active._geometry_skip_audit
+    assert len(mixed_active._geometry_skip_audit) == 1
+    assert mixed_active._geometry_maximum_size == (128, 128)
 
 
 def test_comparison_size_policy_uses_one_fair_filtered_cohort(
@@ -618,6 +727,20 @@ def test_model_collection_compare_atomic_result(
     assert list(prediction_cache.glob("*/cache-manifest.json"))
     assert not list(tmp_path.glob(".comparison.building-*"))
 
+    old_manifest_path = destination / "reports" / "result.json"
+    old_manifest = json.loads(old_manifest_path.read_text())
+    old_manifest["schema"] = 7
+    old_manifest_path.write_text(json.dumps(old_manifest), encoding="utf-8")
+    regenerated = models.compare(
+        dataset,
+        split="val",
+        progress=False,
+        destination=destination,
+    )
+    assert fake_inference.calls == 1
+    assert json.loads(old_manifest_path.read_text())["schema"] == 8
+    assert regenerated.cache_statistics["prediction_hits"] == 1
+
     models.compare(
         dataset,
         split="val",
@@ -682,6 +805,10 @@ def test_segment_comparison_adds_postprocessed_binary_breakdown(
         size=(16, 16),
     )
     dataset = Dataset.open(source, task="segment", progress=False)
+    dataset.manifest["geometry"] = {
+        "native_tile_size": 16,
+        "tiled": True,
+    }
     checkpoint = tmp_path / "segment.pt"
     checkpoint.write_bytes(b"segment checkpoint")
 
@@ -721,6 +848,8 @@ def test_segment_comparison_adds_postprocessed_binary_breakdown(
             "segmenter": {
                 "path": checkpoint,
                 "task": "segment",
+                "native_tile_size": 16,
+                "upscale_factor": 1,
                 "confidence": 0.5,
                 "postprocess": 0.5,
             }
@@ -738,8 +867,21 @@ def test_segment_comparison_adds_postprocessed_binary_breakdown(
     assert row["empty_cases"] == 1
     assert row["empty_image_specificity"] == pytest.approx(1.0)
     manifest = json.loads((destination / "reports" / "result.json").read_text())
-    assert manifest["schema"] == 7
+    assert manifest["schema"] == 8
     assert manifest["ranking"][0]["positive_micro_iou"] == pytest.approx(1.0)
+    assert manifest["ranking"][0]["small_object_dice"] == pytest.approx(1.0)
+    assert manifest["object_size_analysis"]["status"] == "complete"
+    assert not any(
+        "unavailable for tiled" in limitation
+        for limitation in manifest["limitations"]
+    )
+    assert manifest["object_size_analysis"]["reference_object_extraction"] == (
+        "native-instance-annotations"
+    )
+    assert manifest["object_size_analysis"]["matching_class_policy"] == "class-aware"
+    assert manifest["object_size_analysis"]["connectivity"] is None
+    assert manifest["reports"]["metric_breakdown"] == "reports/metric-breakdown.png"
+    assert (destination / "reports" / "object-size-breakdown.png").is_file()
 
 
 def test_comparison_visuals_have_data_and_metadata_sidecars(

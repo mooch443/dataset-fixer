@@ -1046,10 +1046,12 @@ class Model:
             device: Device override.
             batch_size: Inference batch override. ``-1`` adaptively retries
                 accelerator OOM failures with smaller batches.
-            errors: Oversized-input policy. Images at or below the model's
-                declared ``native_tile_size`` are always predicted. ``"raise"``
-                rejects an image exceeding either dimension; ``"skip"`` omits
-                it and records the omission in the result settings.
+            errors: Oversized-input policy for native inference. Images at or
+                below the model's declared ``native_tile_size`` are always
+                predicted. ``"raise"`` rejects an image exceeding either
+                dimension; ``"skip"`` omits it and records the omission in the
+                result settings. SAHI accepts larger full images and slices them
+                with the configured native tile geometry.
             progress: Show package-managed progress bars.
             destination: Optional new/empty directory receiving saved output.
             settings: Additional per-call adapter overrides.
@@ -1086,12 +1088,15 @@ class Model:
             raise ValueError("confidence must be finite and in [0, 1]")
         if not math.isfinite(effective_postprocess) or not 0 <= effective_postprocess <= 1:
             raise ValueError("postprocess must be finite and in [0, 1]")
+        requested = inference or self.inference
+        if requested not in {"native", "sahi"}:
+            raise ValueError("inference must be 'native' or 'sahi'; 'auto' was removed")
         inputs, source_task = normalize_model_inputs(
             source, split=split, progress=progress
         )
         inputs, skipped_inputs = filter_inputs_by_size(
             inputs,
-            maximum=self.native_tile_size,
+            maximum=None if requested == "sahi" else self.native_tile_size,
             errors=errors,
             source=self.name,
         )
@@ -1128,9 +1133,6 @@ class Model:
         from .sahi_support import reject_legacy_sahi_settings, resolve_sahi_settings
 
         reject_legacy_sahi_settings(combined_settings)
-        requested = inference or self.inference
-        if requested not in {"native", "sahi"}:
-            raise ValueError("inference must be 'native' or 'sahi'; 'auto' was removed")
         effective_resolution = resolution or self.resolution or 480
         resolved_sahi = resolve_sahi_settings(
             combined_settings,
@@ -1233,11 +1235,22 @@ class Model:
                 **combined_settings,
                 **(resolved_sahi.as_dict() if selected_backend == "sahi" else {}),
             }
+        maximum_size = (
+            None
+            if requested == "sahi"
+            else list(self.native_tile_size) if self.native_tile_size else None
+        )
+        if requested == "sahi":
+            oversized_action = "retain-for-sahi-slicing"
+        elif maximum_size is None:
+            oversized_action = "retain"
+        else:
+            oversized_action = "skip" if errors == "skip" else "raise"
         resolved_settings["source_size_policy"] = {
             "errors": errors,
-            "maximum_size": list(self.native_tile_size) if self.native_tile_size else None,
+            "maximum_size": maximum_size,
             "smaller_or_equal": "retain",
-            "oversized": "skip" if errors == "skip" else "raise",
+            "oversized": oversized_action,
             "skipped_inputs": list(skipped_inputs),
         }
         result = PredictionResult(
@@ -1677,8 +1690,10 @@ class ModelCollection:
                 Cases with neither a reference nor a prediction are
                 skipped, since their panels are empty.
             errors: Oversized-image policy. Smaller images are valid for every
-                backend. ``"skip"`` omits images exceeding any model's common
-                native-size limit and records them in report settings.
+                backend. SAHI models accept larger full images and use
+                ``native_tile_size`` as their slice geometry. ``"skip"`` omits
+                images exceeding any native-inference model's shared size limit
+                and records them in report settings.
             progress: Show package-managed progress bars.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.

@@ -271,11 +271,16 @@ def validate_collection_geometry(
 
     problems: list[dict[str, Any]] = []
     maxima: list[Size] = []
-    if dataset_geometry.native_tile_size is not None:
+    models = tuple(collection)
+    has_native_inference = any(model.inference != "sahi" for model in models)
+    if dataset_geometry.native_tile_size is not None and has_native_inference:
         maxima.append(dataset_geometry.native_tile_size)
-    for model in collection:
+    for model in models:
         geometry = model.geometry
-        if geometry.native_tile_size is not None:
+        # ``native_tile_size`` is the source-image limit for native inference,
+        # but it is the slice geometry for SAHI.  Full-size SAHI sources must
+        # reach the slicer instead of being rejected here.
+        if geometry.native_tile_size is not None and model.inference != "sahi":
             maxima.append(geometry.native_tile_size)
         if tiled and not geometry.complete:
             missing = [
@@ -336,4 +341,5 @@ def validate_collection_geometry(
     )
     active._geometry_errors = policy
     active._geometry_maximum_size = maximum
+    active._geometry_all_sahi = bool(models) and not has_native_inference
     return active

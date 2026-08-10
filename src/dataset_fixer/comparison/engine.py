@@ -27,6 +27,18 @@ from .metrics import (
     paired_statistics,
     segmentation_binary_metric_breakdown,
 )
+from .object_sizes import (
+    evaluate_object_size_model,
+    object_size_report_artifacts_exist,
+    polygon_components,
+    prepare_object_size_reference,
+    render_large_object_examples,
+    render_object_size_breakdown,
+    render_segmentation_metric_breakdown,
+    select_large_examples,
+    skipped_object_size_reference,
+    unavailable_object_size_summary,
+)
 from .reporting import (
     combine_report_plots,
     render_figures,
@@ -41,7 +53,7 @@ if TYPE_CHECKING:
     from ..dataset import Dataset
 
 
-_MODEL_COMPARISON_REPORT_SCHEMA = 7
+_MODEL_COMPARISON_REPORT_SCHEMA = 8
 
 
 def _compare_models(
@@ -103,6 +115,15 @@ def _compare_models(
             f"Only {independent_clusters} independent ultimate-original clusters are available; paired uncertainty estimates may be unstable."
         )
 
+    geometry_maximum = to_jsonable(
+        getattr(dataset, "_geometry_maximum_size", None)
+    )
+    if getattr(dataset, "_geometry_all_sahi", False):
+        oversized_action = "retain-for-sahi-slicing"
+    elif geometry_maximum is None:
+        oversized_action = "retain"
+    else:
+        oversized_action = "skip" if errors == "skip" else "raise"
     resolved_settings = {
         "report_schema": _MODEL_COMPARISON_REPORT_SCHEMA,
         "split": cohort.split,
@@ -114,11 +135,9 @@ def _compare_models(
         "models": model_systems,
         "source_size_policy": {
             "errors": errors,
-            "maximum_size": to_jsonable(
-                getattr(dataset, "_geometry_maximum_size", None)
-            ),
+            "maximum_size": geometry_maximum,
             "smaller_or_equal": "retain",
-            "oversized": "skip" if errors == "skip" else "raise",
+            "oversized": oversized_action,
             "skipped_inputs": geometry_skips,
         },
     }
@@ -157,7 +176,10 @@ def _compare_models(
         and (not save_prediction_plots or (target / "predictions").is_dir())
     ):
         cached_manifest = json.loads(existing_result.read_text(encoding="utf-8"))
-        if cached_manifest.get("schema") == _MODEL_COMPARISON_REPORT_SCHEMA:
+        if (
+            cached_manifest.get("schema") == _MODEL_COMPARISON_REPORT_SCHEMA
+            and object_size_report_artifacts_exist(target, cached_manifest)
+        ):
             print(f"Reusing complete comparison: {target}")
             return _result_from_manifest(target, cached_manifest)
     temporary = build_staging_dir(
@@ -301,6 +323,41 @@ def _compare_models(
         reports_dir = temporary / "reports"
         combine_report_plots((temporary / "figures",), reports_dir / "plots.png")
         combine_report_plots((temporary / "qualitative",), reports_dir / "comparison.png")
+        metric_breakdown_path: str | None = None
+        if cohort.task == "segment":
+            rendered_metric_breakdown = render_segmentation_metric_breakdown(
+                reports_dir,
+                ranking,
+                title=(
+                    "Instance-segmentation metric breakdown — "
+                    "final reconstructed source images"
+                ),
+            )
+            metric_breakdown_path = str(
+                rendered_metric_breakdown.relative_to(temporary)
+            )
+        (
+            object_size_analysis,
+            object_size_breakdown_path,
+            large_object_examples,
+        ) = _analyze_native_object_sizes(
+            cohort,
+            best_predictions,
+            best_confidences,
+            ranking,
+            reports_dir,
+        )
+        if (
+            cohort.task == "segment"
+            and object_size_analysis["status"] == "skipped"
+        ):
+            skip_reason = str(object_size_analysis["reason"])
+            limitations.append(skip_reason)
+            print(f"Object-size analysis skipped: {skip_reason}")
+        object_size_analysis["examples"] = large_object_examples
+        large_object_example_paths = [
+            str(example["path"]) for example in large_object_examples
+        ]
         prediction_paths: list[str] = []
         if save_prediction_plots:
             prediction_paths = render_prediction_grids(
@@ -333,9 +390,13 @@ def _compare_models(
             "settings_fingerprint": fingerprint,
             "model_hashes": model_hashes,
             "ranking": ranking,
+            "object_size_analysis": object_size_analysis,
             "limitations": limitations,
             "reports": {
                 "plots": "reports/plots.png",
+                "metric_breakdown": metric_breakdown_path,
+                "object_size_breakdown": object_size_breakdown_path,
+                "large_object_examples": large_object_example_paths,
                 "comparison": "reports/comparison.png",
                 "prediction_plots": prediction_paths,
             },
@@ -361,6 +422,11 @@ def _compare_models(
         f"Comparison complete: {target}\nCohort verified: yes; training overlap: "
         f"{'detected' if overlap else 'none detected'}; cache verified: {'yes' if cache_verified else 'no'}"
     )
+    if object_size_analysis["status"] == "complete":
+        print(
+            f"Object-size report: {target / 'reports' / 'object-size-breakdown.png'}\n"
+            f"Large-object examples: {len(large_object_example_paths)}"
+        )
     return ComparisonResult(
         location=target,
         ranking=tuple(ranking),
@@ -374,6 +440,90 @@ def _compare_models(
         settings=resolved_settings,
         limitations=tuple(limitations),
     )
+
+
+def _analyze_native_object_sizes(
+    cohort: Cohort,
+    predictions_by_model: dict[str, dict[str, list[Prediction]]],
+    confidences_by_model: dict[str, float],
+    ranking: list[dict[str, Any]],
+    reports: Path,
+) -> tuple[dict[str, Any], str | None, list[dict[str, Any]]]:
+    """Score final postprocessed instance polygons in native source pixels."""
+
+    if cohort.task != "segment":
+        reference = skipped_object_size_reference(
+            "object-size analysis applies only to segmentation comparisons"
+        )
+        return reference.metadata(), None, []
+    reference = prepare_object_size_reference(
+        {
+            record.image_id: polygon_components(
+                record.width,
+                record.height,
+                record.annotations,
+                image_id=record.image_id,
+                relative_path=record.relative_path,
+                image_path=record.image_path,
+                prefix="reference",
+                strict=True,
+            )
+            for record in cohort.records
+        },
+        reference_extraction="native-instance-annotations",
+        prediction_extraction="final-shifted-postprocessed-instance-polygons",
+        connectivity=None,
+        matching_class_policy="class-aware",
+    )
+    if reference.status != "complete":
+        for row in ranking:
+            row.update(unavailable_object_size_summary())
+        return reference.metadata(), None, []
+
+    predictions: dict[str, dict[str, tuple[Any, ...]]] = {}
+    results = {}
+    for row in ranking:
+        model_name = str(row["model"])
+        confidence = confidences_by_model[model_name]
+        by_image = {
+            record.image_id: polygon_components(
+                record.width,
+                record.height,
+                [
+                    prediction
+                    for prediction in predictions_by_model[model_name].get(
+                        record.image_id, []
+                    )
+                    if prediction.score >= confidence
+                ],
+                image_id=record.image_id,
+                relative_path=record.relative_path,
+                image_path=record.image_path,
+                prefix=f"prediction-{model_name}",
+                strict=False,
+            )
+            for record in cohort.records
+        }
+        predictions[model_name] = by_image
+        result = evaluate_object_size_model(reference, by_image)
+        results[model_name] = result
+        row.update(result.summary)
+
+    size_path = render_object_size_breakdown(reports, ranking, reference)
+    examples = render_large_object_examples(
+        reports,
+        select_large_examples(reference, results),
+        predictions,
+        results,
+        {
+            str(row["model"]): str(row.get("backend") or "unknown")
+            for row in ranking
+        },
+    )
+    relative_size_path = (
+        str(size_path.relative_to(reports.parent)) if size_path is not None else None
+    )
+    return reference.metadata(), relative_size_path, examples
 
 
 def _evaluate_model(
