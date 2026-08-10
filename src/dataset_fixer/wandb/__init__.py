@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import warnings
 from dataclasses import replace
 from pathlib import Path
@@ -12,6 +13,33 @@ from typing import Any, Mapping
 from ..bundle import Bundle, Config, Outcome
 from ..convert import Prepared
 from ..geometry import Geometry
+
+
+_HELDOUT_BREAKDOWN_FIELDS = (
+    "dice",
+    "iou",
+    "micro_dice",
+    "micro_iou",
+    "foreground_precision",
+    "foreground_recall",
+    "positive_case_dice",
+    "positive_case_iou",
+    "positive_micro_dice",
+    "positive_micro_iou",
+    "positive_foreground_precision",
+    "positive_foreground_recall",
+    "positive_cases",
+    "positive_detected_cases",
+    "positive_missed_cases",
+    "positive_image_recall",
+    "empty_cases",
+    "empty_correct_cases",
+    "empty_false_positive_cases",
+    "empty_image_specificity",
+    "empty_image_false_positive_rate",
+    "empty_false_positive_pixels",
+    "empty_mean_false_positive_pixels",
+)
 
 
 def _size(value: tuple[int, int] | None) -> str | None:
@@ -265,6 +293,84 @@ def _set_summary(run: Any, values: Mapping[str, Any]) -> None:
             pass
 
 
+def _comparison_result_file(value: Any) -> tuple[Path, Path]:
+    """Return the completed comparison manifest and its portable report root."""
+
+    location = Path(str(value)).expanduser()
+    if location.is_file():
+        return location, location.parent
+    return location / "reports" / "result.json", location
+
+
+def _matching_ranking_row(rows: list[Any], run: Any) -> Mapping[str, Any] | None:
+    candidates = [row for row in rows if isinstance(row, Mapping)]
+    if len(candidates) == 1:
+        return candidates[0]
+
+    run_id = str(getattr(run, "id", "") or "").strip()
+    if not run_id:
+        return None
+    matches = []
+    for row in candidates:
+        model = str(row.get("model", ""))
+        source = str(row.get("model_source", ""))
+        if source == run_id or source.rstrip("/").endswith(f"/{run_id}"):
+            matches.append(row)
+        elif f"__{run_id}__" in model:
+            matches.append(row)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _heldout_breakdown_values(
+    comparison_report: Any,
+    run: Any,
+) -> tuple[dict[str, Any], str | None]:
+    """Read all held-out metrics from one atomically completed comparison."""
+
+    result_file, report_root = _comparison_result_file(comparison_report)
+    try:
+        manifest = json.loads(result_file.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return {}, f"cannot read {result_file}: {type(exc).__name__}: {exc}"
+
+    if not isinstance(manifest, Mapping):
+        return {}, f"invalid comparison manifest in {result_file}"
+    if manifest.get("kind") != "semantic-mask-model-comparison":
+        return {}, f"not a semantic comparison report: {result_file}"
+    if manifest.get("cohort_verified") is not True or manifest.get("completed_at_unix") is None:
+        return {}, f"comparison report is not marked complete and cohort-verified: {result_file}"
+
+    ranking = manifest.get("ranking")
+    if not isinstance(ranking, list):
+        return {}, f"comparison report has no ranking: {result_file}"
+    row = _matching_ranking_row(ranking, run)
+    if row is None:
+        return {}, (
+            "comparison report contains multiple models and none uniquely matches "
+            f"W&B run {getattr(run, 'id', None)!r}: {result_file}"
+        )
+    missing = [field for field in _HELDOUT_BREAKDOWN_FIELDS if field not in row]
+    if missing:
+        return {}, (
+            "comparison report predates the complete held-out breakdown; rerun evaluation "
+            f"with the current dataset-fixer (missing: {', '.join(missing)}): {result_file}"
+        )
+
+    try:
+        source_file = result_file.relative_to(report_root).as_posix()
+    except ValueError:
+        source_file = result_file.name
+    values = {
+        "schema": 1,
+        "source": "completed dataset-fixer semantic comparison report",
+        "case_unit": "final postprocessed source image",
+        "source_artifact": report_root.name,
+        "source_file": source_file,
+        **{field: row[field] for field in _HELDOUT_BREAKDOWN_FIELDS},
+    }
+    return {f"heldout_breakdown/{key}": value for key, value in values.items()}, None
+
+
 def upload(
     run: Any,
     bundle: Bundle,
@@ -337,6 +443,26 @@ def upload(
                     **dict(outcome.metrics),
                 }
             )
+            comparison_report = outcome.metrics.get("comparison_report")
+            if comparison_report is not None:
+                breakdown, reason = _heldout_breakdown_values(
+                    comparison_report,
+                    selected,
+                )
+                if reason is not None:
+                    warnings.warn(
+                        f"Held-out breakdown was not published: {reason}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                else:
+                    # Explicit caller-supplied summary fields remain authoritative.
+                    for key, value in breakdown.items():
+                        summary_values.setdefault(key, value)
+                    print(
+                        "Published 28 heldout_breakdown fields from the completed "
+                        "semantic comparison report."
+                    )
         _set_summary(
             selected,
             {key: value for key, value in summary_values.items() if value is not None},

@@ -730,3 +730,123 @@ def test_wandb_helpers_configure_upload_and_preserve_local_failures(tmp_path: Pa
     missing = upload(None, bundle)
     assert not missing.uploaded
     assert missing.path.is_file()
+
+
+def test_wandb_upload_publishes_complete_heldout_breakdown(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"weights")
+    report = tmp_path / "evaluations" / "completed-report"
+    result_file = report / "reports" / "result.json"
+    result_file.parent.mkdir(parents=True)
+    metric_values = {
+        "dice": 0.7,
+        "iou": 0.6,
+        "micro_dice": 0.71,
+        "micro_iou": 0.61,
+        "foreground_precision": 0.72,
+        "foreground_recall": 0.73,
+        "positive_case_dice": 0.74,
+        "positive_case_iou": 0.64,
+        "positive_micro_dice": 0.75,
+        "positive_micro_iou": 0.65,
+        "positive_foreground_precision": 0.76,
+        "positive_foreground_recall": 0.77,
+        "positive_cases": 10,
+        "positive_detected_cases": 9,
+        "positive_missed_cases": 1,
+        "positive_image_recall": 0.9,
+        "empty_cases": 5,
+        "empty_correct_cases": 4,
+        "empty_false_positive_cases": 1,
+        "empty_image_specificity": 0.8,
+        "empty_image_false_positive_rate": 0.2,
+        "empty_false_positive_pixels": 12,
+        "empty_mean_false_positive_pixels": 2.4,
+    }
+    result_file.write_text(
+        json.dumps(
+            {
+                "schema": 12,
+                "kind": "semantic-mask-model-comparison",
+                "cohort_verified": True,
+                "completed_at_unix": 123.0,
+                "ranking": [{"model": "trained-model", **metric_values}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = Config(
+        name="school-sem",
+        framework="ultralytics",
+        task="semantic",
+        geometry=Geometry.create(input_size=128),
+        dataset={"content_sha256": "abc", "preparation_kind": "yolo-sem"},
+    )
+    outcome = Outcome(
+        checkpoint=checkpoint,
+        metrics={"comparison_report": str(report)},
+    )
+    bundle = create(config, outcome, destination=tmp_path / "bundle", progress=False)
+    run = SimpleNamespace(id="run-id", summary={})
+    run.upload_file = lambda _path: SimpleNamespace(url="https://example.invalid/file")
+
+    uploaded = upload(run, bundle, outcome)
+
+    assert uploaded.uploaded
+    breakdown = {
+        key: value
+        for key, value in run.summary.items()
+        if key.startswith("heldout_breakdown/")
+    }
+    assert len(breakdown) == 28
+    for key, value in metric_values.items():
+        assert breakdown[f"heldout_breakdown/{key}"] == value
+    assert breakdown["heldout_breakdown/schema"] == 1
+    assert breakdown["heldout_breakdown/source"] == (
+        "completed dataset-fixer semantic comparison report"
+    )
+    assert breakdown["heldout_breakdown/case_unit"] == (
+        "final postprocessed source image"
+    )
+    assert breakdown["heldout_breakdown/source_artifact"] == "completed-report"
+    assert breakdown["heldout_breakdown/source_file"] == "reports/result.json"
+
+
+def test_wandb_upload_never_publishes_partial_heldout_breakdown(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"weights")
+    report = tmp_path / "old-report"
+    result_file = report / "reports" / "result.json"
+    result_file.parent.mkdir(parents=True)
+    result_file.write_text(
+        json.dumps(
+            {
+                "schema": 11,
+                "kind": "semantic-mask-model-comparison",
+                "cohort_verified": True,
+                "completed_at_unix": 123.0,
+                "ranking": [{"model": "trained-model", "dice": 0.7, "iou": 0.6}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = Config(
+        name="school-sem",
+        framework="ultralytics",
+        task="semantic",
+        geometry=Geometry.create(input_size=128),
+        dataset={"content_sha256": "abc", "preparation_kind": "yolo-sem"},
+    )
+    outcome = Outcome(
+        checkpoint=checkpoint,
+        metrics={"comparison_report": str(report)},
+    )
+    bundle = create(config, outcome, destination=tmp_path / "bundle", progress=False)
+    run = SimpleNamespace(id="run-id", summary={})
+    run.upload_file = lambda _path: SimpleNamespace(url="https://example.invalid/file")
+
+    with pytest.warns(RuntimeWarning, match="predates the complete held-out breakdown"):
+        uploaded = upload(run, bundle, outcome)
+
+    assert uploaded.uploaded
+    assert not any(key.startswith("heldout_breakdown/") for key in run.summary)
