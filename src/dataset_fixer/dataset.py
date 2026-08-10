@@ -426,11 +426,6 @@ class Dataset:
         return self._location
 
     @property
-    def source_name(self) -> str:
-        """Portable basename of the folder or ZIP used to open the dataset."""
-        return self._source_name
-
-    @property
     def data_yaml(self) -> Path | None:
         """Canonical YOLO training YAML, or ``None`` for masks and virtual plans."""
         return None if self._plan else self._data_yaml
@@ -1937,7 +1932,7 @@ class Dataset:
         virtual_name = slugify(name) if name else derived_name(self.name, operation.kind, operation.settings)
         return Dataset(
             location=self.location,
-            source_name=self.source_name,
+            source_name=self._source_name,
             name=virtual_name,
             task=self.task,
             metadata=metadata or self._metadata.copy(),

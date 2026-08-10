@@ -945,7 +945,7 @@ def prepare(
             )
         if progress:
             print(f"Cache hit: prepared {target_kind.value} dataset at {root}")
-        existing = replace(existing, source_name=dataset.source_name)
+        existing = replace(existing, source_name=dataset._source_name)
         return _attach_config(
             existing,
             name=name,
@@ -1015,7 +1015,7 @@ def prepare(
             "content_sha256": content_digest,
             "source": {
                 "name": dataset.name,
-                "basename": dataset.source_name,
+                "basename": dataset._source_name,
                 "location": str(dataset.location),
             },
             "geometry": geometry.as_dict(),

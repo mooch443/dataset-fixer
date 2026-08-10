@@ -50,7 +50,7 @@ def test_zip_source_basename_reaches_preparation_bundle_and_wandb(
         progress=False,
     )
 
-    assert dataset.source_name == archive.name
+    assert dataset._source_name == archive.name
     assert prepared.source_name == archive.name
     assert _dataset(prepared)["source_dataset_zip"] == archive.name
 
@@ -61,6 +61,7 @@ def test_zip_source_basename_reaches_preparation_bundle_and_wandb(
     )
     configure(run, prepared.config)
     assert run.config["dataset_source"] == archive.name
+    assert run.config["source_dataset_zip"] == archive.name
     assert archive.name in run.tags
     assert f"source-zip-{archive.stem}" not in run.tags
 
@@ -90,13 +91,14 @@ def test_folder_source_basename_is_tagged_without_absolute_path(tmp_path: Path) 
         framework="ultralytics",
         task="detect",
         geometry=Geometry.create(native_tile_size=64),
-        dataset={"dataset_source": dataset.source_name},
+        dataset={"dataset_source": dataset._source_name},
     )
     run = SimpleNamespace(config=_RunConfig(), tags=(), update=lambda: None)
 
     configure(run, config)
 
-    assert dataset.source_name == "training-folder"
+    assert dataset._source_name == "training-folder"
     assert run.config["dataset_source"] == "training-folder"
+    assert "source_dataset_zip" not in run.config
     assert "training-folder" in run.tags
     assert str(tmp_path) not in repr((run.config, run.tags))

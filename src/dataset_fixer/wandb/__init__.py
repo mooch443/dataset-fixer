@@ -57,6 +57,11 @@ def _values(config: Config | Mapping[str, Any]) -> tuple[dict[str, Any], list[st
             "dataset_content_sha256": dataset_hash,
             "dataset_preparation": preparation,
             "dataset_source": dataset_source,
+            "source_dataset_zip": (
+                dataset_source
+                if dataset_source and dataset_source.lower().endswith(".zip")
+                else None
+            ),
             **dict(config.training),
         }
     else:
