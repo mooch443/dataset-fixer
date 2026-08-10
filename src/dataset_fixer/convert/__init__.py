@@ -21,6 +21,7 @@ from tqdm.auto import tqdm
 
 from ..errors import DatasetValidationError, ValidationIssue
 from ..geometry import Geometry, normalize_size
+from ..io import annotation_to_yolo
 from ..sources import cache_root, fingerprint_files
 from ..utils import slugify, to_jsonable
 
@@ -34,6 +35,25 @@ class Kind(str, Enum):
     YOLO_SEM = "yolo-sem"
     YOLO_SEG = "yolo-seg"
     NNUNET = "nnunet"
+
+
+_YOLO_LAYOUT_REVISION = "split-first-valid-v1"
+
+
+def _yolo_split_directory(split: str) -> str:
+    """Return the physical YOLO directory for one canonical dataset split."""
+
+    return "valid" if split in {"val", "valid", "validation"} else split
+
+
+def _yolo_split_entries(splits: tuple[str, ...]) -> dict[str, str | None]:
+    """Build portable Ultralytics split entries for a prepared dataset."""
+
+    entries: dict[str, str | None] = {"train": None, "val": None}
+    for split in splits:
+        key = "val" if split in {"val", "valid", "validation"} else split
+        entries[key] = f"{_yolo_split_directory(split)}/images"
+    return entries
 
 
 @dataclass(frozen=True)
@@ -385,8 +405,9 @@ def _convert_semantic_case(
         )
         mask = np.asarray(mask_image, dtype=np.uint8)
     case_id = f"{sample.split}_{slugify(item[0].relative_path.stem)}_{hashlib.sha1(str(item[0].relative_path).encode()).hexdigest()[:8]}"
-    image_output = root / "images" / sample.split / f"{case_id}.png"
-    mask_output = root / "masks" / sample.split / f"{case_id}.png"
+    split_directory = _yolo_split_directory(sample.split)
+    image_output = root / split_directory / "images" / f"{case_id}.png"
+    mask_output = root / split_directory / "labels" / f"{case_id}.png"
     image_output.parent.mkdir(parents=True, exist_ok=True)
     mask_output.parent.mkdir(parents=True, exist_ok=True)
     image.save(image_output, format="PNG", compress_level=1)
@@ -468,6 +489,10 @@ def _prepare_yolo_sem(
 ) -> tuple[dict[str, Path], dict[str, dict[str, int]], dict[str, Any]]:
     if dataset.format != "semantic_masks":
         raise DatasetValidationError("YOLO-SEM preparation requires semantic image/mask pairs")
+    for split in dataset.splits:
+        split_root = root / _yolo_split_directory(split)
+        (split_root / "images").mkdir(parents=True, exist_ok=True)
+        (split_root / "labels").mkdir(parents=True, exist_ok=True)
     masks = dict(dataset._mask_paths)
     items = [
         (sample, sample.image_path.resolve(), masks[sample.image_path.resolve()])
@@ -507,9 +532,8 @@ def _prepare_yolo_sem(
             "skipped_oversized_images": len(skipped_split),
         }
     data = {
-        "path": str(root),
-        **{split: f"images/{split}" for split in dataset.splits},
-        "masks_dir": "masks",
+        **_yolo_split_entries(dataset.splits),
+        "masks_dir": "labels",
         "names": {int(key): value for key, value in dataset.classes.items()},
     }
     data_yaml = root / "data.yaml"
@@ -518,6 +542,7 @@ def _prepare_yolo_sem(
     _write_json(cases, records)
     backend = {
         "task": "semantic",
+        "layout": _YOLO_LAYOUT_REVISION,
         "image_resize": "bicubic",
         "mask_resize": "nearest",
         "label_mapping": {"background": 0, "foreground": 1, "ignore": 255},
@@ -614,35 +639,55 @@ def _prepare_yolo_seg(
         )
     audit = root / "polygon-audit.json"
     _write_json(audit, {"status": "passed", "splits": statistics})
-    paths = {"dataset_root": dataset.location, "audit": audit}
-    if skipped:
-        for split, samples in retained_by_split.items():
-            (root / f"{split}.txt").write_text(
-                "".join(f"{sample.image_path.resolve()}\n" for sample in samples),
+    for split, samples in retained_by_split.items():
+        split_root = root / _yolo_split_directory(split)
+        images_root = split_root / "images"
+        labels_root = split_root / "labels"
+        images_root.mkdir(parents=True, exist_ok=True)
+        labels_root.mkdir(parents=True, exist_ok=True)
+        for sample in samples:
+            image_output = images_root / sample.relative_path
+            label_output = labels_root / sample.relative_path.with_suffix(".txt")
+            image_output.parent.mkdir(parents=True, exist_ok=True)
+            label_output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(sample.image_path, image_output)
+            rows = [
+                annotation_to_yolo(
+                    annotation,
+                    dataset.task,
+                    sample.width,
+                    sample.height,
+                    dataset._metadata,
+                )
+                for annotation in sample.annotations
+            ]
+            label_output.write_text(
+                "\n".join(rows) + ("\n" if rows else ""),
                 encoding="utf-8",
             )
-        data_yaml = root / "data.yaml"
-        data_yaml.write_text(
-            yaml.safe_dump(
-                {
-                    **{split: f"{split}.txt" for split in retained_by_split},
-                    "names": {int(key): value for key, value in dataset.classes.items()},
-                },
-                sort_keys=False,
-            ),
-            encoding="utf-8",
-        )
+    data_yaml = root / "data.yaml"
+    data_yaml.write_text(
+        yaml.safe_dump(
+            {
+                **_yolo_split_entries(dataset.splits),
+                "names": {int(key): value for key, value in dataset.classes.items()},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    paths = {"dataset_root": root, "data_yaml": data_yaml, "audit": audit}
+    if skipped:
         skip_report = root / "preparation-skips.json"
         _write_json(
             skip_report,
             {"errors": "skip", "skipped_images": len(skipped), "records": skipped},
         )
-        paths.update({"data_yaml": data_yaml, "skips": skip_report})
-    elif dataset.data_yaml is not None:
-        paths["data_yaml"] = dataset.data_yaml
+        paths["skips"] = skip_report
     return paths, statistics, {
         "task": "segment",
-        "conversion": "none",
+        "conversion": "canonical-yolo-layout",
+        "layout": _YOLO_LAYOUT_REVISION,
         "polygon_audit": "passed",
         "source_size_policy": {
             "errors": errors,
@@ -919,6 +964,11 @@ def prepare(
         source=dataset.name,
     )
     settings = {
+        "layout_revision": (
+            _YOLO_LAYOUT_REVISION
+            if target_kind in {Kind.YOLO_SEM, Kind.YOLO_SEG}
+            else None
+        ),
         "native_tile_size": geometry.native_tile_size,
         "upscale_factor": geometry.upscale_factor,
         "input_size": geometry.input_size,

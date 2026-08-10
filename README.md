@@ -633,6 +633,19 @@ bundle = create(config, Outcome(checkpoint="runs/segment/train/weights/best.pt")
 bundle = upload(existing_run, bundle)  # local ZIP survives every outcome
 ```
 
+YOLO preparations are published in a split-first layout:
+
+```text
+train/images/  train/labels/
+valid/images/  valid/labels/
+```
+
+Their portable `data.yaml` keeps the Ultralytics `val` key but points it to
+`valid/images`. It contains no absolute `path`, so it continues to resolve
+relative to the YAML file after a cache move or atomic publication. YOLO
+semantic masks are PNG files under the corresponding `labels` directory and
+are selected with `masks_dir: labels`.
+
 `prepare()` records exact interpolation and label mapping, requires an explicit
 threshold for binary JPEG recovery, never derives polygons from semantic masks,
 and content-addresses all generated data. Images at or below

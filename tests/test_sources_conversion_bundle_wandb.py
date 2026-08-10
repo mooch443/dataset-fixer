@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import yaml
 from PIL import Image
 
 from dataset_fixer import Dataset, DatasetValidationError, Geometry, Model
@@ -296,7 +297,33 @@ def test_prepare_thresholds_jpeg_resizes_and_reuses(tmp_path: Path) -> None:
     assert second.config.name == "semantic-run-b"
     assert second.config.training["epochs"] == 10
     assert second.config.training["device"] == "cuda"
-    prepared_masks = sorted((first.location / "masks").rglob("*.png"))
+    data = yaml.safe_load(first.data_yaml.read_text(encoding="utf-8"))
+    assert data == {
+        "train": "train/images",
+        "val": "valid/images",
+        "masks_dir": "labels",
+        "names": {0: "island"},
+    }
+    assert "path" not in data
+    for directory in ("train/images", "train/labels", "valid/images", "valid/labels"):
+        assert (first.location / directory).is_dir()
+    assert not (first.location / "images").exists()
+    assert not (first.location / "masks").exists()
+
+    from ultralytics.data.utils import check_det_dataset, img2label_paths
+
+    checked = check_det_dataset(str(first.data_yaml), autodownload=False)
+    assert checked["train"] == str((first.location / "train/images").resolve())
+    assert checked["val"] == str((first.location / "valid/images").resolve())
+    prepared_images = sorted(first.location.glob("*/images/**/*.png"))
+    expected_masks = img2label_paths(
+        [str(path) for path in prepared_images],
+        label_dir=checked["masks_dir"],
+        suffix=".png",
+    )
+    assert all(Path(path).is_file() for path in expected_masks)
+
+    prepared_masks = sorted(first.location.glob("*/labels/**/*.png"))
     assert prepared_masks
     with Image.open(prepared_masks[0]) as opened:
         assert opened.size == (64, 64)
@@ -336,7 +363,7 @@ def test_prepare_retains_and_resizes_smaller_images_by_default(tmp_path: Path) -
         "smaller_or_equal": "retain-and-resize",
         "oversized": "raise",
     }
-    for path in (prepared.location / "images").rglob("*.png"):
+    for path in prepared.location.glob("*/images/**/*.png"):
         with Image.open(path) as opened:
             assert opened.size == (256, 256)
 
@@ -444,9 +471,19 @@ def test_prepare_yolo_seg_skips_only_oversized_images(tmp_path: Path) -> None:
     assert prepared.split_statistics["train"]["skipped_oversized_images"] == 1
     assert prepared.paths["data_yaml"].is_file()
     assert prepared.paths["skips"].is_file()
-    assert str(oversized_path.resolve()) not in (
-        prepared.location / "train.txt"
-    ).read_text(encoding="utf-8")
+    assert prepared.paths["dataset_root"] == prepared.location
+    data = yaml.safe_load(prepared.data_yaml.read_text(encoding="utf-8"))
+    assert data == {
+        "train": "train/images",
+        "val": "valid/images",
+        "names": {0: "island"},
+    }
+    assert "path" not in data
+    assert not (prepared.location / "train/images/group_0/train_0.jpg").exists()
+    assert (prepared.location / "train/images/group_0/train_1.jpg").is_file()
+    assert (prepared.location / "train/labels/group_0/train_1.txt").is_file()
+    assert (prepared.location / "valid/images/val_0.jpg").is_file()
+    assert (prepared.location / "valid/labels/val_0.txt").is_file()
 
 
 def test_prepare_rejects_unknown_errors_policy(tmp_path: Path) -> None:

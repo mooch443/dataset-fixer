@@ -18,6 +18,14 @@ def _size(value: tuple[int, int] | None) -> str | None:
     return f"{value[0]}x{value[1]}" if value is not None else None
 
 
+def _imgsz(value: tuple[int, int] | None) -> int | list[int] | None:
+    """Return the framework-neutral alias used by scalar W&B analyses."""
+
+    if value is None:
+        return None
+    return value[0] if value[0] == value[1] else list(value)
+
+
 def _dataset_source(value: Prepared | Mapping[str, Any]) -> str | None:
     """Return only the portable source folder/ZIP basename."""
 
@@ -30,6 +38,81 @@ def _dataset_source(value: Prepared | Mapping[str, Any]) -> str | None:
         if isinstance(nested, Mapping):
             source = nested.get("basename") or nested.get("name") or nested.get("path")
     return Path(str(source)).name if source else None
+
+
+def _model_family(framework: Any, task: Any, preparation: Any) -> str | None:
+    """Collapse framework/task metadata into one comparable model family."""
+
+    prepared = str(preparation or "").strip().lower().replace("_", "-")
+    if prepared in {"nnunet", "yolo-sem", "yolo-seg"}:
+        return prepared
+    framework_name = str(framework or "").strip().lower()
+    task_name = str(task or "").strip().lower().replace("_", "-")
+    if "nnunet" in framework_name:
+        return "nnunet"
+    if "ultralytics" in framework_name or "yolo" in framework_name:
+        return "yolo-sem" if "semantic" in task_name else "yolo-seg"
+    return None
+
+
+def _split_image_values(value: Prepared | Mapping[str, Any]) -> dict[str, int]:
+    statistics = value.split_statistics if isinstance(value, Prepared) else value.get(
+        "split_statistics", {}
+    )
+    aliases = {"train": "train", "val": "val", "valid": "val", "validation": "val", "test": "test"}
+    result: dict[str, int] = {}
+    for split, raw in dict(statistics or {}).items():
+        canonical = aliases.get(str(split).lower())
+        if canonical is None or not isinstance(raw, Mapping) or raw.get("images") is None:
+            continue
+        result[f"dataset_{canonical}_images"] = int(raw["images"])
+    return result
+
+
+def _nested(value: Mapping[str, Any], *path: str) -> Any:
+    current: Any = value
+    for key in path:
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _native_training_aliases(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize equivalent native trainer fields already present on a run."""
+
+    candidates: dict[str, tuple[tuple[str, ...], ...]] = {
+        "epochs": (("epochs",), ("train_args", "epochs"), ("hparas", "num_epochs")),
+        "batch_size": (
+            ("batch_size",),
+            ("resolved_batch_size",),
+            ("reproducibility", "resolved_batch_size"),
+            ("hparas", "batch_size"),
+            ("train_args", "batch"),
+        ),
+        "initial_lr": (
+            ("initial_lr",),
+            ("train_args", "lr0"),
+            ("hparas", "initial_lr"),
+        ),
+        "weight_decay": (
+            ("weight_decay",),
+            ("train_args", "weight_decay"),
+            ("hparas", "weight_decay"),
+        ),
+        "trainer": (("trainer",), ("reproducibility", "trainer")),
+    }
+    aliases: dict[str, Any] = {}
+    for field, paths in candidates.items():
+        for path in paths:
+            selected = _nested(value, *path)
+            if selected is None:
+                continue
+            if field == "batch_size" and (isinstance(selected, bool) or int(selected) <= 0):
+                continue
+            aliases[field] = selected
+            break
+    return aliases
 
 
 def _values(config: Config | Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -54,14 +137,17 @@ def _values(config: Config | Mapping[str, Any]) -> tuple[dict[str, Any], list[st
             "native_tile_size": list(geometry.native_tile_size) if geometry.native_tile_size else None,
             "upscale_factor": geometry.upscale_factor,
             "model_input_size": list(geometry.input_size) if geometry.input_size else None,
+            "imgsz": _imgsz(geometry.input_size),
             "dataset_content_sha256": dataset_hash,
             "dataset_preparation": preparation,
+            "model_family": _model_family(config.framework, config.task, preparation),
             "dataset_source": dataset_source,
             "source_dataset_zip": (
                 dataset_source
                 if dataset_source and dataset_source.lower().endswith(".zip")
                 else None
             ),
+            **_split_image_values(dataset),
             **dict(config.training),
         }
     else:
@@ -80,6 +166,15 @@ def _values(config: Config | Mapping[str, Any]) -> tuple[dict[str, Any], list[st
         )
         values["upscale_factor"] = geometry.upscale_factor
         values["model_input_size"] = list(geometry.input_size) if geometry.input_size else None
+        values.setdefault("imgsz", _imgsz(geometry.input_size))
+        values.setdefault(
+            "model_family",
+            _model_family(
+                values.get("framework"),
+                values.get("task"),
+                values.get("dataset_preparation", values.get("preparation_kind")),
+            ),
+        )
     # Only searchable top-level values are written.  There is intentionally no
     # duplicate nested metadata block.
     cleaned = {str(key): value for key, value in values.items() if value is not None}
@@ -117,6 +212,8 @@ def configure(run: Any, config: Config | Mapping[str, Any]) -> Any:
     target_config = getattr(run, "config", None)
     if target_config is None:
         raise TypeError("The supplied W&B run has no config")
+    for key, value in _native_training_aliases(target_config).items():
+        values.setdefault(key, value)
     try:
         target_config.update(values, allow_val_change=True)
     except TypeError:

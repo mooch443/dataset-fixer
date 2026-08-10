@@ -62,6 +62,10 @@ def test_zip_source_basename_reaches_preparation_bundle_and_wandb(
     configure(run, prepared.config)
     assert run.config["dataset_source"] == archive.name
     assert run.config["source_dataset_zip"] == archive.name
+    assert run.config["imgsz"] == [120, 160]
+    assert run.config["model_family"] == "yolo-seg"
+    assert run.config["dataset_train_images"] == 1
+    assert run.config["dataset_val_images"] == 1
     assert archive.name in run.tags
     assert f"source-zip-{archive.stem}" not in run.tags
 
@@ -102,3 +106,39 @@ def test_folder_source_basename_is_tagged_without_absolute_path(tmp_path: Path) 
     assert "source_dataset_zip" not in run.config
     assert "training-folder" in run.tags
     assert str(tmp_path) not in repr((run.config, run.tags))
+
+
+def test_nnunet_gets_the_same_scalar_imgsz_alias_as_yolo() -> None:
+    config = Config(
+        name="nnunet-model",
+        framework="nnunetv2",
+        task="semantic",
+        geometry=Geometry.create(native_tile_size=128, upscale_factor=4),
+        dataset={"dataset_source": "training-folder"},
+    )
+    run = SimpleNamespace(
+        config=_RunConfig(
+            {
+                "hparas": {
+                    "batch_size": 13,
+                    "initial_lr": 0.01,
+                    "num_epochs": 184,
+                    "weight_decay": 3e-5,
+                },
+                "reproducibility": {"trainer": "nnUNetTrainer_184epochs"},
+            }
+        ),
+        tags=(),
+        update=lambda: None,
+    )
+
+    configure(run, config)
+
+    assert run.config["model_input_size"] == [512, 512]
+    assert run.config["imgsz"] == 512
+    assert run.config["model_family"] == "nnunet"
+    assert run.config["epochs"] == 184
+    assert run.config["batch_size"] == 13
+    assert run.config["initial_lr"] == 0.01
+    assert run.config["weight_decay"] == 3e-5
+    assert run.config["trainer"] == "nnUNetTrainer_184epochs"
