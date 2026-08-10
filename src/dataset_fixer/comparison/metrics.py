@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
 from PIL import Image, ImageDraw
+from scipy import ndimage
 
 from ..errors import DatasetValidationError
 from .types import Cohort, Prediction
@@ -141,6 +142,21 @@ def binary_metric_breakdown(rows: list[dict[str, Any]]) -> dict[str, Any]:
         row for row in positive_rows if float(row["n_pred"]) == 0
     ]
     empty_false_positive_pixels = sum(int(row["fp"]) for row in empty_rows)
+    positive_detected_cases = len(positive_rows) - len(positive_missed_rows)
+    empty_false_positive_cases = len(empty_false_positive_rows)
+    positive_image_recall = ratio(positive_detected_cases, len(positive_rows))
+    empty_image_specificity = ratio(
+        len(empty_rows) - empty_false_positive_cases,
+        len(empty_rows),
+    )
+    empty_image_false_positive_rate = ratio(
+        empty_false_positive_cases,
+        len(empty_rows),
+    )
+    presence_precision = ratio(
+        positive_detected_cases,
+        positive_detected_cases + empty_false_positive_cases,
+    )
 
     return {
         "micro_dice": ratio(2 * tp, 2 * tp + fp + fn),
@@ -166,28 +182,166 @@ def binary_metric_breakdown(rows: list[dict[str, Any]]) -> dict[str, Any]:
             positive_tp + positive_fn,
         ),
         "positive_cases": len(positive_rows),
-        "positive_detected_cases": len(positive_rows) - len(positive_missed_rows),
+        "positive_detected_cases": positive_detected_cases,
         "positive_missed_cases": len(positive_missed_rows),
-        "positive_image_recall": ratio(
-            len(positive_rows) - len(positive_missed_rows),
-            len(positive_rows),
-        ),
+        "positive_image_recall": positive_image_recall,
         "empty_cases": len(empty_rows),
-        "empty_correct_cases": len(empty_rows) - len(empty_false_positive_rows),
-        "empty_false_positive_cases": len(empty_false_positive_rows),
-        "empty_image_specificity": ratio(
-            len(empty_rows) - len(empty_false_positive_rows),
-            len(empty_rows),
-        ),
-        "empty_image_false_positive_rate": ratio(
-            len(empty_false_positive_rows),
-            len(empty_rows),
-        ),
+        "empty_correct_cases": len(empty_rows) - empty_false_positive_cases,
+        "empty_false_positive_cases": empty_false_positive_cases,
+        "empty_image_specificity": empty_image_specificity,
+        "empty_image_false_positive_rate": empty_image_false_positive_rate,
         "empty_false_positive_pixels": empty_false_positive_pixels,
         "empty_mean_false_positive_pixels": ratio(
             empty_false_positive_pixels,
             len(empty_rows),
         ),
+        # The historical unsuffixed image-level fields remain the raw
+        # any-foreground-pixel metrics. Explicit aliases make comparison with
+        # the connected-component-filtered variants unambiguous in reports.
+        "presence_precision": presence_precision,
+        "raw_positive_image_recall": positive_image_recall,
+        "raw_empty_image_specificity": empty_image_specificity,
+        "raw_empty_image_false_positive_rate": empty_image_false_positive_rate,
+        "raw_presence_precision": presence_precision,
+    }
+
+
+def component_filtered_presence_breakdown(
+    rows: list[dict[str, Any]],
+    prediction_component_areas: Mapping[str, Sequence[float]],
+    minimum_component_area: float,
+) -> dict[str, Any]:
+    """Score image-level presence after rejecting small predicted components.
+
+    ``rows`` retain the raw, unfiltered masks used for Dice/IoU. This helper
+    changes only the binary image-level presence decision: a prediction is
+    present when at least one 8-connected foreground component has area
+    greater than or equal to ``minimum_component_area``.
+    """
+
+    threshold = float(minimum_component_area)
+    if not math.isfinite(threshold) or threshold <= 0:
+        raise ValueError("minimum_component_area must be finite and greater than zero")
+
+    positive_rows = [row for row in rows if float(row["n_ref"]) > 0]
+    empty_rows = [row for row in rows if float(row["n_ref"]) == 0]
+
+    def row_id(row: Mapping[str, Any]) -> str:
+        value = row.get("case_id", row.get("image_id"))
+        if value is None:
+            raise ValueError(
+                "Presence rows require a case_id or image_id for component filtering"
+            )
+        return str(value)
+
+    missing = sorted(
+        row_id(row)
+        for row in rows
+        if row_id(row) not in prediction_component_areas
+    )
+    if missing:
+        raise ValueError(
+            "Prediction component areas are missing evaluation cases: "
+            + ", ".join(missing[:5])
+        )
+
+    def predicted(row: Mapping[str, Any]) -> bool:
+        return any(
+            float(area) >= threshold
+            for area in prediction_component_areas[row_id(row)]
+        )
+
+    positive_detected = sum(predicted(row) for row in positive_rows)
+    empty_false_positive = sum(predicted(row) for row in empty_rows)
+
+    def ratio(numerator: float, denominator: float) -> float:
+        return numerator / denominator if denominator else math.nan
+
+    return {
+        "min_connected_component_area": threshold,
+        "component_filtered_positive_detected_cases": positive_detected,
+        "component_filtered_positive_missed_cases": (
+            len(positive_rows) - positive_detected
+        ),
+        "component_filtered_positive_image_recall": ratio(
+            positive_detected,
+            len(positive_rows),
+        ),
+        "component_filtered_empty_correct_cases": (
+            len(empty_rows) - empty_false_positive
+        ),
+        "component_filtered_empty_false_positive_cases": empty_false_positive,
+        "component_filtered_empty_image_specificity": ratio(
+            len(empty_rows) - empty_false_positive,
+            len(empty_rows),
+        ),
+        "component_filtered_empty_image_false_positive_rate": ratio(
+            empty_false_positive,
+            len(empty_rows),
+        ),
+        "component_filtered_presence_precision": ratio(
+            positive_detected,
+            positive_detected + empty_false_positive,
+        ),
+    }
+
+
+def grouped_binary_metric_breakdown(
+    rows: list[dict[str, Any]],
+    groups: Mapping[str, str],
+) -> dict[str, Any]:
+    """Pool pixel confusion within groups, then macro-average across groups."""
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        value = row.get("case_id", row.get("image_id"))
+        if value is None:
+            raise ValueError("Grouped metric rows require a case_id or image_id")
+        case_id = str(value)
+        if case_id not in groups:
+            raise ValueError(f"No group was resolved for evaluation case {case_id!r}")
+        grouped[str(groups[case_id])].append(row)
+
+    per_group: list[dict[str, Any]] = []
+    for group in sorted(grouped):
+        selected = grouped[group]
+        tp = sum(int(row["tp"]) for row in selected)
+        fp = sum(int(row["fp"]) for row in selected)
+        fn = sum(int(row["fn"]) for row in selected)
+
+        def ratio(numerator: float, denominator: float) -> float:
+            return numerator / denominator if denominator else math.nan
+
+        per_group.append(
+            {
+                "group": group,
+                "cases": len(selected),
+                "positive_cases": sum(float(row["n_ref"]) > 0 for row in selected),
+                "empty_cases": sum(float(row["n_ref"]) == 0 for row in selected),
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "dice": ratio(2 * tp, 2 * tp + fp + fn),
+                "iou": ratio(tp, tp + fp + fn),
+                "foreground_precision": ratio(tp, tp + fp),
+                "foreground_recall": ratio(tp, tp + fn),
+            }
+        )
+
+    return {
+        "group_count": len(per_group),
+        "group_defined_dice_count": sum(
+            math.isfinite(float(row["dice"])) for row in per_group
+        ),
+        "group_macro_dice": _safe_mean([row["dice"] for row in per_group]),
+        "group_macro_iou": _safe_mean([row["iou"] for row in per_group]),
+        "group_macro_foreground_precision": _safe_mean(
+            [row["foreground_precision"] for row in per_group]
+        ),
+        "group_macro_foreground_recall": _safe_mean(
+            [row["foreground_recall"] for row in per_group]
+        ),
+        "per_group": per_group,
     }
 
 
@@ -197,6 +351,21 @@ def segmentation_binary_metric_breakdown(
     confidence: float,
 ) -> dict[str, Any]:
     """Score final instance-segmentation polygons as foreground-union masks."""
+
+    rows = segmentation_binary_metric_rows(cohort, predictions, confidence)
+    return {
+        "dice": _safe_mean([row["dice"] for row in rows]),
+        "iou": _safe_mean([row["iou"] for row in rows]),
+        **binary_metric_breakdown(rows),
+    }
+
+
+def segmentation_binary_metric_rows(
+    cohort: Cohort,
+    predictions: dict[str, list[Prediction]],
+    confidence: float,
+) -> list[dict[str, Any]]:
+    """Return per-image binary-mask rows for final instance predictions."""
 
     if cohort.task != "segment":
         raise ValueError("Binary segmentation breakdown requires a segment cohort")
@@ -228,6 +397,9 @@ def segmentation_binary_metric_breakdown(
         iou_denominator = tp + fp + fn
         rows.append(
             {
+                "case_id": record.image_id,
+                "image_id": record.image_id,
+                "relative_path": record.relative_path,
                 "dice": 2 * tp / dice_denominator if dice_denominator else math.nan,
                 "iou": tp / iou_denominator if iou_denominator else math.nan,
                 "tp": tp,
@@ -235,13 +407,23 @@ def segmentation_binary_metric_breakdown(
                 "fn": fn,
                 "n_ref": int(np.sum(truth)),
                 "n_pred": int(np.sum(prediction)),
+                "prediction_component_areas": _connected_component_areas(
+                    prediction
+                ),
             }
         )
-    return {
-        "dice": _safe_mean([row["dice"] for row in rows]),
-        "iou": _safe_mean([row["iou"] for row in rows]),
-        **binary_metric_breakdown(rows),
-    }
+    return rows
+
+
+def _connected_component_areas(mask: np.ndarray) -> list[int]:
+    labels, count = ndimage.label(
+        np.asarray(mask, dtype=bool),
+        structure=np.ones((3, 3), dtype=np.uint8),
+    )
+    if count == 0:
+        return []
+    counts = np.bincount(labels.ravel(), minlength=count + 1)
+    return [int(value) for value in counts[1:]]
 
 
 def _polygon_union_mask(

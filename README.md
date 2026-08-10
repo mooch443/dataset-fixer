@@ -371,12 +371,27 @@ models = Model.load_many({
 comparison = models.compare(
     masks,
     split="val",
+    # None uses the held-out reference-object p10. This filters only the
+    # area-filtered image-presence metrics; raw any-pixel values remain.
+    min_connected_component_area=None,
+    # The callback receives each evaluation image Path.
+    group_by=lambda path: path.parent.name,
 )
 ```
 
 The report records each model's native task and applied projection. Same-type
 collections continue through their native evaluator; incompatible mixtures
 without an implemented common denominator fail with a validation error.
+Image-level presence is reported both raw (any foreground pixel) and after
+requiring an 8-connected predicted component at least as large as the resolved
+minimum. The report heatmap includes presence precision, positive-image recall,
+and empty-image specificity for both definitions. When
+`min_connected_component_area=None`, the minimum is the p10 area of reference
+objects in the active held-out cohort; a positive numeric value overrides it.
+`group_by` is report-only: TP, FP, and FN are pooled within each returned group,
+then group Dice is macro-averaged with equal group weight. It adds
+`reports/grouped-metric-breakdown.png` and does not alter inference, the cohort,
+or the primary ranking.
 
 The sampled figure and the full comparison use the same renderer: each example
 has one filename title and columns for Original, GT, and each shortened model

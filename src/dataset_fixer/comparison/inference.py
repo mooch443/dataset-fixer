@@ -436,7 +436,18 @@ def _clear_accelerator_memory(device: str | None) -> None:
     if selected in {"", "cuda"} and torch.cuda.is_available():
         torch.cuda.empty_cache()
     mps = getattr(torch, "mps", None)
-    if selected in {"", "mps"} and mps is not None and hasattr(mps, "empty_cache"):
+    mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+    mps_available = bool(
+        mps_backend is not None
+        and hasattr(mps_backend, "is_available")
+        and mps_backend.is_available()
+    )
+    if (
+        selected in {"", "mps"}
+        and mps_available
+        and mps is not None
+        and hasattr(mps, "empty_cache")
+    ):
         try:
             mps.empty_cache()
         except RuntimeError:

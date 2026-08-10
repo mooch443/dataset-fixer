@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -1276,6 +1276,8 @@ class Model:
         progress: bool = True,
         destination: str | Path | None = None,
         trust_legacy_cache: bool = False,
+        min_connected_component_area: float | None = None,
+        group_by: Callable[[Path], Hashable] | None = None,
     ) -> Any:
         """Evaluate this model on one frozen dataset cohort.
 
@@ -1297,6 +1299,14 @@ class Model:
                 frozen cohort paths match, even if the old entry lacks model
                 bytes/settings identity. Use only when you trust the cache's
                 provenance; the default remains verified reuse only.
+            min_connected_component_area: Minimum 8-connected predicted
+                foreground-component area used for the filtered image-level
+                presence metrics. ``None`` resolves to the held-out reference
+                object-area p10. Raw any-pixel presence metrics are always
+                reported alongside the filtered variants.
+            group_by: Optional callback from each evaluation image path
+                to a stable, hashable group label. Adds group-pooled metrics
+                and a separate plot without changing inference or ranking.
 
         Returns:
             A task-appropriate comparison result. Prediction and evaluation
@@ -1311,6 +1321,8 @@ class Model:
             progress=progress,
             destination=destination,
             trust_legacy_cache=trust_legacy_cache,
+            min_connected_component_area=min_connected_component_area,
+            group_by=group_by,
         )
 
     def visualize(
@@ -1670,6 +1682,8 @@ class ModelCollection:
         progress: bool = True,
         destination: str | Path | None = None,
         trust_legacy_cache: bool = False,
+        min_connected_component_area: float | None = None,
+        group_by: Callable[[Path], Hashable] | None = None,
     ) -> Any:
         """Compare the configured models on one frozen dataset cohort.
 
@@ -1702,6 +1716,13 @@ class ModelCollection:
                 frozen cohort paths match, even if the old entry lacks model
                 bytes/settings identity. Use only when you trust the cache's
                 provenance; the default remains verified reuse only.
+            min_connected_component_area: Minimum 8-connected predicted
+                foreground-component area used for filtered image-level
+                presence metrics. ``None`` resolves to the held-out reference
+                object-area p10. Raw any-pixel values remain available.
+            group_by: Optional callback from each evaluation image path
+                to a stable, hashable group label. Adds group-pooled metrics
+                and a separate plot; it does not change inference or ranking.
 
         Returns:
             A task-appropriate comparison result. Comparison space is inferred
@@ -1753,6 +1774,8 @@ class ModelCollection:
                     destination=destination,
                     trust_legacy_cache=trust_legacy_cache,
                     errors=normalize_errors(errors),
+                    min_connected_component_area=min_connected_component_area,
+                    group_by=group_by,
                 )
             from .semantic_comparison import compare_nnunet_models
 
@@ -1765,6 +1788,8 @@ class ModelCollection:
                 destination=destination,
                 trust_legacy_cache=trust_legacy_cache,
                 errors=normalize_errors(errors),
+                min_connected_component_area=min_connected_component_area,
+                group_by=group_by,
             )
         if any(model.kind != "ultralytics" for model in self.models):
             raise DatasetValidationError(
@@ -1808,6 +1833,8 @@ class ModelCollection:
             progress=progress,
             destination=destination,
             errors=normalize_errors(errors),
+            min_connected_component_area=min_connected_component_area,
+            group_by=group_by,
         )
 
     def visualize(

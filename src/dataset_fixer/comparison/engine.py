@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import time
+from collections import Counter
+from collections.abc import Callable, Hashable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from ..errors import DatasetValidationError, ValidationIssue
+from ..planning import callback_description
 from ..sahi_support import reject_legacy_sahi_settings, resolve_sahi_settings
 from ..utils import environment_snapshot, settings_fingerprint, to_jsonable
 from .cache import (
@@ -20,18 +24,23 @@ from .cache import (
     save_evaluation_cache,
 )
 from .cohort import check_training_provenance, freeze_cohort
+from .grouping import resolve_evaluation_groups
 from .inference import resolve_backend, run_inference
 from .metrics import (
+    binary_metric_breakdown,
     bootstrap_metric,
+    component_filtered_presence_breakdown,
     evaluate_configuration,
+    grouped_binary_metric_breakdown,
     paired_statistics,
-    segmentation_binary_metric_breakdown,
+    segmentation_binary_metric_rows,
 )
 from .object_sizes import (
     evaluate_object_size_model,
     object_size_report_artifacts_exist,
     polygon_components,
     prepare_object_size_reference,
+    render_grouped_metric_breakdown,
     render_large_object_examples,
     render_object_size_breakdown,
     render_segmentation_metric_breakdown,
@@ -53,7 +62,7 @@ if TYPE_CHECKING:
     from ..dataset import Dataset
 
 
-_MODEL_COMPARISON_REPORT_SCHEMA = 8
+_MODEL_COMPARISON_REPORT_SCHEMA = 9
 
 
 def _compare_models(
@@ -65,15 +74,38 @@ def _compare_models(
     progress: bool = True,
     destination: str | Path | None = None,
     errors: Literal["raise", "skip"] = "raise",
+    min_connected_component_area: float | None = None,
+    group_by: Callable[[Path], Hashable] | None = None,
 ) -> ComparisonResult:
     """Evaluate multiple model configurations on one cryptographically frozen cohort."""
 
+    if min_connected_component_area is None:
+        requested_component_area = None
+    else:
+        requested_component_area = float(min_connected_component_area)
+        if not math.isfinite(requested_component_area) or requested_component_area <= 0:
+            raise ValueError(
+                "min_connected_component_area must be finite and greater than zero"
+            )
     started = time.time()
     protocol = "fixed"
     seed = 42
     bootstrap_resamples = 10_000
     specs = parse_models(models)
     cohort = freeze_cohort(dataset, split, progress=progress)
+    groups = resolve_evaluation_groups(
+        ((record.image_id, record.image_path) for record in cohort.records),
+        group_by,
+    )
+    group_settings: dict[str, Any] | None = None
+    if group_by is not None and groups is not None:
+        group_counts = Counter(groups.values())
+        group_settings = {
+            "callback": callback_description(group_by),
+            "group_count": len(group_counts),
+            "case_counts": dict(sorted(group_counts.items())),
+            "case_groups": dict(sorted(groups.items())),
+        }
     model_backends = {
         spec.name: resolve_backend(
             str(spec.inference_overrides.get("inference", "native")), cohort.task
@@ -132,6 +164,9 @@ def _compare_models(
         "comparison_unit": comparison_unit,
         "seed": seed,
         "bootstrap_resamples": bootstrap_resamples,
+        "presence_min_connected_component_area": requested_component_area,
+        "presence_threshold_default": "held-out-reference-object-p10",
+        "grouping": group_settings,
         "models": model_systems,
         "source_size_policy": {
             "errors": errors,
@@ -222,6 +257,7 @@ def _compare_models(
         best_rows: dict[str, list[dict[str, Any]]] = {}
         best_predictions: dict[str, dict[str, list[Prediction]]] = {}
         best_confidences: dict[str, float] = {}
+        segmentation_rows_by_model: dict[str, list[dict[str, Any]]] = {}
         for spec in specs:
             output = model_outputs[spec.name]
             grid_rows = output["grid"]
@@ -237,13 +273,36 @@ def _compare_models(
                     best["per_image"], resamples=bootstrap_resamples, seed=seed
                 )
             duration = float(output["timing"].get("inference_seconds", 0))
-            heldout_breakdown = (
-                segmentation_binary_metric_breakdown(
+            heldout_rows = (
+                segmentation_binary_metric_rows(
                     cohort,
                     output["predictions"][output["best_postprocess"]],
                     output["best_confidence"],
                 )
                 if cohort.task == "segment"
+                else []
+            )
+            finite_dice = [
+                float(row["dice"])
+                for row in heldout_rows
+                if math.isfinite(float(row["dice"]))
+            ]
+            finite_iou = [
+                float(row["iou"])
+                for row in heldout_rows
+                if math.isfinite(float(row["iou"]))
+            ]
+            heldout_breakdown = (
+                {
+                    "dice": sum(finite_dice) / len(finite_dice)
+                    if finite_dice
+                    else math.nan,
+                    "iou": sum(finite_iou) / len(finite_iou)
+                    if finite_iou
+                    else math.nan,
+                    **binary_metric_breakdown(heldout_rows),
+                }
+                if heldout_rows
                 else {}
             )
             rank_row = {
@@ -272,6 +331,7 @@ def _compare_models(
             }
             if heldout_breakdown:
                 rank_row["heldout_projection"] = "instance-polygon-foreground-union"
+                segmentation_rows_by_model[spec.name] = heldout_rows
             ranking.append(rank_row)
             best_rows[spec.name] = best["per_image"]
             per_image.extend({"model": spec.name, **row} for row in best["per_image"])
@@ -323,29 +383,19 @@ def _compare_models(
         reports_dir = temporary / "reports"
         combine_report_plots((temporary / "figures",), reports_dir / "plots.png")
         combine_report_plots((temporary / "qualitative",), reports_dir / "comparison.png")
-        metric_breakdown_path: str | None = None
-        if cohort.task == "segment":
-            rendered_metric_breakdown = render_segmentation_metric_breakdown(
-                reports_dir,
-                ranking,
-                title=(
-                    "Instance-segmentation metric breakdown — "
-                    "final reconstructed source images"
-                ),
-            )
-            metric_breakdown_path = str(
-                rendered_metric_breakdown.relative_to(temporary)
-            )
         (
             object_size_analysis,
             object_size_breakdown_path,
             large_object_examples,
+            presence_analysis,
         ) = _analyze_native_object_sizes(
             cohort,
             best_predictions,
             best_confidences,
+            segmentation_rows_by_model,
             ranking,
             reports_dir,
+            requested_component_area=requested_component_area,
         )
         if (
             cohort.task == "segment"
@@ -358,6 +408,29 @@ def _compare_models(
         large_object_example_paths = [
             str(example["path"]) for example in large_object_examples
         ]
+        grouped_analysis, grouped_metric_breakdown_path = _analyze_native_groups(
+            segmentation_rows_by_model,
+            groups,
+            ranking,
+            reports_dir,
+            group_settings=group_settings,
+        )
+        metric_breakdown_path: str | None = None
+        if cohort.task == "segment":
+            rendered_metric_breakdown = render_segmentation_metric_breakdown(
+                reports_dir,
+                ranking,
+                title=(
+                    "Instance-segmentation metric breakdown — "
+                    "final reconstructed source images"
+                ),
+                minimum_component_area=presence_analysis.get(
+                    "resolved_min_connected_component_area_px"
+                ),
+            )
+            metric_breakdown_path = str(
+                rendered_metric_breakdown.relative_to(temporary)
+            )
         prediction_paths: list[str] = []
         if save_prediction_plots:
             prediction_paths = render_prediction_grids(
@@ -391,10 +464,13 @@ def _compare_models(
             "model_hashes": model_hashes,
             "ranking": ranking,
             "object_size_analysis": object_size_analysis,
+            "presence_analysis": presence_analysis,
+            "grouped_analysis": grouped_analysis,
             "limitations": limitations,
             "reports": {
                 "plots": "reports/plots.png",
                 "metric_breakdown": metric_breakdown_path,
+                "grouped_metric_breakdown": grouped_metric_breakdown_path,
                 "object_size_breakdown": object_size_breakdown_path,
                 "large_object_examples": large_object_example_paths,
                 "comparison": "reports/comparison.png",
@@ -446,16 +522,32 @@ def _analyze_native_object_sizes(
     cohort: Cohort,
     predictions_by_model: dict[str, dict[str, list[Prediction]]],
     confidences_by_model: dict[str, float],
+    segmentation_rows_by_model: Mapping[str, list[dict[str, Any]]],
     ranking: list[dict[str, Any]],
     reports: Path,
-) -> tuple[dict[str, Any], str | None, list[dict[str, Any]]]:
+    *,
+    requested_component_area: float | None,
+) -> tuple[
+    dict[str, Any],
+    str | None,
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
     """Score final postprocessed instance polygons in native source pixels."""
 
     if cohort.task != "segment":
         reference = skipped_object_size_reference(
             "object-size analysis applies only to segmentation comparisons"
         )
-        return reference.metadata(), None, []
+        return (
+            reference.metadata(),
+            None,
+            [],
+            {
+                "status": "not-applicable",
+                "reason": "connected-component presence applies only to segmentation comparisons",
+            },
+        )
     reference = prepare_object_size_reference(
         {
             record.image_id: polygon_components(
@@ -475,10 +567,55 @@ def _analyze_native_object_sizes(
         connectivity=None,
         matching_class_policy="class-aware",
     )
+    resolved_component_area = (
+        requested_component_area
+        if requested_component_area is not None
+        else reference.p10_area
+    )
+    presence_analysis: dict[str, Any] = {
+        "raw_definition": "any predicted foreground pixel",
+        "component_filtered_definition": (
+            "at least one predicted 8-connected foreground component with "
+            "area greater than or equal to the resolved threshold"
+        ),
+        "connectivity": 8,
+        "requested_min_connected_component_area_px": requested_component_area,
+        "resolved_min_connected_component_area_px": resolved_component_area,
+        "threshold_source": (
+            "explicit"
+            if requested_component_area is not None
+            else "held-out-reference-object-p10"
+        ),
+    }
+    if resolved_component_area is None:
+        presence_analysis.update(
+            status="skipped",
+            reason=(
+                "minimum connected-component area is unavailable because the "
+                "held-out cohort has no reference foreground objects"
+            ),
+        )
+    else:
+        presence_analysis["status"] = "complete"
+        for row in ranking:
+            model_name = str(row["model"])
+            component_areas = {
+                str(metric_row["case_id"]): list(
+                    metric_row.get("prediction_component_areas", [])
+                )
+                for metric_row in segmentation_rows_by_model[model_name]
+            }
+            row.update(
+                component_filtered_presence_breakdown(
+                    segmentation_rows_by_model[model_name],
+                    component_areas,
+                    resolved_component_area,
+                )
+            )
     if reference.status != "complete":
         for row in ranking:
             row.update(unavailable_object_size_summary())
-        return reference.metadata(), None, []
+        return reference.metadata(), None, [], presence_analysis
 
     predictions: dict[str, dict[str, tuple[Any, ...]]] = {}
     results = {}
@@ -523,7 +660,46 @@ def _analyze_native_object_sizes(
     relative_size_path = (
         str(size_path.relative_to(reports.parent)) if size_path is not None else None
     )
-    return reference.metadata(), relative_size_path, examples
+    return reference.metadata(), relative_size_path, examples, presence_analysis
+
+
+def _analyze_native_groups(
+    rows_by_model: Mapping[str, list[dict[str, Any]]],
+    groups: Mapping[str, str] | None,
+    ranking: list[dict[str, Any]],
+    reports: Path,
+    *,
+    group_settings: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], str | None]:
+    if groups is None:
+        return {"status": "not-requested"}, None
+    if not rows_by_model:
+        return {
+            "status": "not-applicable",
+            "reason": "grouped binary-mask metrics apply only to segmentation comparisons",
+        }, None
+
+    by_model: dict[str, dict[str, Any]] = {}
+    for row in ranking:
+        model_name = str(row["model"])
+        result = grouped_binary_metric_breakdown(rows_by_model[model_name], groups)
+        by_model[model_name] = result
+        row.update({key: value for key, value in result.items() if key != "per_group"})
+    path = render_grouped_metric_breakdown(
+        reports,
+        ranking,
+        by_model,
+    )
+    return (
+        {
+            "status": "complete",
+            "aggregation": "pool TP/FP/FN within group, then macro-average group scores",
+            "primary_ranking_unchanged": True,
+            "grouping": dict(group_settings or {}),
+            "models": by_model,
+        },
+        str(path.relative_to(reports.parent)),
+    )
 
 
 def _evaluate_model(

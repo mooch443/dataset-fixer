@@ -48,7 +48,11 @@ def object_size_report_artifacts_exist(root: Path, manifest: Mapping[str, Any]) 
     ):
         return False
     paths: list[str] = []
-    for key in ("metric_breakdown", "object_size_breakdown"):
+    for key in (
+        "metric_breakdown",
+        "grouped_metric_breakdown",
+        "object_size_breakdown",
+    ):
         value = reports.get(key)
         if value is not None:
             if not isinstance(value, str):
@@ -623,8 +627,9 @@ def render_segmentation_metric_breakdown(
     *,
     title: str = "Segmentation metric breakdown — final reconstructed source images",
     labels: Mapping[str, str] | None = None,
+    minimum_component_area: float | None = None,
 ) -> Path:
-    """Render the compact six-column held-out segmentation summary."""
+    """Render pixel metrics and raw/area-filtered image-presence metrics."""
 
     import matplotlib.pyplot as plt
 
@@ -633,8 +638,21 @@ def render_segmentation_metric_breakdown(
         ("micro_dice", "Pooled foreground\nDice"),
         ("foreground_precision", "Foreground\nprecision"),
         ("foreground_recall", "Foreground\nrecall"),
-        ("positive_image_recall", "Positive-image\nrecall"),
-        ("empty_image_specificity", "Empty-image\nspecificity"),
+        ("raw_presence_precision", "Presence precision\nraw"),
+        (
+            "component_filtered_presence_precision",
+            "Presence precision\narea-filtered",
+        ),
+        ("raw_positive_image_recall", "Positive recall\nraw"),
+        (
+            "component_filtered_positive_image_recall",
+            "Positive recall\narea-filtered",
+        ),
+        ("raw_empty_image_specificity", "Empty specificity\nraw"),
+        (
+            "component_filtered_empty_image_specificity",
+            "Empty specificity\narea-filtered",
+        ),
     )
     values = np.asarray(
         [
@@ -645,7 +663,7 @@ def render_segmentation_metric_breakdown(
     )
     masked = np.ma.masked_invalid(values)
     figure, axis = plt.subplots(
-        figsize=(13.8, max(4.2, 0.85 * len(ranking) + 2.3))
+        figsize=(20.5, max(4.2, 0.85 * len(ranking) + 2.3))
     )
     colormap = plt.get_cmap("viridis").with_extremes(bad="#D9D9D9")
     image = axis.imshow(masked, vmin=0, vmax=1, cmap=colormap, aspect="auto")
@@ -678,11 +696,93 @@ def render_segmentation_metric_breakdown(
                 color="white" if math.isfinite(value) and value < 0.65 else "black",
                 fontsize=8.5,
             )
-    axis.set_title(title, pad=45)
+    threshold_note = (
+        f"\nArea-filtered presence requires an 8-connected component ≥ "
+        f"{minimum_component_area:.1f} px²; raw presence requires any foreground pixel"
+        if minimum_component_area is not None
+        else "\nArea-filtered presence threshold unavailable; raw presence requires any foreground pixel"
+    )
+    axis.set_title(title + threshold_note, pad=58)
     colorbar = figure.colorbar(image, ax=axis, fraction=0.03, pad=0.025)
     colorbar.set_label("Higher is better")
     figure.tight_layout()
     path = reports / "metric-breakdown.png"
+    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.close(figure)
+    return path
+
+
+def render_grouped_metric_breakdown(
+    reports: Path,
+    ranking: list[dict[str, Any]],
+    grouped_by_model: Mapping[str, Mapping[str, Any]],
+    *,
+    labels: Mapping[str, str] | None = None,
+) -> Path:
+    """Render per-group pooled Dice without changing the primary ranking."""
+
+    import matplotlib.pyplot as plt
+
+    groups = sorted(
+        {
+            str(group["group"])
+            for result in grouped_by_model.values()
+            for group in result.get("per_group", [])
+        }
+    )
+    columns = ["Macro", *groups]
+    values: list[list[float]] = []
+    for row in ranking:
+        result = grouped_by_model[str(row["model"])]
+        lookup = {
+            str(group["group"]): float(group["dice"])
+            for group in result.get("per_group", [])
+        }
+        values.append(
+            [float(result.get("group_macro_dice", math.nan))]
+            + [lookup.get(group, math.nan) for group in groups]
+        )
+    array = np.asarray(values, dtype=float)
+    masked = np.ma.masked_invalid(array)
+    figure, axis = plt.subplots(
+        figsize=(max(10.5, 4.5 + 0.58 * len(columns)), max(4.2, 0.85 * len(ranking) + 2.6))
+    )
+    colormap = plt.get_cmap("viridis").with_extremes(bad="#D9D9D9")
+    image = axis.imshow(masked, vmin=0, vmax=1, cmap=colormap, aspect="auto")
+    axis.set_xticks(np.arange(len(columns)), columns, fontsize=8.5, rotation=60, ha="left")
+    axis.set_yticks(
+        np.arange(len(ranking)),
+        [
+            labels.get(str(row["model"]), str(row["model"]))
+            if labels is not None
+            else str(row["model"])
+            for row in ranking
+        ],
+        fontsize=8.5,
+    )
+    axis.tick_params(axis="x", bottom=False, top=True, labelbottom=False, labeltop=True)
+    for row_index in range(array.shape[0]):
+        for column_index in range(array.shape[1]):
+            value = array[row_index, column_index]
+            label = f"{value:.3f}" if math.isfinite(value) else "n/a"
+            axis.text(
+                column_index,
+                row_index,
+                label,
+                ha="center",
+                va="center",
+                color="white" if math.isfinite(value) and value < 0.65 else "black",
+                fontsize=7.5,
+            )
+    axis.set_title(
+        "Grouped foreground Dice — TP/FP/FN pooled within each group\n"
+        "Macro gives every defined group equal weight; primary ranking is unchanged",
+        pad=72,
+    )
+    colorbar = figure.colorbar(image, ax=axis, fraction=0.025, pad=0.02)
+    colorbar.set_label("Foreground Dice")
+    figure.tight_layout()
+    path = reports / "grouped-metric-breakdown.png"
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
     plt.close(figure)
     return path

@@ -287,7 +287,7 @@ def test_four_selected_large_object_crop_reports_are_rendered(
     assert all((tmp_path / row["path"]).is_file() for row in rendered)
 
 
-def test_metric_breakdown_has_exactly_the_six_retained_columns(
+def test_metric_breakdown_includes_raw_and_area_filtered_presence_columns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -300,8 +300,12 @@ def test_metric_breakdown_has_exactly_the_six_retained_columns(
             "micro_dice": 0.2,
             "foreground_precision": 0.3,
             "foreground_recall": 0.4,
-            "positive_image_recall": 0.5,
-            "empty_image_specificity": 0.6,
+            "raw_presence_precision": 0.45,
+            "component_filtered_presence_precision": 0.55,
+            "raw_positive_image_recall": 0.5,
+            "component_filtered_positive_image_recall": 0.4,
+            "raw_empty_image_specificity": 0.6,
+            "component_filtered_empty_image_specificity": 0.8,
             "micro_iou": 0.7,
             "positive_case_dice": 0.8,
         }
@@ -309,7 +313,11 @@ def test_metric_breakdown_has_exactly_the_six_retained_columns(
     original_close = plt.close
     monkeypatch.setattr(plt, "close", lambda _figure: None)
 
-    path = render_segmentation_metric_breakdown(tmp_path, ranking)
+    path = render_segmentation_metric_breakdown(
+        tmp_path,
+        ranking,
+        minimum_component_area=12,
+    )
     figure = plt.gcf()
     labels = [label.get_text() for label in figure.axes[0].get_xticklabels()]
     original_close(figure)
@@ -320,6 +328,10 @@ def test_metric_breakdown_has_exactly_the_six_retained_columns(
         "Pooled foreground\nDice",
         "Foreground\nprecision",
         "Foreground\nrecall",
-        "Positive-image\nrecall",
-        "Empty-image\nspecificity",
+        "Presence precision\nraw",
+        "Presence precision\narea-filtered",
+        "Positive recall\nraw",
+        "Positive recall\narea-filtered",
+        "Empty specificity\nraw",
+        "Empty specificity\narea-filtered",
     ]

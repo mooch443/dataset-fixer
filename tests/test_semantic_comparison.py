@@ -552,6 +552,7 @@ def test_semantic_comparison_reports_finite_dice_support(
         exported,
         progress=False,
         destination=tmp_path / "finite-support-comparison",
+        group_by=lambda path: path.stem,
     )
 
     assert result.ranking[0]["cohort_cases"] == 2
@@ -561,6 +562,29 @@ def test_semantic_comparison_reports_finite_dice_support(
     assert result.ranking[0]["empty_cases"] == 1
     assert result.ranking[0]["positive_case_dice"] == pytest.approx(1.0)
     assert result.ranking[0]["empty_image_specificity"] == pytest.approx(1.0)
+    assert result.ranking[0]["raw_presence_precision"] == pytest.approx(1.0)
+    assert result.ranking[0][
+        "component_filtered_presence_precision"
+    ] == pytest.approx(1.0)
+    manifest = json.loads(
+        (
+            tmp_path
+            / "finite-support-comparison"
+            / "reports"
+            / "result.json"
+        ).read_text()
+    )
+    assert manifest["presence_analysis"]["threshold_source"] == (
+        "held-out-reference-object-p10"
+    )
+    assert manifest["grouped_analysis"]["status"] == "complete"
+    assert manifest["ranking"][0]["group_macro_dice"] == pytest.approx(1.0)
+    assert (
+        tmp_path
+        / "finite-support-comparison"
+        / "reports"
+        / "grouped-metric-breakdown.png"
+    ).is_file()
 
 
 def test_binary_metric_breakdown_separates_positive_and_empty_images() -> None:

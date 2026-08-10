@@ -12,7 +12,7 @@ import textwrap
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -28,11 +28,17 @@ from .comparison.cache import (
     load_evaluation_cache,
     save_evaluation_cache,
 )
-from .comparison.metrics import binary_metric_breakdown
+from .comparison.grouping import resolve_evaluation_groups
+from .comparison.metrics import (
+    binary_metric_breakdown,
+    component_filtered_presence_breakdown,
+    grouped_binary_metric_breakdown,
+)
 from .comparison.object_sizes import (
     evaluate_object_size_model,
     object_size_report_artifacts_exist,
     prepare_object_size_reference,
+    render_grouped_metric_breakdown,
     render_large_object_examples,
     render_object_size_breakdown,
     render_segmentation_metric_breakdown,
@@ -44,6 +50,7 @@ from .comparison.reporting import write_json
 from .errors import DatasetValidationError, ValidationIssue
 from .model import ImagePrediction, Model, ModelCollection, ModelInput
 from .models import SemanticComparisonResult
+from .planning import callback_description
 from .sahi_support import resolve_sahi_settings
 from .utils import (
     IMAGE_SUFFIXES,
@@ -59,7 +66,7 @@ from .utils import (
 # Report presentation evolves independently from prediction/evaluation cache
 # identity. A report bump redraws output from completed caches without forcing
 # model inference to run again.
-SEMANTIC_REPORT_SCHEMA = 13
+SEMANTIC_REPORT_SCHEMA = 14
 SEMANTIC_PREDICTION_SCHEMA = 2
 SEMANTIC_EVALUATION_CACHE_SCHEMA = 2
 
@@ -110,7 +117,23 @@ _METRIC_DEFINITIONS = {
         "Fraction of empty-reference source images on which any foreground was predicted."
     ),
     "positive_image_recall": (
-        "Fraction of positive-reference source images on which any foreground was predicted."
+        "Raw fraction of positive-reference source images on which any foreground pixel was predicted."
+    ),
+    "presence_precision": (
+        "Raw image-level positive predictive value: detected positive-reference images divided "
+        "by all images with any predicted foreground pixel."
+    ),
+    "component_filtered_presence_precision": (
+        "Image-level positive predictive value after requiring at least one predicted 8-connected "
+        "foreground component at or above the configured minimum area."
+    ),
+    "component_filtered_positive_image_recall": (
+        "Fraction of positive-reference images retaining at least one predicted 8-connected "
+        "foreground component at or above the configured minimum area."
+    ),
+    "component_filtered_empty_image_specificity": (
+        "Fraction of empty-reference images with no predicted 8-connected foreground component "
+        "at or above the configured minimum area."
     ),
     "empty_mean_false_positive_pixels": (
         "Mean number of predicted foreground pixels per empty-reference source image."
@@ -126,6 +149,10 @@ _METRIC_DEFINITIONS = {
     "large_object_dice": (
         "Macro object Dice for reference-defined large objects (area >= held-out p90), "
         "including unmatched references and predictions as zero."
+    ),
+    "group_macro_dice": (
+        "Mean foreground Dice after pooling TP, FP, and FN within each caller-defined group; "
+        "every group with defined Dice receives equal weight."
     ),
 }
 
@@ -163,6 +190,32 @@ def _comparison_source_size_policy(export: "Dataset", errors: str) -> dict[str, 
     }
 
 
+def _normalize_minimum_component_area(value: float | None) -> float | None:
+    if value is None:
+        return None
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(
+            "min_connected_component_area must be finite and greater than zero"
+        )
+    return parsed
+
+
+def _evaluation_group_settings(
+    group_by: Callable[[Path], Hashable] | None,
+    groups: Mapping[str, str] | None,
+) -> dict[str, Any] | None:
+    if group_by is None or groups is None:
+        return None
+    counts = Counter(groups.values())
+    return {
+        "callback": callback_description(group_by),
+        "group_count": len(counts),
+        "case_counts": dict(sorted(counts.items())),
+        "case_groups": dict(sorted(groups.items())),
+    }
+
+
 def compare_nnunet_models(
     export: "Dataset",
     models: Any,
@@ -173,9 +226,14 @@ def compare_nnunet_models(
     destination: str | Path | None,
     trust_legacy_cache: bool = False,
     errors: Literal["raise", "skip"] = "raise",
+    min_connected_component_area: float | None = None,
+    group_by: Callable[[Path], Hashable] | None = None,
 ) -> SemanticComparisonResult:
     """Run official nnU-Net v2 prediction and evaluation for an export."""
 
+    requested_component_area = _normalize_minimum_component_area(
+        min_connected_component_area
+    )
     seed = 42
     bootstrap_resamples = 10_000
     split = normalize_split(split)
@@ -211,6 +269,11 @@ def compare_nnunet_models(
         else "system"
     )
     cases, cohort_fingerprint = _freeze_cohort(export, split, progress=progress)
+    groups = resolve_evaluation_groups(
+        ((case.case_id, case.image_path) for case in cases),
+        group_by,
+    )
+    group_settings = _evaluation_group_settings(group_by, groups)
 
     resolved_settings = {
         "backend": (
@@ -232,6 +295,9 @@ def compare_nnunet_models(
         "split": split,
         "bootstrap_resamples": bootstrap_resamples,
         "seed": seed,
+        "presence_min_connected_component_area": requested_component_area,
+        "presence_threshold_default": "held-out-reference-object-p10",
+        "grouping": group_settings,
         "model_backends": model_backends,
         "comparison_unit": comparison_unit,
         "sahi_models": resolved_sahi_by_model,
@@ -272,6 +338,8 @@ def compare_nnunet_models(
                 for spec in specs
             ],
             "source_size_policy": resolved_settings["source_size_policy"],
+            "presence_min_connected_component_area": requested_component_area,
+            "grouping": group_settings,
         }
     )
     target = (
@@ -577,11 +645,14 @@ def compare_nnunet_models(
             object_size_analysis,
             object_size_breakdown_path,
             large_object_examples,
+            presence_analysis,
         ) = _analyze_semantic_object_sizes(
             cases,
             prediction_dirs,
+            model_rows,
             ranking,
             reports,
+            requested_component_area=requested_component_area,
         )
         if object_size_analysis["status"] == "skipped":
             skip_reason = str(object_size_analysis["reason"])
@@ -591,8 +662,21 @@ def compare_nnunet_models(
         large_object_example_paths = [
             str(example["path"]) for example in large_object_examples
         ]
+        grouped_analysis, grouped_metric_breakdown_path = _analyze_grouped_metrics(
+            model_rows,
+            groups,
+            ranking,
+            reports,
+            group_settings=group_settings,
+        )
         _render_ranking(reports, ranking)
-        _render_metric_breakdown(reports, ranking)
+        _render_metric_breakdown(
+            reports,
+            ranking,
+            minimum_component_area=presence_analysis.get(
+                "resolved_min_connected_component_area_px"
+            ),
+        )
         _render_qualitative(reports, cases, prediction_dirs, model_rows, seed=seed)
         # Render only the cases the report keeps, so nothing is drawn that is
         # not also referenced in the manifest.
@@ -630,12 +714,15 @@ def compare_nnunet_models(
             "ranking": ranking,
             "metric_definitions": _METRIC_DEFINITIONS,
             "object_size_analysis": object_size_analysis,
+            "presence_analysis": presence_analysis,
+            "grouped_analysis": grouped_analysis,
             "paired_statistics": paired,
             "limitations": limitations,
             "worst_cases": worst_cases,
             "reports": {
                 "plots": "reports/plots.png",
                 "metric_breakdown": "reports/metric-breakdown.png",
+                "grouped_metric_breakdown": grouped_metric_breakdown_path,
                 "object_size_breakdown": object_size_breakdown_path,
                 "large_object_examples": large_object_example_paths,
                 "comparison": "reports/comparison.png",
@@ -688,9 +775,14 @@ def compare_semantic_models(
     destination: str | Path | None,
     trust_legacy_cache: bool = False,
     errors: Literal["raise", "skip"] = "raise",
+    min_connected_component_area: float | None = None,
+    group_by: Callable[[Path], Hashable] | None = None,
 ) -> SemanticComparisonResult:
     """Compare instance and semantic segmenters in one binary mask space."""
 
+    requested_component_area = _normalize_minimum_component_area(
+        min_connected_component_area
+    )
     seed = 42
     bootstrap_resamples = 10_000
     split = normalize_split(split)
@@ -742,6 +834,11 @@ def compare_semantic_models(
         )
 
     cases, cohort_fingerprint = _freeze_cohort(export, split, progress=progress)
+    groups = resolve_evaluation_groups(
+        ((case.case_id, case.image_path) for case in cases),
+        group_by,
+    )
+    group_settings = _evaluation_group_settings(group_by, groups)
     resolved_settings = {
         "backend": "common-semantic-mask",
         "report_schema": SEMANTIC_REPORT_SCHEMA,
@@ -753,6 +850,9 @@ def compare_semantic_models(
         "model_systems": model_systems,
         "bootstrap_resamples": bootstrap_resamples,
         "seed": seed,
+        "presence_min_connected_component_area": requested_component_area,
+        "presence_threshold_default": "held-out-reference-object-p10",
+        "grouping": group_settings,
         "models": [
             {
                 **model.describe(),
@@ -795,6 +895,8 @@ def compare_semantic_models(
                 for model in models
             ],
             "source_size_policy": resolved_settings["source_size_policy"],
+            "presence_min_connected_component_area": requested_component_area,
+            "grouping": group_settings,
         }
     )
     target = (
@@ -1076,11 +1178,14 @@ def compare_semantic_models(
             object_size_analysis,
             object_size_breakdown_path,
             large_object_examples,
+            presence_analysis,
         ) = _analyze_semantic_object_sizes(
             cases,
             prediction_dirs,
+            model_rows,
             ranking,
             reports,
+            requested_component_area=requested_component_area,
         )
         if object_size_analysis["status"] == "skipped":
             skip_reason = str(object_size_analysis["reason"])
@@ -1090,6 +1195,13 @@ def compare_semantic_models(
         large_object_example_paths = [
             str(example["path"]) for example in large_object_examples
         ]
+        grouped_analysis, grouped_metric_breakdown_path = _analyze_grouped_metrics(
+            model_rows,
+            groups,
+            ranking,
+            reports,
+            group_settings=group_settings,
+        )
         _render_ranking(
             reports,
             ranking,
@@ -1099,7 +1211,13 @@ def compare_semantic_models(
             ),
             title="Semantic-space model comparison",
         )
-        _render_metric_breakdown(reports, ranking)
+        _render_metric_breakdown(
+            reports,
+            ranking,
+            minimum_component_area=presence_analysis.get(
+                "resolved_min_connected_component_area_px"
+            ),
+        )
         _render_qualitative(reports, cases, prediction_dirs, model_rows, seed=seed)
         # Render only the cases the report keeps, so nothing is drawn that is
         # not also referenced in the manifest.
@@ -1136,6 +1254,8 @@ def compare_semantic_models(
             "ranking": ranking,
             "metric_definitions": _METRIC_DEFINITIONS,
             "object_size_analysis": object_size_analysis,
+            "presence_analysis": presence_analysis,
+            "grouped_analysis": grouped_analysis,
             "paired_statistics": paired,
             "limitations": limitations,
             "warnings": projection_warnings,
@@ -1143,6 +1263,7 @@ def compare_semantic_models(
             "reports": {
                 "plots": "reports/plots.png",
                 "metric_breakdown": "reports/metric-breakdown.png",
+                "grouped_metric_breakdown": grouped_metric_breakdown_path,
                 "object_size_breakdown": object_size_breakdown_path,
                 "large_object_examples": large_object_example_paths,
                 "comparison": "reports/comparison.png",
@@ -2929,21 +3050,23 @@ def _render_ranking(
 def _analyze_semantic_object_sizes(
     cases: list[_SemanticCase],
     prediction_dirs: Mapping[str, Path],
+    rows_by_model: Mapping[str, list[dict[str, Any]]],
     ranking: list[dict[str, Any]],
     reports: Path,
-) -> tuple[dict[str, Any], str | None, list[dict[str, Any]]]:
+    *,
+    requested_component_area: float | None,
+) -> tuple[
+    dict[str, Any],
+    str | None,
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
     """Score final full-image masks by reference-defined object area."""
 
     reference = prepare_object_size_reference(
         semantic_components_for_cases(cases, prefix="reference")
     )
-    if reference.status != "complete":
-        for row in ranking:
-            row.update(unavailable_object_size_summary())
-        return reference.metadata(), None, []
-
     predictions: dict[str, dict[str, tuple[Any, ...]]] = {}
-    results = {}
     for row in ranking:
         model_name = str(row["model"])
         model_predictions = semantic_components_for_cases(
@@ -2952,6 +3075,61 @@ def _analyze_semantic_object_sizes(
             prefix=f"prediction-{model_name}",
         )
         predictions[model_name] = model_predictions
+
+    resolved_component_area = (
+        requested_component_area
+        if requested_component_area is not None
+        else reference.p10_area
+    )
+    threshold_source = (
+        "explicit"
+        if requested_component_area is not None
+        else "held-out-reference-object-p10"
+    )
+    presence_analysis: dict[str, Any] = {
+        "raw_definition": "any predicted foreground pixel",
+        "component_filtered_definition": (
+            "at least one predicted 8-connected foreground component with "
+            "area greater than or equal to the resolved threshold"
+        ),
+        "connectivity": 8,
+        "requested_min_connected_component_area_px": requested_component_area,
+        "resolved_min_connected_component_area_px": resolved_component_area,
+        "threshold_source": threshold_source,
+    }
+    if resolved_component_area is None:
+        presence_analysis.update(
+            status="skipped",
+            reason=(
+                "minimum connected-component area is unavailable because the "
+                "held-out cohort has no reference foreground objects"
+            ),
+        )
+    else:
+        presence_analysis["status"] = "complete"
+        for row in ranking:
+            model_name = str(row["model"])
+            component_areas = {
+                case_id: [component.area for component in components]
+                for case_id, components in predictions[model_name].items()
+            }
+            row.update(
+                component_filtered_presence_breakdown(
+                    rows_by_model[model_name],
+                    component_areas,
+                    resolved_component_area,
+                )
+            )
+
+    if reference.status != "complete":
+        for row in ranking:
+            row.update(unavailable_object_size_summary())
+        return reference.metadata(), None, [], presence_analysis
+
+    results = {}
+    for row in ranking:
+        model_name = str(row["model"])
+        model_predictions = predictions[model_name]
         result = evaluate_object_size_model(reference, model_predictions)
         results[model_name] = result
         row.update(result.summary)
@@ -2979,12 +3157,53 @@ def _analyze_semantic_object_sizes(
     relative_size_path = (
         str(size_path.relative_to(reports.parent)) if size_path is not None else None
     )
-    return reference.metadata(), relative_size_path, examples
+    return reference.metadata(), relative_size_path, examples, presence_analysis
+
+
+def _analyze_grouped_metrics(
+    rows_by_model: Mapping[str, list[dict[str, Any]]],
+    groups: Mapping[str, str] | None,
+    ranking: list[dict[str, Any]],
+    reports: Path,
+    *,
+    group_settings: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], str | None]:
+    if groups is None:
+        return {"status": "not-requested"}, None
+
+    by_model: dict[str, dict[str, Any]] = {}
+    for row in ranking:
+        model_name = str(row["model"])
+        result = grouped_binary_metric_breakdown(rows_by_model[model_name], groups)
+        by_model[model_name] = result
+        row.update({key: value for key, value in result.items() if key != "per_group"})
+
+    path = render_grouped_metric_breakdown(
+        reports,
+        ranking,
+        by_model,
+        labels={
+            str(row["model"]): _ranking_plot_label(row)
+            for row in ranking
+        },
+    )
+    return (
+        {
+            "status": "complete",
+            "aggregation": "pool TP/FP/FN within group, then macro-average group scores",
+            "primary_ranking_unchanged": True,
+            "grouping": dict(group_settings or {}),
+            "models": by_model,
+        },
+        str(path.relative_to(reports.parent)),
+    )
 
 
 def _render_metric_breakdown(
     root: Path,
     ranking: list[dict[str, Any]],
+    *,
+    minimum_component_area: float | None,
 ) -> Path:
     return render_segmentation_metric_breakdown(
         root,
@@ -2994,6 +3213,7 @@ def _render_metric_breakdown(
             str(row["model"]): _ranking_plot_label(row)
             for row in ranking
         },
+        minimum_component_area=minimum_component_area,
     )
 
 

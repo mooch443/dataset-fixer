@@ -24,9 +24,12 @@ from dataset_fixer.comparison.cache import (
 from dataset_fixer.comparison.cohort import freeze_cohort
 from dataset_fixer.comparison.inference import _adaptive_batches, _run_native, resolve_backend
 from dataset_fixer.comparison.metrics import (
+    component_filtered_presence_breakdown,
     evaluate_configuration,
+    grouped_binary_metric_breakdown,
     optimal_match,
     segmentation_binary_metric_breakdown,
+    segmentation_binary_metric_rows,
 )
 from dataset_fixer.comparison.types import Cohort, CohortRecord, ModelSpec, Prediction
 from PIL import Image
@@ -166,6 +169,23 @@ def test_instance_segmentation_breakdown_uses_final_foreground_union_masks(
     assert metrics["empty_image_specificity"] == pytest.approx(0.0)
     assert metrics["empty_false_positive_pixels"] == 4
     assert metrics["empty_mean_false_positive_pixels"] == pytest.approx(4.0)
+    assert metrics["raw_presence_precision"] == pytest.approx(0.5)
+
+    rows = segmentation_binary_metric_rows(cohort, predictions, 0.5)
+    component_areas = {
+        str(row["case_id"]): row["prediction_component_areas"] for row in rows
+    }
+    filtered = component_filtered_presence_breakdown(rows, component_areas, 5)
+    assert filtered["component_filtered_positive_image_recall"] == pytest.approx(1.0)
+    assert filtered["component_filtered_empty_image_specificity"] == pytest.approx(1.0)
+    assert filtered["component_filtered_presence_precision"] == pytest.approx(1.0)
+
+    grouped = grouped_binary_metric_breakdown(
+        rows,
+        {"positive": "island-a", "empty": "island-b"},
+    )
+    assert grouped["group_count"] == 2
+    assert grouped["group_macro_dice"] == pytest.approx(0.5)
 
 
 def test_inference_is_explicit_and_pose_supports_sahi(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -729,7 +749,7 @@ def test_model_collection_compare_atomic_result(
 
     old_manifest_path = destination / "reports" / "result.json"
     old_manifest = json.loads(old_manifest_path.read_text())
-    old_manifest["schema"] = 7
+    old_manifest["schema"] = 8
     old_manifest_path.write_text(json.dumps(old_manifest), encoding="utf-8")
     regenerated = models.compare(
         dataset,
@@ -738,7 +758,7 @@ def test_model_collection_compare_atomic_result(
         destination=destination,
     )
     assert fake_inference.calls == 1
-    assert json.loads(old_manifest_path.read_text())["schema"] == 8
+    assert json.loads(old_manifest_path.read_text())["schema"] == 9
     assert regenerated.cache_statistics["prediction_hits"] == 1
 
     models.compare(
@@ -857,7 +877,13 @@ def test_segment_comparison_adds_postprocessed_binary_breakdown(
     )
     destination = tmp_path / "segment-comparison"
 
-    result = models.compare(dataset, progress=False, destination=destination)
+    result = models.compare(
+        dataset,
+        progress=False,
+        destination=destination,
+        min_connected_component_area=2,
+        group_by=lambda path: path.stem.split("_")[0],
+    )
 
     row = result.ranking[0]
     assert row["heldout_projection"] == "instance-polygon-foreground-union"
@@ -867,9 +893,19 @@ def test_segment_comparison_adds_postprocessed_binary_breakdown(
     assert row["empty_cases"] == 1
     assert row["empty_image_specificity"] == pytest.approx(1.0)
     manifest = json.loads((destination / "reports" / "result.json").read_text())
-    assert manifest["schema"] == 8
+    assert manifest["schema"] == 9
     assert manifest["ranking"][0]["positive_micro_iou"] == pytest.approx(1.0)
     assert manifest["ranking"][0]["small_object_dice"] == pytest.approx(1.0)
+    assert manifest["ranking"][0]["raw_presence_precision"] == pytest.approx(1.0)
+    assert manifest["ranking"][0][
+        "component_filtered_presence_precision"
+    ] == pytest.approx(1.0)
+    assert manifest["presence_analysis"]["threshold_source"] == "explicit"
+    assert manifest["presence_analysis"][
+        "resolved_min_connected_component_area_px"
+    ] == pytest.approx(2)
+    assert manifest["grouped_analysis"]["status"] == "complete"
+    assert manifest["grouped_analysis"]["primary_ranking_unchanged"] is True
     assert manifest["object_size_analysis"]["status"] == "complete"
     assert not any(
         "unavailable for tiled" in limitation
@@ -881,6 +917,10 @@ def test_segment_comparison_adds_postprocessed_binary_breakdown(
     assert manifest["object_size_analysis"]["matching_class_policy"] == "class-aware"
     assert manifest["object_size_analysis"]["connectivity"] is None
     assert manifest["reports"]["metric_breakdown"] == "reports/metric-breakdown.png"
+    assert manifest["reports"]["grouped_metric_breakdown"] == (
+        "reports/grouped-metric-breakdown.png"
+    )
+    assert (destination / "reports" / "grouped-metric-breakdown.png").is_file()
     assert (destination / "reports" / "object-size-breakdown.png").is_file()
 
 
