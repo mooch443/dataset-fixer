@@ -1242,6 +1242,7 @@ class Model:
         save_prediction_plots: bool = False,
         progress: bool = True,
         destination: str | Path | None = None,
+        trust_legacy_cache: bool = False,
     ) -> Any:
         """Evaluate this model on one frozen dataset cohort.
 
@@ -1255,6 +1256,11 @@ class Model:
             progress: Show package-managed progress bars.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.
+            trust_legacy_cache: Reuse and migrate one structurally complete
+                legacy semantic prediction cache when its exact model name and
+                frozen cohort paths match, even if the old entry lacks model
+                bytes/settings identity. Use only when you trust the cache's
+                provenance; the default remains verified reuse only.
 
         Returns:
             A task-appropriate comparison result. Prediction and evaluation
@@ -1267,6 +1273,7 @@ class Model:
             save_prediction_plots=save_prediction_plots,
             progress=progress,
             destination=destination,
+            trust_legacy_cache=trust_legacy_cache,
         )
 
     def visualize(
@@ -1616,6 +1623,7 @@ class ModelCollection:
         save_prediction_plots: bool = False,
         progress: bool = True,
         destination: str | Path | None = None,
+        trust_legacy_cache: bool = False,
     ) -> Any:
         """Compare the configured models on one frozen dataset cohort.
 
@@ -1638,6 +1646,11 @@ class ModelCollection:
             progress: Show package-managed progress bars.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.
+            trust_legacy_cache: Reuse and migrate one structurally complete
+                legacy semantic prediction cache when its exact model name and
+                frozen cohort paths match, even if the old entry lacks model
+                bytes/settings identity. Use only when you trust the cache's
+                provenance; the default remains verified reuse only.
 
         Returns:
             A task-appropriate comparison result. Comparison space is inferred
@@ -1687,6 +1700,7 @@ class ModelCollection:
                     save_prediction_plots=save_prediction_plots,
                     progress=progress,
                     destination=destination,
+                    trust_legacy_cache=trust_legacy_cache,
                 )
             from .semantic_comparison import compare_nnunet_models
 
@@ -1697,6 +1711,7 @@ class ModelCollection:
                 save_prediction_plots=save_prediction_plots,
                 progress=progress,
                 destination=destination,
+                trust_legacy_cache=trust_legacy_cache,
             )
         if any(model.kind != "ultralytics" for model in self.models):
             raise DatasetValidationError(
@@ -1726,6 +1741,11 @@ class ModelCollection:
             )
 
         from .comparison.engine import _compare_models
+
+        if trust_legacy_cache:
+            raise ValueError(
+                "trust_legacy_cache is only supported for semantic-mask comparisons"
+            )
 
         return _compare_models(
             active,

@@ -47,7 +47,7 @@ from .utils import (
 # Report presentation evolves independently from prediction/evaluation cache
 # identity. A report bump redraws output from completed caches without forcing
 # model inference to run again.
-SEMANTIC_REPORT_SCHEMA = 11
+SEMANTIC_REPORT_SCHEMA = 12
 SEMANTIC_PREDICTION_SCHEMA = 2
 SEMANTIC_EVALUATION_CACHE_SCHEMA = 2
 
@@ -56,6 +56,54 @@ SEMANTIC_EVALUATION_CACHE_SCHEMA = 2
 _NNUNET_SAHI_PROBABILITY_GROUP_BYTES = 512 * 1024 * 1024
 _NNUNET_SAHI_MAX_IMAGES_PER_GROUP = 512
 _NNUNET_SAHI_INFERENCE_CHUNK_BYTES = 512 * 1024 * 1024
+
+
+_METRIC_DEFINITIONS = {
+    "dice": (
+        "Mean per-source-image foreground Dice over defined cases. Empty reference and empty "
+        "prediction is undefined and excluded; an empty reference with any prediction scores 0."
+    ),
+    "iou": (
+        "Mean per-source-image foreground IoU over the same defined cases as dice."
+    ),
+    "micro_dice": (
+        "Foreground Dice from TP, FP, and FN pooled across all reconstructed source images."
+    ),
+    "micro_iou": (
+        "Foreground IoU from TP, FP, and FN pooled across all reconstructed source images. "
+        "For binary YOLO semantic validation this is the directly comparable foreground mIoU."
+    ),
+    "foreground_precision": (
+        "Foreground pixel precision from TP and FP pooled across all reconstructed source images."
+    ),
+    "foreground_recall": (
+        "Foreground pixel recall from TP and FN pooled across all reconstructed source images."
+    ),
+    "positive_case_dice": (
+        "Mean per-source-image foreground Dice using only images with foreground in the reference."
+    ),
+    "positive_case_iou": (
+        "Mean per-source-image foreground IoU using only images with foreground in the reference."
+    ),
+    "positive_micro_dice": (
+        "Foreground Dice pooled only across images with foreground in the reference."
+    ),
+    "positive_micro_iou": (
+        "Foreground IoU pooled only across images with foreground in the reference."
+    ),
+    "empty_image_specificity": (
+        "Fraction of empty-reference source images on which no foreground was predicted."
+    ),
+    "empty_image_false_positive_rate": (
+        "Fraction of empty-reference source images on which any foreground was predicted."
+    ),
+    "positive_image_recall": (
+        "Fraction of positive-reference source images on which any foreground was predicted."
+    ),
+    "empty_mean_false_positive_pixels": (
+        "Mean number of predicted foreground pixels per empty-reference source image."
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -82,6 +130,7 @@ def compare_nnunet_models(
     save_prediction_plots: bool,
     progress: bool,
     destination: str | Path | None,
+    trust_legacy_cache: bool = False,
 ) -> SemanticComparisonResult:
     """Run official nnU-Net v2 prediction and evaluation for an export."""
 
@@ -193,6 +242,7 @@ def compare_nnunet_models(
     if (
         existing.is_file()
         and (target / "reports" / "plots.png").is_file()
+        and (target / "reports" / "metric-breakdown.png").is_file()
         and (target / "reports" / "comparison.png").is_file()
         and (not save_prediction_plots or (target / "predictions").is_dir())
     ):
@@ -223,7 +273,8 @@ def compare_nnunet_models(
     if "sahi" in model_backends.values():
         limitations.append(
             "nnU-Net predictions were reconstructed from source-coordinate SAHI tiles "
-            "with feathered probability blending before full-image evaluation."
+            "with feathered probability blending before full-image evaluation. Metrics are "
+            "computed once per reconstructed source image, never per SAHI tile."
         )
 
     try:
@@ -288,6 +339,7 @@ def compare_nnunet_models(
                 required_fields=("summary", "native_summary", "native_rows"),
                 progress=progress,
                 model_name=spec.name,
+                trust_legacy_cache=trust_legacy_cache,
             )
             if cached is not None:
                 prediction_dir = cache_dir / "predictions"
@@ -389,6 +441,7 @@ def compare_nnunet_models(
             native_finite_support = sum(
                 math.isfinite(row["dice"]) for row in native_rows
             )
+            metric_breakdown = _binary_metric_breakdown(rows)
             cached_interval = (
                 (cached_statistics or {}).get("intervals", {}).get(spec.name)
             )
@@ -410,6 +463,7 @@ def compare_nnunet_models(
                     "score": dice,
                     "dice": dice,
                     "iou": iou,
+                    **metric_breakdown,
                     "native_dice": native_dice,
                     "native_iou": native_iou,
                     "ci_low": ci_low,
@@ -469,6 +523,7 @@ def compare_nnunet_models(
         reports = temporary / "reports"
         reports.mkdir(parents=True, exist_ok=True)
         _render_ranking(reports, ranking)
+        _render_metric_breakdown(reports, ranking)
         _render_qualitative(reports, cases, prediction_dirs, model_rows, seed=seed)
         # Render only the cases the report keeps, so nothing is drawn that is
         # not also referenced in the manifest.
@@ -500,14 +555,17 @@ def compare_nnunet_models(
             "cohort_verified": True,
             "split": split,
             "cases": len(cases),
+            "case_composition": _case_composition(ranking),
             "settings": resolved_settings,
             "settings_fingerprint": fingerprint,
             "ranking": ranking,
+            "metric_definitions": _METRIC_DEFINITIONS,
             "paired_statistics": paired,
             "limitations": limitations,
             "worst_cases": worst_cases,
             "reports": {
                 "plots": "reports/plots.png",
+                "metric_breakdown": "reports/metric-breakdown.png",
                 "comparison": "reports/comparison.png",
                 "prediction_plots": prediction_paths,
             },
@@ -551,6 +609,7 @@ def compare_semantic_models(
     save_prediction_plots: bool,
     progress: bool,
     destination: str | Path | None,
+    trust_legacy_cache: bool = False,
 ) -> SemanticComparisonResult:
     """Compare instance and semantic segmenters in one binary mask space."""
 
@@ -670,6 +729,7 @@ def compare_semantic_models(
     if (
         existing.is_file()
         and (target / "reports" / "plots.png").is_file()
+        and (target / "reports" / "metric-breakdown.png").is_file()
         and (target / "reports" / "comparison.png").is_file()
         and (not save_prediction_plots or (target / "predictions").is_dir())
     ):
@@ -692,6 +752,11 @@ def compare_semantic_models(
         "Dice is undefined when both reference and prediction are empty; finite support is reported separately.",
         "Training/evaluation overlap cannot be independently verified for models without training provenance.",
     ]
+    if resolved_sahi_by_model:
+        limitations.append(
+            "SAHI predictions are scored only after tile post-processing and full source-image "
+            "reconstruction; logical SAHI tiles are never evaluation cases."
+        )
 
     try:
         statistics_key = f"semantic-comparison-{fingerprint}"
@@ -786,6 +851,7 @@ def compare_semantic_models(
                 required_fields=("projection", "native_task", "backend"),
                 progress=progress,
                 model_name=model.name,
+                trust_legacy_cache=trust_legacy_cache,
             )
             if cached is not None:
                 prediction_dir = cache_dir / "predictions"
@@ -846,11 +912,7 @@ def compare_semantic_models(
             finite_iou = [row["iou"] for row in rows if math.isfinite(row["iou"])]
             dice = float(np.mean(finite_dice)) if finite_dice else math.nan
             iou = float(np.mean(finite_iou)) if finite_iou else math.nan
-            tp = sum(int(row["tp"]) for row in rows)
-            fp = sum(int(row["fp"]) for row in rows)
-            fn = sum(int(row["fn"]) for row in rows)
-            micro_dice_denominator = 2 * tp + fp + fn
-            micro_iou_denominator = tp + fp + fn
+            metric_breakdown = _binary_metric_breakdown(rows)
             cached_interval = (
                 (cached_statistics or {}).get("intervals", {}).get(model.name)
             )
@@ -873,16 +935,7 @@ def compare_semantic_models(
                     "score": dice,
                     "dice": dice,
                     "iou": iou,
-                    "micro_dice": (
-                        2 * tp / micro_dice_denominator
-                        if micro_dice_denominator
-                        else math.nan
-                    ),
-                    "micro_iou": (
-                        tp / micro_iou_denominator
-                        if micro_iou_denominator
-                        else math.nan
-                    ),
+                    **metric_breakdown,
                     "ci_low": ci_low,
                     "ci_high": ci_high,
                     "support_cases": len(finite_dice),
@@ -935,9 +988,13 @@ def compare_semantic_models(
         _render_ranking(
             reports,
             ranking,
-            xlabel="Canonical binary foreground mean Dice",
-            title="Semantic-space model comparison",
+            xlabel=(
+                "Mean per-source-image foreground Dice "
+                "(empty false positives = 0; empty/empty excluded)"
+            ),
+            title="Semantic-space model comparison — existing headline metric",
         )
+        _render_metric_breakdown(reports, ranking)
         _render_qualitative(reports, cases, prediction_dirs, model_rows, seed=seed)
         # Render only the cases the report keeps, so nothing is drawn that is
         # not also referenced in the manifest.
@@ -968,15 +1025,18 @@ def compare_semantic_models(
             "cohort_verified": True,
             "split": split,
             "cases": len(cases),
+            "case_composition": _case_composition(ranking),
             "settings": resolved_settings,
             "settings_fingerprint": fingerprint,
             "ranking": ranking,
+            "metric_definitions": _METRIC_DEFINITIONS,
             "paired_statistics": paired,
             "limitations": limitations,
             "warnings": projection_warnings,
             "worst_cases": worst_cases,
             "reports": {
                 "plots": "reports/plots.png",
+                "metric_breakdown": "reports/metric-breakdown.png",
                 "comparison": "reports/comparison.png",
                 "prediction_plots": prediction_paths,
             },
@@ -2693,12 +2753,26 @@ def _ranking_plot_label(row: Mapping[str, Any]) -> str:
     return _shorten_plot_text(name)
 
 
+def _case_composition(ranking: list[dict[str, Any]]) -> dict[str, int]:
+    if not ranking:
+        return {"positive": 0, "empty": 0, "total": 0}
+    first = ranking[0]
+    return {
+        "positive": int(first.get("positive_cases") or 0),
+        "empty": int(first.get("empty_cases") or 0),
+        "total": int(first.get("cohort_cases") or 0),
+    }
+
+
 def _render_ranking(
     root: Path,
     ranking: list[dict[str, Any]],
     *,
-    xlabel: str = "Canonical probability-pooled foreground mean Dice",
-    title: str = "nnU-Net semantic-mask model comparison",
+    xlabel: str = (
+        "Mean per-source-image foreground Dice "
+        "(empty false positives = 0; empty/empty excluded)"
+    ),
+    title: str = "nnU-Net semantic-mask comparison — existing headline metric",
 ) -> list[str]:
     import matplotlib.pyplot as plt
 
@@ -2725,6 +2799,85 @@ def _render_ranking(
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
     plt.close(figure)
     return [str(path.relative_to(root))]
+
+
+def _render_metric_breakdown(
+    root: Path,
+    ranking: list[dict[str, Any]],
+) -> Path:
+    """Render complementary overlap and empty-image behavior side by side."""
+
+    import matplotlib.pyplot as plt
+
+    columns = (
+        ("dice", "All defined images\nmean Dice"),
+        ("micro_dice", "All pixels pooled\nforeground Dice"),
+        ("micro_iou", "All pixels pooled\nforeground IoU"),
+        ("positive_case_dice", "Positive images only\nmean Dice"),
+        ("positive_micro_dice", "Positive images only\npooled Dice"),
+        ("positive_micro_iou", "Positive images only\npooled IoU"),
+        ("positive_image_recall", "Positive images\nany-prediction rate"),
+        ("empty_image_specificity", "Empty images\nno-prediction rate"),
+    )
+    values = np.asarray(
+        [
+            [float(row.get(key, math.nan)) for key, _ in columns]
+            for row in ranking
+        ],
+        dtype=float,
+    )
+    masked = np.ma.masked_invalid(values)
+    figure, axis = plt.subplots(
+        figsize=(19.5, max(4.5, 0.9 * len(ranking) + 2.3))
+    )
+    colormap = plt.get_cmap("viridis").with_extremes(bad="#D9D9D9")
+    image = axis.imshow(masked, vmin=0, vmax=1, cmap=colormap, aspect="auto")
+    axis.set_xticks(
+        np.arange(len(columns)),
+        [label for _, label in columns],
+        fontsize=9,
+    )
+    axis.set_yticks(
+        np.arange(len(ranking)),
+        [_ranking_plot_label(row) for row in ranking],
+        fontsize=8.5,
+        linespacing=1.15,
+    )
+    axis.tick_params(axis="x", bottom=False, top=True, labelbottom=False, labeltop=True)
+    for row_index in range(values.shape[0]):
+        for column_index in range(values.shape[1]):
+            value = values[row_index, column_index]
+            label = f"{value:.3f}" if math.isfinite(value) else "n/a"
+            axis.text(
+                column_index,
+                row_index,
+                label,
+                ha="center",
+                va="center",
+                color="white" if math.isfinite(value) and value < 0.65 else "black",
+                fontsize=8.5,
+            )
+    axis.set_title(
+        "Semantic metric breakdown — final reconstructed source images",
+        pad=48,
+    )
+    colorbar = figure.colorbar(image, ax=axis, fraction=0.025, pad=0.02)
+    colorbar.set_label("Higher is better")
+    figure.text(
+        0.5,
+        0.01,
+        (
+            "Empty-only Dice/IoU is undefined, so empty images are represented by the "
+            "fraction with no predicted foreground."
+        ),
+        ha="center",
+        fontsize=8.5,
+    )
+    figure.tight_layout(rect=(0, 0.04, 1, 1))
+    path = root / "metric-breakdown.png"
+    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.close(figure)
+    return path
 
 
 def _render_qualitative(
@@ -2892,6 +3045,32 @@ def _semantic_result_from_manifest(
     )
 
 
+def _legacy_semantic_cache_matches(
+    value: Mapping[str, Any],
+    cases: list[_SemanticCase],
+    *,
+    model_name: str,
+) -> bool:
+    """Match the strongest identity fields available in pre-identity caches."""
+
+    rows = value.get("rows")
+    if not isinstance(rows, list) or len(rows) != len(cases):
+        return False
+    expected = {
+        case.case_id: case.relative_path.as_posix()
+        for case in cases
+    }
+    actual: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, Mapping) or str(row.get("model")) != model_name:
+            return False
+        case_id = str(row.get("case_id"))
+        if case_id in actual:
+            return False
+        actual[case_id] = str(row.get("relative_path"))
+    return actual == expected
+
+
 def _load_compatible_semantic_cache(
     cache_dir: Path,
     legacy_cache_dirs: Iterable[Path],
@@ -2901,6 +3080,7 @@ def _load_compatible_semantic_cache(
     required_fields: Iterable[str] = (),
     progress: bool = False,
     model_name: str | None = None,
+    trust_legacy_cache: bool = False,
 ) -> tuple[Path, dict[str, Any] | None]:
     """Load the current semantic cache key or a compatible historical key.
 
@@ -2910,11 +3090,15 @@ def _load_compatible_semantic_cache(
     execution-only values such as device, batching, worker count, and installed
     package versions, so the exact historical hash is checked as a final
     compatibility path. Every verified hit is promoted to the current key.
+    With an explicit trust override, one otherwise unverifiable entry may also
+    be migrated after its model name, case IDs, relative paths, metadata, and
+    complete prediction-mask set have been validated.
     """
 
+    legacy_cache_dirs = tuple(legacy_cache_dirs)
+    known_key_paths = {cache_dir, *legacy_cache_dirs}
     discovered: list[Path] = []
-    unverifiable: list[tuple[Path, str]] = []
-    expected_case_ids = {case.case_id for case in cases}
+    unverifiable: list[Path] = []
     if cache_dir.parent.is_dir():
         for metadata_path in cache_dir.parent.glob("*/evaluation.json"):
             if metadata_path.parent.name.startswith("."):
@@ -2932,34 +3116,79 @@ def _load_compatible_semantic_cache(
                 and cache_key(stored_identity) == cache_key(cache_identity)
             ):
                 discovered.append(metadata_path.parent)
-            elif not isinstance(stored_identity, dict) and isinstance(value, dict):
-                rows = value.get("rows")
+            elif (
+                not isinstance(stored_identity, dict)
+                and isinstance(value, dict)
+                and metadata_path.parent not in known_key_paths
+            ):
                 if (
                     model_name is not None
-                    and isinstance(rows, list)
-                    and {str(row.get("model")) for row in rows} == {model_name}
-                    and {str(row.get("case_id")) for row in rows} == expected_case_ids
-                ):
-                    unverifiable.append(
-                        (
-                            metadata_path.parent,
-                            "legacy entry has no stored logical identity, so model bytes/settings cannot be verified",
-                        )
+                    and _legacy_semantic_cache_matches(
+                        value,
+                        cases,
+                        model_name=model_name,
                     )
+                ):
+                    unverifiable.append(metadata_path.parent)
 
-    candidates = (cache_dir, *discovered, *legacy_cache_dirs)
+    invalid: list[tuple[Path, str]] = []
+    trusted_values: dict[Path, dict[str, Any]] = {}
+    if trust_legacy_cache:
+        for candidate in unverifiable:
+            cached, status = _inspect_semantic_cache(
+                candidate,
+                cases,
+                progress=progress,
+                model_name=model_name,
+            )
+            if cached is None:
+                invalid.append((candidate, status))
+                continue
+            missing_fields = [field for field in required_fields if field not in cached]
+            if missing_fields:
+                invalid.append(
+                    (candidate, f"metadata is missing fields: {', '.join(missing_fields)}")
+                )
+                continue
+            trusted_values[candidate] = cached
+        if len(trusted_values) > 1:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Multiple unverified legacy prediction caches match the same model and cohort",
+                    source=model_name,
+                    value=[str(path) for path in sorted(trusted_values)],
+                    suggestion=(
+                        "keep only the intended legacy cache entry, then rerun with "
+                        "trust_legacy_cache=True"
+                    ),
+                )
+            )
+    else:
+        invalid.extend(
+            (
+                candidate,
+                "legacy entry matches model name and cohort paths but has no stored "
+                "logical identity; pass trust_legacy_cache=True once to migrate it",
+            )
+            for candidate in unverifiable
+        )
+
+    candidates = (cache_dir, *discovered, *legacy_cache_dirs, *trusted_values)
     seen: set[Path] = set()
-    invalid: list[tuple[Path, str]] = list(unverifiable)
     for candidate in candidates:
         if candidate in seen:
             continue
         seen.add(candidate)
-        cached, status = _inspect_semantic_cache(
-            candidate,
-            cases,
-            progress=progress,
-            model_name=model_name,
-        )
+        trusted_legacy = candidate in trusted_values
+        if trusted_legacy:
+            cached, status = trusted_values[candidate], "valid"
+        else:
+            cached, status = _inspect_semantic_cache(
+                candidate,
+                cases,
+                progress=progress,
+                model_name=model_name,
+            )
         if cached is None:
             if status != "not found":
                 invalid.append((candidate, status))
@@ -2971,17 +3200,30 @@ def _load_compatible_semantic_cache(
             )
             continue
         if candidate != cache_dir:
+            promoted_metadata = {**cached, "cache_identity": cache_identity}
+            if trusted_legacy:
+                promoted_metadata["legacy_cache_migration"] = {
+                    "trusted": True,
+                    "matched_on": ["model_name", "case_ids", "relative_paths"],
+                    "source_cache_key": candidate.name,
+                    "migrated_at_unix": time.time(),
+                }
             promoted = _promote_semantic_cache(
                 candidate,
                 cache_dir,
-                {**cached, "cache_identity": cache_identity},
+                promoted_metadata,
             )
             if promoted:
                 candidate = cache_dir
             if progress:
+                detail = (
+                    "user-trusted legacy migration by model name and cohort paths"
+                    if trusted_legacy
+                    else "compatible historical cache key"
+                )
                 print(
                     f"Cache hit: {model_name or 'semantic model'} "
-                    f"({len(cases)} completed masks; compatible historical cache key)"
+                    f"({len(cases)} completed masks; {detail})"
                 )
         elif progress:
             print(
@@ -3213,6 +3455,94 @@ def _binary_mask_metrics(
         "tn": tn,
         "n_ref": int(np.sum(truth)),
         "n_pred": int(np.sum(prediction)),
+    }
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else math.nan
+
+
+def _mean_finite(rows: list[dict[str, Any]], key: str) -> float:
+    values = [float(row[key]) for row in rows if math.isfinite(float(row[key]))]
+    return float(np.mean(values)) if values else math.nan
+
+
+def _binary_metric_breakdown(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize final source-image masks without letting background dominate.
+
+    Rows are emitted only after native or SAHI inference has produced one final
+    reconstructed mask per source image. SAHI tiles are therefore never metric
+    samples in this function.
+    """
+
+    positive_rows = [row for row in rows if float(row["n_ref"]) > 0]
+    empty_rows = [row for row in rows if float(row["n_ref"]) == 0]
+
+    def totals(selected: list[dict[str, Any]]) -> tuple[int, int, int]:
+        return (
+            sum(int(row["tp"]) for row in selected),
+            sum(int(row["fp"]) for row in selected),
+            sum(int(row["fn"]) for row in selected),
+        )
+
+    tp, fp, fn = totals(rows)
+    positive_tp, positive_fp, positive_fn = totals(positive_rows)
+    empty_false_positive_rows = [
+        row for row in empty_rows if float(row["n_pred"]) > 0
+    ]
+    positive_missed_rows = [
+        row for row in positive_rows if float(row["n_pred"]) == 0
+    ]
+    empty_false_positive_pixels = sum(
+        int(row["fp"]) for row in empty_rows
+    )
+
+    return {
+        "micro_dice": _safe_ratio(2 * tp, 2 * tp + fp + fn),
+        "micro_iou": _safe_ratio(tp, tp + fp + fn),
+        "foreground_precision": _safe_ratio(tp, tp + fp),
+        "foreground_recall": _safe_ratio(tp, tp + fn),
+        "positive_case_dice": _mean_finite(positive_rows, "dice"),
+        "positive_case_iou": _mean_finite(positive_rows, "iou"),
+        "positive_micro_dice": _safe_ratio(
+            2 * positive_tp,
+            2 * positive_tp + positive_fp + positive_fn,
+        ),
+        "positive_micro_iou": _safe_ratio(
+            positive_tp,
+            positive_tp + positive_fp + positive_fn,
+        ),
+        "positive_foreground_precision": _safe_ratio(
+            positive_tp,
+            positive_tp + positive_fp,
+        ),
+        "positive_foreground_recall": _safe_ratio(
+            positive_tp,
+            positive_tp + positive_fn,
+        ),
+        "positive_cases": len(positive_rows),
+        "positive_detected_cases": len(positive_rows) - len(positive_missed_rows),
+        "positive_missed_cases": len(positive_missed_rows),
+        "positive_image_recall": _safe_ratio(
+            len(positive_rows) - len(positive_missed_rows),
+            len(positive_rows),
+        ),
+        "empty_cases": len(empty_rows),
+        "empty_correct_cases": len(empty_rows) - len(empty_false_positive_rows),
+        "empty_false_positive_cases": len(empty_false_positive_rows),
+        "empty_image_specificity": _safe_ratio(
+            len(empty_rows) - len(empty_false_positive_rows),
+            len(empty_rows),
+        ),
+        "empty_image_false_positive_rate": _safe_ratio(
+            len(empty_false_positive_rows),
+            len(empty_rows),
+        ),
+        "empty_false_positive_pixels": empty_false_positive_pixels,
+        "empty_mean_false_positive_pixels": _safe_ratio(
+            empty_false_positive_pixels,
+            len(empty_rows),
+        ),
     }
 
 

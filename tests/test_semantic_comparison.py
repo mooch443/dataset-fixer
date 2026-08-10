@@ -24,6 +24,7 @@ from dataset_fixer.semantic_comparison import (
     SEMANTIC_REPORT_SCHEMA,
     _SemanticCase,
     _all_pairwise_statistics,
+    _binary_metric_breakdown,
     _canonicalize_predictions,
     _multiline_model_title,
     _project_semantic_predictions,
@@ -498,6 +499,67 @@ def test_semantic_comparison_reports_finite_dice_support(
     assert result.ranking[0]["cohort_cases"] == 2
     assert result.ranking[0]["support_cases"] == 1
     assert result.ranking[0]["undefined_cases"] == 1
+    assert result.ranking[0]["positive_cases"] == 1
+    assert result.ranking[0]["empty_cases"] == 1
+    assert result.ranking[0]["positive_case_dice"] == pytest.approx(1.0)
+    assert result.ranking[0]["empty_image_specificity"] == pytest.approx(1.0)
+
+
+def test_binary_metric_breakdown_separates_positive_and_empty_images() -> None:
+    rows = [
+        {
+            "dice": 0.8,
+            "iou": 2 / 3,
+            "tp": 8,
+            "fp": 2,
+            "fn": 2,
+            "n_ref": 10,
+            "n_pred": 10,
+        },
+        {
+            "dice": 0.0,
+            "iou": 0.0,
+            "tp": 0,
+            "fp": 0,
+            "fn": 5,
+            "n_ref": 5,
+            "n_pred": 0,
+        },
+        {
+            "dice": 0.0,
+            "iou": 0.0,
+            "tp": 0,
+            "fp": 1,
+            "fn": 0,
+            "n_ref": 0,
+            "n_pred": 1,
+        },
+        {
+            "dice": float("nan"),
+            "iou": float("nan"),
+            "tp": 0,
+            "fp": 0,
+            "fn": 0,
+            "n_ref": 0,
+            "n_pred": 0,
+        },
+    ]
+
+    metrics = _binary_metric_breakdown(rows)
+
+    assert metrics["micro_dice"] == pytest.approx(16 / 26)
+    assert metrics["micro_iou"] == pytest.approx(8 / 18)
+    assert metrics["foreground_precision"] == pytest.approx(8 / 11)
+    assert metrics["foreground_recall"] == pytest.approx(8 / 15)
+    assert metrics["positive_case_dice"] == pytest.approx(0.4)
+    assert metrics["positive_case_iou"] == pytest.approx(1 / 3)
+    assert metrics["positive_micro_dice"] == pytest.approx(16 / 25)
+    assert metrics["positive_micro_iou"] == pytest.approx(8 / 17)
+    assert metrics["positive_image_recall"] == pytest.approx(0.5)
+    assert metrics["empty_image_specificity"] == pytest.approx(0.5)
+    assert metrics["empty_image_false_positive_rate"] == pytest.approx(0.5)
+    assert metrics["empty_false_positive_pixels"] == 1
+    assert metrics["empty_mean_false_positive_pixels"] == pytest.approx(0.5)
 
 
 def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
@@ -653,6 +715,7 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
     assert all(options["inference"] == "sahi" for options in prediction_options)
     assert all(model.settings["sahi_slice_height"] == 24 for model in models)
     assert (destination / "reports" / "plots.png").is_file()
+    assert (destination / "reports" / "metric-breakdown.png").is_file()
     assert (destination / "reports" / "comparison.png").is_file()
     assert not list(destination.rglob("*.jsonl"))
     calls_after_first = len(prediction_options)
@@ -663,6 +726,7 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
     cache_root = default_cache_root(exported.location) / "semantic"
     legacy_dirs: list[Path] = []
     current_dirs: list[Path] = []
+    current_payloads: list[dict[str, object]] = []
     for index, (model, options) in enumerate(zip(models, prediction_options)):
         current_payload = {
             "schema": 2,
@@ -683,6 +747,7 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
                 else {}
             ),
         }
+        current_payloads.append(current_payload)
         current_dir = cache_root / cache_key(current_payload)
         current_dirs.append(current_dir)
         metadata_path = current_dir / "evaluation.json"
@@ -742,6 +807,52 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
     )
     assert relocated_result.cohort_fingerprint == result.cohort_fingerprint
     assert len(prediction_options) == calls_after_first
+
+    # An archive from a release that did not store any logical identity can be
+    # retained through an explicit one-time trust decision. Its model name,
+    # cohort paths, metadata, and complete mask set must still match. Promotion
+    # records that decision and makes subsequent strict lookups reusable.
+    unverified = cache_root / ("unverified-" + "1" * 53)
+    unverified_metadata_path = current_dirs[0] / "evaluation.json"
+    unverified_metadata = json.loads(
+        unverified_metadata_path.read_text(encoding="utf-8")
+    )
+    unverified_metadata.pop("cache_identity")
+    unverified_metadata_path.write_text(
+        json.dumps(unverified_metadata),
+        encoding="utf-8",
+    )
+    current_dirs[0].rename(unverified)
+    calls_before_trusted_migration = len(prediction_options)
+    capsys.readouterr()
+    models.compare(
+        exported,
+        split="val",
+        progress=True,
+        destination=tmp_path / "mixed-comparison-trusted-legacy",
+        trust_legacy_cache=True,
+    )
+    trusted_output = capsys.readouterr().out
+    assert f"Cache hit: {models[0].name}" in trusted_output
+    assert "user-trusted legacy migration" in trusted_output
+    assert len(prediction_options) == calls_before_trusted_migration
+    assert current_dirs[0].is_dir()
+    assert not unverified.exists()
+    migrated_metadata = json.loads(
+        (current_dirs[0] / "evaluation.json").read_text(encoding="utf-8")
+    )
+    assert cache_key(migrated_metadata["cache_identity"]) == cache_key(
+        current_payloads[0]
+    )
+    assert migrated_metadata["legacy_cache_migration"]["trusted"] is True
+
+    models.compare(
+        exported,
+        split="val",
+        progress=False,
+        destination=tmp_path / "mixed-comparison-after-trusted-legacy",
+    )
+    assert len(prediction_options) == calls_before_trusted_migration
 
     # A completed-looking entry with a missing mask is invalid, must be
     # reported before inference, and must be replaced after inference finishes.
@@ -1250,6 +1361,7 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     assert not list(destination.rglob("*.csv"))
     assert not list(destination.rglob("*.jsonl"))
     assert (destination / "reports" / "plots.png").is_file()
+    assert (destination / "reports" / "metric-breakdown.png").is_file()
     assert (destination / "reports" / "comparison.png").is_file()
     assert not (destination / "figures").exists()
     assert not (destination / "qualitative").exists()
@@ -1258,6 +1370,9 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     assert manifest["adapter"] == "nnunetv2-official"
     assert manifest["schema"] == SEMANTIC_REPORT_SCHEMA
     assert manifest["cases"] == 2
+    assert manifest["case_composition"] == {"positive": 2, "empty": 0, "total": 2}
+    assert "micro_iou" in manifest["metric_definitions"]
+    assert manifest["reports"]["metric_breakdown"] == "reports/metric-breakdown.png"
     assert "upscale_factor" not in manifest["settings"]
     assert [model["upscale_factor"] for model in manifest["settings"]["models"]] == [2, 1]
     assert result.ranking[0]["projection"] == "probability-area-pool-argmax"

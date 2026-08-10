@@ -533,6 +533,14 @@ sliced_models = Model.load_many({
 sliced = sliced_models.compare(dataset, split="val")
 ```
 
+Semantic prediction caches created before logical cache identities were stored
+can be migrated once with
+`models.compare(dataset, trust_legacy_cache=True)`. The opt-in requires an
+exact model-name, case-ID, relative-path, metadata, and complete-mask match and
+refuses ambiguous matches. A successful migration records the trust decision
+under the current identity, so later calls should omit the option and reuse the
+cache normally.
+
 `models.compare()` has no shared inference, resolution, threshold, protocol,
 comparison-space, comparison-unit, or model-reference options. Each model
 carries its own configuration, the dataset/task pair determines the canonical
