@@ -18,6 +18,20 @@ def _size(value: tuple[int, int] | None) -> str | None:
     return f"{value[0]}x{value[1]}" if value is not None else None
 
 
+def _dataset_source(value: Prepared | Mapping[str, Any]) -> str | None:
+    """Return only the portable source folder/ZIP basename."""
+
+    if isinstance(value, Prepared):
+        return value.source_name
+    dataset = dict(value)
+    source = dataset.get("dataset_source") or dataset.get("source_dataset_zip")
+    if source is None:
+        nested = dataset.get("source_dataset")
+        if isinstance(nested, Mapping):
+            source = nested.get("basename") or nested.get("name") or nested.get("path")
+    return Path(str(source)).name if source else None
+
+
 def _values(config: Config | Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
     if isinstance(config, Config):
         geometry = (
@@ -26,6 +40,7 @@ def _values(config: Config | Mapping[str, Any]) -> tuple[dict[str, Any], list[st
             else Geometry.create(**dict(config.geometry))
         )
         dataset = config.dataset
+        dataset_source = _dataset_source(dataset)
         if isinstance(dataset, Prepared):
             dataset_hash = dataset.content_sha256
             preparation = dataset.kind.value
@@ -41,10 +56,15 @@ def _values(config: Config | Mapping[str, Any]) -> tuple[dict[str, Any], list[st
             "model_input_size": list(geometry.input_size) if geometry.input_size else None,
             "dataset_content_sha256": dataset_hash,
             "dataset_preparation": preparation,
+            "dataset_source": dataset_source,
             **dict(config.training),
         }
     else:
         values = dict(config)
+        if not values.get("dataset_source"):
+            dataset_source = _dataset_source(values)
+            if dataset_source:
+                values["dataset_source"] = dataset_source
         geometry = Geometry.create(
             native_tile_size=values.get("native_tile_size"),
             upscale_factor=values.get("upscale_factor"),
@@ -69,6 +89,9 @@ def _values(config: Config | Mapping[str, Any]) -> tuple[dict[str, Any], list[st
         tags.append(f"scale-{geometry.upscale_factor}x")
     if geometry.input_size:
         tags.append(f"input-{_size(geometry.input_size)}")
+    dataset_source = cleaned.get("dataset_source")
+    if dataset_source:
+        tags.append(str(dataset_source))
     return cleaned, list(dict.fromkeys(tags))
 
 
@@ -94,6 +117,10 @@ def configure(run: Any, config: Config | Mapping[str, Any]) -> Any:
     except TypeError:
         target_config.update(values)
     existing = list(getattr(run, "tags", ()) or ())
+    dataset_source = values.get("dataset_source")
+    if dataset_source and str(dataset_source).lower().endswith(".zip"):
+        legacy_source_tag = f"source-zip-{Path(str(dataset_source)).stem}"
+        existing = [tag for tag in existing if tag != legacy_source_tag]
     run.tags = tuple(dict.fromkeys([*existing, *tags]))
     update = getattr(run, "update", None)
     if callable(update):

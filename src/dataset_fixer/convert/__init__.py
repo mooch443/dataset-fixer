@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Literal, Mapping
 
 import numpy as np
 import yaml
@@ -45,6 +45,7 @@ class Prepared:
         location: Content-addressed preparation root.
         geometry: Source-tile, scale, and training-input geometry.
         content_sha256: Preparation identity derived from inputs and settings.
+        source_name: Portable basename of the original training folder or ZIP.
         paths: Named backend-specific output paths.
         hashes: Digests for generated configuration and manifest files.
         split_statistics: Per-split image and annotation counts.
@@ -63,6 +64,7 @@ class Prepared:
     hashes: Mapping[str, str]
     split_statistics: Mapping[str, Mapping[str, int]]
     manifests: tuple[Path, ...]
+    source_name: str | None = None
     backend: Mapping[str, Any] = field(default_factory=dict)
     config: Config | None = field(default=None, compare=False)
     reused: bool = False
@@ -92,11 +94,13 @@ def _prepared_from_manifest(path: Path, *, reused: bool) -> Prepared:
             str(key): str(resolve(str(raw)))
             for key, raw in dict(backend["environment"]).items()
         }
+    source = dict(value.get("source") or {})
     return Prepared(
         kind=Kind(value["preparation_kind"]),
         location=root,
         geometry=geometry,
         content_sha256=str(value["content_sha256"]),
+        source_name=(str(source["basename"]) if source.get("basename") else None),
         paths={key: resolve(raw) for key, raw in dict(value.get("paths") or {}).items()},
         hashes={str(key): str(raw) for key, raw in dict(value.get("hashes") or {}).items()},
         split_statistics={
@@ -336,6 +340,7 @@ def _convert_semantic_case(
     geometry: Geometry,
     threshold: int,
     foreground_value: int,
+    errors: Literal["raise", "skip"],
 ) -> dict[str, Any]:
     sample, image_path, mask_path = item
     with Image.open(image_path) as opened:
@@ -350,15 +355,28 @@ def _convert_semantic_case(
             )
         )
     native = geometry.native_tile_size
-    if native is not None and image.size != (native[1], native[0]):
-        raise DatasetValidationError(
-            ValidationIssue(
-                "Source image dimensions do not match native_tile_size",
-                source=str(image_path),
-                value=(image.height, image.width),
-                expected=native,
+    source_size = (image.height, image.width)
+    smaller_than_native = native is not None and source_size != native
+    if native is not None and (image.height > native[0] or image.width > native[1]):
+        if errors == "raise":
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Source image dimensions exceed native_tile_size",
+                    source=str(image_path),
+                    value=source_size,
+                    expected=native,
+                    suggestion="Pass errors='skip' to omit oversized source images.",
+                )
             )
-        )
+        return {
+            "status": "skipped",
+            "split": sample.split,
+            "source_image": str(image_path),
+            "source_mask": str(mask_path),
+            "actual_size": list(source_size),
+            "maximum_size": list(native),
+            "reason": "image exceeds native_tile_size",
+        }
     target = geometry.input_size or (image.height, image.width)
     if image.size != (target[1], target[0]):
         image = image.resize((target[1], target[0]), Image.Resampling.BICUBIC)
@@ -384,6 +402,8 @@ def _convert_semantic_case(
         "foreground_pixels": int(np.count_nonzero(output_mask)),
         "pixels": int(output_mask.size),
         "mask_source": mapping,
+        "source_size": list(source_size),
+        "native_size_validation": "smaller" if smaller_than_native else "matched",
     }
 
 
@@ -409,6 +429,33 @@ def _replace_root(value: Any, old: Path, new: str = ".") -> Any:
     return value
 
 
+def _partition_semantic_records(
+    records: list[dict[str, Any]],
+    root: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Path | None]:
+    retained = [record for record in records if record.get("status") != "skipped"]
+    skipped = [record for record in records if record.get("status") == "skipped"]
+    if not retained:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Preparation contains no usable images after skipping oversized sources",
+                value=skipped[:20],
+            )
+        )
+    if not skipped:
+        return retained, skipped, None
+    report = root / "preparation-skips.json"
+    _write_json(
+        report,
+        {
+            "errors": "skip",
+            "skipped_images": len(skipped),
+            "records": skipped,
+        },
+    )
+    return retained, skipped, report
+
+
 def _prepare_yolo_sem(
     dataset: Any,
     root: Path,
@@ -417,6 +464,7 @@ def _prepare_yolo_sem(
     threshold: int,
     workers: int,
     progress: bool,
+    errors: Literal["raise", "skip"],
 ) -> tuple[dict[str, Path], dict[str, dict[str, int]], dict[str, Any]]:
     if dataset.format != "semantic_masks":
         raise DatasetValidationError("YOLO-SEM preparation requires semantic image/mask pairs")
@@ -435,6 +483,7 @@ def _prepare_yolo_sem(
                         geometry=geometry,
                         threshold=threshold,
                         foreground_value=1,
+                        errors=errors,
                     ),
                     items,
                 ),
@@ -443,13 +492,19 @@ def _prepare_yolo_sem(
                 disable=not progress,
             )
         )
+    records, skipped, skip_report = _partition_semantic_records(records, root)
     statistics: dict[str, dict[str, int]] = {}
     for split in dataset.splits:
         selected = [record for record in records if record["split"] == split]
+        skipped_split = [record for record in skipped if record["split"] == split]
         statistics[split] = {
             "images": len(selected),
             "foreground_pixels": sum(record["foreground_pixels"] for record in selected),
             "pixels": sum(record["pixels"] for record in selected),
+            "resized_smaller_images": sum(
+                record["native_size_validation"] == "smaller" for record in selected
+            ),
+            "skipped_oversized_images": len(skipped_split),
         }
     data = {
         "path": str(root),
@@ -467,13 +522,24 @@ def _prepare_yolo_sem(
         "mask_resize": "nearest",
         "label_mapping": {"background": 0, "foreground": 1, "ignore": 255},
         "source_binary_jpeg_threshold": threshold,
+        "source_size_policy": {
+            "errors": errors,
+            "smaller_or_equal": "retain-and-resize",
+            "oversized": "skip" if errors == "skip" else "raise",
+        },
     }
-    return {"data_yaml": data_yaml, "dataset_root": root, "cases": cases}, statistics, backend
+    paths = {"data_yaml": data_yaml, "dataset_root": root, "cases": cases}
+    if skip_report is not None:
+        paths["skips"] = skip_report
+    return paths, statistics, backend
 
 
 def _prepare_yolo_seg(
     dataset: Any,
     root: Path,
+    *,
+    geometry: Geometry,
+    errors: Literal["raise", "skip"],
 ) -> tuple[dict[str, Path], dict[str, dict[str, int]], dict[str, Any]]:
     if dataset.format == "semantic_masks":
         raise DatasetValidationError(
@@ -486,17 +552,58 @@ def _prepare_yolo_seg(
     if dataset.task.value != "segment":
         raise DatasetValidationError("YOLO-SEG preparation requires task='segment'")
     failures: list[str] = []
+    skipped: list[dict[str, Any]] = []
+    retained_by_split: dict[str, list[Any]] = {}
     statistics: dict[str, dict[str, int]] = {}
     for split in dataset.splits:
         samples = [sample for sample in dataset._samples if sample.split == split]
-        instances = 0
+        retained: list[Any] = []
         for sample in samples:
+            actual = (int(sample.height), int(sample.width))
+            native = geometry.native_tile_size
+            if native is not None and (
+                actual[0] > native[0] or actual[1] > native[1]
+            ):
+                skipped.append(
+                    {
+                        "status": "skipped",
+                        "split": split,
+                        "source_image": str(sample.image_path.resolve()),
+                        "actual_size": list(actual),
+                        "maximum_size": list(native),
+                        "reason": "image exceeds native_tile_size",
+                    }
+                )
+            else:
+                retained.append(sample)
+        if skipped and errors == "raise":
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Source image dimensions exceed native_tile_size",
+                    value=skipped[:20],
+                    suggestion="Pass errors='skip' to omit oversized source images.",
+                )
+            )
+        retained_by_split[split] = retained
+        instances = 0
+        for sample in retained:
             for annotation in sample.annotations:
                 if not annotation.polygon or len(annotation.polygon) < 3 or annotation.rle:
                     failures.append(str(sample.relative_path))
                 else:
                     instances += 1
-        statistics[split] = {"images": len(samples), "instances": instances}
+        statistics[split] = {
+            "images": len(retained),
+            "instances": instances,
+            "skipped_oversized_images": len(samples) - len(retained),
+        }
+    if not any(retained_by_split.values()):
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Preparation contains no usable images after skipping oversized sources",
+                value=skipped[:20],
+            )
+        )
     if failures:
         raise DatasetValidationError(
             ValidationIssue(
@@ -508,9 +615,41 @@ def _prepare_yolo_seg(
     audit = root / "polygon-audit.json"
     _write_json(audit, {"status": "passed", "splits": statistics})
     paths = {"dataset_root": dataset.location, "audit": audit}
-    if dataset.data_yaml is not None:
+    if skipped:
+        for split, samples in retained_by_split.items():
+            (root / f"{split}.txt").write_text(
+                "".join(f"{sample.image_path.resolve()}\n" for sample in samples),
+                encoding="utf-8",
+            )
+        data_yaml = root / "data.yaml"
+        data_yaml.write_text(
+            yaml.safe_dump(
+                {
+                    **{split: f"{split}.txt" for split in retained_by_split},
+                    "names": {int(key): value for key, value in dataset.classes.items()},
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        skip_report = root / "preparation-skips.json"
+        _write_json(
+            skip_report,
+            {"errors": "skip", "skipped_images": len(skipped), "records": skipped},
+        )
+        paths.update({"data_yaml": data_yaml, "skips": skip_report})
+    elif dataset.data_yaml is not None:
         paths["data_yaml"] = dataset.data_yaml
-    return paths, statistics, {"task": "segment", "conversion": "none", "polygon_audit": "passed"}
+    return paths, statistics, {
+        "task": "segment",
+        "conversion": "none",
+        "polygon_audit": "passed",
+        "source_size_policy": {
+            "errors": errors,
+            "smaller_or_equal": "retain",
+            "oversized": "skip" if errors == "skip" else "raise",
+        },
+    }
 
 
 def _prepare_nnunet(
@@ -524,6 +663,7 @@ def _prepare_nnunet(
     preprocess: bool,
     dataset_id: int,
     planner: str | None,
+    errors: Literal["raise", "skip"],
 ) -> tuple[dict[str, Path], dict[str, dict[str, int]], dict[str, Any]]:
     if dataset.format != "semantic_masks":
         raise DatasetValidationError("nnU-Net preparation requires semantic image/mask pairs")
@@ -553,6 +693,7 @@ def _prepare_nnunet(
                         geometry=geometry,
                         threshold=threshold,
                         foreground_value=1,
+                        errors=errors,
                     ),
                     items,
                 ),
@@ -561,6 +702,7 @@ def _prepare_nnunet(
                 disable=not progress,
             )
         )
+    records, skipped, skip_report = _partition_semantic_records(records, root)
     statistics: dict[str, dict[str, int]] = {}
     split_cases: dict[str, list[str]] = {"train": [], "val": []}
     for record in records:
@@ -570,7 +712,16 @@ def _prepare_nnunet(
         shutil.move(intermediate / record["prepared_mask"], labels_tr / f"{case_id}.png")
     shutil.rmtree(intermediate, ignore_errors=True)
     for split, cases in split_cases.items():
-        statistics[split] = {"images": len(cases), "cases": len(cases)}
+        selected = [record for record in records if record["split"] == split]
+        skipped_split = [record for record in skipped if record["split"] == split]
+        statistics[split] = {
+            "images": len(cases),
+            "cases": len(cases),
+            "resized_smaller_images": sum(
+                record["native_size_validation"] == "smaller" for record in selected
+            ),
+            "skipped_oversized_images": len(skipped_split),
+        }
     dataset_json = raw_dataset / "dataset.json"
     _write_json(
         dataset_json,
@@ -626,6 +777,8 @@ def _prepare_nnunet(
         "preprocessed_root": preprocessed_root,
         "results_root": results_root,
     }
+    if skip_report is not None:
+        paths["skips"] = skip_report
     return paths, statistics, {
         "task": "semantic",
         "dataset_id": dataset_id,
@@ -635,6 +788,11 @@ def _prepare_nnunet(
         "mask_resize": "nearest",
         "label_mapping": {"background": 0, "foreground": 1},
         "source_binary_jpeg_threshold": threshold,
+        "source_size_policy": {
+            "errors": errors,
+            "smaller_or_equal": "retain-and-resize",
+            "oversized": "skip" if errors == "skip" else "raise",
+        },
         "preprocessed": preprocess,
         "planner": planner,
     }
@@ -661,6 +819,7 @@ def prepare(
     epochs: int | None = None,
     checkpoint_name: str | None = None,
     device: str | None = None,
+    errors: Literal["raise", "skip"] = "raise",
     progress: bool = True,
 ) -> Prepared:
     """Prepare one dataset for a selected backend using a reusable identity.
@@ -696,6 +855,11 @@ def prepare(
         checkpoint_name: Expected checkpoint name. nnU-Net defaults to
             ``checkpoint_final.pth``.
         device: Training device recorded in bundle and W&B metadata.
+        errors: Oversized-source policy. Images whose height and width are at
+            most ``native_tile_size`` are always retained and resized with
+            their masks to the training input size. ``"raise"`` rejects an
+            image exceeding either native dimension; ``"skip"`` omits it and
+            writes an audit report.
         progress: Show hashing, conversion, and preprocessing progress.
 
     Returns:
@@ -705,6 +869,9 @@ def prepare(
 
     from ..dataset import Dataset
 
+    errors = errors.lower()
+    if errors not in {"raise", "skip"}:
+        raise ValueError("errors must be 'raise' or 'skip'")
     if not isinstance(dataset, Dataset):
         dataset = Dataset.open(dataset, progress=progress)
     if dataset._plan:
@@ -760,6 +927,7 @@ def prepare(
         "preprocess": preprocess if target_kind == Kind.NNUNET else None,
         "dataset_id": dataset_id if target_kind == Kind.NNUNET else None,
         "planner": planner if target_kind == Kind.NNUNET else None,
+        "errors": errors,
     }
     content_digest = _identity(dataset, target_kind, settings, progress=progress)
     resolved_dataset_id = dataset_id or (500 + int(content_digest[:8], 16) % 500)
@@ -777,6 +945,7 @@ def prepare(
             )
         if progress:
             print(f"Cache hit: prepared {target_kind.value} dataset at {root}")
+        existing = replace(existing, source_name=dataset.source_name)
         return _attach_config(
             existing,
             name=name,
@@ -803,9 +972,15 @@ def prepare(
                 threshold=int(mask_threshold),
                 workers=workers,
                 progress=progress,
+                errors=errors,
             )
         elif target_kind == Kind.YOLO_SEG:
-            paths, statistics, backend = _prepare_yolo_seg(dataset, temporary)
+            paths, statistics, backend = _prepare_yolo_seg(
+                dataset,
+                temporary,
+                geometry=geometry,
+                errors=errors,
+            )
         else:
             paths, statistics, backend = _prepare_nnunet(
                 dataset,
@@ -817,6 +992,7 @@ def prepare(
                 preprocess=preprocess,
                 dataset_id=resolved_dataset_id,
                 planner=planner,
+                errors=errors,
             )
         # Paths created below the temporary root become relative so the atomic
         # rename does not leave stale temporary paths in the result manifest.
@@ -827,7 +1003,7 @@ def prepare(
             except ValueError:
                 serialized_paths[key] = str(value)
         manifest_names = ["preparation.json"]
-        for key in ("data_yaml", "cases", "dataset_json", "splits", "audit"):
+        for key in ("data_yaml", "cases", "dataset_json", "splits", "audit", "skips"):
             if key in serialized_paths:
                 raw = Path(serialized_paths[key])
                 if not raw.is_absolute():
@@ -837,7 +1013,11 @@ def prepare(
             "format": "prepared-dataset",
             "preparation_kind": target_kind.value,
             "content_sha256": content_digest,
-            "source": {"name": dataset.name, "location": str(dataset.location)},
+            "source": {
+                "name": dataset.name,
+                "basename": dataset.source_name,
+                "location": str(dataset.location),
+            },
             "geometry": geometry.as_dict(),
             "paths": serialized_paths,
             "hashes": {"source_content": content_digest},

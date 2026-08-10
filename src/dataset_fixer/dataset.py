@@ -50,6 +50,8 @@ class Dataset:
 
     Parameters:
         location: Physical dataset root.
+        source_name: Basename of the folder or ZIP originally passed to
+            :meth:`open`, retained independently of extraction paths.
         name: Human-readable dataset name.
         task: Validated annotation task.
         metadata: Class, channel, and task-specific metadata.
@@ -81,6 +83,7 @@ class Dataset:
         self,
         *,
         location: Path,
+        source_name: str | None = None,
         name: str,
         task: Task,
         metadata: DatasetMetadata,
@@ -105,6 +108,7 @@ class Dataset:
         provenance_progress: bool = False,
     ) -> None:
         self._location = location.resolve()
+        self._source_name = source_name or self._location.name
         self._name = name
         self._task = task
         self._metadata = metadata
@@ -220,7 +224,16 @@ class Dataset:
         # signature remains identical for directories, manifests, and archives.
         from .sources import resolve_dataset_source
 
-        requested = resolve_dataset_source(location, progress=progress)
+        source_path = Path(location).expanduser()
+        requested = resolve_dataset_source(source_path, progress=progress)
+        if source_path.suffix.lower() == ".zip":
+            source_name = source_path.name
+        elif source_path.is_dir():
+            source_name = source_path.name
+        elif source_path.name == DATASET_INFO_NAME and source_path.parent.name == "reports":
+            source_name = source_path.parent.parent.name
+        else:
+            source_name = source_path.parent.name
         errors = errors.lower()
         if errors not in {"raise", "skip"}:
             raise ValueError("errors must be 'raise' or 'skip'")
@@ -240,6 +253,7 @@ class Dataset:
                 deep=deep,
                 errors=errors,
                 progress=progress,
+                source_name=source_name,
             )
         if requested.is_file() and requested.name == DATASET_INFO_NAME:
             requested = requested.parent.parent
@@ -277,6 +291,7 @@ class Dataset:
             _assert_no_orphan_labels(root, samples, errors=errors, warnings=warnings)
         dataset = cls(
             location=root,
+            source_name=source_name,
             name=resolved_name or "dataset",
             task=resolved_task,
             metadata=metadata,
@@ -315,6 +330,7 @@ class Dataset:
         deep: bool,
         errors: Literal["raise", "skip"],
         progress: bool,
+        source_name: str,
     ) -> "Dataset":
         root = requested.parent if requested.is_file() else requested
         if requested.is_file() and requested.name == DATASET_INFO_NAME and root.name == "reports":
@@ -364,6 +380,7 @@ class Dataset:
         inherited_warnings = [str(value) for value in manifest.get("warnings") or []]
         dataset = cls(
             location=root,
+            source_name=source_name,
             name=name or str(manifest.get("name") or root.name),
             task=Task.SEGMENT,
             metadata=metadata,
@@ -407,6 +424,11 @@ class Dataset:
     def location(self) -> Path:
         """Absolute source root, or output root for a materialized derivative."""
         return self._location
+
+    @property
+    def source_name(self) -> str:
+        """Portable basename of the folder or ZIP used to open the dataset."""
+        return self._source_name
 
     @property
     def data_yaml(self) -> Path | None:
@@ -1915,6 +1937,7 @@ class Dataset:
         virtual_name = slugify(name) if name else derived_name(self.name, operation.kind, operation.settings)
         return Dataset(
             location=self.location,
+            source_name=self.source_name,
             name=virtual_name,
             task=self.task,
             metadata=metadata or self._metadata.copy(),

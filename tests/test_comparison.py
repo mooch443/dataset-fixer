@@ -180,6 +180,102 @@ def test_native_inference_batches_honors_device_backs_off_and_reuses_runtime(
     assert second.settings["oom_retries"] == 0
 
 
+def test_prediction_size_policy_retains_smaller_and_skips_only_oversized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "size-policy.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    images: list[Path] = []
+    for name, size in (("smaller", (64, 80)), ("exact", (128, 128)), ("larger", (129, 128))):
+        path = tmp_path / f"{name}.png"
+        Image.new("RGB", size, "white").save(path)
+        images.append(path)
+    calls: list[list[str]] = []
+
+    class FakeYOLO:
+        task = "detect"
+
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def predict(self, *, source, **_kwargs):
+            sources = [source] if isinstance(source, str) else list(source)
+            calls.append(sources)
+            boxes = types.SimpleNamespace(xyxy=[], conf=[], cls=[])
+            return [
+                types.SimpleNamespace(path=value, boxes=boxes, masks=None, keypoints=None)
+                for value in sources
+            ]
+
+    monkeypatch.setitem(sys.modules, "ultralytics", types.SimpleNamespace(YOLO=FakeYOLO))
+    model = Model(
+        checkpoint,
+        task="detect",
+        native_tile_size=128,
+        upscale_factor=1,
+        batch_size=8,
+    )
+
+    with pytest.raises(DatasetValidationError, match="exceeds native_tile_size"):
+        model.predict(images, progress=False)
+    assert not model.loaded
+
+    result = model.predict(images, errors="skip", progress=False)
+
+    assert [record.image_path for record in result.records] == [
+        images[0].resolve(),
+        images[1].resolve(),
+    ]
+    assert calls == [[str(images[0].resolve()), str(images[1].resolve())]]
+    policy = result.settings["source_size_policy"]
+    assert policy["smaller_or_equal"] == "retain"
+    assert policy["oversized"] == "skip"
+    assert policy["skipped_inputs"][0]["source"] == str(images[2].resolve())
+
+
+def test_comparison_size_policy_uses_one_fair_filtered_cohort(
+    detect_dataset: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+    val_samples = [sample for sample in dataset._samples if sample.split == "val"]
+    with Image.open(val_samples[0].image_path) as opened:
+        opened.resize((64, 64)).save(val_samples[0].image_path)
+    val_samples[0].width = val_samples[0].height = 64
+    checkpoint = tmp_path / "comparison-size-policy.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    models = Model.load_many(
+        {
+            "candidate": {
+                "path": checkpoint,
+                "task": "detect",
+                "native_tile_size": 128,
+                "upscale_factor": 1,
+            }
+        }
+    )
+    captured: dict[str, object] = {}
+
+    def fake_compare(active: Dataset, _models: ModelCollection, **kwargs: object) -> str:
+        captured["samples"] = tuple(
+            sample.image_path for sample in active._samples if sample.split == "val"
+        )
+        captured["audit"] = tuple(active._geometry_skip_audit)
+        captured["errors"] = kwargs["errors"]
+        return "filtered"
+
+    monkeypatch.setattr("dataset_fixer.comparison.engine._compare_models", fake_compare)
+
+    with pytest.raises(DatasetValidationError, match="exceeds native_tile_size"):
+        models.compare(dataset, progress=False)
+    assert models.compare(dataset, errors="skip", progress=False) == "filtered"
+    assert captured["samples"] == (val_samples[0].image_path,)
+    assert len(captured["audit"]) == 1
+    assert captured["errors"] == "skip"
+
+
 def test_collection_predict_uses_each_models_shared_batching_configuration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

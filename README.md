@@ -486,6 +486,14 @@ Use `Model.load_many(...)` to normalize an ordered model collection once. The
 collection accepts a dataset/export at operation time and exposes `predict`,
 `compare`, and—for semantic-mask exports—the shared sampled `visualize` grid.
 
+Source geometry uses an upper bound, not an exact-size requirement. Every
+Ultralytics and nnU-Net prediction/evaluation path retains images whose height
+and width are at most the model's `native_tile_size`. An image exceeding either
+dimension raises by default. Pass `errors="skip"` to `predict()`, `compare()`,
+or `visualize()` to omit only those oversized images. Prediction results record
+the skipped inputs in `settings.source_size_policy`; comparisons use one common
+filtered cohort for every model and record the same audit in the report.
+
 ## Cached model comparison
 
 `ModelCollection.compare()` freezes one ordered evaluation cohort and requires every
@@ -606,7 +614,13 @@ from dataset_fixer.convert import Kind, prepare
 from dataset_fixer.bundle import Config, Outcome, create
 from dataset_fixer.wandb import configure, upload
 
-prepared = prepare(dataset, Kind.YOLO_SEM, native_tile_size=128, upscale_factor=2)
+prepared = prepare(
+    dataset,
+    Kind.YOLO_SEM,
+    native_tile_size=128,
+    upscale_factor=2,
+    errors="skip",  # omit only images larger than 128x128
+)
 config = Config(
     name="islands-sem",
     framework="ultralytics",
@@ -621,8 +635,13 @@ bundle = upload(existing_run, bundle)  # local ZIP survives every outcome
 
 `prepare()` records exact interpolation and label mapping, requires an explicit
 threshold for binary JPEG recovery, never derives polygons from semantic masks,
-and content-addresses all generated data. `bundle.create()` always creates the
-ZIP in local storage. Neither helper uploads or copies a bundle to Google Drive.
+and content-addresses all generated data. Images at or below
+`native_tile_size` are expected: they are retained and resized with their masks
+to the configured training input size. Only an image exceeding either native
+dimension is an error. The default `errors="raise"` aborts on that image;
+`errors="skip"` omits it and records the omission in `preparation-skips.json`.
+`bundle.create()` always creates the ZIP in local storage. Neither helper
+uploads or copies a bundle to Google Drive.
 
 The returned `ComparisonResult` reports factual state: the cohort fingerprint,
 cohort verification, training overlap, provenance completeness, cache

@@ -154,6 +154,7 @@ def _source_dataset_zip(*values: Mapping[str, Any]) -> str | None:
         candidates.extend(
             (
                 dataset.get("source_dataset_zip"),
+                dataset.get("dataset_source"),
                 signature.get("source"),
                 dataset.get("source_archive"),
                 source_dataset.get("path"),

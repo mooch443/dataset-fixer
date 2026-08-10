@@ -4,7 +4,7 @@ import json
 import shutil
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from ..errors import DatasetValidationError, ValidationIssue
 from ..sahi_support import reject_legacy_sahi_settings, resolve_sahi_settings
@@ -44,6 +44,7 @@ def _compare_models(
     save_prediction_plots: bool = False,
     progress: bool = True,
     destination: str | Path | None = None,
+    errors: Literal["raise", "skip"] = "raise",
 ) -> ComparisonResult:
     """Evaluate multiple model configurations on one cryptographically frozen cohort."""
 
@@ -82,6 +83,12 @@ def _compare_models(
     overlap, provenance_complete, leakage, limitations = check_training_provenance(
         specs, cohort, "warn"
     )
+    geometry_skips = list(getattr(dataset, "_geometry_skip_audit", ()))
+    if geometry_skips:
+        limitations.append(
+            f"Skipped {len(geometry_skips)} oversized evaluation image(s); "
+            "details are recorded in settings.source_size_policy."
+        )
     independent_clusters = len({record.original_id for record in cohort.records})
     if independent_clusters < 10:
         limitations.append(
@@ -97,6 +104,15 @@ def _compare_models(
         "seed": seed,
         "bootstrap_resamples": bootstrap_resamples,
         "models": model_systems,
+        "source_size_policy": {
+            "errors": errors,
+            "maximum_size": to_jsonable(
+                getattr(dataset, "_geometry_maximum_size", None)
+            ),
+            "smaller_or_equal": "retain",
+            "oversized": "skip" if errors == "skip" else "raise",
+            "skipped_inputs": geometry_skips,
+        },
     }
     model_hashes = {spec.name: spec.resolved_model.digest for spec in specs}
     fingerprint = settings_fingerprint(

@@ -14,7 +14,7 @@ import yaml
 from PIL import Image
 
 from .errors import DatasetValidationError, ValidationIssue
-from .geometry import Geometry
+from .geometry import Geometry, filter_inputs_by_size, normalize_errors
 from .utils import IMAGE_SUFFIXES, sha256_file, slugify, to_jsonable
 
 ModelKind = Literal["ultralytics", "nnunet"]
@@ -1009,6 +1009,7 @@ class Model:
         postprocess: float | None = None,
         device: str | None = None,
         batch_size: int | None = None,
+        errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
         destination: str | Path | None = None,
         settings: Mapping[str, Any] | None = None,
@@ -1045,6 +1046,10 @@ class Model:
             device: Device override.
             batch_size: Inference batch override. ``-1`` adaptively retries
                 accelerator OOM failures with smaller batches.
+            errors: Oversized-input policy. Images at or below the model's
+                declared ``native_tile_size`` are always predicted. ``"raise"``
+                rejects an image exceeding either dimension; ``"skip"`` omits
+                it and records the omission in the result settings.
             progress: Show package-managed progress bars.
             destination: Optional new/empty directory receiving saved output.
             settings: Additional per-call adapter overrides.
@@ -1065,6 +1070,7 @@ class Model:
             Ordered :class:`PredictionResult` values with stable image IDs.
         """
 
+        errors = normalize_errors(errors)
         combined_settings = {**self.settings, **dict(settings or {})}
         effective_confidence = (
             float(confidence)
@@ -1082,6 +1088,12 @@ class Model:
             raise ValueError("postprocess must be finite and in [0, 1]")
         inputs, source_task = normalize_model_inputs(
             source, split=split, progress=progress
+        )
+        inputs, skipped_inputs = filter_inputs_by_size(
+            inputs,
+            maximum=self.native_tile_size,
+            errors=errors,
+            source=self.name,
         )
         if not inputs:
             raise ValueError("Prediction source contains no supported images")
@@ -1221,6 +1233,13 @@ class Model:
                 **combined_settings,
                 **(resolved_sahi.as_dict() if selected_backend == "sahi" else {}),
             }
+        resolved_settings["source_size_policy"] = {
+            "errors": errors,
+            "maximum_size": list(self.native_tile_size) if self.native_tile_size else None,
+            "smaller_or_equal": "retain",
+            "oversized": "skip" if errors == "skip" else "raise",
+            "skipped_inputs": list(skipped_inputs),
+        }
         result = PredictionResult(
             model_name=self.name,
             model_kind=self.kind,
@@ -1240,6 +1259,7 @@ class Model:
         *,
         split: Literal["train", "val", "test"] = "val",
         save_prediction_plots: bool = False,
+        errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
         destination: str | Path | None = None,
         trust_legacy_cache: bool = False,
@@ -1253,6 +1273,9 @@ class Model:
                 ``predictions/`` for the cases the report keeps in
                 ``worst_cases``. Cases with neither a reference nor a
                 prediction are skipped, since their panels are empty.
+            errors: Oversized-image policy shared by all evaluated models.
+                Smaller images are always retained; ``"skip"`` omits images
+                exceeding the common native-size limit and audits them.
             progress: Show package-managed progress bars.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.
@@ -1271,6 +1294,7 @@ class Model:
             source,
             split=split,
             save_prediction_plots=save_prediction_plots,
+            errors=errors,
             progress=progress,
             destination=destination,
             trust_legacy_cache=trust_legacy_cache,
@@ -1286,6 +1310,7 @@ class Model:
         seed: int = 42,
         panel_size: float = 3.0,
         destination: str | Path | None = None,
+        errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
         prediction_options: Mapping[str, Any] | None = None,
     ) -> Any:
@@ -1299,6 +1324,7 @@ class Model:
             seed: Deterministic sampling seed.
             panel_size: Width and height, in inches, of each image panel.
             destination: Optional PNG output path.
+            errors: Oversized-input policy forwarded to :meth:`predict`.
             progress: Show package-managed progress bars.
             prediction_options: Optional per-call overrides forwarded to
                 :meth:`predict`.
@@ -1309,6 +1335,7 @@ class Model:
 
         options = dict(prediction_options or {})
         options.setdefault("split", split)
+        options.setdefault("errors", errors)
         options.setdefault("progress", progress)
         result = self.predict(source, **options)
         return result.visualize(
@@ -1593,6 +1620,7 @@ class ModelCollection:
         source: Any,
         *,
         split: Literal["train", "val", "test"] | None = None,
+        errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
     ) -> dict[str, PredictionResult]:
         """Run every independently configured model on the same inputs.
@@ -1603,6 +1631,8 @@ class ModelCollection:
         Parameters:
             source: Any source accepted by :meth:`Model.predict`.
             split: Dataset split. Direct image inputs ignore this value.
+            errors: Oversized-input policy applied independently using each
+                model's declared native size.
             progress: Show package-managed progress bars.
 
         Returns:
@@ -1611,7 +1641,9 @@ class ModelCollection:
         """
 
         return {
-            model.name: model.predict(source, split=split, progress=progress)
+            model.name: model.predict(
+                source, split=split, errors=errors, progress=progress
+            )
             for model in self.models
         }
 
@@ -1621,6 +1653,7 @@ class ModelCollection:
         *,
         split: Literal["train", "val", "test"] = "val",
         save_prediction_plots: bool = False,
+        errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
         destination: str | Path | None = None,
         trust_legacy_cache: bool = False,
@@ -1643,6 +1676,9 @@ class ModelCollection:
                 ``worst_cases``, with at most two model panels per row.
                 Cases with neither a reference nor a prediction are
                 skipped, since their panels are empty.
+            errors: Oversized-image policy. Smaller images are valid for every
+                backend. ``"skip"`` omits images exceeding any model's common
+                native-size limit and records them in report settings.
             progress: Show package-managed progress bars.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.
@@ -1669,7 +1705,7 @@ class ModelCollection:
             )
         from .geometry import validate_collection_geometry
 
-        validate_collection_geometry(active, self, split=split)
+        active = validate_collection_geometry(active, self, split=split, errors=errors)
 
         if isinstance(active, Dataset) and active.format == "semantic_masks":
             model_tasks = {model.task for model in self.models}
@@ -1701,6 +1737,7 @@ class ModelCollection:
                     progress=progress,
                     destination=destination,
                     trust_legacy_cache=trust_legacy_cache,
+                    errors=normalize_errors(errors),
                 )
             from .semantic_comparison import compare_nnunet_models
 
@@ -1712,6 +1749,7 @@ class ModelCollection:
                 progress=progress,
                 destination=destination,
                 trust_legacy_cache=trust_legacy_cache,
+                errors=normalize_errors(errors),
             )
         if any(model.kind != "ultralytics" for model in self.models):
             raise DatasetValidationError(
@@ -1754,6 +1792,7 @@ class ModelCollection:
             save_prediction_plots=save_prediction_plots,
             progress=progress,
             destination=destination,
+            errors=normalize_errors(errors),
         )
 
     def visualize(
@@ -1770,6 +1809,7 @@ class ModelCollection:
         image_title_length: int = 72,
         progress: bool = True,
         destination: str | Path | None = None,
+        errors: Literal["raise", "skip"] = "raise",
     ) -> Any:
         """Render a sampled semantic cohort with the shared comparison grid.
 
@@ -1785,6 +1825,7 @@ class ModelCollection:
             image_title_length: Maximum displayed source-path length.
             progress: Show package-managed progress bars.
             destination: Optional PNG output path or directory.
+            errors: Oversized-image policy shared by the visualized models.
 
         Returns:
             The rendered Matplotlib figure.
@@ -1798,6 +1839,9 @@ class ModelCollection:
                 "Collection visualization currently requires a semantic-mask Dataset; "
                 "use Model.predict for other sources"
             )
+        from .geometry import validate_collection_geometry
+
+        active = validate_collection_geometry(active, self, split=split, errors=errors)
         from .semantic_comparison import visualize_nnunet_models
 
         return visualize_nnunet_models(

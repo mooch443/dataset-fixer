@@ -222,7 +222,7 @@ def test_model_load_many_standalone_and_immutable_configure(tmp_path: Path) -> N
         )
 
 
-def test_tiled_geometry_mismatch_fails_before_runtime(tmp_path: Path) -> None:
+def test_tiled_oversized_images_fail_before_runtime(tmp_path: Path) -> None:
     dataset = _semantic_dataset(tmp_path, size=(128, 128))
     dataset._manifest.setdefault("history", []).append(
         {"operation": "tile-grid", "settings": {"tile_size": 128}}
@@ -231,17 +231,17 @@ def test_tiled_geometry_mismatch_fails_before_runtime(tmp_path: Path) -> None:
     checkpoint.write_bytes(b"checkpoint")
     models = Model.load_many(
         {
-            "trained-on-256": {
+            "trained-on-64": {
                 "source": checkpoint,
                 "task": "semantic",
-                "native_tile_size": 256,
+                "native_tile_size": 64,
                 "upscale_factor": 2,
-                "input_size": 512,
+                "input_size": 128,
             }
         }
     )
 
-    with pytest.raises(DatasetValidationError, match="inference was not started"):
+    with pytest.raises(DatasetValidationError, match="exceeds native_tile_size"):
         models.compare(dataset, progress=False)
     assert not models[0].loaded
 
@@ -304,6 +304,156 @@ def test_prepare_thresholds_jpeg_resizes_and_reuses(tmp_path: Path) -> None:
     cases = json.loads(first.paths["cases"].read_text(encoding="utf-8"))
     jpeg_record = next(value for value in cases if value["source_mask"].endswith(".jpg"))
     assert jpeg_record["mask_source"]["threshold"] == 128
+
+
+def test_prepare_retains_and_resizes_smaller_images_by_default(tmp_path: Path) -> None:
+    dataset = _semantic_dataset(tmp_path, size=(128, 128))
+    smaller = next(value for value in dataset._samples if value.split == "train")
+    smaller_mask = dataset._mask_paths[smaller.image_path.resolve()]
+    with Image.open(smaller.image_path) as opened:
+        opened.resize((64, 64), Image.Resampling.BICUBIC).save(smaller.image_path)
+    with Image.open(smaller_mask) as opened:
+        opened.resize((64, 64), Image.Resampling.NEAREST).save(smaller_mask)
+
+    prepared = prepare(
+        dataset,
+        Kind.YOLO_SEM,
+        native_tile_size=128,
+        upscale_factor=2,
+        destination=tmp_path / "preparation",
+        workers=1,
+        progress=False,
+    )
+
+    cases = json.loads(prepared.paths["cases"].read_text(encoding="utf-8"))
+    assert len(cases) == len(dataset._samples)
+    smaller_case = next(value for value in cases if value["source_image"] == str(smaller.image_path))
+    assert smaller_case["source_size"] == [64, 64]
+    assert smaller_case["native_size_validation"] == "smaller"
+    assert prepared.split_statistics["train"]["resized_smaller_images"] == 1
+    assert prepared.backend["source_size_policy"] == {
+        "errors": "raise",
+        "smaller_or_equal": "retain-and-resize",
+        "oversized": "raise",
+    }
+    for path in (prepared.location / "images").rglob("*.png"):
+        with Image.open(path) as opened:
+            assert opened.size == (256, 256)
+
+
+def test_prepare_errors_skip_omits_and_audits_oversized_images(tmp_path: Path) -> None:
+    dataset = _semantic_dataset(tmp_path, size=(128, 128))
+    oversized = next(value for value in dataset._samples if value.split == "train")
+    oversized_mask = dataset._mask_paths[oversized.image_path.resolve()]
+    with Image.open(oversized.image_path) as opened:
+        opened.resize((129, 128), Image.Resampling.BICUBIC).save(oversized.image_path)
+    with Image.open(oversized_mask) as opened:
+        opened.resize((129, 128), Image.Resampling.NEAREST).save(oversized_mask)
+
+    with pytest.raises(DatasetValidationError, match="exceed native_tile_size"):
+        prepare(
+            dataset,
+            Kind.YOLO_SEM,
+            native_tile_size=128,
+            destination=tmp_path / "strict-oversized-preparation",
+            workers=1,
+            progress=False,
+        )
+
+    prepared = prepare(
+        dataset,
+        Kind.YOLO_SEM,
+        native_tile_size=128,
+        destination=tmp_path / "skipped-oversized-preparation",
+        workers=1,
+        errors="skip",
+        progress=False,
+    )
+    cases = json.loads(prepared.paths["cases"].read_text(encoding="utf-8"))
+    skips = json.loads(prepared.paths["skips"].read_text(encoding="utf-8"))
+    assert len(cases) == len(dataset._samples) - 1
+    assert skips["skipped_images"] == 1
+    assert skips["records"][0]["source_image"] == str(oversized.image_path)
+    assert prepared.split_statistics["train"]["skipped_oversized_images"] == 1
+
+
+def test_prepare_nnunet_retains_smaller_images_by_default(tmp_path: Path) -> None:
+    dataset = _semantic_dataset(tmp_path, size=(128, 128))
+    smaller = next(value for value in dataset._samples if value.split == "train")
+    smaller_mask = dataset._mask_paths[smaller.image_path.resolve()]
+    with Image.open(smaller.image_path) as opened:
+        opened.resize((64, 64), Image.Resampling.BICUBIC).save(smaller.image_path)
+    with Image.open(smaller_mask) as opened:
+        opened.resize((64, 64), Image.Resampling.NEAREST).save(smaller_mask)
+
+    prepared = prepare(
+        dataset,
+        Kind.NNUNET,
+        native_tile_size=128,
+        upscale_factor=2,
+        destination=tmp_path / "nnunet-smaller-preparation",
+        workers=1,
+        preprocess=False,
+        progress=False,
+    )
+
+    assert prepared.split_statistics["train"]["resized_smaller_images"] == 1
+    prepared_images = sorted(prepared.paths["raw_dataset"].joinpath("imagesTr").glob("*.png"))
+    assert len(prepared_images) == len(dataset._samples)
+    for path in prepared_images:
+        with Image.open(path) as opened:
+            assert opened.size == (256, 256)
+
+
+def test_prepare_yolo_seg_skips_only_oversized_images(tmp_path: Path) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "polygon-sizes",
+        task="segment",
+        names=["island"],
+        train_rows=[
+            "0 0.1 0.1 0.9 0.1 0.9 0.9 0.1 0.9",
+            "0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8",
+        ],
+        val_rows=["0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"],
+        size=(128, 128),
+    )
+    oversized_path = source / "train" / "images" / "group_0" / "train_0.jpg"
+    with Image.open(oversized_path) as opened:
+        opened.resize((129, 128), Image.Resampling.BICUBIC).save(oversized_path)
+    dataset = Dataset.open(source, task="segment", progress=False)
+
+    with pytest.raises(DatasetValidationError, match="exceed native_tile_size"):
+        prepare(
+            dataset,
+            Kind.YOLO_SEG,
+            native_tile_size=128,
+            destination=tmp_path / "strict-yolo-seg",
+            progress=False,
+        )
+
+    prepared = prepare(
+        dataset,
+        Kind.YOLO_SEG,
+        native_tile_size=128,
+        destination=tmp_path / "skip-yolo-seg",
+        errors="skip",
+        progress=False,
+    )
+
+    assert prepared.split_statistics["train"]["images"] == 1
+    assert prepared.split_statistics["train"]["skipped_oversized_images"] == 1
+    assert prepared.paths["data_yaml"].is_file()
+    assert prepared.paths["skips"].is_file()
+    assert str(oversized_path.resolve()) not in (
+        prepared.location / "train.txt"
+    ).read_text(encoding="utf-8")
+
+
+def test_prepare_rejects_unknown_errors_policy(tmp_path: Path) -> None:
+    dataset = _semantic_dataset(tmp_path)
+
+    with pytest.raises(ValueError, match="errors must be 'raise' or 'skip'"):
+        prepare(dataset, Kind.YOLO_SEM, errors="ignore", progress=False)  # type: ignore[arg-type]
 
 
 def test_prepare_returns_complete_nnunet_bundle_config(tmp_path: Path) -> None:

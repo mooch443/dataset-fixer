@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping, Sequence, TypeVar
 
 from PIL import Image
 
@@ -12,6 +13,72 @@ from .errors import DatasetValidationError, ValidationIssue
 
 
 Size = tuple[int, int]
+InputT = TypeVar("InputT")
+
+
+def normalize_errors(errors: str) -> Literal["raise", "skip"]:
+    """Normalize the shared recoverable-error policy."""
+
+    value = errors.lower()
+    if value not in {"raise", "skip"}:
+        raise ValueError("errors must be 'raise' or 'skip'")
+    return value
+
+
+def exceeds_size(size: Size, maximum: Size) -> bool:
+    """Return whether either image dimension exceeds its declared maximum."""
+
+    return size[0] > maximum[0] or size[1] > maximum[1]
+
+
+def filter_inputs_by_size(
+    inputs: Sequence[InputT],
+    *,
+    maximum: Size | None,
+    errors: str,
+    source: str,
+) -> tuple[tuple[InputT, ...], tuple[dict[str, Any], ...]]:
+    """Keep at-most-maximum inputs and raise or audit oversized inputs."""
+
+    policy = normalize_errors(errors)
+    if maximum is None:
+        return tuple(inputs), ()
+    kept: list[InputT] = []
+    skipped: list[dict[str, Any]] = []
+    for value in inputs:
+        size = (int(getattr(value, "height")), int(getattr(value, "width")))
+        if not exceeds_size(size, maximum):
+            kept.append(value)
+            continue
+        skipped.append(
+            {
+                "source": str(getattr(value, "image_path", "")),
+                "relative_path": str(getattr(value, "relative_path", "")),
+                "actual_size": list(size),
+                "maximum_size": list(maximum),
+                "reason": "image exceeds native_tile_size",
+            }
+        )
+    if skipped and policy == "raise":
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Prediction input exceeds native_tile_size",
+                source=source,
+                value=skipped[:20],
+                expected={"maximum_size": maximum, "rule": "height and width must be at most the maximum"},
+                suggestion="Pass errors='skip' to omit oversized inputs.",
+            )
+        )
+    if skipped and not kept:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "No usable images remain after skipping oversized inputs",
+                source=source,
+                value=skipped[:20],
+                expected={"maximum_size": maximum},
+            )
+        )
+    return tuple(kept), tuple(skipped)
 
 
 def normalize_size(value: Any, *, field: str) -> Size | None:
@@ -190,16 +257,26 @@ def infer_dataset_geometry(dataset: Any, split: str) -> tuple[Geometry, bool, se
     return geometry, tiled, actual
 
 
-def validate_collection_geometry(dataset: Any, collection: Any, *, split: str) -> None:
-    """Reject incompatible or unproven tiled geometry before runtime loading."""
+def validate_collection_geometry(
+    dataset: Any,
+    collection: Any,
+    *,
+    split: str,
+    errors: str = "raise",
+) -> Any:
+    """Validate shared geometry and return a view omitting allowed oversize skips."""
 
-    dataset_geometry, tiled, actual_sizes = infer_dataset_geometry(dataset, split)
-    if not tiled and dataset_geometry.native_tile_size is None:
-        return
+    policy = normalize_errors(errors)
+    dataset_geometry, tiled, _ = infer_dataset_geometry(dataset, split)
 
     problems: list[dict[str, Any]] = []
+    maxima: list[Size] = []
+    if dataset_geometry.native_tile_size is not None:
+        maxima.append(dataset_geometry.native_tile_size)
     for model in collection:
         geometry = model.geometry
+        if geometry.native_tile_size is not None:
+            maxima.append(geometry.native_tile_size)
         if tiled and not geometry.complete:
             missing = [
                 field
@@ -214,31 +291,6 @@ def validate_collection_geometry(dataset: Any, collection: Any, *, split: str) -
                 }
             )
             continue
-        for field in ("native_tile_size", "upscale_factor", "input_size"):
-            dataset_value = getattr(dataset_geometry, field)
-            model_value = getattr(geometry, field)
-            if dataset_value is not None and model_value is not None and dataset_value != model_value:
-                problems.append(
-                    {
-                        "model": model.name,
-                        "field": field,
-                        "dataset": dataset_value,
-                        "model_value": model_value,
-                    }
-                )
-        if dataset_geometry.native_tile_size is not None and actual_sizes:
-            acceptable = {dataset_geometry.native_tile_size}
-            if dataset_geometry.input_size is not None:
-                acceptable.add(dataset_geometry.input_size)
-            if not actual_sizes <= acceptable:
-                problems.append(
-                    {
-                        "model": model.name,
-                        "problem": "actual split image sizes contradict dataset geometry",
-                        "actual_sizes": sorted(actual_sizes),
-                        "declared": sorted(acceptable),
-                    }
-                )
     if problems:
         raise DatasetValidationError(
             ValidationIssue(
@@ -247,7 +299,10 @@ def validate_collection_geometry(dataset: Any, collection: Any, *, split: str) -
                 value=problems,
                 expected={
                     "dataset_geometry": dataset_geometry.as_dict(),
-                    "rule": "all known fields must match for tiled datasets",
+                    "rule": (
+                        "source images may be smaller than native_tile_size; "
+                        "tiled datasets require proven model geometry"
+                    ),
                 },
                 suggestion=(
                     "Use ModelCollection.configure() to supply missing standalone-checkpoint "
@@ -255,3 +310,30 @@ def validate_collection_geometry(dataset: Any, collection: Any, *, split: str) -
                 ),
             )
         )
+    maximum = (
+        (min(size[0] for size in maxima), min(size[1] for size in maxima))
+        if maxima
+        else None
+    )
+    selected = [sample for sample in dataset._samples if sample.split == split]
+    _, skipped = filter_inputs_by_size(
+        selected,
+        maximum=maximum,
+        errors=policy,
+        source=dataset.name,
+    )
+    active = copy.copy(dataset)
+    if skipped:
+        skipped_paths = {str(Path(row["source"]).resolve()) for row in skipped}
+        active._samples = [
+            sample
+            for sample in dataset._samples
+            if sample.split != split
+            or str(Path(sample.image_path).resolve()) not in skipped_paths
+        ]
+    active._geometry_skip_audit = tuple(
+        {**row, "split": split, "errors": policy} for row in skipped
+    )
+    active._geometry_errors = policy
+    active._geometry_maximum_size = maximum
+    return active

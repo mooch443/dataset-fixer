@@ -99,7 +99,7 @@ def _geometry(value: Geometry | Mapping[str, Any]) -> Geometry:
 
 def _dataset(value: Prepared | Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(value, Prepared):
-        return {
+        result = {
             "name": value.location.name,
             "content_sha256": value.content_sha256,
             "preparation_kind": value.kind.value,
@@ -107,6 +107,11 @@ def _dataset(value: Prepared | Mapping[str, Any]) -> dict[str, Any]:
             "split_statistics": to_jsonable(value.split_statistics),
             "manifest": str(value.manifest),
         }
+        if value.source_name:
+            result["dataset_source"] = value.source_name
+            if value.source_name.lower().endswith(".zip"):
+                result["source_dataset_zip"] = value.source_name
+        return result
     return to_jsonable(dict(value))
 
 

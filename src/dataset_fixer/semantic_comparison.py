@@ -15,7 +15,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -122,6 +122,18 @@ if TYPE_CHECKING:
     from .dataset import Dataset
 
 
+def _comparison_source_size_policy(export: "Dataset", errors: str) -> dict[str, Any]:
+    return {
+        "errors": errors,
+        "maximum_size": to_jsonable(
+            getattr(export, "_geometry_maximum_size", None)
+        ),
+        "smaller_or_equal": "retain",
+        "oversized": "skip" if errors == "skip" else "raise",
+        "skipped_inputs": list(getattr(export, "_geometry_skip_audit", ())),
+    }
+
+
 def compare_nnunet_models(
     export: "Dataset",
     models: Any,
@@ -131,6 +143,7 @@ def compare_nnunet_models(
     progress: bool,
     destination: str | Path | None,
     trust_legacy_cache: bool = False,
+    errors: Literal["raise", "skip"] = "raise",
 ) -> SemanticComparisonResult:
     """Run official nnU-Net v2 prediction and evaluation for an export."""
 
@@ -209,6 +222,7 @@ def compare_nnunet_models(
             }
             for spec in specs
         ],
+        "source_size_policy": _comparison_source_size_policy(export, errors),
     }
     fingerprint = settings_fingerprint(
         {
@@ -228,6 +242,7 @@ def compare_nnunet_models(
                 }
                 for spec in specs
             ],
+            "source_size_policy": resolved_settings["source_size_policy"],
         }
     )
     target = (
@@ -265,6 +280,12 @@ def compare_nnunet_models(
         "Dice is undefined when both reference and prediction are empty; finite support is reported separately "
         "from total cohort size.",
     ]
+    geometry_skips = list(getattr(export, "_geometry_skip_audit", ()))
+    if geometry_skips:
+        limitations.append(
+            f"Skipped {len(geometry_skips)} oversized evaluation image(s); "
+            "details are recorded in settings.source_size_policy."
+        )
     if any(spec.upscale_factor != 1 for spec in specs):
         limitations.append(
             "Each model received inputs at its configured training-adapter scale; predicted class probabilities "
@@ -610,6 +631,7 @@ def compare_semantic_models(
     progress: bool,
     destination: str | Path | None,
     trust_legacy_cache: bool = False,
+    errors: Literal["raise", "skip"] = "raise",
 ) -> SemanticComparisonResult:
     """Compare instance and semantic segmenters in one binary mask space."""
 
@@ -687,6 +709,7 @@ def compare_semantic_models(
             }
             for model in models
         ],
+        "source_size_policy": _comparison_source_size_policy(export, errors),
     }
     fingerprint = settings_fingerprint(
         {
@@ -715,6 +738,7 @@ def compare_semantic_models(
                 }
                 for model in models
             ],
+            "source_size_policy": resolved_settings["source_size_policy"],
         }
     )
     target = (
@@ -752,6 +776,12 @@ def compare_semantic_models(
         "Dice is undefined when both reference and prediction are empty; finite support is reported separately.",
         "Training/evaluation overlap cannot be independently verified for models without training provenance.",
     ]
+    geometry_skips = list(getattr(export, "_geometry_skip_audit", ()))
+    if geometry_skips:
+        limitations.append(
+            f"Skipped {len(geometry_skips)} oversized evaluation image(s); "
+            "details are recorded in settings.source_size_policy."
+        )
     if resolved_sahi_by_model:
         limitations.append(
             "SAHI predictions are scored only after tile post-processing and full source-image "
@@ -2001,14 +2031,27 @@ def _freeze_cohort(
                 value={"images": str(image_root), "masks": str(mask_root)},
             )
         )
-    images = sorted(
+    all_images = sorted(
         path for path in image_root.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
     )
-    if not images:
+    if not all_images:
         raise DatasetValidationError(f"No images found in semantic-mask split {split!r}")
+    excluded = {
+        str(Path(row["source"]).resolve())
+        for row in getattr(export, "_geometry_skip_audit", ())
+        if row.get("split") == split
+    }
+    images = [path for path in all_images if str(path.resolve()) not in excluded]
+    if not images:
+        raise DatasetValidationError(
+            f"No usable images remain in semantic-mask split {split!r}"
+        )
 
     cases: list[_SemanticCase] = []
-    expected_masks: set[Path] = set()
+    expected_masks = {
+        (mask_root / path.relative_to(image_root).with_suffix(".png")).resolve()
+        for path in all_images
+    }
     digest = hashlib.sha256()
     digest.update(f"semantic-mask-cohort-v2:{split}:canonical-export".encode("utf-8"))
     cohort_progress = tqdm(
@@ -2020,7 +2063,6 @@ def _freeze_cohort(
     for index, image_path in enumerate(images):
         relative = image_path.relative_to(image_root)
         mask_path = mask_root / relative.with_suffix(".png")
-        expected_masks.add(mask_path.resolve())
         if not mask_path.is_file():
             raise DatasetValidationError(
                 ValidationIssue(

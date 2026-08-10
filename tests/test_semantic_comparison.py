@@ -26,6 +26,7 @@ from dataset_fixer.semantic_comparison import (
     _all_pairwise_statistics,
     _binary_metric_breakdown,
     _canonicalize_predictions,
+    _freeze_cohort,
     _multiline_model_title,
     _project_semantic_predictions,
     _ranking_plot_label,
@@ -88,6 +89,63 @@ def _nnunet_model(root: Path) -> Path:
     fold.mkdir()
     (fold / "checkpoint_final.pth").write_bytes(f"checkpoint:{root.name}".encode())
     return root
+
+
+def test_semantic_cohort_freeze_honors_oversized_skip_audit(tmp_path: Path) -> None:
+    exported = _semantic_export(tmp_path)
+    val_samples = [sample for sample in exported._samples if sample.split == "val"]
+    exported._geometry_skip_audit = (
+        {"source": str(val_samples[1].image_path), "split": "val"},
+    )
+
+    cases, _ = _freeze_cohort(exported, "val", progress=False)
+
+    assert [case.image_path for case in cases] == [val_samples[0].image_path]
+
+
+def test_nnunet_prediction_uses_shared_smaller_and_oversized_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exported = _semantic_export(tmp_path)
+    val_samples = [sample for sample in exported._samples if sample.split == "val"]
+    oversized = val_samples[1]
+    oversized_mask = exported._mask_paths[oversized.image_path.resolve()]
+    with Image.open(oversized.image_path) as opened:
+        opened.resize((41, 30), Image.Resampling.BICUBIC).save(oversized.image_path)
+    with Image.open(oversized_mask) as opened:
+        opened.resize((41, 30), Image.Resampling.NEAREST).save(oversized_mask)
+    model = Model(
+        _nnunet_model(tmp_path / "size-policy-nnunet"),
+        native_tile_size=(30, 40),
+        upscale_factor=1,
+        workers=1,
+    )
+
+    def fake_predict(_model: Model, inputs, **_kwargs):
+        return tuple(
+            ImagePrediction(
+                image_id=value.image_id,
+                image_path=value.image_path,
+                relative_path=value.relative_path,
+                width=value.width,
+                height=value.height,
+                mask=np.zeros((value.height, value.width), dtype=np.uint8),
+            )
+            for value in inputs
+        )
+
+    monkeypatch.setattr(
+        "dataset_fixer.semantic_comparison.predict_nnunet_model",
+        fake_predict,
+    )
+
+    with pytest.raises(DatasetValidationError, match="exceeds native_tile_size"):
+        model.predict(exported, split="val", progress=False)
+    result = model.predict(exported, split="val", errors="skip", progress=False)
+
+    assert [record.image_path for record in result.records] == [val_samples[0].image_path]
+    assert len(result.settings["source_size_policy"]["skipped_inputs"]) == 1
 
 
 def test_ranking_plot_label_breaks_canonical_name_without_wandb_prefix() -> None:
