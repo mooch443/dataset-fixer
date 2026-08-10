@@ -992,7 +992,7 @@ def compare_semantic_models(
                 "Mean per-source-image foreground Dice "
                 "(empty false positives = 0; empty/empty excluded)"
             ),
-            title="Semantic-space model comparison — existing headline metric",
+            title="Semantic-space model comparison",
         )
         _render_metric_breakdown(reports, ranking)
         _render_qualitative(reports, cases, prediction_dirs, model_rows, seed=seed)
@@ -2772,7 +2772,7 @@ def _render_ranking(
         "Mean per-source-image foreground Dice "
         "(empty false positives = 0; empty/empty excluded)"
     ),
-    title: str = "nnU-Net semantic-mask comparison — existing headline metric",
+    title: str = "nnU-Net semantic-mask comparison",
 ) -> list[str]:
     import matplotlib.pyplot as plt
 
