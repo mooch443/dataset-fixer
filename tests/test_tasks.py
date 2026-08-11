@@ -11,7 +11,12 @@ from PIL import Image
 from dataset_fixer import Dataset, DatasetValidationError, Task
 from dataset_fixer import tiling as tiling_module
 from dataset_fixer.models import Annotation, Sample
-from dataset_fixer.visualization import _polygon_invalidity_details, save_coverage_annotated_original
+from dataset_fixer.visualization import (
+    _focus_invalid_annotation,
+    _highlight_invalid_annotation,
+    _polygon_invalidity_details,
+    save_coverage_annotated_original,
+)
 from conftest import make_image, make_yolo_dataset
 
 
@@ -185,6 +190,38 @@ def test_invalid_polygon_visualization_identifies_exact_defects() -> None:
     )
     assert "vertex 0 lies outside the image" in reasons
     assert markers[0] == (0.0, 20.0, "vertex 0 outside image\n(-5.0, 20.0)")
+
+
+def test_invalid_polygon_visualization_focuses_and_labels_vertices() -> None:
+    from matplotlib import pyplot as plt
+
+    annotation = Annotation(
+        class_id=0,
+        polygon=[(90.0, 90.0), (130.0, 130.0), (130.0, 90.0), (90.0, 130.0)],
+    )
+    figure, axis = plt.subplots()
+    _focus_invalid_annotation(axis, annotation, width=1000, height=800)
+    _highlight_invalid_annotation(axis, annotation, width=1000, height=800)
+
+    x_limits = sorted(axis.get_xlim())
+    y_limits = sorted(axis.get_ylim())
+    assert x_limits[1] - x_limits[0] < 300
+    assert y_limits[1] - y_limits[0] < 300
+    assert x_limits[0] <= 90 <= 130 <= x_limits[1]
+    assert y_limits[0] <= 90 <= 130 <= y_limits[1]
+    labels = {text.get_text() for text in axis.texts}
+    assert labels >= {
+        "0",
+        "1",
+        "2",
+        "3",
+        "self-intersection",
+    }
+    assert any(
+        label.startswith("Invalid polygon\n") and "self-intersection" in label
+        for label in labels
+    )
+    plt.close(figure)
 
 
 def test_grid_tiling_transforms_segment_and_pose(tmp_path: Path) -> None:

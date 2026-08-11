@@ -1136,6 +1136,68 @@ def test_generic_model_predicts_semantic_export_and_saves_masks(
     assert len(list((saved / "masks").glob("*.png"))) == 2
 
 
+def test_semantic_predict_and_compare_share_raw_prediction_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exported = _semantic_export(tmp_path)
+    checkpoint = tmp_path / "shared-semantic.pt"
+    checkpoint.write_bytes(b"shared-semantic")
+    model = Model(checkpoint, task="semantic", resolution=64)
+    calls = 0
+
+    def fake_predict_inputs(_model, inputs, **_kwargs):
+        nonlocal calls
+        calls += 1
+        values = {}
+        for value in inputs:
+            assert value.mask_path is not None
+            with Image.open(value.mask_path) as opened:
+                values[value.image_id] = np.asarray(opened.convert("L")) > 0
+        return values, "semantic_segment", {"synthetic": True}
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.inference.predict_model_inputs",
+        fake_predict_inputs,
+    )
+    direct = model.predict(
+        exported,
+        split="val",
+        progress=False,
+        prediction_cache=True,
+    )
+    assert direct.cache_info["status"] == "fresh"
+    assert calls == 1
+
+    comparison = model.compare(
+        exported,
+        split="val",
+        progress=False,
+        destination=tmp_path / "shared-semantic-comparison",
+    )
+    assert comparison.ranking[0]["dice"] == pytest.approx(1.0)
+    assert calls == 1
+    initial_entry = Path(direct.cache_info["location"])
+    shutil.rmtree(initial_entry / "raw-result")
+
+    reused = Model(
+        checkpoint,
+        name="renamed-semantic",
+        task="semantic",
+        resolution=64,
+    ).predict(
+        exported,
+        split="val",
+        progress=False,
+        prediction_cache=True,
+    )
+    assert reused.cache_info["status"] == "legacy-hit"
+    assert calls == 1
+    cache_entry = Path(reused.cache_info["location"])
+    assert (cache_entry / "raw-result").is_dir()
+    assert (cache_entry / "evaluation.json").is_file()
+
+
 def test_nnunet_without_a_device_uses_runtime_device_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

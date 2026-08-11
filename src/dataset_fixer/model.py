@@ -5,7 +5,7 @@ import json
 import math
 import time
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -15,6 +15,7 @@ from PIL import Image
 
 from .errors import DatasetValidationError, ValidationIssue
 from .geometry import Geometry, filter_inputs_by_size, normalize_errors
+from .prediction_cache import PredictionCache
 from .utils import IMAGE_SUFFIXES, sha256_file, slugify, to_jsonable
 
 ModelKind = Literal["ultralytics", "nnunet"]
@@ -52,6 +53,8 @@ class ModelInput:
         relative_path: Cohort-relative input image path.
         mask_path: Optional ground-truth mask used only by evaluation code;
             prediction never reads it.
+        image_sha256: Optional already-computed image digest used to avoid
+            hashing frozen comparison inputs again for prediction caching.
     """
 
     image_id: str
@@ -60,6 +63,7 @@ class ModelInput:
     height: int
     relative_path: str
     mask_path: Path | None = None
+    image_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +113,7 @@ class PredictionResult:
         records: Predictions in the same order as the model inputs.
         inference_seconds: Measured prediction wall time.
         settings: Effective device, batching, and inference configuration.
+        cache_info: Verified prediction-cache status and location, when used.
     """
 
     model_name: str
@@ -118,6 +123,7 @@ class PredictionResult:
     records: tuple[ImagePrediction, ...]
     inference_seconds: float
     settings: dict[str, Any] = field(default_factory=dict)
+    cache_info: dict[str, Any] = field(default_factory=dict)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -251,6 +257,7 @@ class PredictionResult:
                 if self.inference_seconds > 0
                 else None
             ),
+            "cache": to_jsonable(self.cache_info),
         }
 
     def visualize(
@@ -357,6 +364,18 @@ class PredictionResult:
             path.parent.mkdir(parents=True, exist_ok=True)
             figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
         return figure
+
+
+@dataclass(frozen=True)
+class _PredictionCacheRequest:
+    cache: PredictionCache
+    key: str
+    identity: dict[str, Any]
+    namespace: Literal["predictions", "semantic"]
+    cohort: Any | None = None
+    package_payload: dict[str, Any] | None = None
+    postprocess: float = 0.7
+    keep_native: bool = False
 
 
 class Model:
@@ -1012,6 +1031,7 @@ class Model:
         errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
         destination: str | Path | None = None,
+        prediction_cache: bool | str | Path | PredictionCache = False,
         settings: Mapping[str, Any] | None = None,
         sahi_slice_height: int | None = None,
         sahi_slice_width: int | None = None,
@@ -1054,6 +1074,10 @@ class Model:
                 with the configured native tile geometry.
             progress: Show package-managed progress bars.
             destination: Optional new/empty directory receiving saved output.
+            prediction_cache: Opt-in verified prediction caching. ``True`` uses
+                the dataset-local comparison cache for :class:`Dataset`
+                inputs and package-managed storage otherwise. A path is an
+                explicit cache base; :class:`PredictionCache` is also accepted.
             settings: Additional per-call adapter overrides.
             sahi_slice_height: Optional SAHI tile height in source pixels.
             sahi_slice_width: Optional SAHI tile width in source pixels.
@@ -1073,6 +1097,14 @@ class Model:
         """
 
         errors = normalize_errors(errors)
+        cache_override = getattr(self, "_prediction_cache_override", None)
+        if cache_override is None:
+            cache_identity_override = None
+            cache_namespace_override = None
+        else:
+            prediction_cache, cache_identity_override, cache_namespace_override = (
+                cache_override
+            )
         combined_settings = {**self.settings, **dict(settings or {})}
         effective_confidence = (
             float(confidence)
@@ -1091,7 +1123,7 @@ class Model:
         requested = inference or self.inference
         if requested not in {"native", "sahi"}:
             raise ValueError("inference must be 'native' or 'sahi'; 'auto' was removed")
-        inputs, source_task = normalize_model_inputs(
+        inputs, source_task, cache_context = normalize_model_inputs(
             source, split=split, progress=progress
         )
         inputs, skipped_inputs = filter_inputs_by_size(
@@ -1138,12 +1170,77 @@ class Model:
             combined_settings,
             resolution=effective_resolution,
         )
+        from .comparison.inference import resolve_backend
+
+        known_task = (
+            "semantic_segment"
+            if self.kind == "nnunet"
+            else self.task
+            or (source_task if source_task != "semantic_segment" else None)
+        )
+        selected_backend = resolve_backend(
+            requested,
+            known_task or "detect",
+        )
+        maximum_size = (
+            None
+            if requested == "sahi"
+            else list(self.native_tile_size) if self.native_tile_size else None
+        )
+        if requested == "sahi":
+            oversized_action = "retain-for-sahi-slicing"
+        elif maximum_size is None:
+            oversized_action = "retain"
+        else:
+            oversized_action = "skip" if errors == "skip" else "raise"
+        source_size_policy = {
+            "errors": errors,
+            "maximum_size": maximum_size,
+            "smaller_or_equal": "retain",
+            "oversized": oversized_action,
+            "skipped_inputs": list(skipped_inputs),
+        }
+        cache_request = _prepare_prediction_cache_request(
+            model=self,
+            source=source,
+            inputs=inputs,
+            source_task=source_task,
+            cache_context=cache_context,
+            prediction_cache=prediction_cache,
+            backend=selected_backend,
+            inference=requested,
+            resolution=effective_resolution,
+            confidence=effective_confidence,
+            postprocess=effective_postprocess,
+            combined_settings=combined_settings,
+            resolved_sahi=resolved_sahi.as_dict(),
+            keep_native=_keep_native,
+            identity_override=cache_identity_override,
+            namespace_override=cache_namespace_override,
+        )
+        cached_result = _load_prediction_cache_request(
+            cache_request,
+            inputs=inputs,
+            model=self,
+            backend=selected_backend,
+            source_size_policy=source_size_policy,
+            device=selected_device,
+            batch_size=effective_batch_size,
+            resolution=effective_resolution,
+            confidence=effective_confidence,
+            postprocess=effective_postprocess,
+            combined_settings=combined_settings,
+            resolved_sahi=resolved_sahi.as_dict(),
+        )
+        if cached_result is not None:
+            if destination is not None:
+                cached_result.save(destination)
+            return cached_result
+
         started = time.perf_counter()
         if self.kind == "nnunet":
-            from .comparison.inference import resolve_backend
             from .semantic_comparison import predict_nnunet_model
 
-            selected_backend = resolve_backend(requested, "semantic_segment")
             records = predict_nnunet_model(
                 self,
                 inputs,
@@ -1177,12 +1274,8 @@ class Model:
                 },
             }
         else:
-            from .comparison.inference import predict_model_inputs, resolve_backend
+            from .comparison.inference import predict_model_inputs
 
-            known_task = self.task or (
-                source_task if source_task != "semantic_segment" else None
-            )
-            selected_backend = resolve_backend(requested, known_task or "detect")
             by_id, resolved_task, inference_telemetry = predict_model_inputs(
                 self,
                 inputs,
@@ -1235,24 +1328,7 @@ class Model:
                 **combined_settings,
                 **(resolved_sahi.as_dict() if selected_backend == "sahi" else {}),
             }
-        maximum_size = (
-            None
-            if requested == "sahi"
-            else list(self.native_tile_size) if self.native_tile_size else None
-        )
-        if requested == "sahi":
-            oversized_action = "retain-for-sahi-slicing"
-        elif maximum_size is None:
-            oversized_action = "retain"
-        else:
-            oversized_action = "skip" if errors == "skip" else "raise"
-        resolved_settings["source_size_policy"] = {
-            "errors": errors,
-            "maximum_size": maximum_size,
-            "smaller_or_equal": "retain",
-            "oversized": oversized_action,
-            "skipped_inputs": list(skipped_inputs),
-        }
+        resolved_settings["source_size_policy"] = source_size_policy
         result = PredictionResult(
             model_name=self.name,
             model_kind=self.kind,
@@ -1261,6 +1337,11 @@ class Model:
             records=tuple(records),
             inference_seconds=time.perf_counter() - started,
             settings=resolved_settings,
+        )
+        result = _save_prediction_cache_request(
+            cache_request,
+            inputs=inputs,
+            result=result,
         )
         if destination is not None:
             result.save(destination)
@@ -1275,6 +1356,7 @@ class Model:
         errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
         destination: str | Path | None = None,
+        prediction_cache: bool | str | Path | PredictionCache | None = None,
         trust_legacy_cache: bool = False,
         min_connected_component_area: float | None = None,
         group_by: Callable[[Path], Hashable] | None = None,
@@ -1294,6 +1376,9 @@ class Model:
             progress: Show package-managed progress bars.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.
+            prediction_cache: Optional prediction-cache override. Omission or
+                ``True`` preserves the established dataset-local cache;
+                ``False`` disables persistent prediction caching.
             trust_legacy_cache: Reuse and migrate one structurally complete
                 legacy semantic prediction cache when its exact model name and
                 frozen cohort paths match, even if the old entry lacks model
@@ -1320,6 +1405,7 @@ class Model:
             errors=errors,
             progress=progress,
             destination=destination,
+            prediction_cache=prediction_cache,
             trust_legacy_cache=trust_legacy_cache,
             min_connected_component_area=min_connected_component_area,
             group_by=group_by,
@@ -1681,6 +1767,7 @@ class ModelCollection:
         errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
         destination: str | Path | None = None,
+        prediction_cache: bool | str | Path | PredictionCache | None = None,
         trust_legacy_cache: bool = False,
         min_connected_component_area: float | None = None,
         group_by: Callable[[Path], Hashable] | None = None,
@@ -1711,6 +1798,9 @@ class ModelCollection:
             progress: Show package-managed progress bars.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.
+            prediction_cache: Optional prediction-cache override. Omission or
+                ``True`` preserves the established dataset-local cache;
+                ``False`` disables persistent prediction caching.
             trust_legacy_cache: Reuse and migrate one structurally complete
                 legacy semantic prediction cache when its exact model name and
                 frozen cohort paths match, even if the old entry lacks model
@@ -1772,6 +1862,7 @@ class ModelCollection:
                     save_prediction_plots=save_prediction_plots,
                     progress=progress,
                     destination=destination,
+                    prediction_cache=prediction_cache,
                     trust_legacy_cache=trust_legacy_cache,
                     errors=normalize_errors(errors),
                     min_connected_component_area=min_connected_component_area,
@@ -1786,6 +1877,7 @@ class ModelCollection:
                 save_prediction_plots=save_prediction_plots,
                 progress=progress,
                 destination=destination,
+                prediction_cache=prediction_cache,
                 trust_legacy_cache=trust_legacy_cache,
                 errors=normalize_errors(errors),
                 min_connected_component_area=min_connected_component_area,
@@ -1832,6 +1924,7 @@ class ModelCollection:
             save_prediction_plots=save_prediction_plots,
             progress=progress,
             destination=destination,
+            prediction_cache=prediction_cache,
             errors=normalize_errors(errors),
             min_connected_component_area=min_connected_component_area,
             group_by=group_by,
@@ -1905,18 +1998,450 @@ class ModelCollection:
         return f"ModelCollection(models={self.names!r})"
 
 
+def _prepare_prediction_cache_request(
+    *,
+    model: Model,
+    source: Any,
+    inputs: Sequence[ModelInput],
+    source_task: PredictionTask | None,
+    cache_context: Mapping[str, Any],
+    prediction_cache: bool | str | Path | PredictionCache,
+    backend: str,
+    inference: str,
+    resolution: int,
+    confidence: float,
+    postprocess: float,
+    combined_settings: Mapping[str, Any],
+    resolved_sahi: Mapping[str, Any],
+    keep_native: bool,
+    identity_override: Mapping[str, Any] | None,
+    namespace_override: Literal["predictions", "semantic"] | None,
+) -> _PredictionCacheRequest | None:
+    from .prediction_cache import (
+        prediction_cache_key,
+        prediction_input_fingerprint,
+        resolve_prediction_cache,
+    )
+
+    cache = resolve_prediction_cache(
+        prediction_cache,
+        source=source,
+        default=False,
+    )
+    if cache is None:
+        return None
+
+    if identity_override is not None:
+        identity = dict(identity_override)
+        namespace = namespace_override or "predictions"
+        return _PredictionCacheRequest(
+            cache=cache,
+            key=prediction_cache_key(identity),
+            identity=identity,
+            namespace=namespace,
+            postprocess=postprocess,
+            keep_native=keep_native,
+        )
+
+    semantic_cohort = cache_context.get("semantic_cohort_fingerprint")
+    if semantic_cohort:
+        if model.kind == "nnunet":
+            identity = {
+                "schema": 2,
+                "space": "nnunet-semantic",
+                "cohort": str(semantic_cohort),
+                "model_sha256": model.digest,
+                "backend": inference,
+                "folds": model.folds,
+                "checkpoint": model.checkpoint,
+                "upscale_factor": model.upscale_factor,
+                "resolution": resolution,
+                "nnunet_tta": model.nnunet_tta,
+                "sahi": dict(resolved_sahi) if inference == "sahi" else None,
+            }
+            return _PredictionCacheRequest(
+                cache=cache,
+                key=prediction_cache_key(identity),
+                identity=identity,
+                namespace="semantic",
+                postprocess=postprocess,
+                keep_native=keep_native,
+            )
+        identity_settings = dict(combined_settings)
+        identity_settings["confidence"] = confidence
+        identity_settings["postprocess"] = postprocess
+        identity = {
+            "schema": 2,
+            "space": "binary-semantic",
+            "cohort": str(semantic_cohort),
+            "model_sha256": model.digest,
+            "kind": model.kind,
+            "task": model.task,
+            "folds": model.folds,
+            "checkpoint": model.checkpoint,
+            "upscale_factor": model.upscale_factor,
+            "inference": inference,
+            "resolution": resolution,
+            "settings": identity_settings,
+            **(
+                {"nnunet_tta": model.nnunet_tta}
+                if model.kind == "nnunet"
+                else {}
+            ),
+        }
+        return _PredictionCacheRequest(
+            cache=cache,
+            key=prediction_cache_key(identity),
+            identity=identity,
+            namespace="semantic",
+            postprocess=postprocess,
+            keep_native=keep_native,
+        )
+
+    cohort = cache_context.get("cohort")
+    prediction_task = model.task or source_task
+    if (
+        cohort is not None
+        and prediction_task == cohort.task
+        and prediction_task != "semantic_segment"
+        and len(inputs) == len(cohort.records)
+        and all(
+            value.image_id == record.image_id
+            for value, record in zip(inputs, cohort.records)
+        )
+    ):
+        adapter_settings = {
+            "inference": inference,
+            **dict(combined_settings),
+        }
+        adapter_settings.pop("confidence", None)
+        adapter_settings.pop("postprocess", None)
+        identity = {
+            "model_sha256": model.digest,
+            "cohort_fingerprint": cohort.fingerprint,
+            "task": cohort.task,
+            "classes": cohort.classes,
+            "backend": backend,
+            "resolution": resolution,
+            "confidence_floor": confidence,
+            "settings": adapter_settings,
+        }
+        payload = {
+            **identity,
+            "postprocess_thresholds": (postprocess,),
+        }
+        return _PredictionCacheRequest(
+            cache=cache,
+            key=prediction_cache_key(identity),
+            identity=identity,
+            namespace="predictions",
+            cohort=cohort,
+            package_payload=payload,
+            postprocess=postprocess,
+            keep_native=keep_native,
+        )
+
+    identity_settings = dict(combined_settings)
+    identity_settings["confidence"] = confidence
+    identity_settings["postprocess"] = postprocess
+    identity = {
+        "schema": 1,
+        "space": "raw-prediction-result",
+        "input_fingerprint": prediction_input_fingerprint(inputs),
+        "model_sha256": model.digest,
+        "kind": model.kind,
+        "task": prediction_task,
+        "source_task": source_task,
+        "backend": backend,
+        "resolution": resolution,
+        "inference": inference,
+        "folds": model.folds,
+        "checkpoint": model.checkpoint,
+        "upscale_factor": model.upscale_factor,
+        "nnunet_tta": model.nnunet_tta,
+        "keep_native": keep_native,
+        "settings": identity_settings,
+    }
+    return _PredictionCacheRequest(
+        cache=cache,
+        key=prediction_cache_key(identity),
+        identity=identity,
+        namespace=namespace_override
+        or str(cache_context.get("namespace") or "predictions"),
+        postprocess=postprocess,
+        keep_native=keep_native,
+    )
+
+
+def _load_prediction_cache_request(
+    request: _PredictionCacheRequest | None,
+    *,
+    inputs: Sequence[ModelInput],
+    model: Model,
+    backend: str,
+    source_size_policy: Mapping[str, Any],
+    device: str | None,
+    batch_size: int,
+    resolution: int,
+    confidence: float,
+    postprocess: float,
+    combined_settings: Mapping[str, Any],
+    resolved_sahi: Mapping[str, Any],
+) -> PredictionResult | None:
+    if request is None:
+        return None
+
+    if request.package_payload is not None:
+        from .comparison.cache import load_package_cache
+
+        root = request.cache.entry(request.key, namespace="predictions")
+        loaded, shards, complete = load_package_cache(
+            root,
+            request.cohort,
+            (request.postprocess,),
+            progress=False,
+        )
+        if complete:
+            by_image = loaded[float(request.postprocess)]
+            records = tuple(
+                ImagePrediction(
+                    image_id=value.image_id,
+                    image_path=value.image_path,
+                    relative_path=value.relative_path,
+                    width=value.width,
+                    height=value.height,
+                    objects=tuple(by_image[value.image_id]),
+                    metadata={"backend": backend},
+                )
+                for value in inputs
+            )
+            return PredictionResult(
+                model_name=model.name,
+                model_kind=model.kind,
+                task=request.cohort.task,
+                backend=backend,
+                records=records,
+                inference_seconds=0.0,
+                settings=_cached_result_settings(
+                    device=device,
+                    batch_size=batch_size,
+                    resolution=resolution,
+                    confidence=confidence,
+                    postprocess=postprocess,
+                    combined_settings=combined_settings,
+                    resolved_sahi=resolved_sahi,
+                    source_size_policy=source_size_policy,
+                ),
+                cache_info={
+                    "status": "hit",
+                    "verified": True,
+                    "key": request.key,
+                    "namespace": "predictions",
+                    "location": str(root),
+                    "shards": shards,
+                },
+            )
+
+    cached = request.cache.load(
+        request.key,
+        namespace=request.namespace,
+        identity=request.identity,
+        inputs=inputs,
+    )
+    if cached is not None:
+        if request.keep_native and any(
+            record.native_mask is None for record in cached.records
+        ):
+            cached = None
+        elif not request.keep_native and any(
+            record.native_mask is not None for record in cached.records
+        ):
+            cached = replace(
+                cached,
+                records=tuple(
+                    replace(record, native_mask=None)
+                    for record in cached.records
+                ),
+            )
+    if cached is not None:
+        return replace(cached, model_name=model.name)
+
+    if request.namespace == "semantic" and not request.keep_native:
+        legacy = _load_legacy_semantic_prediction(
+            request,
+            inputs=inputs,
+            model=model,
+            backend=backend,
+            settings=_cached_result_settings(
+                device=device,
+                batch_size=batch_size,
+                resolution=resolution,
+                confidence=confidence,
+                postprocess=postprocess,
+                combined_settings=combined_settings,
+                resolved_sahi=resolved_sahi,
+                source_size_policy=source_size_policy,
+            ),
+        )
+        if legacy is not None:
+            promoted = request.cache.save(
+                request.key,
+                legacy,
+                namespace=request.namespace,
+                identity=request.identity,
+                inputs=inputs,
+            )
+            return replace(
+                promoted,
+                cache_info={
+                    **promoted.cache_info,
+                    "status": "legacy-hit",
+                },
+            )
+    return None
+
+
+def _save_prediction_cache_request(
+    request: _PredictionCacheRequest | None,
+    *,
+    inputs: Sequence[ModelInput],
+    result: PredictionResult,
+) -> PredictionResult:
+    if request is None:
+        return result
+    if (
+        request.package_payload is not None
+        and result.task == request.cohort.task
+        and all(record.mask is None and record.native_mask is None for record in result)
+    ):
+        from .comparison.cache import save_package_cache
+
+        root = request.cache.entry(request.key, namespace="predictions")
+        save_package_cache(
+            root,
+            request.cohort,
+            request.package_payload,
+            {
+                float(request.postprocess): {
+                    record.image_id: list(record.objects)
+                    for record in result
+                }
+            },
+            progress=False,
+        )
+        return replace(
+            result,
+            cache_info={
+                "status": "fresh",
+                "verified": True,
+                "key": request.key,
+                "namespace": "predictions",
+                "location": str(root),
+            },
+        )
+    return request.cache.save(
+        request.key,
+        result,
+        namespace=request.namespace,
+        identity=request.identity,
+        inputs=inputs,
+    )
+
+
+def _cached_result_settings(
+    *,
+    device: str | None,
+    batch_size: int,
+    resolution: int,
+    confidence: float,
+    postprocess: float,
+    combined_settings: Mapping[str, Any],
+    resolved_sahi: Mapping[str, Any],
+    source_size_policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "device": device,
+        "resolution": resolution,
+        "confidence": confidence,
+        "postprocess": postprocess,
+        "batch_size": batch_size,
+        **dict(combined_settings),
+        **dict(resolved_sahi),
+        "source_size_policy": dict(source_size_policy),
+    }
+
+
+def _load_legacy_semantic_prediction(
+    request: _PredictionCacheRequest,
+    *,
+    inputs: Sequence[ModelInput],
+    model: Model,
+    backend: str,
+    settings: Mapping[str, Any],
+) -> PredictionResult | None:
+    if model.task != "semantic_segment":
+        return None
+    root = request.cache.entry(request.key, namespace="semantic")
+    metadata_path = root / "evaluation.json"
+    predictions = root / "predictions"
+    if not metadata_path.is_file() or not predictions.is_dir():
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    from .prediction_cache import prediction_cache_key
+
+    stored_identity = metadata.get("cache_identity") if isinstance(metadata, dict) else None
+    if not isinstance(stored_identity, dict) or prediction_cache_key(stored_identity) != request.key:
+        return None
+    expected = {f"{value.image_id}.png" for value in inputs}
+    actual = {path.name for path in predictions.glob("*.png") if path.is_file()}
+    if actual != expected:
+        return None
+    records: list[ImagePrediction] = []
+    for value in inputs:
+        try:
+            with Image.open(predictions / f"{value.image_id}.png") as opened:
+                mask = np.asarray(opened.copy())
+        except OSError:
+            return None
+        if mask.ndim != 2 or mask.shape != (value.height, value.width):
+            return None
+        records.append(
+            ImagePrediction(
+                image_id=value.image_id,
+                image_path=value.image_path,
+                relative_path=value.relative_path,
+                width=value.width,
+                height=value.height,
+                mask=mask,
+                metadata={"backend": backend, "legacy_semantic_cache": True},
+            )
+        )
+    return PredictionResult(
+        model_name=model.name,
+        model_kind=model.kind,
+        task="semantic_segment",
+        backend=backend,
+        records=tuple(records),
+        inference_seconds=float(metadata.get("inference_seconds", 0.0)),
+        settings=dict(settings),
+    )
+
+
 def normalize_model_inputs(
     source: Any,
     *,
     split: str | None,
     progress: bool = False,
-) -> tuple[tuple[ModelInput, ...], PredictionTask | None]:
+) -> tuple[tuple[ModelInput, ...], PredictionTask | None, dict[str, Any]]:
     """Normalize public prediction sources without reading their annotations."""
 
     if isinstance(source, ModelInput):
-        return (source,), None
+        return (source,), None, {}
     if _is_model_input_sequence(source):
-        return tuple(source), None
+        return tuple(source), None, {}
 
     from .dataset import Dataset
 
@@ -1929,7 +2454,9 @@ def normalize_model_inputs(
             )
         from .semantic_comparison import _freeze_cohort
 
-        cases, _ = _freeze_cohort(source, selected_split, progress=progress)
+        cases, cohort_fingerprint = _freeze_cohort(
+            source, selected_split, progress=progress
+        )
         return (
             tuple(
                 ModelInput(
@@ -1939,10 +2466,15 @@ def normalize_model_inputs(
                     height=case.height,
                     relative_path=case.relative_path.as_posix(),
                     mask_path=case.mask_path,
+                    image_sha256=case.image_sha256,
                 )
                 for case in cases
             ),
             "semantic_segment",
+            {
+                "semantic_cohort_fingerprint": cohort_fingerprint,
+                "namespace": "semantic",
+            },
         )
 
     from .comparison.types import Cohort
@@ -1956,10 +2488,12 @@ def normalize_model_inputs(
                     width=record.width,
                     height=record.height,
                     relative_path=record.relative_path,
+                    image_sha256=record.image_sha256,
                 )
                 for record in source.records
             ),
             source.task,
+            {"cohort": source, "namespace": "predictions"},
         )
 
     if isinstance(source, Dataset):
@@ -1969,7 +2503,7 @@ def normalize_model_inputs(
             )
         from .comparison.cohort import freeze_cohort
 
-        cohort = freeze_cohort(source, split or "val")
+        cohort = freeze_cohort(source, split or "val", progress=progress)
         return normalize_model_inputs(cohort, split=None)
 
     paths: list[Path]
@@ -2011,7 +2545,7 @@ def normalize_model_inputs(
                 relative_path=path.name,
             )
         )
-    return tuple(inputs), None
+    return tuple(inputs), None, {}
 
 
 def _is_model_input_sequence(value: Any) -> bool:

@@ -13,8 +13,11 @@ from dataset_fixer import (
     ComparisonResult,
     Dataset,
     DatasetValidationError,
+    ImagePrediction,
     Model,
     ModelCollection,
+    ModelInput,
+    PredictionCache,
     PredictionResult,
 )
 from dataset_fixer.geometry import validate_collection_geometry
@@ -23,6 +26,7 @@ from dataset_fixer.comparison.cache import (
     save_package_cache,
 )
 from dataset_fixer.comparison.cohort import freeze_cohort
+from dataset_fixer.comparison.grouping import resolve_group_splits
 from dataset_fixer.comparison.inference import _adaptive_batches, _run_native, resolve_backend
 from dataset_fixer.comparison.metrics import (
     component_filtered_presence_breakdown,
@@ -35,6 +39,7 @@ from dataset_fixer.comparison.metrics import (
     segmentation_binary_metric_rows,
 )
 from dataset_fixer.comparison.types import Cohort, CohortRecord, ModelSpec, Prediction
+from dataset_fixer.prediction_cache import prediction_cache_key
 from PIL import Image
 from conftest import make_yolo_dataset
 
@@ -49,6 +54,22 @@ def test_cohort_is_ordered_and_content_addressed(detect_dataset: Path) -> None:
     label.write_text("0 0.4 0.5 0.25 0.25\n", encoding="utf-8")
     changed = freeze_cohort(Dataset.open(detect_dataset, task="detect", progress=False), "val")
     assert changed.fingerprint != first.fingerprint
+
+
+def test_group_split_membership_is_normalized_and_detects_mixed_groups() -> None:
+    membership = resolve_group_splits(
+        [
+            ("train", Path("/dataset/train/aoi-a_01.png")),
+            ("validation", Path("/dataset/val/aoi-a_02.png")),
+            ("valid", Path("/dataset/val/aoi-b_01.png")),
+        ],
+        lambda path: path.stem.rsplit("_", 1)[0],
+    )
+
+    assert membership == {
+        "aoi-a": ("train", "val"),
+        "aoi-b": ("val",),
+    }
 
 
 def test_package_cache_is_pickle_free_and_detects_corruption(detect_dataset: Path, tmp_path: Path) -> None:
@@ -665,6 +686,339 @@ def test_model_load_many_returns_reusable_unbound_collection(
     assert models["baseline"].postprocess == pytest.approx(0.5)
 
 
+def test_model_predict_opt_in_cache_round_trips_without_loading_runtime(
+    detect_dataset: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "cached-model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    image = detect_dataset / "val" / "images" / "val_0.jpg"
+
+    class FakeYOLO:
+        task = "detect"
+        calls = 0
+
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def predict(self, *, source, **_kwargs):
+            FakeYOLO.calls += 1
+            boxes = types.SimpleNamespace(
+                xyxy=[[1, 2, 8, 9]],
+                conf=[0.9],
+                cls=[0],
+            )
+            return [
+                types.SimpleNamespace(
+                    path=source,
+                    boxes=boxes,
+                    masks=None,
+                    keypoints=None,
+                )
+            ]
+
+    monkeypatch.setitem(sys.modules, "ultralytics", types.SimpleNamespace(YOLO=FakeYOLO))
+    cache = PredictionCache(tmp_path / "shared-cache")
+    first_model = Model(checkpoint, task="detect", resolution=64)
+    first = first_model.predict(
+        image,
+        progress=False,
+        prediction_cache=cache,
+    )
+    assert first.cache_info["status"] == "fresh"
+    assert first.cache_info["location"].startswith(
+        str(cache.location / "predictions")
+    )
+    assert FakeYOLO.calls == 1
+
+    second_model = Model(checkpoint, name="renamed", task="detect", resolution=64)
+    second = second_model.predict(
+        image,
+        progress=False,
+        prediction_cache=cache,
+        destination=tmp_path / "cached-output",
+    )
+    assert second.cache_info["status"] == "hit"
+    assert second.model_name == "renamed"
+    assert second.records[0].objects[0].bbox == pytest.approx((1, 2, 8, 9))
+    assert FakeYOLO.calls == 1
+    assert (tmp_path / "cached-output" / "predictions.json").is_file()
+
+
+def test_prediction_cache_round_trips_semantic_and_native_masks(
+    detect_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    image = (detect_dataset / "val" / "images" / "val_0.jpg").resolve()
+    with Image.open(image) as opened:
+        width, height = opened.size
+    model_input = ModelInput(
+        image_id="case",
+        image_path=image,
+        width=width,
+        height=height,
+        relative_path="val_0.jpg",
+    )
+    mask = np.zeros((height, width), dtype=np.uint8)
+    mask[1:3, 2:4] = 1
+    native_mask = np.repeat(np.repeat(mask, 2, axis=0), 2, axis=1)
+    result = PredictionResult(
+        model_name="semantic",
+        model_kind="nnunet",
+        task="semantic_segment",
+        backend="native",
+        records=(
+            ImagePrediction(
+                image_id="case",
+                image_path=image,
+                relative_path="val_0.jpg",
+                width=width,
+                height=height,
+                mask=mask,
+                native_mask=native_mask,
+                metadata={"fold": 0},
+            ),
+        ),
+        inference_seconds=1.5,
+    )
+    identity = {"schema": 1, "test": "native-mask"}
+    key = prediction_cache_key(identity)
+    cache = PredictionCache(tmp_path / "mask-cache")
+    cached = cache.save(
+        key,
+        result,
+        namespace="semantic",
+        identity=identity,
+        inputs=(model_input,),
+    )
+    loaded = cache.load(
+        key,
+        namespace="semantic",
+        identity=identity,
+        inputs=(model_input,),
+    )
+
+    assert cached.cache_info["status"] == "fresh"
+    assert loaded is not None
+    assert loaded.cache_info["status"] == "hit"
+    assert np.array_equal(loaded.records[0].mask, mask)
+    assert np.array_equal(loaded.records[0].native_mask, native_mask)
+    assert loaded.records[0].metadata == {"fold": 0}
+
+
+def test_semantic_predict_cache_on_vector_dataset_reuses_complete_masks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "segments-for-semantic-predict",
+        task="segment",
+        names=["school"],
+        train_rows=[""],
+        val_rows=["0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"],
+        size=(16, 16),
+    )
+    dataset = Dataset.open(source, task="segment", progress=False)
+    checkpoint = tmp_path / "semantic.pt"
+    checkpoint.write_bytes(b"semantic-checkpoint")
+    model = Model(checkpoint, task="semantic", resolution=32)
+    calls = 0
+
+    def fake_predict_inputs(_model, inputs, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return (
+            {
+                value.image_id: np.pad(
+                    np.ones((8, 8), dtype=np.uint8),
+                    ((4, 4), (4, 4)),
+                )
+                for value in inputs
+            },
+            "semantic_segment",
+            {"synthetic": True},
+        )
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.inference.predict_model_inputs",
+        fake_predict_inputs,
+    )
+    first = model.predict(
+        dataset,
+        split="val",
+        progress=False,
+        prediction_cache=True,
+    )
+    second = model.predict(
+        dataset,
+        split="val",
+        progress=False,
+        prediction_cache=True,
+    )
+
+    assert calls == 1
+    assert first.cache_info["status"] == "fresh"
+    assert second.cache_info["status"] == "hit"
+    assert np.array_equal(first.records[0].mask, second.records[0].mask)
+    assert Path(second.cache_info["location"]).is_relative_to(
+        dataset.location / ".cache" / "evaluations" / "predictions"
+    )
+    broken_mask = next(
+        (Path(second.cache_info["location"]) / "raw-result" / "masks").glob("*.png")
+    )
+    broken_mask.unlink()
+    repaired = model.predict(
+        dataset,
+        split="val",
+        progress=False,
+        prediction_cache=True,
+        batch_size=2,
+    )
+    assert repaired.cache_info["status"] == "fresh"
+    assert calls == 2
+    execution_only_change = model.predict(
+        dataset,
+        split="val",
+        progress=False,
+        prediction_cache=True,
+        batch_size=1,
+    )
+    assert execution_only_change.cache_info["status"] == "hit"
+    assert calls == 2
+    changed_threshold = model.predict(
+        dataset,
+        split="val",
+        progress=False,
+        prediction_cache=True,
+        confidence=0.6,
+    )
+    assert changed_threshold.cache_info["status"] == "fresh"
+    assert calls == 3
+
+
+def test_predict_and_native_compare_share_the_existing_package_cache(
+    detect_dataset: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+    checkpoint = tmp_path / "shared-native.pt"
+    checkpoint.write_bytes(b"shared-native")
+    model = Model(checkpoint, task="detect", resolution=480)
+    cache = PredictionCache(tmp_path / "explicit-comparison-cache")
+    direct_calls = 0
+
+    def fake_predict_inputs(_model, inputs, **_kwargs):
+        nonlocal direct_calls
+        direct_calls += 1
+        return ({value.image_id: [] for value in inputs}, "detect", {})
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.inference.predict_model_inputs",
+        fake_predict_inputs,
+    )
+    direct = model.predict(
+        dataset,
+        split="val",
+        progress=False,
+        prediction_cache=cache,
+    )
+    assert direct_calls == 1
+    assert direct.cache_info["status"] == "fresh"
+
+    def cached_only_comparison_inference(
+        _spec,
+        _cohort,
+        *,
+        thresholds,
+        existing=None,
+        **_kwargs,
+    ):
+        assert existing is not None
+        assert set(existing) == {float(value) for value in thresholds}
+        return dict(existing), {"synthetic": 0.0}
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.engine.run_inference",
+        cached_only_comparison_inference,
+    )
+    comparison = model.compare(
+        dataset,
+        split="val",
+        progress=False,
+        prediction_cache=cache,
+        destination=tmp_path / "predict-then-compare",
+    )
+    assert comparison.cache_statistics["prediction_hits"] == 1
+    assert Path(direct.cache_info["location"]).is_relative_to(
+        cache.location / "predictions"
+    )
+
+
+def test_native_compare_cache_is_reused_by_predict(
+    detect_dataset: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+    checkpoint = tmp_path / "comparison-first.pt"
+    checkpoint.write_bytes(b"comparison-first")
+    model = Model(checkpoint, task="detect", resolution=480)
+    cache = PredictionCache(tmp_path / "comparison-first-cache")
+    comparison_calls = 0
+
+    def fake_inference(
+        _spec,
+        cohort,
+        *,
+        thresholds,
+        existing=None,
+        on_threshold=None,
+        **_kwargs,
+    ):
+        nonlocal comparison_calls
+        values = dict(existing or {})
+        for threshold in thresholds:
+            threshold = float(threshold)
+            if threshold in values:
+                continue
+            comparison_calls += 1
+            values[threshold] = {record.image_id: [] for record in cohort.records}
+            if on_threshold is not None:
+                on_threshold(threshold, values[threshold])
+        return values, {"synthetic": 0.0}
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.engine.run_inference",
+        fake_inference,
+    )
+    model.compare(
+        dataset,
+        split="val",
+        progress=False,
+        prediction_cache=cache,
+        destination=tmp_path / "comparison-first-report",
+    )
+    assert comparison_calls == 1
+
+    def forbidden_predict(*_args, **_kwargs):
+        raise AssertionError("direct inference ran despite a compatible comparison cache")
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.inference.predict_model_inputs",
+        forbidden_predict,
+    )
+    result = model.predict(
+        dataset,
+        split="val",
+        progress=False,
+        prediction_cache=cache,
+    )
+    assert result.cache_info["status"] == "hit"
+    assert comparison_calls == 1
+
+
 def test_model_collection_rejects_removed_shared_configuration(
     tmp_path: Path,
 ) -> None:
@@ -774,7 +1128,7 @@ def test_model_collection_compare_atomic_result(
         destination=destination,
     )
     assert fake_inference.calls == 1
-    assert json.loads(old_manifest_path.read_text())["schema"] == 10
+    assert json.loads(old_manifest_path.read_text())["schema"] == 12
     assert regenerated.cache_statistics["prediction_hits"] == 1
 
     models.compare(
@@ -909,7 +1263,8 @@ def test_segment_comparison_adds_postprocessed_binary_breakdown(
     assert row["empty_cases"] == 1
     assert row["empty_image_specificity"] == pytest.approx(1.0)
     manifest = json.loads((destination / "reports" / "result.json").read_text())
-    assert manifest["schema"] == 10
+    assert manifest["schema"] == 12
+    assert manifest["ranking"][0]["model_type"] == models[0].model_type
     assert manifest["ranking"][0]["positive_micro_iou"] == pytest.approx(1.0)
     assert manifest["ranking"][0]["small_object_dice"] == pytest.approx(1.0)
     assert manifest["ranking"][0]["raw_presence_precision"] == pytest.approx(1.0)
@@ -922,6 +1277,14 @@ def test_segment_comparison_adds_postprocessed_binary_breakdown(
     ] == pytest.approx(2)
     assert manifest["grouped_analysis"]["status"] == "complete"
     assert manifest["grouped_analysis"]["primary_ranking_unchanged"] is True
+    assert manifest["settings"]["grouping"]["group_splits"] == {
+        "train": ["train"],
+        "val": ["val"],
+    }
+    assert {
+        row["group"]: row["dataset_splits"]
+        for row in manifest["grouped_analysis"]["models"]["segmenter"]["per_group"]
+    } == {"val": ["val"]}
     assert manifest["object_size_analysis"]["status"] == "complete"
     assert not any(
         "unavailable for tiled" in limitation

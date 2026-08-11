@@ -6,6 +6,7 @@ from .errors import DatasetValidationError
 from .geometry import Geometry
 from .model import ImagePrediction, Model, ModelCollection, ModelInput, PredictionResult
 from .models import SemanticComparisonResult, Task
+from .prediction_cache import PredictionCache
 from .tracing import DatasetTrace, DatasetTraceNode, SampleTrace
 
 try:
@@ -25,6 +26,7 @@ __all__ = [
     "ModelCollection",
     "ModelInput",
     "PredictionResult",
+    "PredictionCache",
     "SemanticComparisonResult",
     "SampleTrace",
     "Task",

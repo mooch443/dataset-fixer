@@ -16,7 +16,6 @@ from ..utils import environment_snapshot, settings_fingerprint, to_jsonable
 from .cache import (
     build_staging_dir,
     cache_key,
-    default_cache_root,
     load_evaluation_cache,
     load_package_cache,
     model_cache_dir,
@@ -24,7 +23,11 @@ from .cache import (
     save_evaluation_cache,
 )
 from .cohort import check_training_provenance, freeze_cohort
-from .grouping import resolve_evaluation_groups
+from .grouping import (
+    annotate_group_splits,
+    resolve_evaluation_groups,
+    resolve_group_splits,
+)
 from .inference import resolve_backend, run_inference
 from .metrics import (
     binary_metric_breakdown,
@@ -65,7 +68,7 @@ if TYPE_CHECKING:
     from ..dataset import Dataset
 
 
-_MODEL_COMPARISON_REPORT_SCHEMA = 10
+_MODEL_COMPARISON_REPORT_SCHEMA = 12
 
 
 def _compare_models(
@@ -76,6 +79,7 @@ def _compare_models(
     save_prediction_plots: bool = False,
     progress: bool = True,
     destination: str | Path | None = None,
+    prediction_cache: Any = None,
     errors: Literal["raise", "skip"] = "raise",
     min_connected_component_area: float | None = None,
     group_by: Callable[[Path], Hashable] | None = None,
@@ -100,6 +104,10 @@ def _compare_models(
         ((record.image_id, record.image_path) for record in cohort.records),
         group_by,
     )
+    group_splits = resolve_group_splits(
+        ((sample.split, sample.image_path) for sample in dataset._samples),
+        group_by,
+    )
     group_settings: dict[str, Any] | None = None
     if group_by is not None and groups is not None:
         group_counts = Counter(groups.values())
@@ -108,6 +116,10 @@ def _compare_models(
             "group_count": len(group_counts),
             "case_counts": dict(sorted(group_counts.items())),
             "case_groups": dict(sorted(groups.items())),
+            "group_splits": {
+                group: list(splits)
+                for group, splits in (group_splits or {}).items()
+            },
         }
     model_backends = {
         spec.name: resolve_backend(
@@ -224,7 +236,18 @@ def _compare_models(
         target,
         dataset_location=None if destination else dataset.location,
     )
-    cache_root = default_cache_root(dataset.location)
+    from ..prediction_cache import resolve_prediction_cache
+
+    selected_cache = resolve_prediction_cache(
+        prediction_cache,
+        source=dataset,
+        default=True,
+    )
+    cache_root = (
+        selected_cache.location
+        if selected_cache is not None
+        else temporary / "cache-disabled"
+    )
     print(
         f"Comparing {len(specs)} models on frozen {cohort.split!r} cohort "
         f"({len(cohort.records)} images, fingerprint {cohort.fingerprint[:12]})\nDestination: {target}\n"
@@ -310,6 +333,7 @@ def _compare_models(
             )
             rank_row = {
                 "model": spec.name,
+                "model_type": spec.resolved_model.model_type,
                 "configuration": f"{spec.name}@{spec.resolution}/{output['backend']}",
                 "backend": output["backend"],
                 "metric": primary_metric,
@@ -699,10 +723,13 @@ def _analyze_native_groups(
             "reason": "grouped binary-mask metrics apply only to segmentation comparisons",
         }, None
 
+    group_splits = dict((group_settings or {}).get("group_splits") or {})
+
     by_model: dict[str, dict[str, Any]] = {}
     for row in ranking:
         model_name = str(row["model"])
         result = grouped_binary_metric_breakdown(rows_by_model[model_name], groups)
+        annotate_group_splits(result, group_splits)
         by_model[model_name] = result
         row.update({key: value for key, value in result.items() if key != "per_group"})
 
@@ -731,6 +758,7 @@ def _analyze_native_groups(
                 groups,
                 decisions,
             )
+            annotate_group_splits(result, group_splits)
             presence_by_model[model_name] = result
             row.update(
                 {key: value for key, value in result.items() if key != "per_group"}
@@ -739,6 +767,7 @@ def _analyze_native_groups(
         reports,
         ranking,
         by_model,
+        group_splits=group_splits,
     )
     if presence_available:
         for metric in presence_reports:
@@ -747,6 +776,7 @@ def _analyze_native_groups(
                 ranking,
                 presence_by_model,
                 metric=metric,
+                group_splits=group_splits,
             )
             presence_reports[metric] = str(
                 presence_path.relative_to(reports.parent)

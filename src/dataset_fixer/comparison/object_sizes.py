@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import re
 import textwrap
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +15,117 @@ from scipy.optimize import linear_sum_assignment
 
 
 SIZE_GROUPS = ("small", "medium", "large")
+
+_GROUP_SPLIT_COLORS = {
+    "train": "#2563EB",
+    "val": "#D97706",
+    "test": "#059669",
+    "mixed": "#7C3AED",
+    "other": "#4B5563",
+}
+
+_MODEL_TYPE_COLORS = {
+    "semantic": "#0F766E",
+    "instance": "#2563EB",
+    "yolox": "#C2410C",
+    "nnunet": "#7C3AED",
+    "other": "#4B5563",
+}
+
+
+def _group_split_values(
+    group: str,
+    group_splits: Mapping[str, Iterable[str]] | None,
+) -> tuple[str, ...]:
+    if not group_splits or group not in group_splits:
+        return ()
+    raw = group_splits[group]
+    values = (raw,) if isinstance(raw, str) else tuple(raw)
+    aliases = {"valid": "val", "validation": "val"}
+    normalized = {aliases.get(str(value).lower(), str(value).lower()) for value in values}
+    return tuple(
+        sorted(
+            normalized,
+            key=lambda value: (
+                {"train": 0, "val": 1, "test": 2}.get(value, 3),
+                value,
+            ),
+        )
+    )
+
+
+def _style_group_split_ticks(
+    axis: Any,
+    groups: list[str],
+    group_splits: Mapping[str, Iterable[str]] | None,
+) -> None:
+    for tick, group in zip(axis.get_xticklabels()[1:], groups, strict=True):
+        splits = _group_split_values(group, group_splits)
+        if not splits:
+            continue
+        color_key = "mixed" if len(splits) > 1 else splits[0]
+        tick.set_color(_GROUP_SPLIT_COLORS.get(color_key, _GROUP_SPLIT_COLORS["other"]))
+        tick.set_fontweight("semibold")
+
+
+def _model_type_color(model_type: str) -> str:
+    normalized = model_type.lower()
+    if normalized.startswith("nnunet"):
+        return _MODEL_TYPE_COLORS["nnunet"]
+    if normalized.startswith("yolox"):
+        return _MODEL_TYPE_COLORS["yolox"]
+    if normalized.endswith("-sem") or "semantic" in normalized:
+        return _MODEL_TYPE_COLORS["semantic"]
+    if normalized.endswith("-seg") or "instance" in normalized:
+        return _MODEL_TYPE_COLORS["instance"]
+    return _MODEL_TYPE_COLORS["other"]
+
+
+def _model_display_name(
+    row: Mapping[str, Any],
+    labels: Mapping[str, str] | None,
+) -> str:
+    model = str(row["model"])
+    return labels.get(model, model) if labels is not None else model
+
+
+def _style_model_row_labels(
+    axis: Any,
+    ranking: list[dict[str, Any]],
+    labels: Mapping[str, str] | None,
+) -> None:
+    """Render model types as compact colored badges below model row labels."""
+
+    axis.set_yticks(
+        np.arange(len(ranking)),
+        [_model_display_name(row, labels) for row in ranking],
+        fontsize=8.5,
+    )
+    for row_index, (tick, row) in enumerate(
+        zip(axis.get_yticklabels(), ranking, strict=True)
+    ):
+        model_type = str(row.get("model_type") or "").strip()
+        if not model_type:
+            continue
+        tick.set_verticalalignment("bottom")
+        axis.annotate(
+            model_type,
+            xy=(0, row_index),
+            xycoords=("axes fraction", "data"),
+            xytext=(-6, -5),
+            textcoords="offset points",
+            horizontalalignment="right",
+            verticalalignment="top",
+            fontsize=7,
+            fontfamily="monospace",
+            color="white",
+            bbox={
+                "boxstyle": "round,pad=0.24",
+                "facecolor": _model_type_color(model_type),
+                "edgecolor": "none",
+            },
+            annotation_clip=False,
+        )
 
 
 def object_size_report_artifacts_exist(root: Path, manifest: Mapping[str, Any]) -> bool:
@@ -591,7 +702,7 @@ def render_object_size_breakdown(
     )
     masked = np.ma.masked_invalid(values)
     figure, axis = plt.subplots(
-        figsize=(9.2, max(3.8, 0.75 * len(ranking) + 2.2))
+        figsize=(9.2, max(3.8, 1.05 * len(ranking) + 2.2))
     )
     colormap = plt.get_cmap("viridis").with_extremes(bad="#D9D9D9")
     image = axis.imshow(masked, vmin=0, vmax=1, cmap=colormap, aspect="auto")
@@ -601,16 +712,7 @@ def render_object_size_breakdown(
         for group in SIZE_GROUPS
     ]
     axis.set_xticks(np.arange(len(SIZE_GROUPS)), column_labels, fontsize=9)
-    axis.set_yticks(
-        np.arange(len(ranking)),
-        [
-            labels.get(str(row["model"]), str(row["model"]))
-            if labels is not None
-            else str(row["model"])
-            for row in ranking
-        ],
-        fontsize=8.5,
-    )
+    _style_model_row_labels(axis, ranking, labels)
     axis.tick_params(axis="x", bottom=False, top=True, labelbottom=False, labeltop=True)
     for row_index in range(values.shape[0]):
         for column_index in range(values.shape[1]):
@@ -682,7 +784,7 @@ def render_segmentation_metric_breakdown(
     )
     masked = np.ma.masked_invalid(values)
     figure, axis = plt.subplots(
-        figsize=(20.5, max(4.2, 0.85 * len(ranking) + 2.3))
+        figsize=(20.5, max(4.2, 1.05 * len(ranking) + 2.3))
     )
     colormap = plt.get_cmap("viridis").with_extremes(bad="#D9D9D9")
     image = axis.imshow(masked, vmin=0, vmax=1, cmap=colormap, aspect="auto")
@@ -691,16 +793,7 @@ def render_segmentation_metric_breakdown(
         [label for _, label in columns],
         fontsize=9,
     )
-    axis.set_yticks(
-        np.arange(len(ranking)),
-        [
-            labels.get(str(row["model"]), str(row["model"]))
-            if labels is not None
-            else str(row["model"])
-            for row in ranking
-        ],
-        fontsize=8.5,
-    )
+    _style_model_row_labels(axis, ranking, labels)
     axis.tick_params(axis="x", bottom=False, top=True, labelbottom=False, labeltop=True)
     for row_index in range(values.shape[0]):
         for column_index in range(values.shape[1]):
@@ -737,6 +830,7 @@ def render_grouped_metric_breakdown(
     grouped_by_model: Mapping[str, Mapping[str, Any]],
     *,
     labels: Mapping[str, str] | None = None,
+    group_splits: Mapping[str, Iterable[str]] | None = None,
 ) -> Path:
     """Render per-group pooled Dice, ordered by equal-weight group macro Dice."""
 
@@ -787,23 +881,15 @@ def render_grouped_metric_breakdown(
     figure, axis = plt.subplots(
         figsize=(
             max(10.5, 4.5 + 0.58 * len(columns)),
-            max(4.2, 0.85 * len(ordered_ranking) + 2.6),
+            max(4.2, 1.05 * len(ordered_ranking) + 2.6),
         )
     )
     colormap = plt.get_cmap("viridis").with_extremes(bad="#D9D9D9")
     image = axis.imshow(masked, vmin=0, vmax=1, cmap=colormap, aspect="auto")
     axis.set_xticks(np.arange(len(columns)), columns, fontsize=8.5, rotation=60, ha="left")
-    axis.set_yticks(
-        np.arange(len(ordered_ranking)),
-        [
-            labels.get(str(row["model"]), str(row["model"]))
-            if labels is not None
-            else str(row["model"])
-            for row in ordered_ranking
-        ],
-        fontsize=8.5,
-    )
+    _style_model_row_labels(axis, ordered_ranking, labels)
     axis.tick_params(axis="x", bottom=False, top=True, labelbottom=False, labeltop=True)
+    _style_group_split_ticks(axis, groups, group_splits)
     for row_index in range(array.shape[0]):
         for column_index in range(array.shape[1]):
             value = array[row_index, column_index]
@@ -854,6 +940,7 @@ def render_grouped_presence_metric_breakdown(
     *,
     metric: str,
     labels: Mapping[str, str] | None = None,
+    group_splits: Mapping[str, Iterable[str]] | None = None,
 ) -> Path:
     """Render an AOI-level area-filtered presence precision, recall, or F1 grid."""
 
@@ -939,23 +1026,15 @@ def render_grouped_presence_metric_breakdown(
     figure, axis = plt.subplots(
         figsize=(
             max(10.5, 4.5 + 0.58 * len(columns)),
-            max(4.2, 0.85 * len(ordered_ranking) + 2.6),
+            max(4.2, 1.05 * len(ordered_ranking) + 2.6),
         )
     )
     colormap = plt.get_cmap("viridis").with_extremes(bad="#D9D9D9")
     image = axis.imshow(masked, vmin=0, vmax=1, cmap=colormap, aspect="auto")
     axis.set_xticks(np.arange(len(columns)), columns, fontsize=8.5, rotation=60, ha="left")
-    axis.set_yticks(
-        np.arange(len(ordered_ranking)),
-        [
-            labels.get(str(row["model"]), str(row["model"]))
-            if labels is not None
-            else str(row["model"])
-            for row in ordered_ranking
-        ],
-        fontsize=8.5,
-    )
+    _style_model_row_labels(axis, ordered_ranking, labels)
     axis.tick_params(axis="x", bottom=False, top=True, labelbottom=False, labeltop=True)
+    _style_group_split_ticks(axis, groups, group_splits)
     for row_index in range(array.shape[0]):
         for column_index in range(array.shape[1]):
             display_value = display_array[row_index, column_index]

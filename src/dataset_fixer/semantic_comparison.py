@@ -24,11 +24,14 @@ from tqdm import tqdm
 from .comparison.cache import (
     build_staging_dir,
     cache_key,
-    default_cache_root,
     load_evaluation_cache,
     save_evaluation_cache,
 )
-from .comparison.grouping import resolve_evaluation_groups
+from .comparison.grouping import (
+    annotate_group_splits,
+    resolve_evaluation_groups,
+    resolve_group_splits,
+)
 from .comparison.metrics import (
     binary_metric_breakdown,
     component_filtered_presence_breakdown,
@@ -69,7 +72,7 @@ from .utils import (
 # Report presentation evolves independently from prediction/evaluation cache
 # identity. A report bump redraws output from completed caches without forcing
 # model inference to run again.
-SEMANTIC_REPORT_SCHEMA = 15
+SEMANTIC_REPORT_SCHEMA = 17
 SEMANTIC_PREDICTION_SCHEMA = 2
 SEMANTIC_EVALUATION_CACHE_SCHEMA = 2
 
@@ -220,6 +223,7 @@ def _normalize_minimum_component_area(value: float | None) -> float | None:
 def _evaluation_group_settings(
     group_by: Callable[[Path], Hashable] | None,
     groups: Mapping[str, str] | None,
+    group_splits: Mapping[str, Iterable[str]] | None,
 ) -> dict[str, Any] | None:
     if group_by is None or groups is None:
         return None
@@ -229,6 +233,10 @@ def _evaluation_group_settings(
         "group_count": len(counts),
         "case_counts": dict(sorted(counts.items())),
         "case_groups": dict(sorted(groups.items())),
+        "group_splits": {
+            group: list(splits)
+            for group, splits in (group_splits or {}).items()
+        },
     }
 
 
@@ -240,6 +248,7 @@ def compare_nnunet_models(
     save_prediction_plots: bool,
     progress: bool,
     destination: str | Path | None,
+    prediction_cache: Any = None,
     trust_legacy_cache: bool = False,
     errors: Literal["raise", "skip"] = "raise",
     min_connected_component_area: float | None = None,
@@ -289,7 +298,11 @@ def compare_nnunet_models(
         ((case.case_id, case.image_path) for case in cases),
         group_by,
     )
-    group_settings = _evaluation_group_settings(group_by, groups)
+    group_splits = resolve_group_splits(
+        ((sample.split, sample.image_path) for sample in export._samples),
+        group_by,
+    )
+    group_settings = _evaluation_group_settings(group_by, groups, group_splits)
 
     resolved_settings = {
         "backend": (
@@ -386,6 +399,18 @@ def compare_nnunet_models(
         target,
         dataset_location=None if destination is not None else export.location,
     )
+    from .prediction_cache import resolve_prediction_cache
+
+    selected_prediction_cache = resolve_prediction_cache(
+        prediction_cache,
+        source=export,
+        default=True,
+    )
+    comparison_cache_root = (
+        selected_prediction_cache.location
+        if selected_prediction_cache is not None
+        else temporary / "cache-disabled"
+    )
     started = time.time()
     limitations = [
         "Metrics are produced by the official nnU-Net v2 folder evaluator on binary foreground masks.",
@@ -414,7 +439,7 @@ def compare_nnunet_models(
 
     try:
         statistics_key = f"semantic-comparison-{fingerprint}"
-        statistics_cache = default_cache_root(export.location)
+        statistics_cache = comparison_cache_root
         cached_statistics = load_evaluation_cache(statistics_cache, statistics_key)
         canonical_labels = temporary / "cohort" / "canonical" / "labels"
         _prepare_labels(cases, canonical_labels)
@@ -438,7 +463,7 @@ def compare_nnunet_models(
                 "sahi": resolved_sahi_by_model.get(spec.name),
             }
             cache_identity = cache_key(cache_payload)
-            semantic_cache_root = default_cache_root(export.location) / "semantic"
+            semantic_cache_root = comparison_cache_root / "semantic"
             cache_dir = semantic_cache_root / cache_identity
             legacy_cache_dir = semantic_cache_root / cache_key(
                 {
@@ -506,13 +531,18 @@ def compare_nnunet_models(
                     f"(folds={spec.folds}, checkpoint={spec.checkpoint}, "
                     f"input_scale={spec.upscale_factor}x)"
                 )
-                prediction_result = spec.predict(
+                prediction_result = _predict_with_cache_context(
+                    spec,
                     model_inputs,
-                    device=resolved_devices[spec.name],
-                    progress=progress,
-                    _keep_native=True,
-                    inference=selected_backend,
-                    resolution=spec.resolution or 480,
+                    cache=(selected_prediction_cache or False),
+                    identity=cache_payload,
+                    options={
+                        "device": resolved_devices[spec.name],
+                        "progress": progress,
+                        "_keep_native": True,
+                        "inference": selected_backend,
+                        "resolution": spec.resolution or 480,
+                    },
                 )
                 inference_seconds = prediction_result.inference_seconds
                 execution = _engine_telemetry(prediction_result.records)
@@ -796,6 +826,7 @@ def compare_semantic_models(
     save_prediction_plots: bool,
     progress: bool,
     destination: str | Path | None,
+    prediction_cache: Any = None,
     trust_legacy_cache: bool = False,
     errors: Literal["raise", "skip"] = "raise",
     min_connected_component_area: float | None = None,
@@ -861,7 +892,11 @@ def compare_semantic_models(
         ((case.case_id, case.image_path) for case in cases),
         group_by,
     )
-    group_settings = _evaluation_group_settings(group_by, groups)
+    group_splits = resolve_group_splits(
+        ((sample.split, sample.image_path) for sample in export._samples),
+        group_by,
+    )
+    group_settings = _evaluation_group_settings(group_by, groups, group_splits)
     resolved_settings = {
         "backend": "common-semantic-mask",
         "report_schema": SEMANTIC_REPORT_SCHEMA,
@@ -950,6 +985,18 @@ def compare_semantic_models(
         target,
         dataset_location=None if destination is not None else export.location,
     )
+    from .prediction_cache import resolve_prediction_cache
+
+    selected_prediction_cache = resolve_prediction_cache(
+        prediction_cache,
+        source=export,
+        default=True,
+    )
+    comparison_cache_root = (
+        selected_prediction_cache.location
+        if selected_prediction_cache is not None
+        else temporary / "cache-disabled"
+    )
     started = time.time()
     limitations = [
         "All models are evaluated as binary foreground at the canonical semantic-mask export resolution.",
@@ -972,7 +1019,7 @@ def compare_semantic_models(
 
     try:
         statistics_key = f"semantic-comparison-{fingerprint}"
-        statistics_cache = default_cache_root(export.location)
+        statistics_cache = comparison_cache_root
         cached_statistics = load_evaluation_cache(statistics_cache, statistics_key)
         model_inputs = _model_inputs_from_cases(cases)
         model_rows: dict[str, list[dict[str, Any]]] = {}
@@ -1016,7 +1063,7 @@ def compare_semantic_models(
                 ),
             }
             cache_identity = cache_key(cache_payload)
-            semantic_cache_root = default_cache_root(export.location) / "semantic"
+            semantic_cache_root = comparison_cache_root / "semantic"
             cache_dir = semantic_cache_root / cache_identity
             legacy_cache_dir = semantic_cache_root / cache_key(
                 {
@@ -1079,7 +1126,13 @@ def compare_semantic_models(
             else:
                 prediction_dir = temporary / "working" / "predictions" / model.slug
                 prediction_dir.mkdir(parents=True, exist_ok=True)
-                prediction_result = model.predict(model_inputs, **predict_options)
+                prediction_result = _predict_with_cache_context(
+                    model,
+                    model_inputs,
+                    cache=(selected_prediction_cache or False),
+                    identity=cache_payload,
+                    options=predict_options,
+                )
                 projected, projection, model_warnings = _project_semantic_predictions(
                     prediction_result.records,
                     prediction_result.task,
@@ -2235,6 +2288,33 @@ def _parse_models(models: Any) -> list[Model]:
     return list(collection.models)
 
 
+def _predict_with_cache_context(
+    model: Model,
+    source: Any,
+    *,
+    cache: Any,
+    identity: Mapping[str, Any],
+    options: Mapping[str, Any],
+) -> PredictionResult:
+    """Cache one comparison prediction without changing its public kwargs.
+
+    Historical semantic cache identities included the exact keyword arguments
+    supplied to ``Model.predict``. Keeping the cache context off that call
+    preserves those identities and third-party wrappers around the method.
+    """
+
+    marker = object()
+    previous = getattr(model, "_prediction_cache_override", marker)
+    model._prediction_cache_override = (cache, dict(identity), "semantic")
+    try:
+        return model.predict(source, **dict(options))
+    finally:
+        if previous is marker:
+            delattr(model, "_prediction_cache_override")
+        else:
+            model._prediction_cache_override = previous
+
+
 def _require_official_commands(*commands: str) -> None:
     missing = [
         command
@@ -2371,6 +2451,7 @@ def _model_inputs_from_cases(
             height=case.height,
             relative_path=case.relative_path.as_posix(),
             mask_path=case.mask_path,
+            image_sha256=case.image_sha256,
         )
         for case in cases
     )
@@ -3211,10 +3292,13 @@ def _analyze_grouped_metrics(
     if groups is None:
         return {"status": "not-requested"}, None
 
+    group_splits = dict((group_settings or {}).get("group_splits") or {})
+
     by_model: dict[str, dict[str, Any]] = {}
     for row in ranking:
         model_name = str(row["model"])
         result = grouped_binary_metric_breakdown(rows_by_model[model_name], groups)
+        annotate_group_splits(result, group_splits)
         by_model[model_name] = result
         row.update({key: value for key, value in result.items() if key != "per_group"})
 
@@ -3243,6 +3327,7 @@ def _analyze_grouped_metrics(
                 groups,
                 decisions,
             )
+            annotate_group_splits(result, group_splits)
             presence_by_model[model_name] = result
             row.update(
                 {key: value for key, value in result.items() if key != "per_group"}
@@ -3256,6 +3341,7 @@ def _analyze_grouped_metrics(
             str(row["model"]): _ranking_plot_label(row)
             for row in ranking
         },
+        group_splits=group_splits,
     )
     if presence_available:
         plot_labels = {
@@ -3269,6 +3355,7 @@ def _analyze_grouped_metrics(
                 presence_by_model,
                 metric=metric,
                 labels=plot_labels,
+                group_splits=group_splits,
             )
             presence_reports[metric] = str(
                 presence_path.relative_to(reports.parent)
@@ -3780,6 +3867,9 @@ def _save_semantic_cache(
         tempfile.mkdtemp(prefix=f".{cache_dir.name}.building-", dir=cache_dir.parent)
     )
     try:
+        existing_raw = cache_dir / "raw-result"
+        if existing_raw.is_dir():
+            shutil.copytree(existing_raw, staging / "raw-result")
         staged_predictions = staging / "predictions"
         staged_predictions.mkdir(parents=True)
         prediction_paths = sorted(

@@ -67,6 +67,12 @@ def visualize_validation_failures(
             try:
                 _draw_sample(ax, sample, task, metadata)
                 if example.annotation is not None:
+                    _focus_invalid_annotation(
+                        ax,
+                        example.annotation,
+                        width=example.width,
+                        height=example.height,
+                    )
                     _highlight_invalid_annotation(
                         ax,
                         example.annotation,
@@ -89,8 +95,9 @@ def visualize_validation_failures(
             placeholder=" …",
         )
         ax.set_title(
-            f"SKIPPED · {example.split or 'unknown split'} · {source}\n{message}",
-            color="#b00020",
+            f"Skipped · {example.split or 'unknown split'} · "
+            f"{textwrap.shorten(source, width=78, placeholder='…')}\n{message}",
+            color="#7f1d1d",
             fontsize=9,
             pad=8,
         )
@@ -196,7 +203,7 @@ def _highlight_invalid_annotation(
     width: int,
     height: int,
 ) -> None:
-    """Overlay explicit defect markers on a rejected annotation."""
+    """Overlay ordered vertices and explicit defects on a rejected polygon."""
 
     if annotation.polygon is None:
         return
@@ -214,64 +221,141 @@ def _highlight_invalid_annotation(
         if math.isfinite(x) and math.isfinite(y)
     ]
     if len(finite_polygon) >= 2:
-        ax.add_patch(
-            patches.Polygon(
-                finite_polygon,
-                closed=len(finite_polygon) >= 3,
-                fill=False,
-                edgecolor="#ff1744",
-                linewidth=2.5,
-                linestyle="--",
-            )
+        closed_polygon = finite_polygon + (
+            [finite_polygon[0]] if len(finite_polygon) >= 3 else []
         )
-    elif len(finite_polygon) == 1:
+        ax.plot(
+            [point[0] for point in closed_polygon],
+            [point[1] for point in closed_polygon],
+            color="#dc2626",
+            linewidth=2.0,
+            zorder=8,
+        )
+    if finite_polygon:
         ax.scatter(
-            [finite_polygon[0][0]],
-            [finite_polygon[0][1]],
-            marker="X",
-            s=150,
-            c="#ffea00",
-            edgecolors="#b00020",
-            linewidths=1.4,
-            zorder=10,
+            [point[0] for point in finite_polygon],
+            [point[1] for point in finite_polygon],
+            marker="o",
+            s=42,
+            facecolors="white",
+            edgecolors="#dc2626",
+            linewidths=1.5,
+            zorder=9,
         )
+        for index, (x, y) in enumerate(finite_polygon):
+            ax.annotate(
+                str(index),
+                xy=(x, y),
+                xytext=(5, 5),
+                textcoords="offset points",
+                color="#111827",
+                fontsize=7,
+                bbox={
+                    "boxstyle": "round,pad=0.16",
+                    "facecolor": "white",
+                    "edgecolor": "#d1d5db",
+                    "alpha": 0.92,
+                },
+                zorder=10,
+            )
     for x, y, label in markers:
         ax.scatter(
             [x],
             [y],
-            marker="X",
-            s=150,
-            c="#ffea00",
-            edgecolors="#b00020",
-            linewidths=1.4,
-            zorder=10,
+            marker="o",
+            s=110,
+            facecolors="none",
+            edgecolors="#f59e0b",
+            linewidths=2.2,
+            zorder=11,
             clip_on=False,
         )
+        ax.scatter([x], [y], marker="o", s=18, c="#f59e0b", zorder=12)
         ax.annotate(
             label,
             xy=(x, y),
-            xytext=(8, 12),
+            xytext=(9, 11),
             textcoords="offset points",
-            color="white",
-            fontsize=7,
-            fontweight="bold",
-            bbox={"facecolor": "#b00020", "alpha": 0.9, "pad": 2, "edgecolor": "white"},
-            arrowprops={"arrowstyle": "->", "color": "#ffea00", "linewidth": 1.2},
-            zorder=11,
+            color="#111827",
+            fontsize=8,
+            bbox={
+                "boxstyle": "round,pad=0.24",
+                "facecolor": "white",
+                "edgecolor": "#f59e0b",
+                "alpha": 0.94,
+            },
+            arrowprops={"arrowstyle": "->", "color": "#f59e0b", "linewidth": 1.2},
+            zorder=13,
         )
     ax.text(
         0.02,
-        0.98,
-        "INVALID: " + "; ".join(reasons),
+        0.02,
+        "Invalid polygon\n" + "\n".join(reasons),
         transform=ax.transAxes,
         ha="left",
-        va="top",
-        color="white",
-        fontsize=7.5,
-        fontweight="bold",
-        bbox={"facecolor": "#b00020", "alpha": 0.88, "pad": 3, "edgecolor": "white"},
-        zorder=12,
+        va="bottom",
+        color="#7f1d1d",
+        fontsize=8,
+        bbox={
+            "boxstyle": "round,pad=0.3",
+            "facecolor": "#fff7ed",
+            "edgecolor": "#fca5a5",
+            "alpha": 0.94,
+        },
+        zorder=14,
     )
+
+
+def _focus_invalid_annotation(
+    ax,
+    annotation: Annotation,
+    *,
+    width: int,
+    height: int,
+) -> None:
+    """Zoom to the finite polygon vertices while retaining nearby image context."""
+
+    if annotation.polygon is None:
+        return
+    points = [
+        (float(x), float(y))
+        for x, y in annotation.polygon
+        if math.isfinite(x) and math.isfinite(y)
+    ]
+    if not points or width <= 0 or height <= 0:
+        return
+
+    clipped_x = [min(max(x, 0.0), float(width)) for x, _ in points]
+    clipped_y = [min(max(y, 0.0), float(height)) for _, y in points]
+    center_x = (min(clipped_x) + max(clipped_x)) / 2
+    center_y = (min(clipped_y) + max(clipped_y)) / 2
+    polygon_width = max(clipped_x) - min(clipped_x)
+    polygon_height = max(clipped_y) - min(clipped_y)
+    minimum_window = min(
+        float(min(width, height)),
+        max(48.0, min(256.0, 0.15 * min(width, height))),
+    )
+    window_width = min(float(width), max(minimum_window, polygon_width * 1.7))
+    window_height = min(float(height), max(minimum_window, polygon_height * 1.7))
+
+    def bounded_window(center: float, span: float, limit: float) -> tuple[float, float]:
+        if span >= limit:
+            return 0.0, limit
+        lower = center - span / 2
+        upper = center + span / 2
+        if lower < 0:
+            upper -= lower
+            lower = 0.0
+        if upper > limit:
+            lower -= upper - limit
+            upper = limit
+        return max(0.0, lower), min(limit, upper)
+
+    left, right = bounded_window(center_x, window_width, float(width))
+    top, bottom = bounded_window(center_y, window_height, float(height))
+    ax.set_xlim(left, right)
+    # imshow uses an upper-left origin, so increasing data y runs downward.
+    ax.set_ylim(bottom, top)
 
 
 def visualize_samples(
