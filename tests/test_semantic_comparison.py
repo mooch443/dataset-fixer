@@ -579,12 +579,21 @@ def test_semantic_comparison_reports_finite_dice_support(
     )
     assert manifest["grouped_analysis"]["status"] == "complete"
     assert manifest["ranking"][0]["group_macro_dice"] == pytest.approx(1.0)
+    assert manifest["ranking"][0]["group_macro_presence_f1"] == pytest.approx(1.0)
+    assert manifest["grouped_analysis"]["presence"]["status"] == "complete"
     assert (
         tmp_path
         / "finite-support-comparison"
         / "reports"
         / "grouped-metric-breakdown.png"
     ).is_file()
+    for metric in ("precision", "recall", "f1"):
+        assert (
+            tmp_path
+            / "finite-support-comparison"
+            / "reports"
+            / f"grouped-presence-{metric}.png"
+        ).is_file()
 
 
 def test_binary_metric_breakdown_separates_positive_and_empty_images() -> None:

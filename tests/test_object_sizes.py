@@ -17,6 +17,8 @@ from dataset_fixer.comparison.object_sizes import (
     object_size_report_artifacts_exist,
     polygon_components,
     prepare_object_size_reference,
+    render_grouped_metric_breakdown,
+    render_grouped_presence_metric_breakdown,
     render_large_object_examples,
     render_segmentation_metric_breakdown,
     select_large_examples,
@@ -335,3 +337,149 @@ def test_metric_breakdown_includes_raw_and_area_filtered_presence_columns(
         "Empty specificity\nraw",
         "Empty specificity\narea-filtered",
     ]
+
+
+def test_grouped_metric_breakdown_sorts_by_macro_and_shows_defined_support(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    ranking = [{"model": "lower"}, {"model": "higher"}]
+    grouped_by_model = {
+        "lower": {
+            "group_macro_dice": 0.25,
+            "group_defined_dice_count": 1,
+            "group_count": 2,
+            "per_group": [
+                {"group": "aoi-a", "dice": 0.25},
+                {"group": "aoi-b", "dice": math.nan},
+            ],
+        },
+        "higher": {
+            "group_macro_dice": 0.75,
+            "group_defined_dice_count": 2,
+            "group_count": 2,
+            "per_group": [
+                {"group": "aoi-a", "dice": 0.5},
+                {"group": "aoi-b", "dice": 1.0},
+            ],
+        },
+    }
+    original_close = plt.close
+    monkeypatch.setattr(plt, "close", lambda _figure: None)
+
+    path = render_grouped_metric_breakdown(
+        tmp_path,
+        ranking,
+        grouped_by_model,
+    )
+    figure = plt.gcf()
+    axis = figure.axes[0]
+    row_labels = [label.get_text() for label in axis.get_yticklabels()]
+    cell_labels = [label.get_text() for label in axis.texts]
+    displayed_values = np.asarray(axis.images[0].get_array())
+    original_close(figure)
+
+    assert path.is_file()
+    assert row_labels == ["higher", "lower"]
+    assert cell_labels[0] == "0.750\n(2/2)"
+    assert cell_labels[3] == "0.250\n(1/2)"
+    assert cell_labels[5] == "TN"
+    assert displayed_values[1, 2] == 1.0
+
+
+@pytest.mark.parametrize("metric", ["precision", "recall", "f1"])
+def test_grouped_presence_breakdown_sorts_by_macro_f1_and_marks_edge_cases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metric: str,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    ranking = [{"model": "lower"}, {"model": "higher"}]
+    grouped_by_model = {
+        "lower": {
+            "group_count": 3,
+            "group_macro_presence_precision": 0.5,
+            "group_macro_presence_recall": 0.25,
+            "group_macro_presence_f1": 0.3,
+            "group_defined_presence_precision_count": 1,
+            "group_defined_presence_recall_count": 1,
+            "group_defined_presence_f1_count": 2,
+            "per_group": [
+                {
+                    "group": "aoi-fp",
+                    "positive_cases": 0,
+                    "presence_tp": 0,
+                    "presence_fp": 1,
+                    "presence_precision": 0.0,
+                    "presence_recall": math.nan,
+                    "presence_f1": 0.0,
+                },
+                {
+                    "group": "aoi-miss",
+                    "positive_cases": 1,
+                    "presence_tp": 0,
+                    "presence_fp": 0,
+                    "presence_precision": math.nan,
+                    "presence_recall": 0.0,
+                    "presence_f1": 0.0,
+                },
+                {
+                    "group": "aoi-tn",
+                    "positive_cases": 0,
+                    "presence_tp": 0,
+                    "presence_fp": 0,
+                    "presence_precision": math.nan,
+                    "presence_recall": math.nan,
+                    "presence_f1": math.nan,
+                },
+            ],
+        },
+        "higher": {
+            "group_count": 3,
+            "group_macro_presence_precision": 1.0,
+            "group_macro_presence_recall": 1.0,
+            "group_macro_presence_f1": 1.0,
+            "group_defined_presence_precision_count": 1,
+            "group_defined_presence_recall_count": 1,
+            "group_defined_presence_f1_count": 1,
+            "per_group": [
+                {
+                    "group": group,
+                    "positive_cases": int(group == "aoi-miss"),
+                    "presence_tp": int(group == "aoi-miss"),
+                    "presence_fp": 0,
+                    "presence_precision": 1.0 if group == "aoi-miss" else math.nan,
+                    "presence_recall": 1.0 if group == "aoi-miss" else math.nan,
+                    "presence_f1": 1.0 if group == "aoi-miss" else math.nan,
+                }
+                for group in ["aoi-fp", "aoi-miss", "aoi-tn"]
+            ],
+        },
+    }
+    original_close = plt.close
+    monkeypatch.setattr(plt, "close", lambda _figure: None)
+
+    path = render_grouped_presence_metric_breakdown(
+        tmp_path,
+        ranking,
+        grouped_by_model,
+        metric=metric,
+    )
+    figure = plt.gcf()
+    axis = figure.axes[0]
+    row_labels = [label.get_text() for label in axis.get_yticklabels()]
+    cell_labels = [label.get_text() for label in axis.texts]
+    original_close(figure)
+
+    assert path.name == f"grouped-presence-{metric}.png"
+    assert path.is_file()
+    assert row_labels == ["higher", "lower"]
+    assert cell_labels[0].startswith("1.000")
+    assert "TN" in cell_labels
+    if metric == "precision":
+        assert "MISS" in cell_labels
+    if metric == "recall":
+        assert "FP" in cell_labels

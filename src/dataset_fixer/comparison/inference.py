@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from PIL import Image
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from ..errors import DatasetValidationError, ValidationIssue
 from ..sahi_support import (

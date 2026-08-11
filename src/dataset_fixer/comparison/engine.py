@@ -30,8 +30,10 @@ from .metrics import (
     binary_metric_breakdown,
     bootstrap_metric,
     component_filtered_presence_breakdown,
+    component_filtered_presence_decisions,
     evaluate_configuration,
     grouped_binary_metric_breakdown,
+    grouped_presence_metric_breakdown,
     paired_statistics,
     segmentation_binary_metric_rows,
 )
@@ -41,6 +43,7 @@ from .object_sizes import (
     polygon_components,
     prepare_object_size_reference,
     render_grouped_metric_breakdown,
+    render_grouped_presence_metric_breakdown,
     render_large_object_examples,
     render_object_size_breakdown,
     render_segmentation_metric_breakdown,
@@ -62,7 +65,7 @@ if TYPE_CHECKING:
     from ..dataset import Dataset
 
 
-_MODEL_COMPARISON_REPORT_SCHEMA = 9
+_MODEL_COMPARISON_REPORT_SCHEMA = 10
 
 
 def _compare_models(
@@ -471,6 +474,13 @@ def _compare_models(
                 "plots": "reports/plots.png",
                 "metric_breakdown": metric_breakdown_path,
                 "grouped_metric_breakdown": grouped_metric_breakdown_path,
+                "grouped_presence_precision": grouped_analysis.get("reports", {}).get(
+                    "precision"
+                ),
+                "grouped_presence_recall": grouped_analysis.get("reports", {}).get(
+                    "recall"
+                ),
+                "grouped_presence_f1": grouped_analysis.get("reports", {}).get("f1"),
                 "object_size_breakdown": object_size_breakdown_path,
                 "large_object_examples": large_object_example_paths,
                 "comparison": "reports/comparison.png",
@@ -612,6 +622,16 @@ def _analyze_native_object_sizes(
                     resolved_component_area,
                 )
             )
+            decisions = component_filtered_presence_decisions(
+                segmentation_rows_by_model[model_name],
+                component_areas,
+                resolved_component_area,
+            )
+            for metric_row in segmentation_rows_by_model[model_name]:
+                case_id = str(metric_row.get("case_id", metric_row.get("image_id")))
+                metric_row["component_filtered_predicted_presence"] = decisions[
+                    case_id
+                ]
     if reference.status != "complete":
         for row in ranking:
             row.update(unavailable_object_size_summary())
@@ -685,11 +705,52 @@ def _analyze_native_groups(
         result = grouped_binary_metric_breakdown(rows_by_model[model_name], groups)
         by_model[model_name] = result
         row.update({key: value for key, value in result.items() if key != "per_group"})
+
+    presence_by_model: dict[str, dict[str, Any]] = {}
+    presence_available = all(
+        "component_filtered_predicted_presence" in metric_row
+        for model_rows in rows_by_model.values()
+        for metric_row in model_rows
+    )
+    presence_reports: dict[str, str | None] = {
+        "precision": None,
+        "recall": None,
+        "f1": None,
+    }
+    if presence_available:
+        for row in ranking:
+            model_name = str(row["model"])
+            decisions = {
+                str(metric_row.get("case_id", metric_row.get("image_id"))): bool(
+                    metric_row["component_filtered_predicted_presence"]
+                )
+                for metric_row in rows_by_model[model_name]
+            }
+            result = grouped_presence_metric_breakdown(
+                rows_by_model[model_name],
+                groups,
+                decisions,
+            )
+            presence_by_model[model_name] = result
+            row.update(
+                {key: value for key, value in result.items() if key != "per_group"}
+            )
     path = render_grouped_metric_breakdown(
         reports,
         ranking,
         by_model,
     )
+    if presence_available:
+        for metric in presence_reports:
+            presence_path = render_grouped_presence_metric_breakdown(
+                reports,
+                ranking,
+                presence_by_model,
+                metric=metric,
+            )
+            presence_reports[metric] = str(
+                presence_path.relative_to(reports.parent)
+            )
     return (
         {
             "status": "complete",
@@ -697,6 +758,19 @@ def _analyze_native_groups(
             "primary_ranking_unchanged": True,
             "grouping": dict(group_settings or {}),
             "models": by_model,
+            "presence": {
+                "status": "complete" if presence_available else "skipped",
+                "prediction_definition": (
+                    "at least one predicted 8-connected foreground component "
+                    "at or above the resolved area threshold"
+                ),
+                "aggregation": (
+                    "pool image-level TP/FP/FN/TN within group, then "
+                    "macro-average defined group scores"
+                ),
+                "models": presence_by_model,
+            },
+            "reports": presence_reports,
         },
         str(path.relative_to(reports.parent)),
     )

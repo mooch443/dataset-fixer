@@ -47,10 +47,29 @@ def object_size_report_artifacts_exist(root: Path, manifest: Mapping[str, Any]) 
         and not isinstance(reports.get("object_size_breakdown"), str)
     ):
         return False
+    grouped_analysis = manifest.get("grouped_analysis")
+    if isinstance(grouped_analysis, Mapping):
+        grouped_presence = grouped_analysis.get("presence")
+        if (
+            isinstance(grouped_presence, Mapping)
+            and grouped_presence.get("status") == "complete"
+            and not all(
+                isinstance(reports.get(key), str)
+                for key in (
+                    "grouped_presence_precision",
+                    "grouped_presence_recall",
+                    "grouped_presence_f1",
+                )
+            )
+        ):
+            return False
     paths: list[str] = []
     for key in (
         "metric_breakdown",
         "grouped_metric_breakdown",
+        "grouped_presence_precision",
+        "grouped_presence_recall",
+        "grouped_presence_f1",
         "object_size_breakdown",
     ):
         value = reports.get(key)
@@ -719,7 +738,7 @@ def render_grouped_metric_breakdown(
     *,
     labels: Mapping[str, str] | None = None,
 ) -> Path:
-    """Render per-group pooled Dice without changing the primary ranking."""
+    """Render per-group pooled Dice, ordered by equal-weight group macro Dice."""
 
     import matplotlib.pyplot as plt
 
@@ -731,8 +750,23 @@ def render_grouped_metric_breakdown(
         }
     )
     columns = ["Macro", *groups]
+
+    def macro_sort_key(row: Mapping[str, Any]) -> tuple[bool, float, str]:
+        value = float(
+            grouped_by_model[str(row["model"])].get("group_macro_dice", math.nan)
+        )
+        return (
+            not math.isfinite(value),
+            -value if math.isfinite(value) else 0.0,
+            str(row["model"]),
+        )
+
+    ordered_ranking = sorted(
+        ranking,
+        key=macro_sort_key,
+    )
     values: list[list[float]] = []
-    for row in ranking:
+    for row in ordered_ranking:
         result = grouped_by_model[str(row["model"])]
         lookup = {
             str(group["group"]): float(group["dice"])
@@ -743,20 +777,29 @@ def render_grouped_metric_breakdown(
             + [lookup.get(group, math.nan) for group in groups]
         )
     array = np.asarray(values, dtype=float)
-    masked = np.ma.masked_invalid(array)
+    display_array = array.copy()
+    display_array[:, 1:] = np.where(
+        np.isfinite(display_array[:, 1:]),
+        display_array[:, 1:],
+        1.0,
+    )
+    masked = np.ma.masked_invalid(display_array)
     figure, axis = plt.subplots(
-        figsize=(max(10.5, 4.5 + 0.58 * len(columns)), max(4.2, 0.85 * len(ranking) + 2.6))
+        figsize=(
+            max(10.5, 4.5 + 0.58 * len(columns)),
+            max(4.2, 0.85 * len(ordered_ranking) + 2.6),
+        )
     )
     colormap = plt.get_cmap("viridis").with_extremes(bad="#D9D9D9")
     image = axis.imshow(masked, vmin=0, vmax=1, cmap=colormap, aspect="auto")
     axis.set_xticks(np.arange(len(columns)), columns, fontsize=8.5, rotation=60, ha="left")
     axis.set_yticks(
-        np.arange(len(ranking)),
+        np.arange(len(ordered_ranking)),
         [
             labels.get(str(row["model"]), str(row["model"]))
             if labels is not None
             else str(row["model"])
-            for row in ranking
+            for row in ordered_ranking
         ],
         fontsize=8.5,
     )
@@ -764,25 +807,181 @@ def render_grouped_metric_breakdown(
     for row_index in range(array.shape[0]):
         for column_index in range(array.shape[1]):
             value = array[row_index, column_index]
-            label = f"{value:.3f}" if math.isfinite(value) else "n/a"
+            if column_index == 0 and math.isfinite(value):
+                result = grouped_by_model[
+                    str(ordered_ranking[row_index]["model"])
+                ]
+                defined = int(result.get("group_defined_dice_count", 0))
+                total = int(result.get("group_count", len(groups)))
+                label = f"{value:.3f}\n({defined}/{total})"
+            elif column_index > 0 and not math.isfinite(value):
+                label = "TN"
+            else:
+                label = f"{value:.3f}" if math.isfinite(value) else "n/a"
             axis.text(
                 column_index,
                 row_index,
                 label,
                 ha="center",
                 va="center",
-                color="white" if math.isfinite(value) and value < 0.65 else "black",
+                color=(
+                    "white"
+                    if math.isfinite(display_array[row_index, column_index])
+                    and display_array[row_index, column_index] < 0.65
+                    else "black"
+                ),
                 fontsize=7.5,
             )
     axis.set_title(
         "Grouped foreground Dice — TP/FP/FN pooled within each group\n"
-        "Macro gives every defined group equal weight; primary ranking is unchanged",
+        "Rows are sorted by macro Dice; support is defined groups / all groups\n"
+        "0 = no overlap; green TN = empty reference and prediction (excluded from macro)",
         pad=72,
     )
     colorbar = figure.colorbar(image, ax=axis, fraction=0.025, pad=0.02)
-    colorbar.set_label("Foreground Dice")
+    colorbar.set_label("Display score (foreground Dice; TN = 1)")
     figure.tight_layout()
     path = reports / "grouped-metric-breakdown.png"
+    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.close(figure)
+    return path
+
+
+def render_grouped_presence_metric_breakdown(
+    reports: Path,
+    ranking: list[dict[str, Any]],
+    grouped_by_model: Mapping[str, Mapping[str, Any]],
+    *,
+    metric: str,
+    labels: Mapping[str, str] | None = None,
+) -> Path:
+    """Render an AOI-level area-filtered presence precision, recall, or F1 grid."""
+
+    import matplotlib.pyplot as plt
+
+    if metric not in {"precision", "recall", "f1"}:
+        raise ValueError("metric must be one of: precision, recall, f1")
+    value_key = f"presence_{metric}"
+    macro_key = f"group_macro_presence_{metric}"
+    defined_key = f"group_defined_presence_{metric}_count"
+    groups = sorted(
+        {
+            str(group["group"])
+            for result in grouped_by_model.values()
+            for group in result.get("per_group", [])
+        }
+    )
+
+    def macro_f1_sort_key(row: Mapping[str, Any]) -> tuple[bool, float, str]:
+        value = float(
+            grouped_by_model[str(row["model"])].get(
+                "group_macro_presence_f1", math.nan
+            )
+        )
+        return (
+            not math.isfinite(value),
+            -value if math.isfinite(value) else 0.0,
+            str(row["model"]),
+        )
+
+    ordered_ranking = sorted(ranking, key=macro_f1_sort_key)
+    columns = [f"Macro {metric.upper()}", *groups]
+    values: list[list[float]] = []
+    group_rows: list[dict[str, Mapping[str, Any]]] = []
+    for row in ordered_ranking:
+        result = grouped_by_model[str(row["model"])]
+        lookup = {
+            str(group["group"]): group
+            for group in result.get("per_group", [])
+        }
+        group_rows.append(lookup)
+        values.append(
+            [float(result.get(macro_key, math.nan))]
+            + [float(lookup[group].get(value_key, math.nan)) for group in groups]
+        )
+
+    array = np.asarray(values, dtype=float)
+    display_array = array.copy()
+    display_labels: list[list[str]] = []
+    for row_index, row in enumerate(ordered_ranking):
+        result = grouped_by_model[str(row["model"])]
+        macro_value = array[row_index, 0]
+        if math.isfinite(macro_value):
+            defined = int(result.get(defined_key, 0))
+            total = int(result.get("group_count", len(groups)))
+            macro_label = f"{macro_value:.3f}\n({defined}/{total})"
+        else:
+            macro_label = "n/a"
+        labels_for_row = [macro_label]
+        for column_index, group in enumerate(groups, start=1):
+            group_row = group_rows[row_index][group]
+            value = array[row_index, column_index]
+            positive_cases = int(group_row.get("positive_cases", 0))
+            false_positives = int(group_row.get("presence_fp", 0))
+            predicted_positives = int(group_row.get("presence_tp", 0)) + false_positives
+            if math.isfinite(value):
+                label = f"{value:.3f}"
+            elif positive_cases == 0 and false_positives == 0:
+                display_array[row_index, column_index] = 1.0
+                label = "TN"
+            elif metric == "precision" and positive_cases > 0 and predicted_positives == 0:
+                display_array[row_index, column_index] = 0.0
+                label = "MISS"
+            elif metric == "recall" and positive_cases == 0 and false_positives > 0:
+                display_array[row_index, column_index] = 0.0
+                label = "FP"
+            else:
+                label = "n/a"
+            labels_for_row.append(label)
+        display_labels.append(labels_for_row)
+
+    masked = np.ma.masked_invalid(display_array)
+    figure, axis = plt.subplots(
+        figsize=(
+            max(10.5, 4.5 + 0.58 * len(columns)),
+            max(4.2, 0.85 * len(ordered_ranking) + 2.6),
+        )
+    )
+    colormap = plt.get_cmap("viridis").with_extremes(bad="#D9D9D9")
+    image = axis.imshow(masked, vmin=0, vmax=1, cmap=colormap, aspect="auto")
+    axis.set_xticks(np.arange(len(columns)), columns, fontsize=8.5, rotation=60, ha="left")
+    axis.set_yticks(
+        np.arange(len(ordered_ranking)),
+        [
+            labels.get(str(row["model"]), str(row["model"]))
+            if labels is not None
+            else str(row["model"])
+            for row in ordered_ranking
+        ],
+        fontsize=8.5,
+    )
+    axis.tick_params(axis="x", bottom=False, top=True, labelbottom=False, labeltop=True)
+    for row_index in range(array.shape[0]):
+        for column_index in range(array.shape[1]):
+            display_value = display_array[row_index, column_index]
+            axis.text(
+                column_index,
+                row_index,
+                display_labels[row_index][column_index],
+                ha="center",
+                va="center",
+                color=(
+                    "white"
+                    if math.isfinite(display_value) and display_value < 0.65
+                    else "black"
+                ),
+                fontsize=7.5,
+            )
+    axis.set_title(
+        f"Area-filtered case-presence {metric} pooled within each AOI\n"
+        "Rows are sorted by macro presence F1; macro support is defined AOIs / all AOIs\n"
+        "Green TN = empty reference and prediction; MISS/FP = zero display score",
+        pad=72,
+    )
+    colorbar = figure.colorbar(image, ax=axis, fraction=0.025, pad=0.02)
+    colorbar.set_label(f"Display score (presence {metric}; TN = 1)")
+    figure.tight_layout()
+    path = reports / f"grouped-presence-{metric}.png"
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
     plt.close(figure)
     return path

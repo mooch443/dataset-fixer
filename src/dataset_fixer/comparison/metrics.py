@@ -219,37 +219,20 @@ def component_filtered_presence_breakdown(
     greater than or equal to ``minimum_component_area``.
     """
 
-    threshold = float(minimum_component_area)
-    if not math.isfinite(threshold) or threshold <= 0:
-        raise ValueError("minimum_component_area must be finite and greater than zero")
-
     positive_rows = [row for row in rows if float(row["n_ref"]) > 0]
     empty_rows = [row for row in rows if float(row["n_ref"]) == 0]
 
-    def row_id(row: Mapping[str, Any]) -> str:
-        value = row.get("case_id", row.get("image_id"))
-        if value is None:
-            raise ValueError(
-                "Presence rows require a case_id or image_id for component filtering"
-            )
-        return str(value)
-
-    missing = sorted(
-        row_id(row)
-        for row in rows
-        if row_id(row) not in prediction_component_areas
+    decisions = component_filtered_presence_decisions(
+        rows,
+        prediction_component_areas,
+        minimum_component_area,
     )
-    if missing:
-        raise ValueError(
-            "Prediction component areas are missing evaluation cases: "
-            + ", ".join(missing[:5])
-        )
+
+    def row_id(row: Mapping[str, Any]) -> str:
+        return str(row.get("case_id", row.get("image_id")))
 
     def predicted(row: Mapping[str, Any]) -> bool:
-        return any(
-            float(area) >= threshold
-            for area in prediction_component_areas[row_id(row)]
-        )
+        return decisions[row_id(row)]
 
     positive_detected = sum(predicted(row) for row in positive_rows)
     empty_false_positive = sum(predicted(row) for row in empty_rows)
@@ -258,7 +241,7 @@ def component_filtered_presence_breakdown(
         return numerator / denominator if denominator else math.nan
 
     return {
-        "min_connected_component_area": threshold,
+        "min_connected_component_area": float(minimum_component_area),
         "component_filtered_positive_detected_cases": positive_detected,
         "component_filtered_positive_missed_cases": (
             len(positive_rows) - positive_detected
@@ -283,6 +266,128 @@ def component_filtered_presence_breakdown(
             positive_detected,
             positive_detected + empty_false_positive,
         ),
+    }
+
+
+def component_filtered_presence_decisions(
+    rows: Sequence[Mapping[str, Any]],
+    prediction_component_areas: Mapping[str, Sequence[float]],
+    minimum_component_area: float,
+) -> dict[str, bool]:
+    """Resolve the area-filtered presence decision for every evaluation case."""
+
+    threshold = float(minimum_component_area)
+    if not math.isfinite(threshold) or threshold <= 0:
+        raise ValueError("minimum_component_area must be finite and greater than zero")
+
+    def row_id(row: Mapping[str, Any]) -> str:
+        value = row.get("case_id", row.get("image_id"))
+        if value is None:
+            raise ValueError(
+                "Presence rows require a case_id or image_id for component filtering"
+            )
+        return str(value)
+
+    missing = sorted(
+        row_id(row)
+        for row in rows
+        if row_id(row) not in prediction_component_areas
+    )
+    if missing:
+        raise ValueError(
+            "Prediction component areas are missing evaluation cases: "
+            + ", ".join(missing[:5])
+        )
+
+    return {
+        row_id(row): any(
+            float(area) >= threshold
+            for area in prediction_component_areas[row_id(row)]
+        )
+        for row in rows
+    }
+
+
+def grouped_presence_metric_breakdown(
+    rows: list[dict[str, Any]],
+    groups: Mapping[str, str],
+    predicted_presence: Mapping[str, bool],
+) -> dict[str, Any]:
+    """Pool image-level presence confusion within groups and macro-average."""
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    def row_id(row: Mapping[str, Any]) -> str:
+        value = row.get("case_id", row.get("image_id"))
+        if value is None:
+            raise ValueError("Grouped presence rows require a case_id or image_id")
+        return str(value)
+
+    for row in rows:
+        case_id = row_id(row)
+        if case_id not in groups:
+            raise ValueError(f"No group was resolved for evaluation case {case_id!r}")
+        if case_id not in predicted_presence:
+            raise ValueError(
+                f"No filtered presence decision was resolved for case {case_id!r}"
+            )
+        grouped[str(groups[case_id])].append(row)
+
+    def ratio(numerator: float, denominator: float) -> float:
+        return numerator / denominator if denominator else math.nan
+
+    per_group: list[dict[str, Any]] = []
+    for group in sorted(grouped):
+        selected = grouped[group]
+        tp = fp = fn = tn = 0
+        for row in selected:
+            reference = float(row["n_ref"]) > 0
+            prediction = bool(predicted_presence[row_id(row)])
+            if reference and prediction:
+                tp += 1
+            elif prediction:
+                fp += 1
+            elif reference:
+                fn += 1
+            else:
+                tn += 1
+        per_group.append(
+            {
+                "group": group,
+                "cases": len(selected),
+                "positive_cases": tp + fn,
+                "empty_cases": tn + fp,
+                "presence_tp": tp,
+                "presence_fp": fp,
+                "presence_fn": fn,
+                "presence_tn": tn,
+                "presence_precision": ratio(tp, tp + fp),
+                "presence_recall": ratio(tp, tp + fn),
+                "presence_f1": ratio(2 * tp, 2 * tp + fp + fn),
+            }
+        )
+
+    return {
+        "group_count": len(per_group),
+        "group_defined_presence_precision_count": sum(
+            math.isfinite(float(row["presence_precision"])) for row in per_group
+        ),
+        "group_defined_presence_recall_count": sum(
+            math.isfinite(float(row["presence_recall"])) for row in per_group
+        ),
+        "group_defined_presence_f1_count": sum(
+            math.isfinite(float(row["presence_f1"])) for row in per_group
+        ),
+        "group_macro_presence_precision": _safe_mean(
+            [row["presence_precision"] for row in per_group]
+        ),
+        "group_macro_presence_recall": _safe_mean(
+            [row["presence_recall"] for row in per_group]
+        ),
+        "group_macro_presence_f1": _safe_mean(
+            [row["presence_f1"] for row in per_group]
+        ),
+        "per_group": per_group,
     }
 
 

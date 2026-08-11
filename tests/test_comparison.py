@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import types
 from pathlib import Path
@@ -25,8 +26,10 @@ from dataset_fixer.comparison.cohort import freeze_cohort
 from dataset_fixer.comparison.inference import _adaptive_batches, _run_native, resolve_backend
 from dataset_fixer.comparison.metrics import (
     component_filtered_presence_breakdown,
+    component_filtered_presence_decisions,
     evaluate_configuration,
     grouped_binary_metric_breakdown,
+    grouped_presence_metric_breakdown,
     optimal_match,
     segmentation_binary_metric_breakdown,
     segmentation_binary_metric_rows,
@@ -179,6 +182,8 @@ def test_instance_segmentation_breakdown_uses_final_foreground_union_masks(
     assert filtered["component_filtered_positive_image_recall"] == pytest.approx(1.0)
     assert filtered["component_filtered_empty_image_specificity"] == pytest.approx(1.0)
     assert filtered["component_filtered_presence_precision"] == pytest.approx(1.0)
+    decisions = component_filtered_presence_decisions(rows, component_areas, 5)
+    assert decisions == {"positive": True, "empty": False}
 
     grouped = grouped_binary_metric_breakdown(
         rows,
@@ -186,6 +191,17 @@ def test_instance_segmentation_breakdown_uses_final_foreground_union_masks(
     )
     assert grouped["group_count"] == 2
     assert grouped["group_macro_dice"] == pytest.approx(0.5)
+
+    grouped_presence = grouped_presence_metric_breakdown(
+        rows,
+        {"positive": "island-a", "empty": "island-b"},
+        decisions,
+    )
+    assert grouped_presence["group_macro_presence_precision"] == pytest.approx(1.0)
+    assert grouped_presence["group_macro_presence_recall"] == pytest.approx(1.0)
+    assert grouped_presence["group_macro_presence_f1"] == pytest.approx(1.0)
+    assert grouped_presence["group_defined_presence_f1_count"] == 1
+    assert math.isnan(grouped_presence["per_group"][1]["presence_f1"])
 
 
 def test_inference_is_explicit_and_pose_supports_sahi(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -758,7 +774,7 @@ def test_model_collection_compare_atomic_result(
         destination=destination,
     )
     assert fake_inference.calls == 1
-    assert json.loads(old_manifest_path.read_text())["schema"] == 9
+    assert json.loads(old_manifest_path.read_text())["schema"] == 10
     assert regenerated.cache_statistics["prediction_hits"] == 1
 
     models.compare(
@@ -893,7 +909,7 @@ def test_segment_comparison_adds_postprocessed_binary_breakdown(
     assert row["empty_cases"] == 1
     assert row["empty_image_specificity"] == pytest.approx(1.0)
     manifest = json.loads((destination / "reports" / "result.json").read_text())
-    assert manifest["schema"] == 9
+    assert manifest["schema"] == 10
     assert manifest["ranking"][0]["positive_micro_iou"] == pytest.approx(1.0)
     assert manifest["ranking"][0]["small_object_dice"] == pytest.approx(1.0)
     assert manifest["ranking"][0]["raw_presence_precision"] == pytest.approx(1.0)
@@ -921,6 +937,12 @@ def test_segment_comparison_adds_postprocessed_binary_breakdown(
         "reports/grouped-metric-breakdown.png"
     )
     assert (destination / "reports" / "grouped-metric-breakdown.png").is_file()
+    assert manifest["grouped_analysis"]["presence"]["status"] == "complete"
+    for metric in ("precision", "recall", "f1"):
+        assert manifest["reports"][f"grouped_presence_{metric}"] == (
+            f"reports/grouped-presence-{metric}.png"
+        )
+        assert (destination / "reports" / f"grouped-presence-{metric}.png").is_file()
     assert (destination / "reports" / "object-size-breakdown.png").is_file()
 
 

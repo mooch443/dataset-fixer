@@ -32,13 +32,16 @@ from .comparison.grouping import resolve_evaluation_groups
 from .comparison.metrics import (
     binary_metric_breakdown,
     component_filtered_presence_breakdown,
+    component_filtered_presence_decisions,
     grouped_binary_metric_breakdown,
+    grouped_presence_metric_breakdown,
 )
 from .comparison.object_sizes import (
     evaluate_object_size_model,
     object_size_report_artifacts_exist,
     prepare_object_size_reference,
     render_grouped_metric_breakdown,
+    render_grouped_presence_metric_breakdown,
     render_large_object_examples,
     render_object_size_breakdown,
     render_segmentation_metric_breakdown,
@@ -66,7 +69,7 @@ from .utils import (
 # Report presentation evolves independently from prediction/evaluation cache
 # identity. A report bump redraws output from completed caches without forcing
 # model inference to run again.
-SEMANTIC_REPORT_SCHEMA = 14
+SEMANTIC_REPORT_SCHEMA = 15
 SEMANTIC_PREDICTION_SCHEMA = 2
 SEMANTIC_EVALUATION_CACHE_SCHEMA = 2
 
@@ -153,6 +156,19 @@ _METRIC_DEFINITIONS = {
     "group_macro_dice": (
         "Mean foreground Dice after pooling TP, FP, and FN within each caller-defined group; "
         "every group with defined Dice receives equal weight."
+    ),
+    "group_macro_presence_precision": (
+        "Mean area-filtered case-presence precision across caller-defined groups with at least "
+        "one predicted-positive case."
+    ),
+    "group_macro_presence_recall": (
+        "Mean area-filtered case-presence recall across caller-defined groups with at least "
+        "one positive-reference case."
+    ),
+    "group_macro_presence_f1": (
+        "Mean area-filtered case-presence F1 across caller-defined groups containing a "
+        "positive reference or prediction; correct-empty groups are reported as TN and "
+        "excluded from this foreground-presence macro."
     ),
 }
 
@@ -723,6 +739,13 @@ def compare_nnunet_models(
                 "plots": "reports/plots.png",
                 "metric_breakdown": "reports/metric-breakdown.png",
                 "grouped_metric_breakdown": grouped_metric_breakdown_path,
+                "grouped_presence_precision": grouped_analysis.get("reports", {}).get(
+                    "precision"
+                ),
+                "grouped_presence_recall": grouped_analysis.get("reports", {}).get(
+                    "recall"
+                ),
+                "grouped_presence_f1": grouped_analysis.get("reports", {}).get("f1"),
                 "object_size_breakdown": object_size_breakdown_path,
                 "large_object_examples": large_object_example_paths,
                 "comparison": "reports/comparison.png",
@@ -1264,6 +1287,13 @@ def compare_semantic_models(
                 "plots": "reports/plots.png",
                 "metric_breakdown": "reports/metric-breakdown.png",
                 "grouped_metric_breakdown": grouped_metric_breakdown_path,
+                "grouped_presence_precision": grouped_analysis.get("reports", {}).get(
+                    "precision"
+                ),
+                "grouped_presence_recall": grouped_analysis.get("reports", {}).get(
+                    "recall"
+                ),
+                "grouped_presence_f1": grouped_analysis.get("reports", {}).get("f1"),
                 "object_size_breakdown": object_size_breakdown_path,
                 "large_object_examples": large_object_example_paths,
                 "comparison": "reports/comparison.png",
@@ -3120,6 +3150,16 @@ def _analyze_semantic_object_sizes(
                     resolved_component_area,
                 )
             )
+            decisions = component_filtered_presence_decisions(
+                rows_by_model[model_name],
+                component_areas,
+                resolved_component_area,
+            )
+            for metric_row in rows_by_model[model_name]:
+                case_id = str(metric_row.get("case_id", metric_row.get("image_id")))
+                metric_row["component_filtered_predicted_presence"] = decisions[
+                    case_id
+                ]
 
     if reference.status != "complete":
         for row in ranking:
@@ -3178,6 +3218,36 @@ def _analyze_grouped_metrics(
         by_model[model_name] = result
         row.update({key: value for key, value in result.items() if key != "per_group"})
 
+    presence_by_model: dict[str, dict[str, Any]] = {}
+    presence_available = all(
+        "component_filtered_predicted_presence" in metric_row
+        for model_rows in rows_by_model.values()
+        for metric_row in model_rows
+    )
+    presence_reports: dict[str, str | None] = {
+        "precision": None,
+        "recall": None,
+        "f1": None,
+    }
+    if presence_available:
+        for row in ranking:
+            model_name = str(row["model"])
+            decisions = {
+                str(metric_row.get("case_id", metric_row.get("image_id"))): bool(
+                    metric_row["component_filtered_predicted_presence"]
+                )
+                for metric_row in rows_by_model[model_name]
+            }
+            result = grouped_presence_metric_breakdown(
+                rows_by_model[model_name],
+                groups,
+                decisions,
+            )
+            presence_by_model[model_name] = result
+            row.update(
+                {key: value for key, value in result.items() if key != "per_group"}
+            )
+
     path = render_grouped_metric_breakdown(
         reports,
         ranking,
@@ -3187,6 +3257,22 @@ def _analyze_grouped_metrics(
             for row in ranking
         },
     )
+    if presence_available:
+        plot_labels = {
+            str(row["model"]): _ranking_plot_label(row)
+            for row in ranking
+        }
+        for metric in presence_reports:
+            presence_path = render_grouped_presence_metric_breakdown(
+                reports,
+                ranking,
+                presence_by_model,
+                metric=metric,
+                labels=plot_labels,
+            )
+            presence_reports[metric] = str(
+                presence_path.relative_to(reports.parent)
+            )
     return (
         {
             "status": "complete",
@@ -3194,6 +3280,19 @@ def _analyze_grouped_metrics(
             "primary_ranking_unchanged": True,
             "grouping": dict(group_settings or {}),
             "models": by_model,
+            "presence": {
+                "status": "complete" if presence_available else "skipped",
+                "prediction_definition": (
+                    "at least one predicted 8-connected foreground component "
+                    "at or above the resolved area threshold"
+                ),
+                "aggregation": (
+                    "pool tile-level TP/FP/FN/TN within group, then "
+                    "macro-average defined group scores"
+                ),
+                "models": presence_by_model,
+            },
+            "reports": presence_reports,
         },
         str(path.relative_to(reports.parent)),
     )
