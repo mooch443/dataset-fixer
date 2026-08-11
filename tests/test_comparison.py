@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -18,7 +19,9 @@ from dataset_fixer import (
     ModelCollection,
     ModelInput,
     PredictionCache,
+    PredictionCacheMissError,
     PredictionResult,
+    PredictionScoreUnavailableError,
 )
 from dataset_fixer.geometry import validate_collection_geometry
 from dataset_fixer.comparison.cache import (
@@ -805,6 +808,305 @@ def test_prediction_cache_round_trips_semantic_and_native_masks(
     assert np.array_equal(loaded.records[0].mask, mask)
     assert np.array_equal(loaded.records[0].native_mask, native_mask)
     assert loaded.records[0].metadata == {"fold": 0}
+
+
+def test_prediction_cache_round_trips_foreground_probabilities(
+    detect_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    image = (detect_dataset / "val" / "images" / "val_0.jpg").resolve()
+    with Image.open(image) as opened:
+        width, height = opened.size
+    model_input = ModelInput("case", image, width, height, "val_0.jpg")
+    probability = np.linspace(0, 1, width * height, dtype=np.float32).reshape(
+        height, width
+    )
+    result = PredictionResult(
+        model_name="semantic",
+        model_kind="ultralytics",
+        task="semantic_segment",
+        backend="native",
+        records=(
+            ImagePrediction(
+                "case",
+                image,
+                "val_0.jpg",
+                width,
+                height,
+                mask=(probability >= 0.5).astype(np.uint8),
+                foreground_probability=probability,
+            ),
+        ),
+        inference_seconds=0.1,
+    )
+    identity = {"schema": 1, "test": "probability-map"}
+    key = prediction_cache_key(identity)
+    cache = PredictionCache(tmp_path / "probability-cache")
+    cache.save(
+        key,
+        result,
+        namespace="semantic",
+        identity=identity,
+        inputs=(model_input,),
+    )
+    loaded = cache.load(
+        key,
+        namespace="semantic",
+        identity=identity,
+        inputs=(model_input,),
+    )
+
+    assert loaded is not None
+    assert loaded.records[0].foreground_probability is not None
+    assert np.allclose(
+        loaded.records[0].foreground_probability,
+        probability,
+        atol=5e-4,
+    )
+    compact = loaded.save(tmp_path / "compact-probability-result")
+    assert not (compact / "foreground-probabilities").exists()
+    complete = loaded.save(
+        tmp_path / "complete-probability-result",
+        include_probabilities=True,
+    )
+    assert len(list((complete / "foreground-probabilities").glob("*.npy"))) == 1
+
+
+def test_prediction_threshold_is_task_aware_and_source_configurable(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    semantic = Model(
+        checkpoint,
+        task="semantic",
+        prediction_threshold=0.61,
+    )
+    instance = Model(
+        checkpoint,
+        task="segment",
+        prediction_threshold=0.17,
+    )
+    hinted_checkpoint = tmp_path / "yolo26x-sem.pt"
+    hinted_checkpoint.write_bytes(b"semantic-checkpoint")
+    hinted_semantic = Model(
+        hinted_checkpoint,
+        prediction_threshold=0.66,
+    )
+
+    assert semantic.prediction_threshold == pytest.approx(0.61)
+    assert semantic.foreground_probability_threshold == pytest.approx(0.61)
+    assert instance.prediction_threshold == pytest.approx(0.17)
+    assert instance.confidence == pytest.approx(0.17)
+    assert hinted_semantic.task is None
+    assert hinted_semantic.prediction_threshold == pytest.approx(0.66)
+    assert hinted_semantic.foreground_probability_threshold == pytest.approx(0.66)
+    assert hinted_semantic.confidence == pytest.approx(0.25)
+
+    reconfigured = semantic._configured_copy(
+        overrides={"prediction_threshold": 0.73}
+    )
+    assert reconfigured.prediction_threshold == pytest.approx(0.73)
+    with pytest.raises(ValueError, match="both threshold aliases"):
+        Model(
+            checkpoint,
+            task="semantic",
+            prediction_threshold=0.6,
+            foreground_probability_threshold=0.5,
+        )
+
+
+def test_cache_only_probability_requirement_rejects_hard_mask_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = tmp_path / "image.png"
+    Image.new("RGB", (8, 8)).save(image)
+    checkpoint = tmp_path / "semantic.pt"
+    checkpoint.write_bytes(b"semantic")
+    model = Model(checkpoint, task="semantic", resolution=8)
+    cache = PredictionCache(tmp_path / "cache")
+    calls = 0
+
+    def hard_mask_only(_model: object, inputs: object, **_kwargs: object):
+        nonlocal calls
+        calls += 1
+        image_id = tuple(inputs)[0].image_id  # type: ignore[arg-type]
+        return {image_id: np.ones((8, 8), dtype=np.uint8)}, "semantic_segment", {}
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.inference.predict_model_inputs",
+        hard_mask_only,
+    )
+    model.predict(image, prediction_cache=cache, progress=False)
+    assert calls == 1
+    with pytest.raises(PredictionCacheMissError) as error:
+        model.predict(
+            image,
+            prediction_cache=cache,
+            cache_only=True,
+            require_probability_maps=True,
+            progress=False,
+        )
+    assert error.value.reason == "missing-probability-maps"
+    assert calls == 1
+
+
+def test_model_prediction_threshold_reaches_semantic_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataset_fixer.comparison.inference import SemanticOutput
+
+    image = tmp_path / "semantic-image.png"
+    Image.new("RGB", (8, 8)).save(image)
+    checkpoint = tmp_path / "semantic-threshold.pt"
+    checkpoint.write_bytes(b"semantic")
+    model = Model(
+        checkpoint,
+        task="semantic",
+        resolution=8,
+        prediction_threshold=0.7,
+    )
+
+    def semantic_output(_model: object, inputs: object, **options: object):
+        assert options["foreground_probability_threshold"] == pytest.approx(0.7)
+        image_id = tuple(inputs)[0].image_id  # type: ignore[arg-type]
+        probability = np.full((8, 8), 0.6, dtype=np.float32)
+        return {
+            image_id: SemanticOutput(
+                class_map=np.zeros((8, 8), dtype=np.uint8),
+                foreground_probability=probability,
+                probability_source="model-probabilities",
+            )
+        }, "semantic_segment", {}
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.inference.predict_model_inputs",
+        semantic_output,
+    )
+    result = model.predict(image, progress=False)
+
+    assert result.settings["prediction_threshold"] == pytest.approx(0.7)
+    assert not np.any(result.records[0].mask)
+    assert np.allclose(result.records[0].foreground_probability, 0.6)
+
+
+def test_semantic_threshold_errors_without_scores_but_keeps_hard_mask_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = tmp_path / "hard-map-image.png"
+    Image.new("RGB", (8, 8)).save(image)
+    checkpoint = tmp_path / "hard-map-semantic.pt"
+    checkpoint.write_bytes(b"hard-map-semantic")
+    thresholded = Model(
+        checkpoint,
+        task="semantic",
+        resolution=8,
+        prediction_threshold=0.7,
+    )
+    cache = PredictionCache(tmp_path / "hard-map-cache")
+    calls = 0
+
+    def hard_map_only(_model: object, inputs: object, **_options: object):
+        nonlocal calls
+        calls += 1
+        image_id = tuple(inputs)[0].image_id  # type: ignore[arg-type]
+        return {image_id: np.ones((8, 8), dtype=np.uint8)}, "semantic_segment", {}
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.inference.predict_model_inputs",
+        hard_map_only,
+    )
+    with pytest.raises(PredictionScoreUnavailableError) as error:
+        thresholded.predict(
+            image,
+            prediction_cache=cache,
+            progress=False,
+        )
+    assert error.value.reason == "backend-returned-no-semantic-probabilities"
+    assert calls == 1
+
+    # The scoreless artifact is not destroyed: an unthresholded semantic model
+    # with the same checkpoint/image identity can still reuse its hard mask.
+    unthresholded = Model(checkpoint, task="semantic", resolution=8)
+    recovered = unthresholded.predict(
+        image,
+        prediction_cache=cache,
+        cache_only=True,
+        progress=False,
+    )
+    assert recovered.cache_info["status"] == "hit"
+    assert np.all(recovered.records[0].mask == 1)
+    assert calls == 1
+
+
+def test_semantic_probability_cache_is_shared_across_reference_variants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "segments-image-identity",
+        task="segment",
+        names=["school"],
+        train_rows=[""],
+        val_rows=["0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"],
+        size=(12, 12),
+    )
+    first = Dataset.open(source, task="segment", progress=False).export(
+        destination=tmp_path / "semantic-reference-a",
+        format="semantic_masks",
+        visualize=False,
+        progress=False,
+    )
+    second_root = tmp_path / "semantic-reference-b"
+    shutil.copytree(first.location, second_root)
+    second = Dataset.open(second_root, progress=False)
+    second_mask = next(second.mask_dirs["val"].glob("*.png"))
+    Image.new("L", (12, 12), 0).save(second_mask)
+
+    checkpoint = tmp_path / "shared-semantic.pt"
+    checkpoint.write_bytes(b"semantic")
+    model = Model(checkpoint, task="semantic", resolution=12)
+    cache = PredictionCache(tmp_path / "shared-cache")
+    calls = 0
+
+    def semantic_output(_model: object, inputs: object, **_options: object):
+        nonlocal calls
+        calls += 1
+        values = {}
+        for value in inputs:  # type: ignore[union-attr]
+            probability = np.full((value.height, value.width), 0.7, dtype=np.float32)
+            values[value.image_id] = types.SimpleNamespace(
+                class_map=np.ones((value.height, value.width), dtype=np.uint8),
+                foreground_probability=probability,
+                probability_source="model-probabilities",
+            )
+        return values, "semantic_segment", {}
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.inference.predict_model_inputs",
+        semantic_output,
+    )
+    fresh = model.predict(
+        first,
+        split="val",
+        prediction_cache=cache,
+        progress=False,
+    )
+    reused = model.predict(
+        second,
+        split="val",
+        prediction_cache=cache,
+        require_probability_maps=True,
+        progress=False,
+    )
+
+    assert calls == 1
+    assert fresh.cache_info["key"] == reused.cache_info["key"]
+    assert reused.cache_info["status"] == "hit"
+    assert reused.records[0].image_path.is_relative_to(second.location)
 
 
 def test_semantic_predict_cache_on_vector_dataset_reuses_complete_masks(

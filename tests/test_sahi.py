@@ -12,7 +12,9 @@ from dataset_fixer import Model
 from dataset_fixer.comparison.inference import (
     _postprocess_payload_predictions,
     _sahi_prediction,
+    _semantic_probability_predictor,
     _semantic_probabilities,
+    _semantic_output,
     resolve_backend,
 )
 from dataset_fixer.comparison.types import Prediction
@@ -118,6 +120,69 @@ def test_single_channel_semantic_logits_become_binary_probabilities() -> None:
     assert np.array_equal(
         np.argmax(probabilities, axis=0),
         np.asarray([[0, 1], [0, 1]]),
+    )
+
+
+def test_extreme_single_channel_logits_use_stable_sigmoid() -> None:
+    result = types.SimpleNamespace(
+        semantic_logits=np.asarray([[[[-1000.0, 1000.0]]]], dtype=np.float32)
+    )
+    with np.errstate(over="raise", invalid="raise"):
+        probabilities = _semantic_probabilities(
+            result,
+            expected_shape=(1, 2),
+            num_classes=2,
+            source="extreme-logits",
+        )
+    assert np.array_equal(probabilities[1], np.asarray([[0.0, 1.0]]))
+
+
+def test_semantic_prediction_threshold_is_applied_to_model_probabilities() -> None:
+    result = types.SimpleNamespace(
+        semantic_logits=np.asarray([[[[-1.0, 0.2], [1.0, 2.0]]]], dtype=np.float32)
+    )
+    output = _semantic_output(
+        result,
+        expected_shape=(2, 2),
+        num_classes=2,
+        threshold=0.7,
+        source="test",
+    )
+
+    assert output.foreground_probability is not None
+    assert np.array_equal(
+        output.class_map,
+        np.asarray([[0, 0], [1, 1]], dtype=np.uint8),
+    )
+
+
+def test_ultralytics_semantic_predictor_retains_pre_argmax_logits() -> None:
+    torch = pytest.importorskip("torch")
+    predictor_type = _semantic_probability_predictor()
+    predictor = predictor_type.__new__(predictor_type)
+    predictor.args = types.SimpleNamespace(classes=None)
+    predictor.model = types.SimpleNamespace(names={0: "background", 1: "school"})
+    predictor.batch = (["case.png"],)
+    logits = torch.tensor(
+        [[[[2.0, -2.0], [1.0, -1.0]], [[-2.0, 2.0], [-1.0, 1.0]]]],
+        dtype=torch.float32,
+    )
+    image_batch = torch.zeros((1, 3, 2, 2), dtype=torch.float32)
+    originals = [np.zeros((2, 2, 3), dtype=np.uint8)]
+
+    results = predictor.postprocess(logits, image_batch, originals)
+
+    assert len(results) == 1
+    assert getattr(results[0], "semantic_logits", None) is not None
+    probabilities = _semantic_probabilities(
+        results[0],
+        expected_shape=(2, 2),
+        num_classes=2,
+        source="test",
+    )
+    assert np.array_equal(
+        np.argmax(probabilities, axis=0),
+        np.asarray([[0, 1], [0, 1]], dtype=np.uint8),
     )
 
 

@@ -12,13 +12,13 @@ import textwrap
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Hashable, Iterable, Mapping
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 from tqdm import tqdm
 
 from .comparison.cache import (
@@ -862,6 +862,7 @@ def compare_semantic_models(
             "resolution": model.resolution or 480,
             "confidence": model.confidence if model.kind == "ultralytics" else None,
             "postprocess": model.postprocess if model.kind == "ultralytics" else None,
+            "prediction_threshold": model.prediction_threshold,
             "nnunet_tta": model.nnunet_tta if model.kind == "nnunet" else None,
             "sahi": resolved_sahi_by_model.get(model.name),
         }
@@ -944,6 +945,12 @@ def compare_semantic_models(
                     "postprocess": model.postprocess,
                     "settings": model.settings,
                     **(
+                        {"semantic_probability_thresholding_schema": 1}
+                        if model._uses_semantic_prediction_threshold()
+                        and model.foreground_probability_threshold is not None
+                        else {}
+                    ),
+                    **(
                         {"nnunet_tta": model.nnunet_tta}
                         if model.kind == "nnunet"
                         else {}
@@ -1001,7 +1008,7 @@ def compare_semantic_models(
     limitations = [
         "All models are evaluated as binary foreground at the canonical semantic-mask export resolution.",
         "YOLO instance classes and identities are discarded by unioning every retained prediction polygon.",
-        "YOLO confidence and postprocessing thresholds do not alter native semantic-model predictions.",
+        "Semantic prediction thresholds are applied to foreground probabilities only after full source-image reconstruction.",
         "Dice is undefined when both reference and prediction are empty; finite support is reported separately.",
         "Training/evaluation overlap cannot be independently verified for models without training provenance.",
     ]
@@ -1056,6 +1063,12 @@ def compare_semantic_models(
                 "inference": model.inference,
                 "resolution": model.resolution or 480,
                 "settings": model.settings,
+                **(
+                    {"semantic_probability_thresholding_schema": 1}
+                    if model._uses_semantic_prediction_threshold()
+                    and model.foreground_probability_threshold is not None
+                    else {}
+                ),
                 **(
                     {"nnunet_tta": model.nnunet_tta}
                     if model.kind == "nnunet"
@@ -1130,7 +1143,18 @@ def compare_semantic_models(
                     model,
                     model_inputs,
                     cache=(selected_prediction_cache or False),
-                    identity=cache_payload,
+                    identity=_raw_semantic_prediction_cache_identity(
+                        model,
+                        inputs=model_inputs,
+                        resolved_sahi=resolved_sahi_by_model.get(model.name),
+                    ),
+                    compatible_identities=(
+                        _cohort_semantic_prediction_cache_identity(
+                            model,
+                            cohort_fingerprint=cohort_fingerprint,
+                            resolved_sahi=resolved_sahi_by_model.get(model.name),
+                        ),
+                    ),
                     options=predict_options,
                 )
                 projected, projection, model_warnings = _project_semantic_predictions(
@@ -1460,15 +1484,12 @@ def _project_semantic_predictions(
                 f"YOLO prediction dimensions {(record.width, record.height)} do not "
                 f"match {case.relative_path}: {(case.width, case.height)}"
             )
-        canvas = Image.new("L", (case.width, case.height), 0)
-        draw = ImageDraw.Draw(canvas)
         for index, prediction in enumerate(record.objects, start=1):
             if float(prediction.score) < confidence:
                 continue
             polygons = prediction.polygons or (
                 [prediction.polygon] if prediction.polygon is not None else []
             )
-            usable: list[list[tuple[float, float]]] = []
             for polygon in polygons:
                 reason = None
                 if len(polygon) < 3:
@@ -1490,7 +1511,6 @@ def _project_semantic_predictions(
                         }
                     )
                     continue
-                usable.append(polygon)
             if not polygons:
                 warnings.append(
                     {
@@ -1502,8 +1522,9 @@ def _project_semantic_predictions(
                         "action": "skipped-object",
                     }
                 )
-            for polygon in usable:
-                draw.polygon([(float(x), float(y)) for x, y in polygon], fill=1)
+        score_map = record.foreground_score_map()
+        if score_map is None:
+            score_map = np.zeros((case.height, case.width), dtype=np.float32)
         projected.append(
             ImagePrediction(
                 image_id=record.image_id,
@@ -1511,8 +1532,12 @@ def _project_semantic_predictions(
                 relative_path=record.relative_path,
                 width=record.width,
                 height=record.height,
-                mask=np.asarray(canvas, dtype=np.uint8) > 0,
-                metadata={"semantic_projection": "polygon-foreground-union"},
+                mask=score_map >= confidence,
+                foreground_probability=score_map.astype(np.float16),
+                metadata={
+                    "semantic_projection": "polygon-foreground-union",
+                    "probability_source": "rasterized-instance-confidence",
+                },
             )
         )
     return tuple(projected), "polygon-foreground-union", warnings
@@ -1529,6 +1554,7 @@ def predict_nnunet_model(
     resolution: int = 480,
     settings: dict[str, Any] | None = None,
     batch_size: int = -1,
+    foreground_probability_threshold: float | None = None,
 ) -> tuple[ImagePrediction, ...]:
     """Run the official nnU-Net adapter for :meth:`Model.predict`."""
 
@@ -1553,6 +1579,7 @@ def predict_nnunet_model(
             resolution=resolution,
             settings=dict(settings or {}),
             batch_size=batch_size,
+            foreground_probability_threshold=foreground_probability_threshold,
         )
     _require_official_commands("nnUNetv2_predict_from_modelfolder")
     with tempfile.TemporaryDirectory(prefix="dataset-fixer-nnunet-predict-") as temporary:
@@ -1619,13 +1646,21 @@ def predict_nnunet_model(
                         expected=str(expected_native),
                     )
                 )
-            mask = _canonical_mask_from_probabilities(
+            _, canonical_probabilities = _canonical_probabilities_from_export(
                 native_predictions / f"{value.image_id}.npz",
                 image_id=value.image_id,
                 width=value.width,
                 height=value.height,
                 model_name=model.name,
                 upscale_factor=model.upscale_factor,
+            )
+            foreground_probability = np.asarray(
+                canonical_probabilities[1],
+                dtype=np.float16,
+            )
+            mask = _binary_probability_mask(
+                canonical_probabilities,
+                foreground_probability_threshold,
             )
             records.append(
                 ImagePrediction(
@@ -1636,6 +1671,7 @@ def predict_nnunet_model(
                     height=value.height,
                     mask=mask,
                     native_mask=native_mask if keep_native else None,
+                    foreground_probability=foreground_probability,
                     metadata={
                         "backend": "native",
                         "adapter": "nnunetv2-official",
@@ -1657,6 +1693,7 @@ def _predict_nnunet_sahi(
     resolution: int,
     settings: dict[str, Any],
     batch_size: int,
+    foreground_probability_threshold: float | None = None,
 ) -> tuple[ImagePrediction, ...]:
     """Predict SAHI tiles in process, as real network minibatches.
 
@@ -1906,6 +1943,9 @@ def _predict_nnunet_sahi(
                         model=model,
                         keep_native=keep_native,
                         resolved=resolved,
+                        foreground_probability_threshold=(
+                            foreground_probability_threshold
+                        ),
                     )
                 )
                 # Release each completed source image promptly.
@@ -2040,6 +2080,7 @@ def _stitch_sahi_source(
     model: Model,
     keep_native: bool,
     resolved: Any,
+    foreground_probability_threshold: float | None = None,
 ) -> ImagePrediction:
     from .sahi_support import stitch_probability_tiles
 
@@ -2074,7 +2115,10 @@ def _stitch_sahi_source(
             value.width,
             model.upscale_factor,
         ).mean(axis=(2, 4))
-    mask = np.argmax(canonical_probabilities, axis=0).astype(np.uint8)
+    mask = _binary_probability_mask(
+        canonical_probabilities,
+        foreground_probability_threshold,
+    )
     return ImagePrediction(
         image_id=value.image_id,
         image_path=value.image_path,
@@ -2083,6 +2127,10 @@ def _stitch_sahi_source(
         height=value.height,
         mask=mask,
         native_mask=native_mask if keep_native else None,
+        foreground_probability=np.asarray(
+            canonical_probabilities[1],
+            dtype=np.float16,
+        ),
         metadata={
             "backend": "sahi",
             "adapter": "nnunetv2-official",
@@ -2294,6 +2342,7 @@ def _predict_with_cache_context(
     *,
     cache: Any,
     identity: Mapping[str, Any],
+    compatible_identities: Sequence[Mapping[str, Any]] = (),
     options: Mapping[str, Any],
 ) -> PredictionResult:
     """Cache one comparison prediction without changing its public kwargs.
@@ -2305,7 +2354,12 @@ def _predict_with_cache_context(
 
     marker = object()
     previous = getattr(model, "_prediction_cache_override", marker)
-    model._prediction_cache_override = (cache, dict(identity), "semantic")
+    model._prediction_cache_override = (
+        cache,
+        dict(identity),
+        "semantic",
+        tuple(dict(value) for value in compatible_identities),
+    )
     try:
         return model.predict(source, **dict(options))
     finally:
@@ -2313,6 +2367,73 @@ def _predict_with_cache_context(
             delattr(model, "_prediction_cache_override")
         else:
             model._prediction_cache_override = previous
+
+
+def _raw_semantic_prediction_cache_identity(
+    model: Model,
+    *,
+    inputs: Sequence[ModelInput],
+    resolved_sahi: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return the label-independent full-image inference identity."""
+
+    from .model import _semantic_image_prediction_cache_identity
+
+    return _semantic_image_prediction_cache_identity(
+        model,
+        inputs=inputs,
+        inference=model.inference,
+        resolution=model.resolution or 480,
+        confidence=model.confidence,
+        postprocess=model.postprocess,
+        combined_settings=model.settings,
+        resolved_sahi=resolved_sahi,
+    )
+
+
+def _cohort_semantic_prediction_cache_identity(
+    model: Model,
+    *,
+    cohort_fingerprint: str,
+    resolved_sahi: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return the established label-inclusive comparison cache identity."""
+
+    resolution = model.resolution or 480
+    if model.kind == "nnunet":
+        return {
+            "schema": 2,
+            "space": "nnunet-semantic",
+            "cohort": cohort_fingerprint,
+            "model_sha256": model.digest,
+            "backend": model.inference,
+            "folds": model.folds,
+            "checkpoint": model.checkpoint,
+            "upscale_factor": model.upscale_factor,
+            "resolution": resolution,
+            "nnunet_tta": model.nnunet_tta,
+            "sahi": dict(resolved_sahi or {}) if model.inference == "sahi" else None,
+        }
+    settings = model.settings
+    if model._uses_semantic_prediction_threshold():
+        settings.pop("foreground_probability_threshold", None)
+        settings.pop("prediction_threshold", None)
+    settings["confidence"] = model.confidence
+    settings["postprocess"] = model.postprocess
+    return {
+        "schema": 2,
+        "space": "binary-semantic",
+        "cohort": cohort_fingerprint,
+        "model_sha256": model.digest,
+        "kind": model.kind,
+        "task": model.task,
+        "folds": model.folds,
+        "checkpoint": model.checkpoint,
+        "upscale_factor": model.upscale_factor,
+        "inference": model.inference,
+        "resolution": resolution,
+        "settings": settings,
+    }
 
 
 def _require_official_commands(*commands: str) -> None:
@@ -2841,6 +2962,26 @@ def _canonical_mask_from_probabilities(
     model_name: str,
     upscale_factor: int,
 ) -> np.ndarray:
+    _, pooled = _canonical_probabilities_from_export(
+        source,
+        image_id=image_id,
+        width=width,
+        height=height,
+        model_name=model_name,
+        upscale_factor=upscale_factor,
+    )
+    return np.argmax(pooled, axis=0).astype(np.uint8)
+
+
+def _canonical_probabilities_from_export(
+    source: Path,
+    *,
+    image_id: str,
+    width: int,
+    height: int,
+    model_name: str,
+    upscale_factor: int,
+) -> tuple[np.ndarray, np.ndarray]:
     if not source.is_file():
         raise DatasetValidationError(
             ValidationIssue(
@@ -2889,7 +3030,17 @@ def _canonical_mask_from_probabilities(
         width,
         upscale_factor,
     ).mean(axis=(2, 4))
-    return np.argmax(pooled, axis=0).astype(np.uint8)
+    return probabilities, pooled
+
+
+def _binary_probability_mask(
+    probabilities: np.ndarray,
+    threshold: float | None,
+) -> np.ndarray:
+    values = np.asarray(probabilities, dtype=np.float32)
+    if threshold is None:
+        return np.argmax(values, axis=0).astype(np.uint8)
+    return (values[1] >= float(threshold)).astype(np.uint8)
 
 
 def _load_official_summary(path: Path, model_name: str) -> dict[str, Any]:

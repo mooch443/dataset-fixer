@@ -1,8 +1,13 @@
 """Safe, reproducible computer-vision dataset transformations."""
 
 from .dataset import Dataset
+from .calibration import ThresholdCalibrationResult, calibrate_prediction_thresholds
 from .comparison.types import ComparisonResult
-from .errors import DatasetValidationError
+from .errors import (
+    DatasetValidationError,
+    PredictionCacheMissError,
+    PredictionScoreUnavailableError,
+)
 from .geometry import Geometry
 from .model import ImagePrediction, Model, ModelCollection, ModelInput, PredictionResult
 from .models import SemanticComparisonResult, Task
@@ -16,6 +21,7 @@ except ImportError:  # source tree before setuptools-scm has generated the file
 
 __all__ = [
     "Dataset",
+    "calibrate_prediction_thresholds",
     "ComparisonResult",
     "DatasetValidationError",
     "DatasetTrace",
@@ -27,8 +33,11 @@ __all__ = [
     "ModelInput",
     "PredictionResult",
     "PredictionCache",
+    "PredictionCacheMissError",
+    "PredictionScoreUnavailableError",
     "SemanticComparisonResult",
     "SampleTrace",
     "Task",
+    "ThresholdCalibrationResult",
     "__version__",
 ]

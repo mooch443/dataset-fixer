@@ -174,6 +174,17 @@ class PredictionCache:
             native_mask = _load_mask(root, stored.get("native_mask"), None, None)
             if stored.get("native_mask") is not None and native_mask is None:
                 return None
+            foreground_probability = _load_probability(
+                root,
+                stored.get("foreground_probability"),
+                source.width,
+                source.height,
+            )
+            if (
+                stored.get("foreground_probability") is not None
+                and foreground_probability is None
+            ):
+                return None
 
             objects: list[Prediction] = []
             raw_objects = stored.get("objects") or []
@@ -203,6 +214,7 @@ class PredictionCache:
                     objects=tuple(objects),
                     mask=mask,
                     native_mask=native_mask,
+                    foreground_probability=foreground_probability,
                     metadata=metadata,
                 )
             )
@@ -282,6 +294,13 @@ class PredictionCache:
                     record.image_id,
                     record.native_mask,
                 )
+                probability_path = _save_probability(
+                    staging,
+                    record.image_id,
+                    record.foreground_probability,
+                    width=record.width,
+                    height=record.height,
+                )
                 objects_path = _save_objects(staging, record.image_id, record.objects)
                 records.append(
                     {
@@ -291,6 +310,7 @@ class PredictionCache:
                         "height": record.height,
                         "mask": mask_path,
                         "native_mask": native_path,
+                        "foreground_probability": probability_path,
                         "objects": objects_path,
                         "metadata": to_jsonable(record.metadata),
                     }
@@ -439,6 +459,64 @@ def _load_mask(
     if width is not None and height is not None and mask.shape != (height, width):
         return None
     return mask
+
+
+def _save_probability(
+    root: Path,
+    image_id: str,
+    value: np.ndarray | None,
+    *,
+    width: int,
+    height: int,
+) -> str | None:
+    if value is None:
+        return None
+    probability = np.asarray(value, dtype=np.float32)
+    if probability.shape != (height, width):
+        raise DatasetValidationError(
+            f"Foreground probability {image_id!r} has shape {probability.shape}; "
+            f"expected {(height, width)}"
+        )
+    if (
+        not np.all(np.isfinite(probability))
+        or np.any(probability < -1e-6)
+        or np.any(probability > 1 + 1e-6)
+    ):
+        raise DatasetValidationError(
+            f"Foreground probability {image_id!r} is not finite in [0, 1]"
+        )
+    relative = Path("foreground-probabilities") / f"{image_id}.npy"
+    destination = root / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # Float16 halves long-lived cache size; threshold calibration does not
+    # benefit from float32 precision at the selected operating grid.
+    np.save(destination, np.clip(probability, 0.0, 1.0).astype(np.float16))
+    return relative.as_posix()
+
+
+def _load_probability(
+    root: Path,
+    value: Any,
+    width: int,
+    height: int,
+) -> np.ndarray | None:
+    if value is None:
+        return None
+    path = root / str(value)
+    if not path.is_file():
+        return None
+    try:
+        probability = np.load(path, allow_pickle=False, mmap_mode="r")
+    except (OSError, ValueError):
+        return None
+    if (
+        probability.shape != (height, width)
+        or not np.all(np.isfinite(probability))
+        or np.any(probability < -1e-6)
+        or np.any(probability > 1 + 1e-6)
+    ):
+        return None
+    return probability
 
 
 def _prediction_to_json(value: Any) -> dict[str, Any]:

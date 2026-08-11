@@ -11,9 +11,14 @@ from typing import Any, Literal
 
 import numpy as np
 import yaml
-from PIL import Image
+from PIL import Image, ImageDraw
 
-from .errors import DatasetValidationError, ValidationIssue
+from .errors import (
+    DatasetValidationError,
+    PredictionCacheMissError,
+    PredictionScoreUnavailableError,
+    ValidationIssue,
+)
 from .geometry import Geometry, filter_inputs_by_size, normalize_errors
 from .prediction_cache import PredictionCache
 from .utils import IMAGE_SUFFIXES, sha256_file, slugify, to_jsonable
@@ -79,6 +84,10 @@ class ImagePrediction:
         objects: Object predictions for instance-style tasks.
         mask: Projected semantic prediction in output-image space.
         native_mask: Optional prediction in native adapter output space.
+        foreground_probability: Optional canonical-space foreground
+            probability map. Unlike ``mask``, this is independent of the
+            selected semantic operating threshold and can therefore be reused
+            for calibration without rerunning inference.
         metadata: Backend-specific non-tensor prediction metadata.
     """
 
@@ -90,6 +99,11 @@ class ImagePrediction:
     objects: tuple[Any, ...] = ()
     mask: np.ndarray | None = field(default=None, repr=False, compare=False)
     native_mask: np.ndarray | None = field(default=None, repr=False, compare=False)
+    foreground_probability: np.ndarray | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -99,6 +113,51 @@ class ImagePrediction:
         if self.mask is not None:
             return int(np.count_nonzero(self.mask))
         return len(self.objects)
+
+    def foreground_score_map(self) -> np.ndarray | None:
+        """Return reusable semantic scores or rasterized instance scores.
+
+        Semantic records return their foreground-probability map. Instance
+        segmentation records are rasterized lazily without changing or
+        discarding their object polygons: each covered pixel receives the
+        maximum score of any covering instance. This derived field is an
+        object-confidence projection, not a calibrated per-pixel posterior.
+
+        Returns:
+            A float32 ``(height, width)`` score map, or ``None`` when neither
+            semantic probabilities nor segmentation polygons are available.
+        """
+
+        if self.foreground_probability is not None:
+            return np.asarray(self.foreground_probability, dtype=np.float32)
+        polygon_predictions = [
+            prediction
+            for prediction in self.objects
+            if prediction.polygons or prediction.polygon is not None
+        ]
+        if not polygon_predictions and self.objects:
+            return None
+        canvas = Image.new("F", (self.width, self.height), 0.0)
+        draw = ImageDraw.Draw(canvas)
+        # Painting low-to-high makes overlaps equal the maximum object score.
+        for prediction in sorted(
+            polygon_predictions,
+            key=lambda value: float(value.score),
+        ):
+            polygons = prediction.polygons or (
+                [prediction.polygon] if prediction.polygon is not None else []
+            )
+            for polygon in polygons:
+                if len(polygon) < 3 or any(
+                    not math.isfinite(float(x)) or not math.isfinite(float(y))
+                    for x, y in polygon
+                ):
+                    continue
+                draw.polygon(
+                    [(float(x), float(y)) for x, y in polygon],
+                    fill=float(prediction.score),
+                )
+        return np.asarray(canvas, dtype=np.float32)
 
 
 @dataclass(frozen=True)
@@ -155,7 +214,12 @@ class PredictionResult:
             if record.mask is not None
         }
 
-    def save(self, destination: str | Path) -> Path:
+    def save(
+        self,
+        destination: str | Path,
+        *,
+        include_probabilities: bool = False,
+    ) -> Path:
         """Save predictions in a compact task-appropriate representation.
 
         Semantic masks are written to ``masks/*.png`` and object-style output
@@ -163,6 +227,10 @@ class PredictionResult:
 
         Parameters:
             destination: New or empty prediction directory.
+            include_probabilities: Also export semantic foreground scores as
+                float16 ``foreground-probabilities/*.npy`` files. Unified
+                prediction caches retain these independently; the default
+                avoids duplicating large maps in report directories.
 
         Returns:
             The resolved output directory.
@@ -191,6 +259,12 @@ class PredictionResult:
         if self.task == "semantic_segment":
             mask_root = root / "masks"
             mask_root.mkdir(parents=True, exist_ok=True)
+            probability_root = root / "foreground-probabilities"
+            if include_probabilities and any(
+                record.foreground_probability is not None
+                for record in self.records
+            ):
+                probability_root.mkdir(parents=True, exist_ok=True)
             for record in self.records:
                 if record.mask is None:
                     raise DatasetValidationError(
@@ -209,6 +283,21 @@ class PredictionResult:
                 Image.fromarray(mask.astype(dtype)).save(
                     mask_root / f"{record.image_id}.png", format="PNG"
                 )
+                if include_probabilities and record.foreground_probability is not None:
+                    probability = np.asarray(
+                        record.foreground_probability,
+                        dtype=np.float32,
+                    )
+                    if probability.shape != (record.height, record.width):
+                        raise DatasetValidationError(
+                            f"Foreground probability {record.image_id!r} has "
+                            f"shape {probability.shape}; expected "
+                            f"{(record.height, record.width)}"
+                        )
+                    np.save(
+                        probability_root / f"{record.image_id}.npy",
+                        np.clip(probability, 0.0, 1.0).astype(np.float16),
+                    )
         else:
             rows = []
             for record in self.records:
@@ -376,6 +465,7 @@ class _PredictionCacheRequest:
     package_payload: dict[str, Any] | None = None
     postprocess: float = 0.7
     keep_native: bool = False
+    compatible_identities: tuple[dict[str, Any], ...] = ()
 
 
 class Model:
@@ -418,8 +508,12 @@ class Model:
         nnunet_tta: Whether nnU-Net inference averages mirrored test-time
             augmentations. Disabled by default because it multiplies inference
             work by up to four for a 2D model.
-        confidence: Default prediction confidence floor.
+        confidence: Backward-compatible instance-score floor.
         postprocess: Default native IoU or SAHI match threshold.
+        prediction_threshold: Task-aware retention threshold: foreground
+            probability for semantic models and instance score otherwise.
+        foreground_probability_threshold: Backward-compatible semantic alias
+            for ``prediction_threshold``.
         sahi_slice_height: SAHI tile height in canonical source pixels.
         sahi_slice_width: SAHI tile width in canonical source pixels.
         sahi_overlap: Default SAHI overlap ratio for both axes.
@@ -457,6 +551,8 @@ class Model:
         nnunet_tta: bool = False,
         confidence: float = 0.25,
         postprocess: float = 0.7,
+        foreground_probability_threshold: float | None = None,
+        prediction_threshold: float | None = None,
         sahi_slice_height: int | None = None,
         sahi_slice_width: int | None = None,
         sahi_overlap: float | None = None,
@@ -545,6 +641,8 @@ class Model:
         explicit_settings = {
             "confidence": confidence,
             "postprocess": postprocess,
+            "foreground_probability_threshold": foreground_probability_threshold,
+            "prediction_threshold": prediction_threshold,
             "sahi_slice_height": sahi_slice_height,
             "sahi_slice_width": sahi_slice_width,
             "sahi_overlap": sahi_overlap,
@@ -558,6 +656,13 @@ class Model:
         self._settings.update(
             {key: value for key, value in explicit_settings.items() if value is not None}
         )
+        if (
+            self._settings.get("prediction_threshold") is not None
+            and self._settings.get("foreground_probability_threshold") is not None
+        ):
+            raise ValueError(
+                "Use prediction_threshold; do not configure both threshold aliases"
+            )
         removed_comparison_settings = sorted(
             {
                 "baseline",
@@ -587,7 +692,12 @@ class Model:
                 self._settings,
                 resolution=int(resolution) if resolution is not None else 480,
             )
-        for key in ("confidence", "postprocess"):
+        for key in (
+            "confidence",
+            "postprocess",
+            "foreground_probability_threshold",
+            "prediction_threshold",
+        ):
             if key in self._settings:
                 value = float(self._settings[key])
                 if not math.isfinite(value) or not 0 <= value <= 1:
@@ -796,6 +906,10 @@ class Model:
     def confidence(self) -> float:
         """Fixed prediction/evaluation confidence floor."""
 
+        if not self._uses_semantic_prediction_threshold() and self._settings.get(
+            "prediction_threshold"
+        ) is not None:
+            return float(self._settings["prediction_threshold"])
         return float(self._settings["confidence"])
 
     @property
@@ -803,6 +917,36 @@ class Model:
         """Fixed native IoU or SAHI match threshold."""
 
         return float(self._settings["postprocess"])
+
+    @property
+    def foreground_probability_threshold(self) -> float | None:
+        """Foreground cutoff for semantic models, or ``None`` for argmax."""
+
+        value = self._settings.get("foreground_probability_threshold")
+        if self._uses_semantic_prediction_threshold() and self._settings.get(
+            "prediction_threshold"
+        ) is not None:
+            value = self._settings["prediction_threshold"]
+        return None if value is None else float(value)
+
+    @property
+    def prediction_threshold(self) -> float:
+        """Task-aware cutoff used to retain semantic pixels or instances."""
+
+        if self._uses_semantic_prediction_threshold():
+            value = self.foreground_probability_threshold
+            return 0.5 if value is None else value
+        return self.confidence
+
+    def _uses_semantic_prediction_threshold(self) -> bool:
+        """Recognize semantic checkpoints before lazy backend task loading."""
+
+        return (
+            self.kind == "nnunet"
+            or self.task == "semantic_segment"
+            or "-sem" in self.model_type.lower()
+            or "-sem" in self.path.stem.lower()
+        )
 
     @property
     def training_dataset(self) -> Path | None:
@@ -934,6 +1078,8 @@ class Model:
             "device": self.device,
             "confidence": self.confidence,
             "postprocess": self.postprocess,
+            "foreground_probability_threshold": self.foreground_probability_threshold,
+            "prediction_threshold": self.prediction_threshold,
             "folds": self.folds,
             "checkpoint": self.checkpoint if self.kind == "nnunet" else None,
             "checkpoint_sha256": (
@@ -960,6 +1106,12 @@ class Model:
 
         values = dict(overrides or {})
         settings = {**self.settings, **dict(values.pop("settings", {}) or {})}
+        requested_prediction_threshold = values.get(
+            "prediction_threshold",
+            self._settings.get("prediction_threshold"),
+        )
+        if requested_prediction_threshold is not None:
+            settings.pop("foreground_probability_threshold", None)
         native = values.pop("native_tile_size", self.geometry.native_tile_size)
         factor = values.pop("upscale_factor", self.geometry.upscale_factor)
         model_input = values.pop(
@@ -986,6 +1138,12 @@ class Model:
             "nnunet_tta": self.nnunet_tta,
             "confidence": self.confidence,
             "postprocess": self.postprocess,
+            "foreground_probability_threshold": (
+                None
+                if requested_prediction_threshold is not None
+                else self.foreground_probability_threshold
+            ),
+            "prediction_threshold": requested_prediction_threshold,
             "settings": settings,
         }
         defaults.update(values)
@@ -1026,12 +1184,16 @@ class Model:
         resolution: int | None = None,
         confidence: float | None = None,
         postprocess: float | None = None,
+        prediction_threshold: float | None = None,
+        foreground_probability_threshold: float | None = None,
         device: str | None = None,
         batch_size: int | None = None,
         errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
         destination: str | Path | None = None,
         prediction_cache: bool | str | Path | PredictionCache = False,
+        cache_only: bool = False,
+        require_probability_maps: bool = False,
         settings: Mapping[str, Any] | None = None,
         sahi_slice_height: int | None = None,
         sahi_slice_width: int | None = None,
@@ -1063,6 +1225,12 @@ class Model:
                 the model's ``confidence`` setting, then ``0.25``.
             postprocess: Native IoU or SAHI match-threshold override. If
                 omitted, use the model's ``postprocess`` setting, then ``0.7``.
+            prediction_threshold: Task-aware retention threshold. For semantic
+                models this is a foreground-probability cutoff after full-image
+                reconstruction; for instance models it is the minimum score.
+            foreground_probability_threshold: Semantic foreground-probability
+                cutoff retained as a backward-compatible alias for
+                ``prediction_threshold``.
             device: Device override.
             batch_size: Inference batch override. ``-1`` adaptively retries
                 accelerator OOM failures with smaller batches.
@@ -1078,6 +1246,12 @@ class Model:
                 the dataset-local comparison cache for :class:`Dataset`
                 inputs and package-managed storage otherwise. A path is an
                 explicit cache base; :class:`PredictionCache` is also accepted.
+            cache_only: Never run inference. Raise
+                :class:`PredictionCacheMissError` when a complete compatible
+                cache entry is unavailable.
+            require_probability_maps: Require canonical semantic foreground
+                probabilities rather than accepting a legacy hard-mask-only
+                cache. This is intended for threshold calibration.
             settings: Additional per-call adapter overrides.
             sahi_slice_height: Optional SAHI tile height in source pixels.
             sahi_slice_width: Optional SAHI tile width in source pixels.
@@ -1101,13 +1275,41 @@ class Model:
         if cache_override is None:
             cache_identity_override = None
             cache_namespace_override = None
+            cache_compatible_identity_overrides: tuple[dict[str, Any], ...] = ()
         else:
-            prediction_cache, cache_identity_override, cache_namespace_override = (
-                cache_override
-            )
+            if len(cache_override) == 3:
+                (
+                    prediction_cache,
+                    cache_identity_override,
+                    cache_namespace_override,
+                ) = cache_override
+                cache_compatible_identity_overrides = ()
+            else:
+                (
+                    prediction_cache,
+                    cache_identity_override,
+                    cache_namespace_override,
+                    cache_compatible_identity_overrides,
+                ) = cache_override
         combined_settings = {**self.settings, **dict(settings or {})}
+        if (
+            prediction_threshold is not None
+            and foreground_probability_threshold is not None
+        ):
+            raise ValueError(
+                "Pass prediction_threshold, not both threshold aliases"
+            )
+        semantic_task = self._uses_semantic_prediction_threshold()
+        if prediction_threshold is not None:
+            combined_settings["prediction_threshold"] = float(prediction_threshold)
+        elif foreground_probability_threshold is not None:
+            combined_settings["foreground_probability_threshold"] = float(
+                foreground_probability_threshold
+            )
         effective_confidence = (
-            float(confidence)
+            float(prediction_threshold)
+            if prediction_threshold is not None and not semantic_task
+            else float(confidence)
             if confidence is not None
             else self.confidence
         )
@@ -1116,16 +1318,47 @@ class Model:
             if postprocess is not None
             else self.postprocess
         )
+        effective_foreground_threshold = (
+            float(prediction_threshold)
+            if prediction_threshold is not None and semantic_task
+            else float(foreground_probability_threshold)
+            if foreground_probability_threshold is not None
+            else self.foreground_probability_threshold
+        )
         if not math.isfinite(effective_confidence) or not 0 <= effective_confidence <= 1:
             raise ValueError("confidence must be finite and in [0, 1]")
         if not math.isfinite(effective_postprocess) or not 0 <= effective_postprocess <= 1:
             raise ValueError("postprocess must be finite and in [0, 1]")
+        if effective_foreground_threshold is not None and (
+            not math.isfinite(effective_foreground_threshold)
+            or not 0 <= effective_foreground_threshold <= 1
+        ):
+            raise ValueError(
+                "foreground_probability_threshold must be finite and in [0, 1]"
+            )
+        if cache_only and prediction_cache is False:
+            raise ValueError("cache_only=True requires prediction_cache to be enabled")
         requested = inference or self.inference
         if requested not in {"native", "sahi"}:
             raise ValueError("inference must be 'native' or 'sahi'; 'auto' was removed")
-        inputs, source_task, cache_context = normalize_model_inputs(
-            source, split=split, progress=progress
+        normalized_override = getattr(
+            self,
+            "_normalized_prediction_override",
+            None,
         )
+        if (
+            isinstance(normalized_override, tuple)
+            and len(normalized_override) == 5
+            and normalized_override[0] is source
+            and normalized_override[1] == split
+        ):
+            inputs = tuple(normalized_override[2])
+            source_task = normalized_override[3]
+            cache_context = dict(normalized_override[4])
+        else:
+            inputs, source_task, cache_context = normalize_model_inputs(
+                source, split=split, progress=progress
+            )
         inputs, skipped_inputs = filter_inputs_by_size(
             inputs,
             maximum=None if requested == "sahi" else self.native_tile_size,
@@ -1217,6 +1450,7 @@ class Model:
             keep_native=_keep_native,
             identity_override=cache_identity_override,
             namespace_override=cache_namespace_override,
+            compatible_identity_overrides=cache_compatible_identity_overrides,
         )
         cached_result = _load_prediction_cache_request(
             cache_request,
@@ -1231,11 +1465,27 @@ class Model:
             postprocess=effective_postprocess,
             combined_settings=combined_settings,
             resolved_sahi=resolved_sahi.as_dict(),
+            foreground_probability_threshold=effective_foreground_threshold,
+            require_probability_maps=require_probability_maps,
         )
         if cached_result is not None:
             if destination is not None:
                 cached_result.save(destination)
             return cached_result
+        if cache_only:
+            detail = (
+                "a verified cache entry with foreground probability maps"
+                if require_probability_maps
+                else "a verified complete prediction cache entry"
+            )
+            raise PredictionCacheMissError(
+                f"Cache-only prediction for {self.name!r} requires {detail}",
+                reason=(
+                    "missing-probability-maps"
+                    if require_probability_maps
+                    else "missing"
+                ),
+            )
 
         started = time.perf_counter()
         if self.kind == "nnunet":
@@ -1251,6 +1501,7 @@ class Model:
                 resolution=effective_resolution,
                 settings={**combined_settings, **resolved_sahi.as_dict()},
                 batch_size=effective_batch_size,
+                foreground_probability_threshold=effective_foreground_threshold,
             )
             backend = selected_backend
             task: PredictionTask = "semantic_segment"
@@ -1288,23 +1539,45 @@ class Model:
                 progress=progress,
                 settings={**combined_settings, **resolved_sahi.as_dict()},
                 batch_size=effective_batch_size,
+                foreground_probability_threshold=effective_foreground_threshold,
             )
             self._resolved_task = resolved_task
             task = resolved_task
             backend = selected_backend
             if task == "semantic_segment":
-                records = tuple(
-                    ImagePrediction(
-                        image_id=value.image_id,
-                        image_path=value.image_path,
-                        relative_path=value.relative_path,
-                        width=value.width,
-                        height=value.height,
-                        mask=np.asarray(by_id[value.image_id]),
-                        metadata={"backend": backend},
+                semantic_records: list[ImagePrediction] = []
+                for value in inputs:
+                    semantic = by_id[value.image_id]
+                    class_map = getattr(semantic, "class_map", semantic)
+                    probability = getattr(
+                        semantic,
+                        "foreground_probability",
+                        None,
                     )
-                    for value in inputs
-                )
+                    semantic_records.append(
+                        ImagePrediction(
+                            image_id=value.image_id,
+                            image_path=value.image_path,
+                            relative_path=value.relative_path,
+                            width=value.width,
+                            height=value.height,
+                            mask=np.asarray(class_map),
+                            foreground_probability=(
+                                None
+                                if probability is None
+                                else np.asarray(probability, dtype=np.float16)
+                            ),
+                            metadata={
+                                "backend": backend,
+                                "probability_source": getattr(
+                                    semantic,
+                                    "probability_source",
+                                    "class-map-only",
+                                ),
+                            },
+                        )
+                    )
+                records = tuple(semantic_records)
             else:
                 records = tuple(
                     ImagePrediction(
@@ -1323,6 +1596,12 @@ class Model:
                 "resolution": effective_resolution,
                 "confidence": effective_confidence,
                 "postprocess": effective_postprocess,
+                "foreground_probability_threshold": effective_foreground_threshold,
+                "prediction_threshold": (
+                    effective_foreground_threshold
+                    if task == "semantic_segment"
+                    else effective_confidence
+                ),
                 "batch_size": effective_batch_size,
                 **inference_telemetry,
                 **combined_settings,
@@ -1343,6 +1622,25 @@ class Model:
             inputs=inputs,
             result=result,
         )
+        if result.task == "semantic_segment" and (
+            effective_foreground_threshold is not None
+            or require_probability_maps
+        ):
+            missing_scores = [
+                record.image_id
+                for record in result.records
+                if record.foreground_probability is None
+            ]
+            if missing_scores:
+                # The hard-mask result was deliberately cached above. It is
+                # still valid for ordinary argmax/class-map use, but cannot be
+                # re-thresholded or calibrated without real model scores.
+                raise PredictionScoreUnavailableError(
+                    f"Semantic thresholding for {self.name!r} requires foreground "
+                    "probabilities or logits, but the backend returned only hard "
+                    f"class maps for {len(missing_scores)} image(s)",
+                    reason="backend-returned-no-semantic-probabilities",
+                )
         if destination is not None:
             result.save(destination)
         return result
@@ -1557,6 +1855,8 @@ class Model:
                     "nnunet_tta",
                     "confidence",
                     "postprocess",
+                    "foreground_probability_threshold",
+                    "prediction_threshold",
                     "sahi_slice_height",
                     "sahi_slice_width",
                     "sahi_overlap",
@@ -1698,6 +1998,8 @@ class ModelCollection:
             "nnunet_tta",
             "confidence",
             "postprocess",
+            "foreground_probability_threshold",
+            "prediction_threshold",
             "sahi_slice_height",
             "sahi_slice_width",
             "sahi_overlap",
@@ -1836,8 +2138,13 @@ class ModelCollection:
         if isinstance(active, Dataset) and active.format == "semantic_masks":
             model_tasks = {model.task for model in self.models}
             all_nnunet = all(model.kind == "nnunet" for model in self.models)
+            has_semantic_threshold = any(
+                model._settings.get("prediction_threshold") is not None
+                or model._settings.get("foreground_probability_threshold") is not None
+                for model in self.models
+            )
             semantic_compatible = model_tasks <= {"segment", "semantic_segment"}
-            if not all_nnunet:
+            if not all_nnunet or has_semantic_threshold:
                 if not semantic_compatible:
                     raise DatasetValidationError(
                         ValidationIssue(
@@ -1998,6 +2305,57 @@ class ModelCollection:
         return f"ModelCollection(models={self.names!r})"
 
 
+def _semantic_image_prediction_cache_identity(
+    model: Model,
+    *,
+    inputs: Sequence[ModelInput],
+    inference: str,
+    resolution: int,
+    confidence: float,
+    postprocess: float,
+    combined_settings: Mapping[str, Any],
+    resolved_sahi: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Identify inference from images and functional settings, never labels."""
+
+    from .prediction_cache import prediction_input_fingerprint
+
+    settings = dict(combined_settings)
+    for key in tuple(settings):
+        if key.startswith("sahi_"):
+            settings.pop(key)
+    settings.pop("prediction_threshold", None)
+    settings.pop("foreground_probability_threshold", None)
+    if model._uses_semantic_prediction_threshold():
+        # Ultralytics semantic logits and nnU-Net probabilities are produced
+        # before these detection/postprocessing compatibility settings.
+        settings.pop("confidence", None)
+        settings.pop("postprocess", None)
+    else:
+        settings["confidence"] = confidence
+        settings["postprocess"] = postprocess
+    return {
+        "schema": 3,
+        "space": "semantic-image-prediction",
+        "input_fingerprint": prediction_input_fingerprint(inputs),
+        "model_sha256": model.digest,
+        "kind": model.kind,
+        "task": (
+            "semantic_segment"
+            if model._uses_semantic_prediction_threshold()
+            else model.task
+        ),
+        "folds": model.folds,
+        "checkpoint": model.checkpoint,
+        "upscale_factor": model.upscale_factor,
+        "inference": inference,
+        "resolution": resolution,
+        "nnunet_tta": model.nnunet_tta if model.kind == "nnunet" else None,
+        "sahi": dict(resolved_sahi or {}) if inference == "sahi" else None,
+        "settings": settings,
+    }
+
+
 def _prepare_prediction_cache_request(
     *,
     model: Model,
@@ -2016,6 +2374,7 @@ def _prepare_prediction_cache_request(
     keep_native: bool,
     identity_override: Mapping[str, Any] | None,
     namespace_override: Literal["predictions", "semantic"] | None,
+    compatible_identity_overrides: Sequence[Mapping[str, Any]] = (),
 ) -> _PredictionCacheRequest | None:
     from .prediction_cache import (
         prediction_cache_key,
@@ -2041,12 +2400,25 @@ def _prepare_prediction_cache_request(
             namespace=namespace,
             postprocess=postprocess,
             keep_native=keep_native,
+            compatible_identities=tuple(
+                dict(value) for value in compatible_identity_overrides
+            ),
         )
 
     semantic_cohort = cache_context.get("semantic_cohort_fingerprint")
     if semantic_cohort:
+        image_identity = _semantic_image_prediction_cache_identity(
+            model,
+            inputs=inputs,
+            inference=inference,
+            resolution=resolution,
+            confidence=confidence,
+            postprocess=postprocess,
+            combined_settings=combined_settings,
+            resolved_sahi=resolved_sahi,
+        )
         if model.kind == "nnunet":
-            identity = {
+            cohort_identity = {
                 "schema": 2,
                 "space": "nnunet-semantic",
                 "cohort": str(semantic_cohort),
@@ -2061,16 +2433,23 @@ def _prepare_prediction_cache_request(
             }
             return _PredictionCacheRequest(
                 cache=cache,
-                key=prediction_cache_key(identity),
-                identity=identity,
+                key=prediction_cache_key(image_identity),
+                identity=image_identity,
                 namespace="semantic",
                 postprocess=postprocess,
                 keep_native=keep_native,
+                compatible_identities=(cohort_identity,),
             )
         identity_settings = dict(combined_settings)
+        # Probability maps are the threshold-independent inference product.
+        # The selected cutoff belongs to evaluation/report identity, not the
+        # expensive prediction identity.
+        identity_settings.pop("foreground_probability_threshold", None)
+        if model._uses_semantic_prediction_threshold():
+            identity_settings.pop("prediction_threshold", None)
         identity_settings["confidence"] = confidence
         identity_settings["postprocess"] = postprocess
-        identity = {
+        cohort_identity = {
             "schema": 2,
             "space": "binary-semantic",
             "cohort": str(semantic_cohort),
@@ -2091,11 +2470,12 @@ def _prepare_prediction_cache_request(
         }
         return _PredictionCacheRequest(
             cache=cache,
-            key=prediction_cache_key(identity),
-            identity=identity,
+            key=prediction_cache_key(image_identity),
+            identity=image_identity,
             namespace="semantic",
             postprocess=postprocess,
             keep_native=keep_native,
+            compatible_identities=(cohort_identity,),
         )
 
     cohort = cache_context.get("cohort")
@@ -2142,6 +2522,12 @@ def _prepare_prediction_cache_request(
         )
 
     identity_settings = dict(combined_settings)
+    if (
+        prediction_task == "semantic_segment"
+        or model._uses_semantic_prediction_threshold()
+    ):
+        identity_settings.pop("foreground_probability_threshold", None)
+        identity_settings.pop("prediction_threshold", None)
     identity_settings["confidence"] = confidence
     identity_settings["postprocess"] = postprocess
     identity = {
@@ -2187,6 +2573,8 @@ def _load_prediction_cache_request(
     postprocess: float,
     combined_settings: Mapping[str, Any],
     resolved_sahi: Mapping[str, Any],
+    foreground_probability_threshold: float | None,
+    require_probability_maps: bool,
 ) -> PredictionResult | None:
     if request is None:
         return None
@@ -2248,6 +2636,35 @@ def _load_prediction_cache_request(
         identity=request.identity,
         inputs=inputs,
     )
+    if cached is None:
+        from .prediction_cache import prediction_cache_key
+
+        for compatible_identity in request.compatible_identities:
+            compatible_key = prediction_cache_key(compatible_identity)
+            compatible = request.cache.load(
+                compatible_key,
+                namespace=request.namespace,
+                identity=compatible_identity,
+                inputs=inputs,
+            )
+            if compatible is None:
+                continue
+            promoted = request.cache.save(
+                request.key,
+                compatible,
+                namespace=request.namespace,
+                identity=request.identity,
+                inputs=inputs,
+            )
+            cached = replace(
+                promoted,
+                cache_info={
+                    **promoted.cache_info,
+                    "status": "compatible-hit",
+                    "compatible_key": compatible_key,
+                },
+            )
+            break
     if cached is not None:
         if request.keep_native and any(
             record.native_mask is None for record in cached.records
@@ -2263,27 +2680,96 @@ def _load_prediction_cache_request(
                     for record in cached.records
                 ),
             )
+        if cached is not None and cached.task == "semantic_segment":
+            missing_probabilities = any(
+                record.foreground_probability is None
+                for record in cached.records
+            )
+            if require_probability_maps and missing_probabilities:
+                cached = None
+            elif foreground_probability_threshold is not None:
+                if missing_probabilities:
+                    cached = None
+                else:
+                    cached = replace(
+                        cached,
+                        records=tuple(
+                            replace(
+                                record,
+                                mask=(
+                                    np.asarray(record.foreground_probability)
+                                    >= foreground_probability_threshold
+                                ).astype(np.uint8),
+                            )
+                            for record in cached.records
+                        ),
+                        settings={
+                            **cached.settings,
+                            "foreground_probability_threshold": (
+                                foreground_probability_threshold
+                            ),
+                            "prediction_threshold": foreground_probability_threshold,
+                        },
+                    )
+        elif cached is not None:
+            cached = replace(
+                cached,
+                records=tuple(
+                    replace(
+                        record,
+                        objects=tuple(
+                            value
+                            for value in record.objects
+                            if float(value.score) >= confidence
+                        ),
+                    )
+                    for record in cached.records
+                ),
+                settings={
+                    **cached.settings,
+                    "confidence": confidence,
+                    "prediction_threshold": confidence,
+                },
+            )
     if cached is not None:
         return replace(cached, model_name=model.name)
 
-    if request.namespace == "semantic" and not request.keep_native:
-        legacy = _load_legacy_semantic_prediction(
-            request,
-            inputs=inputs,
-            model=model,
-            backend=backend,
-            settings=_cached_result_settings(
-                device=device,
-                batch_size=batch_size,
-                resolution=resolution,
-                confidence=confidence,
-                postprocess=postprocess,
-                combined_settings=combined_settings,
-                resolved_sahi=resolved_sahi,
-                source_size_policy=source_size_policy,
-            ),
+    if (
+        request.namespace == "semantic"
+        and not request.keep_native
+        and not require_probability_maps
+        and foreground_probability_threshold is None
+    ):
+        from .prediction_cache import prediction_cache_key
+
+        legacy_requests = (request,) + tuple(
+            replace(
+                request,
+                key=prediction_cache_key(identity),
+                identity=dict(identity),
+                compatible_identities=(),
+            )
+            for identity in request.compatible_identities
         )
-        if legacy is not None:
+        for legacy_request in legacy_requests:
+            legacy = _load_legacy_semantic_prediction(
+                legacy_request,
+                inputs=inputs,
+                model=model,
+                backend=backend,
+                settings=_cached_result_settings(
+                    device=device,
+                    batch_size=batch_size,
+                    resolution=resolution,
+                    confidence=confidence,
+                    postprocess=postprocess,
+                    combined_settings=combined_settings,
+                    resolved_sahi=resolved_sahi,
+                    source_size_policy=source_size_policy,
+                ),
+            )
+            if legacy is None:
+                continue
             promoted = request.cache.save(
                 request.key,
                 legacy,
@@ -2296,6 +2782,7 @@ def _load_prediction_cache_request(
                 cache_info={
                     **promoted.cache_info,
                     "status": "legacy-hit",
+                    "compatible_key": legacy_request.key,
                 },
             )
     return None
@@ -2379,7 +2866,7 @@ def _load_legacy_semantic_prediction(
     backend: str,
     settings: Mapping[str, Any],
 ) -> PredictionResult | None:
-    if model.task != "semantic_segment":
+    if not model._uses_semantic_prediction_threshold():
         return None
     root = request.cache.entry(request.key, namespace="semantic")
     metadata_path = root / "evaluation.json"

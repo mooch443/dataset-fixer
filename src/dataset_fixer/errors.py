@@ -43,3 +43,43 @@ class DatasetValidationError(ValueError):
             self.issues = issues
         body = "\n".join(f"  {i + 1}. {issue.format()}" for i, issue in enumerate(self.issues))
         super().__init__(f"Dataset validation failed with {len(self.issues)} error(s):\n{body}")
+
+
+class PredictionCacheMissError(RuntimeError):
+    """Raised when cache-only prediction cannot return the requested data.
+
+    ``reason`` is machine-readable so calibration workflows can distinguish a
+    completely missing prediction from a valid legacy hard-mask cache that
+    lacks probability maps.
+
+    Args:
+        message: Human-readable description of the unavailable cache product.
+        reason: Stable machine-readable cache-miss category.
+    """
+
+    def __init__(self, message: str, *, reason: str = "missing") -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
+class PredictionScoreUnavailableError(RuntimeError):
+    """Raised when a requested threshold cannot be applied to model output.
+
+    Semantic probability thresholds require logits or probabilities. A hard
+    class map remains a valid prediction artifact, but it cannot be calibrated
+    or re-thresholded without inventing score information that the backend did
+    not return.
+
+    Args:
+        message: Human-readable explanation of the unavailable score product.
+        reason: Stable machine-readable failure category.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str = "missing-semantic-probabilities",
+    ) -> None:
+        self.reason = reason
+        super().__init__(message)

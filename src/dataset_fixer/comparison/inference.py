@@ -4,6 +4,7 @@ import gc
 import math
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -28,6 +29,93 @@ if TYPE_CHECKING:
 
 _ULTRALYTICS_AUTO_BATCH_PIXELS = 64 * 1024 * 1024
 _ULTRALYTICS_AUTO_BATCH_MAX = 128
+
+
+@dataclass(frozen=True)
+class SemanticOutput:
+    """One semantic class map plus reusable canonical foreground scores."""
+
+    class_map: np.ndarray
+    foreground_probability: np.ndarray | None
+    probability_source: str
+
+
+_SEMANTIC_PROBABILITY_PREDICTOR: type[Any] | None = None
+
+
+def _semantic_probability_predictor() -> type[Any]:
+    """Return an Ultralytics semantic predictor that retains scaled logits."""
+
+    global _SEMANTIC_PROBABILITY_PREDICTOR
+    if _SEMANTIC_PROBABILITY_PREDICTOR is not None:
+        return _SEMANTIC_PROBABILITY_PREDICTOR
+
+    import torch
+    import torch.nn.functional as torch_functional
+    from ultralytics.models.yolo.semantic.predict import (
+        SemanticSegmentationPredictor,
+    )
+    from ultralytics.utils import ops
+
+    class ProbabilitySemanticSegmentationPredictor(
+        SemanticSegmentationPredictor
+    ):
+        """Preserve pre-argmax semantic logits on each Results object."""
+
+        def postprocess(self, preds: Any, img: Any, orig_imgs: Any) -> list[Any]:
+            raw = preds[0] if isinstance(preds, (tuple, list)) else preds
+            originals = (
+                orig_imgs
+                if isinstance(orig_imgs, list)
+                else ops.convert_torch2numpy_batch(orig_imgs)[..., ::-1]
+            )
+            output = super().postprocess(preds, img, orig_imgs)
+            for prediction, original, result in zip(
+                raw,
+                originals,
+                output,
+                strict=True,
+            ):
+                if prediction.ndim == 2:
+                    # Exported graphs with an in-graph ArgMax have already
+                    # destroyed the score information and are not calibratable.
+                    continue
+                logits = prediction[None].float()
+                if logits.shape[2:] != img.shape[2:]:
+                    logits = torch_functional.interpolate(
+                        logits,
+                        img.shape[2:],
+                        mode="bilinear",
+                    )
+                logits = ops.scale_masks(logits, original.shape[:2])[0]
+                result.semantic_logits = logits.detach().to(
+                    device="cpu",
+                    dtype=torch.float16,
+                )
+            return output
+
+    ProbabilitySemanticSegmentationPredictor.__name__ = (
+        "DatasetFixerProbabilitySemanticSegmentationPredictor"
+    )
+    _SEMANTIC_PROBABILITY_PREDICTOR = ProbabilitySemanticSegmentationPredictor
+    return ProbabilitySemanticSegmentationPredictor
+
+
+def _predict_ultralytics(
+    model: Any,
+    *,
+    source: Any,
+    semantic: bool,
+    options: dict[str, Any],
+) -> list[Any]:
+    """Predict while retaining semantic score maps when the backend has them."""
+
+    if not semantic:
+        return list(model.predict(source=source, **options))
+    predictor = _semantic_probability_predictor()
+    if not isinstance(getattr(model, "predictor", None), predictor):
+        model.predictor = None
+    return list(model.predict(source=source, predictor=predictor, **options))
 
 
 def resolve_backend(requested: str, task: str) -> str:
@@ -116,8 +204,9 @@ def predict_model_inputs(
     progress: bool,
     settings: dict[str, Any],
     batch_size: int,
+    foreground_probability_threshold: float | None = None,
 ) -> tuple[
-    dict[str, list[Prediction] | np.ndarray],
+    dict[str, list[Prediction] | SemanticOutput],
     "PredictionTask",
     dict[str, Any],
 ]:
@@ -135,6 +224,7 @@ def predict_model_inputs(
             progress=progress,
             settings=settings,
             batch_size=batch_size,
+            foreground_probability_threshold=foreground_probability_threshold,
         )
     return _predict_native_inputs(
         model,
@@ -147,6 +237,7 @@ def predict_model_inputs(
         progress=progress,
         settings=settings,
         batch_size=batch_size,
+        foreground_probability_threshold=foreground_probability_threshold,
     )
 
 
@@ -162,8 +253,9 @@ def _predict_native_inputs(
     progress: bool,
     settings: dict[str, Any],
     batch_size: int,
+    foreground_probability_threshold: float | None = None,
 ) -> tuple[
-    dict[str, list[Prediction] | np.ndarray],
+    dict[str, list[Prediction] | SemanticOutput],
     "PredictionTask",
     dict[str, Any],
 ]:
@@ -203,7 +295,7 @@ def _predict_native_inputs(
         kwargs["device"] = device
     if settings.get("precision") == "half":
         kwargs["half"] = True
-    output: dict[str, list[Prediction] | np.ndarray] = {}
+    output: dict[str, list[Prediction] | SemanticOutput] = {}
     progress_bar = tqdm(
         total=len(inputs),
         desc=f"{model.name} native {threshold:g}",
@@ -216,7 +308,12 @@ def _predict_native_inputs(
     def predict_batch(batch: list["ModelInput"]) -> list[Any]:
         paths = [str(record.image_path) for record in batch]
         source: str | list[str] = paths[0] if len(paths) == 1 else paths
-        results = list(loaded.predict(source=source, **kwargs))
+        results = _predict_ultralytics(
+            loaded,
+            source=source,
+            semantic=detected_task == "semantic_segment",
+            options=kwargs,
+        )
         if len(results) != len(batch):
             raise DatasetValidationError(
                 ValidationIssue(
@@ -250,9 +347,11 @@ def _predict_native_inputs(
     def consume_batch(batch: list["ModelInput"], results: list[Any]) -> None:
         for record, result in zip(batch, results):
             if detected_task == "semantic_segment":
-                output[record.image_id] = _semantic_class_map(
+                output[record.image_id] = _semantic_output(
                     result,
                     expected_shape=(record.height, record.width),
+                    num_classes=_model_class_count(loaded),
+                    threshold=foreground_probability_threshold,
                     source=f"{model.name}: {record.relative_path}",
                 )
             else:
@@ -488,8 +587,9 @@ def _predict_sahi_inputs(
     progress: bool,
     settings: dict[str, Any],
     batch_size: int,
+    foreground_probability_threshold: float | None = None,
 ) -> tuple[
-    dict[str, list[Prediction] | np.ndarray],
+    dict[str, list[Prediction] | SemanticOutput],
     "PredictionTask",
     dict[str, Any],
 ]:
@@ -528,7 +628,7 @@ def _predict_sahi_inputs(
                 expected="detect, segment, pose, polo/locate, or semantic",
             )
         )
-    output: dict[str, list[Prediction] | np.ndarray] = {}
+    output: dict[str, list[Prediction] | SemanticOutput] = {}
     manifests = {
         record.image_id: build_tile_manifest(
             width=record.width,
@@ -547,6 +647,9 @@ def _predict_sahi_inputs(
     }
     semantic_by_image: dict[str, list[tuple[SahiTile, np.ndarray]]] = {
         record.image_id: [] for record in inputs
+    }
+    semantic_probability_sources: dict[str, set[str]] = {
+        record.image_id: set() for record in inputs
     }
     tile_progress = tqdm(
         total=len(descriptors),
@@ -600,6 +703,16 @@ def _predict_sahi_inputs(
     ) -> None:
         for (record, tile), result in zip(batch, results):
             if detected_task == "semantic_segment":
+                if getattr(result, "semantic_probabilities", None) is not None:
+                    semantic_probability_sources[record.image_id].add(
+                        "model-probabilities"
+                    )
+                elif getattr(result, "semantic_logits", None) is not None:
+                    semantic_probability_sources[record.image_id].add("model-logits")
+                else:
+                    semantic_probability_sources[record.image_id].add(
+                        "class-map-fallback"
+                    )
                 semantic_by_image[record.image_id].append(
                     (
                         tile,
@@ -653,8 +766,17 @@ def _predict_sahi_inputs(
                 height=record.height,
                 tiles=semantic_by_image[record.image_id],
             )
-            output[record.image_id] = np.argmax(probabilities, axis=0).astype(
-                _class_map_dtype(probabilities.shape[0])
+            sources = semantic_probability_sources[record.image_id]
+            probability_source = (
+                next(iter(sources))
+                if len(sources) == 1
+                else "mixed:" + ",".join(sorted(sources))
+            )
+            output[record.image_id] = _semantic_output_from_probabilities(
+                probabilities,
+                threshold=foreground_probability_threshold,
+                probability_source=probability_source,
+                retain_probability="class-map-fallback" not in sources,
             )
         elif detected_task in {"pose", "polo"}:
             output[record.image_id] = _postprocess_payload_predictions(
@@ -748,7 +870,13 @@ def _predict_ultralytics_tiles(
         kwargs["device"] = device
     if settings.get("precision") == "half":
         kwargs["half"] = True
-    results = model.predict(**kwargs)
+    results = _predict_ultralytics(
+        model,
+        source=kwargs.pop("source"),
+        semantic=_canonical_task(getattr(model, "task", None))
+        == "semantic_segment",
+        options=kwargs,
+    )
     if len(results) != len(images):
         raise DatasetValidationError(
             ValidationIssue(
@@ -1179,7 +1307,14 @@ def _semantic_probabilities(
         )
     if logits is not None:
         if values.shape[0] == 1:
-            foreground = 1.0 / (1.0 + np.exp(-values[0]))
+            binary_logits = values[0]
+            foreground = np.empty_like(binary_logits, dtype=np.float32)
+            nonnegative = binary_logits >= 0
+            foreground[nonnegative] = 1.0 / (
+                1.0 + np.exp(-binary_logits[nonnegative])
+            )
+            negative_exp = np.exp(binary_logits[~nonnegative])
+            foreground[~nonnegative] = negative_exp / (1.0 + negative_exp)
             values = np.stack((1.0 - foreground, foreground))
         else:
             values = values - np.max(values, axis=0, keepdims=True)
@@ -1192,6 +1327,74 @@ def _semantic_probabilities(
             ValidationIssue("Semantic probabilities contain non-finite values", source=source)
         )
     return values
+
+
+def _semantic_output(
+    result: Any,
+    *,
+    expected_shape: tuple[int, int],
+    num_classes: int | None,
+    threshold: float | None,
+    source: str,
+) -> SemanticOutput:
+    """Normalize a semantic result without pretending a class map is calibrated."""
+
+    has_probabilities = getattr(result, "semantic_probabilities", None) is not None
+    has_logits = getattr(result, "semantic_logits", None) is not None
+    probabilities = _semantic_probabilities(
+        result,
+        expected_shape=expected_shape,
+        num_classes=num_classes,
+        source=source,
+    )
+    probability_source = (
+        "model-probabilities"
+        if has_probabilities
+        else "model-logits"
+        if has_logits
+        else "class-map-fallback"
+    )
+    return _semantic_output_from_probabilities(
+        probabilities,
+        threshold=threshold,
+        probability_source=probability_source,
+        retain_probability=has_probabilities or has_logits,
+    )
+
+
+def _semantic_output_from_probabilities(
+    probabilities: np.ndarray,
+    *,
+    threshold: float | None,
+    probability_source: str,
+    retain_probability: bool = True,
+) -> SemanticOutput:
+    values = np.asarray(probabilities, dtype=np.float32)
+    if values.ndim != 3 or values.shape[0] < 2:
+        raise DatasetValidationError(
+            "Semantic probabilities must have at least background and foreground channels"
+        )
+    argmax = np.argmax(values, axis=0)
+    if threshold is None:
+        class_map = argmax.astype(_class_map_dtype(values.shape[0]))
+    else:
+        foreground = 1.0 - values[0]
+        foreground_class = np.argmax(values[1:], axis=0) + 1
+        class_map = np.where(
+            foreground >= float(threshold),
+            foreground_class,
+            0,
+        ).astype(_class_map_dtype(values.shape[0]))
+    foreground_probability = (
+        np.asarray(1.0 - values[0], dtype=np.float32)
+        if retain_probability
+        else None
+    )
+    return SemanticOutput(
+        class_map=class_map,
+        foreground_probability=foreground_probability,
+        probability_source=probability_source,
+    )
 
 
 def _model_class_count(model: Any) -> int | None:

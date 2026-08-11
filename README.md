@@ -481,6 +481,10 @@ segmenter = Model(
     device="mps",
 )
 mask_predictions = segmenter.predict(masks, split="val")
+
+# Direct prediction caching is opt-in. Dataset inputs use the same cache base
+# as Model.compare(), so either operation can reuse compatible predictions.
+cached = segmenter.predict(masks, split="val", prediction_cache=True)
 ```
 
 `PredictionResult` preserves input ordering and stable image IDs. Object-style
@@ -489,6 +493,26 @@ models populate each record's `objects`; semantic models populate `mask`.
 utilities. Direct `Model.predict` defaults to native prediction. Configure a
 model with `inference="sahi"` to opt it into tiled inference; no
 availability-based selection or fallback is performed.
+
+Use `prediction_cache=True` when a direct prediction run should be retained.
+For explicit placement or reuse across calls, construct
+`PredictionCache("/cache/base")` and pass it as `prediction_cache=cache`.
+`PredictionCache.for_dataset(dataset)` resolves the established
+`<dataset>/.cache/evaluations` base, preserving the `predictions/`,
+`semantic/`, and `metrics/` namespaces used by comparison. `PredictionResult`
+records the verified cache status, key, namespace, and location in
+`cache_info`. Direct prediction remains uncached when the argument is omitted.
+
+`prediction_threshold` is task-aware. Semantic models apply it to genuine
+foreground probabilities after full-image reconstruction; requesting that
+operation from a backend that returns only hard class maps raises
+`PredictionScoreUnavailableError`. The hard-mask cache is retained and remains
+usable for unthresholded prediction. Instance-segmentation models retain their
+scored polygons and apply the same setting as an object-score floor. Call
+`ImagePrediction.foreground_score_map()` to rasterize those polygons lazily as
+the maximum covering object score per pixel. This object-confidence projection
+supports the common semantic evaluation space without pretending to be a
+pixel-calibrated posterior or replacing the original instances.
 
 Inference defaults to `batch_size=-1`. Ultralytics native inputs and SAHI
 tiles are sent through the official prediction API in cohort-wide batches;
@@ -514,6 +538,11 @@ filtered cohort for every model and record the same audit in the report.
 `ModelCollection.compare()` freezes one ordered evaluation cohort and requires every
 model to predict exactly those images. It never takes a validation split from a
 checkpoint or training configuration.
+
+Comparison continues to cache automatically when `prediction_cache` is
+omitted. Pass an explicit `PredictionCache` or cache-base path to redirect the
+same layout, or `prediction_cache=False` to disable persistent prediction and
+metric caching for that comparison run.
 
 ```python
 models = Model.load_many(
@@ -761,6 +790,7 @@ The intentionally small public API is:
 - `ModelCollection.configure`
 - `ModelCollection.predict`
 - `ModelCollection.compare`
+- `PredictionCache`
 
 Operation-specific previews and audits are controlled with each method's
 `visualize=` parameter. Consistency checks run automatically during loading.

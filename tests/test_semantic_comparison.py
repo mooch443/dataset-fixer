@@ -296,6 +296,14 @@ def test_invalid_instance_polygons_become_cached_style_warnings(
 
     assert projection == "polygon-foreground-union"
     assert projected[0].mask.any()
+    assert projected[0].foreground_probability is not None
+    assert projected[0].metadata["probability_source"] == (
+        "rasterized-instance-confidence"
+    )
+    assert float(np.max(projected[0].foreground_probability)) == pytest.approx(
+        0.9,
+        abs=5e-4,
+    )
     assert [warning["action"] for warning in warnings] == [
         "skipped-object",
         "skipped-object",
@@ -304,6 +312,41 @@ def test_invalid_instance_polygons_become_cached_style_warnings(
         "fewer than three polygon points",
         "no polygon returned by segmentation model",
     }
+
+
+def test_instance_foreground_score_map_uses_maximum_overlapping_score(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "overlap.png"
+    Image.new("RGB", (10, 10)).save(image)
+    record = ImagePrediction(
+        image_id="overlap",
+        image_path=image,
+        relative_path="overlap.png",
+        width=10,
+        height=10,
+        objects=(
+            Prediction(
+                class_id=0,
+                score=0.35,
+                polygon=[(1, 1), (7, 1), (7, 7), (1, 7)],
+            ),
+            Prediction(
+                class_id=0,
+                score=0.8,
+                polygon=[(4, 4), (9, 4), (9, 9), (4, 9)],
+            ),
+        ),
+    )
+
+    score_map = record.foreground_score_map()
+
+    assert score_map is not None
+    assert score_map[2, 2] == pytest.approx(0.35)
+    assert score_map[5, 5] == pytest.approx(0.8)
+    assert score_map[8, 8] == pytest.approx(0.8)
+    assert score_map[0, 0] == pytest.approx(0.0)
+    assert len(record.objects) == 2
 
 
 class FakeSession:
@@ -1195,7 +1238,8 @@ def test_semantic_predict_and_compare_share_raw_prediction_cache(
     assert calls == 1
     cache_entry = Path(reused.cache_info["location"])
     assert (cache_entry / "raw-result").is_dir()
-    assert (cache_entry / "evaluation.json").is_file()
+    compatible_entry = cache_entry.parent / reused.cache_info["compatible_key"]
+    assert (compatible_entry / "evaluation.json").is_file()
 
 
 def test_nnunet_without_a_device_uses_runtime_device_resolution(
