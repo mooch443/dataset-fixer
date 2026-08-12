@@ -1116,6 +1116,8 @@ def _summarize_rows(
     return {
         "macro_dice": float(np.mean(finite)) if finite else math.nan,
         "micro_dice": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else math.nan,
+        "foreground_precision": tp / (tp + fp) if tp + fp else math.nan,
+        "foreground_recall": tp / (tp + fn) if tp + fn else math.nan,
         "presence_precision": presence_precision,
         "presence_recall": presence_recall,
         "presence_f1": presence_f1,
@@ -1241,6 +1243,8 @@ def _calibration_improvement_row(
     for metric in (
         "macro_dice",
         "micro_dice",
+        "foreground_precision",
+        "foreground_recall",
         "presence_precision",
         "presence_recall",
         "presence_f1",

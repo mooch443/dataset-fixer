@@ -39,6 +39,9 @@ def test_area_filtered_component_f1_requires_one_to_one_overlap() -> None:
     assert metrics["area_filtered_component_precision"] == pytest.approx(1 / 3)
     assert metrics["area_filtered_component_recall"] == pytest.approx(1 / 2)
     assert metrics["area_filtered_component_f1"] == pytest.approx(0.4)
+    assert metrics["foreground_precision"] == pytest.approx(
+        row["tp"] / (row["tp"] + row["fp"])
+    )
     # Image presence is still reported separately and does not require overlap.
     assert metrics["area_filtered_image_presence_f1"] == pytest.approx(1.0)
 
