@@ -14,7 +14,33 @@ from dataset_fixer import (
     PredictionResult,
     calibrate_prediction_thresholds,
 )
+from dataset_fixer.calibration import _case_row, _summarize_rows
 from conftest import make_yolo_dataset
+
+
+def test_area_filtered_component_f1_requires_one_to_one_overlap() -> None:
+    reference = np.zeros((10, 10), dtype=bool)
+    reference[2, 1:7] = True  # retained reference touched by two predictions
+    reference[7:9, 7:9] = True  # retained and missed
+    reference[0, 9] = True  # excluded tiny reference
+
+    prediction = np.zeros_like(reference)
+    prediction[1:3, 1:3] = True  # retained; touches first reference
+    prediction[1:3, 5:7] = True  # retained duplicate on first reference
+    prediction[5:7, 0:2] = True  # retained false positive
+    prediction[9, 0] = True  # excluded tiny prediction
+
+    row = _case_row(reference, prediction, minimum_component_area=4)
+    metrics = _summarize_rows((row,), minimum_component_area=4)
+
+    assert row["component_reference_count"] == 2
+    assert row["component_prediction_count"] == 3
+    assert row["component_match_count"] == 1
+    assert metrics["area_filtered_component_precision"] == pytest.approx(1 / 3)
+    assert metrics["area_filtered_component_recall"] == pytest.approx(1 / 2)
+    assert metrics["area_filtered_component_f1"] == pytest.approx(0.4)
+    # Image presence is still reported separately and does not require overlap.
+    assert metrics["area_filtered_image_presence_f1"] == pytest.approx(1.0)
 
 
 def test_grouped_threshold_calibration_uses_cached_probabilities_only(
@@ -123,6 +149,35 @@ def test_grouped_threshold_calibration_uses_cached_probabilities_only(
     assert improvement["recommended_threshold"] == pytest.approx(0.5)
     assert improvement["cv_macro_dice_gain"] > 0
     assert improvement["cv_macro_dice_relative_gain_pct"] > 0
+
+    repeated = calibrate_prediction_thresholds(
+        (model,),
+        dataset,
+        split="val",
+        group_by=lambda path: path.stem,
+        thresholds=(0.4, 0.5, 0.8),
+        folds=2,
+        destination=tmp_path / "calibration-repeated",
+        progress=False,
+    )
+    assert len(calls) == 1
+    assert repeated.cache_audit[0]["cache"] == "score-hit"
+    assert repeated.cache_audit[0]["cached_thresholds"] == 3
+    assert repeated.cache_audit[0]["scored_thresholds"] == 0
+
+    extended = calibrate_prediction_thresholds(
+        (model,),
+        dataset,
+        split="val",
+        group_by=lambda path: path.stem,
+        thresholds=(0.4, 0.5, 0.6, 0.8),
+        folds=2,
+        destination=tmp_path / "calibration-extended",
+        progress=False,
+    )
+    assert len(calls) == 2
+    assert extended.cache_audit[0]["cached_thresholds"] == 3
+    assert extended.cache_audit[0]["scored_thresholds"] == 1
 
 
 def test_probability_map_rerun_requires_explicit_switch(
