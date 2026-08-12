@@ -30,6 +30,26 @@ def slugify(value: str) -> str:
     return value or "dataset"
 
 
+def bounded_slug(value: str, max_length: int = 80) -> str:
+    """Return one readable collision-resistant filesystem token.
+
+    value:
+        Arbitrary source text to normalize.
+    max_length:
+        Maximum token length, including the hash suffix when truncation is
+        required.
+    """
+
+    if isinstance(max_length, bool) or max_length < 14:
+        raise ValueError("max_length must be an integer of at least 14")
+    normalized = slugify(value).lower()
+    if len(normalized) <= max_length:
+        return normalized
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+    readable = normalized[: max_length - len(digest) - 1].rstrip("-._")
+    return f"{readable}-{digest}"
+
+
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:

@@ -5,10 +5,18 @@ import json
 import shutil
 from pathlib import Path
 
+import numpy as np
 import pytest
 import yaml
 
-from dataset_fixer import Dataset, DatasetValidationError, Task
+from dataset_fixer import (
+    Dataset,
+    DatasetValidationError,
+    ImagePrediction,
+    Model,
+    PredictionResult,
+    Task,
+)
 from dataset_fixer.utils import settings_fingerprint, to_jsonable
 from conftest import make_yolo_dataset
 
@@ -49,6 +57,235 @@ def test_dataset_string_reports_file_derived_statistics(detect_dataset: Path) ->
     assert "fruit              4       4    66.7%" in summary
     assert "damaged            3       3    50.0%" in summary
     assert "validation: passed | warnings: 0" in summary
+
+
+def test_dataset_sample_is_a_deterministic_materialized_view(
+    detect_dataset: Path,
+) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+
+    first = dataset.sample(n=1, split="val", seed=7)
+    second = dataset.sample(n=1, split="val", seed=7)
+
+    assert first.location == dataset.location
+    assert first.format == dataset.format
+    assert first.splits == ("val",)
+    assert len(first._samples) == 1
+    assert first._samples[0].relative_path == second._samples[0].relative_path
+    assert first._samples[0] is not dataset._samples[-1]
+    assert first.manifest["view"] == {
+        "kind": "sample",
+        "n": 1,
+        "requested_n": 1,
+        "split": "val",
+        "seed": 7,
+    }
+    assert len(dataset._samples) == 6
+
+
+def test_dataset_sample_validates_size_split_and_seed(detect_dataset: Path) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        dataset.sample(n=0)
+    with pytest.raises(ValueError, match="seed must be an integer"):
+        dataset.sample(n=1, seed=True)
+    with pytest.raises(ValueError, match="Unknown split"):
+        dataset.sample(n=1, split="test")
+
+
+def test_dataset_presence_filters_sample_and_add_preserve_order(
+    tmp_path: Path,
+) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "presence",
+        task="detect",
+        val_rows=["0 0.5 0.5 0.25 0.25", ""],
+    )
+    dataset = Dataset.open(source, task="detect", progress=False)
+    validation = [sample for sample in dataset._samples if sample.split == "val"]
+    result = PredictionResult(
+        model_name="presence-model",
+        model_kind="ultralytics",
+        task="segment",
+        backend="native",
+        records=(
+            ImagePrediction(
+                image_id="annotated-miss",
+                image_path=validation[0].image_path,
+                relative_path=validation[0].relative_path,
+                width=validation[0].width,
+                height=validation[0].height,
+                mask=np.zeros(
+                    (validation[0].height, validation[0].width),
+                    dtype=bool,
+                ),
+            ),
+            ImagePrediction(
+                image_id="empty-false-positive",
+                image_path=validation[1].image_path,
+                relative_path=validation[1].relative_path,
+                width=validation[1].width,
+                height=validation[1].height,
+                mask=np.ones(
+                    (validation[1].height, validation[1].width),
+                    dtype=bool,
+                ),
+            ),
+        ),
+        inference_seconds=0.0,
+    )
+
+    annotated_misses = dataset.filter(
+        gt_annotated=True,
+        predictions=result,
+        has_prediction=False,
+    ).sample(n=5, split="val", seed=1335)
+    empty_false_positives = dataset.filter(
+        gt_annotated=False,
+        predictions=result,
+        has_prediction=True,
+    ).sample(n=5, split="val", seed=42)
+    combined = annotated_misses.add(empty_false_positives)
+
+    assert [sample.relative_path for sample in combined._samples] == [
+        validation[0].relative_path,
+        validation[1].relative_path,
+    ]
+    assert len(annotated_misses.add(annotated_misses)._samples) == 1
+    assert len(dataset._samples) == 4
+
+
+def test_dataset_prediction_filter_requires_a_result_or_model(
+    tmp_path: Path,
+) -> None:
+    source = make_yolo_dataset(tmp_path / "presence-validation", task="detect")
+    dataset = Dataset.open(source, task="detect", progress=False)
+
+    with pytest.raises(ValueError, match="requires predictions=PredictionResult or model=Model"):
+        dataset.filter(has_prediction=True)
+    with pytest.raises(ValueError, match="at least one filter"):
+        dataset.filter()
+
+    image = tmp_path / "unrelated.jpg"
+    image.write_bytes(b"not read by the filter")
+    unrelated = PredictionResult(
+        model_name="unrelated",
+        model_kind="ultralytics",
+        task="segment",
+        backend="native",
+        records=(
+            ImagePrediction(
+                image_id="unrelated",
+                image_path=image,
+                relative_path=image.name,
+                width=1,
+                height=1,
+                mask=np.zeros((1, 1), dtype=bool),
+            ),
+        ),
+        inference_seconds=0.0,
+    )
+    with pytest.raises(ValueError, match="does not cover any image"):
+        dataset.filter(predictions=unrelated, has_prediction=False)
+
+
+def test_dataset_prediction_filter_resolves_model_cache_or_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "model-backed-filter",
+        task="detect",
+        val_rows=["0 0.5 0.5 0.25 0.25", ""],
+    )
+    dataset = Dataset.open(source, task="detect", progress=False)
+    validation = [sample for sample in dataset._samples if sample.split == "val"]
+    checkpoint = tmp_path / "filter-model.pt"
+    checkpoint.write_bytes(b"filter-model")
+    model = Model(checkpoint, task="segment")
+    calls: list[dict[str, object]] = []
+    source_sizes: list[int] = []
+
+    def fake_predict(self, prediction_source, **kwargs):
+        assert self is model
+        assert prediction_source.location == dataset.location
+        source_sizes.append(len(prediction_source._samples))
+        calls.append(kwargs)
+        return PredictionResult(
+            model_name=self.name,
+            model_kind="ultralytics",
+            task="segment",
+            backend="native",
+            records=(
+                ImagePrediction(
+                    image_id="empty",
+                    image_path=validation[0].image_path,
+                    relative_path=validation[0].relative_path,
+                    width=validation[0].width,
+                    height=validation[0].height,
+                ),
+                ImagePrediction(
+                    image_id="positive",
+                    image_path=validation[1].image_path,
+                    relative_path=validation[1].relative_path,
+                    width=validation[1].width,
+                    height=validation[1].height,
+                    objects=(object(),),
+                ),
+            ),
+            inference_seconds=0.0,
+        )
+
+    monkeypatch.setattr(Model, "predict", fake_predict)
+
+    filtered = dataset.filter(
+        model=model,
+        has_prediction=True,
+        split="val",
+        progress=False,
+    )
+
+    assert [sample.relative_path for sample in filtered._samples] == [
+        validation[1].relative_path
+    ]
+    assert calls == [
+        {
+            "split": "val",
+            "progress": False,
+            "prediction_cache": True,
+        }
+    ]
+    assert source_sizes == [2]
+
+    calls.clear()
+    source_sizes.clear()
+    filtered = dataset.filter(
+        gt_annotated=False,
+        model=model,
+        has_prediction=True,
+        split="val",
+        progress=False,
+    )
+    assert [sample.relative_path for sample in filtered._samples] == [
+        validation[1].relative_path
+    ]
+    assert len(calls) == 1
+    assert source_sizes == [1]
+
+    calls.clear()
+    source_sizes.clear()
+    annotated = dataset.filter(
+        gt_annotated=True,
+        model=model,
+        split="val",
+        progress=False,
+    )
+    assert [sample.relative_path for sample in annotated._samples] == [
+        validation[0].relative_path
+    ]
+    assert calls == []
+    assert source_sizes == []
 
 
 def test_streaming_settings_fingerprint_preserves_canonical_value(tmp_path: Path) -> None:

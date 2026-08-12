@@ -314,6 +314,8 @@ def test_metric_breakdown_includes_model_type_and_presence_columns(
         {
             "model": "model",
             "model_type": model_type,
+            "upscale_factor": 4,
+            "effective_prediction_resolution": "512px",
             "dice": 0.1,
             "micro_dice": 0.2,
             "foreground_precision": 0.3,
@@ -345,17 +347,17 @@ def test_metric_breakdown_includes_model_type_and_presence_columns(
 
     assert path.is_file()
     assert row_labels == ["model"]
-    assert set(badges) == {expected_slug}
+    assert set(badges) == {expected_slug, "4×", "512px"}
     assert badges[expected_slug][3] == pytest.approx(1.0)
     assert column_labels == [
         "Mean Dice",
         "Pooled foreground\nDice",
-        "Foreground\nprecision",
-        "Foreground\nrecall",
+        "Pixel\nprecision",
+        "Pixel\nrecall",
         "Presence precision\nraw",
         "Presence precision\narea-filtered",
-        "Positive recall\nraw",
-        "Positive recall\narea-filtered",
+        "Positive-image recall\nraw",
+        "Positive-image recall\narea-filtered",
         "Empty specificity\nraw",
         "Empty specificity\narea-filtered",
     ]

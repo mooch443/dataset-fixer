@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import types
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,7 @@ from dataset_fixer import (
     ModelCollection,
     PredictionResult,
     SemanticComparisonResult,
+    model_label,
 )
 from dataset_fixer.comparison.cache import cache_key, default_cache_root
 from dataset_fixer.comparison.types import Prediction
@@ -29,7 +31,6 @@ from dataset_fixer.semantic_comparison import (
     _freeze_cohort,
     _multiline_model_title,
     _project_semantic_predictions,
-    _ranking_plot_label,
     _run_command,
     _select_visual_cases,
 )
@@ -148,8 +149,8 @@ def test_nnunet_prediction_uses_shared_smaller_and_oversized_policy(
     assert len(result.settings["source_size_policy"]["skipped_inputs"]) == 1
 
 
-def test_ranking_plot_label_breaks_canonical_name_without_wandb_prefix() -> None:
-    label = _ranking_plot_label(
+def test_model_label_uses_normalized_run_identifier() -> None:
+    label = model_label(
         {
             "model": (
                 "islands-128-08.08.2026-merged-1class_masks"
@@ -159,14 +160,56 @@ def test_ranking_plot_label_breaks_canonical_name_without_wandb_prefix() -> None
                 "wandb:max-planck-institute-for-animal-behavior/"
                 "schools-segmentation/gnsuhtfc"
             ),
+            "source_created_at": "2026-08-10T14:07:09+00:00",
+            "model_sha256_short": "abcdef12",
         }
     )
 
-    assert label == (
-        "islands-128-08.08.2026-merged-1class_masks\n"
-        "gnsuhtfc__yolo26x-sem__512px"
-    )
+    assert label == "2026-08-10 14:07:09 · abcdef12"
     assert "wandb:" not in label
+
+
+def test_model_label_uses_local_basename_without_dataset_prefix() -> None:
+    label = model_label(
+        {
+            "model": (
+                "08.08.2026-merged-1class_masks-yolo26x-sem-512px-"
+                "2026-08-11_00-21_20260811_002334"
+            ),
+            "model_source": (
+                "/models/08.08.2026-merged-1class_masks-yolo26x-sem-512px-"
+                "2026-08-11_00-21_20260811_002334.pt"
+            ),
+            "model_type": "yolo26x-sem",
+            "upscale_factor": 4,
+            "effective_prediction_resolution": "512px",
+            "checkpoint_sha256_short": "74c3e770",
+        }
+    )
+
+    assert label == "2026-08-11 00:23:34 · 74c3e770"
+    assert "local checkpoint" not in label
+
+
+def test_model_label_normalizes_named_wandb_run_and_adds_hash() -> None:
+    label = model_label(
+        {
+            "model": (
+                "islands-128-08.08.2026-merged-1class_masks__run__"
+                "yolo26m-sem__1024px"
+            ),
+            "model_source": (
+                "wandb:team/project/islands-128-08.08.2026-merged-1class_masks-"
+                "yolo26m-sem-1024px-8x-2026-08-10_11-46_20260810_114819"
+            ),
+            "model_type": "yolo26m-sem",
+            "upscale_factor": 8,
+            "effective_prediction_resolution": "1024px",
+            "model_sha256_short": "a1b2c3d4",
+        }
+    )
+
+    assert label == "2026-08-10 11:48:19 · a1b2c3d4"
 
 
 def test_semantic_grid_model_title_wraps_canonical_identity() -> None:
@@ -347,6 +390,54 @@ def test_instance_foreground_score_map_uses_maximum_overlapping_score(
     assert score_map[8, 8] == pytest.approx(0.8)
     assert score_map[0, 0] == pytest.approx(0.0)
     assert len(record.objects) == 2
+
+
+def test_prediction_result_projects_scored_instances_to_semantic_masks(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "project.png"
+    Image.new("RGB", (10, 10)).save(image)
+    native = PredictionResult(
+        model_name="segmenter",
+        model_kind="ultralytics",
+        task="segment",
+        backend="sahi",
+        records=(
+            ImagePrediction(
+                image_id="project",
+                image_path=image,
+                relative_path="project.png",
+                width=10,
+                height=10,
+                objects=(
+                    Prediction(
+                        class_id=0,
+                        score=0.4,
+                        polygon=[(1, 1), (4, 1), (4, 4), (1, 4)],
+                    ),
+                    Prediction(
+                        class_id=0,
+                        score=0.8,
+                        polygon=[(5, 5), (9, 5), (9, 9), (5, 9)],
+                    ),
+                ),
+            ),
+        ),
+        inference_seconds=1.0,
+        settings={"prediction_threshold": 0.6},
+        cache_info={"status": "hit"},
+    )
+
+    projected = native.as_semantic()
+
+    assert projected.task == "semantic_segment"
+    assert not projected.records[0].mask[2, 2]
+    assert projected.records[0].mask[7, 7]
+    assert len(projected.records[0].objects) == 2
+    assert projected.cache_info["status"] == "hit"
+    assert projected.cache_info["projection_status"] == (
+        "derived-from-native-predictions"
+    )
 
 
 class FakeSession:
@@ -1128,7 +1219,9 @@ def test_loaded_semantic_models_visualize_only_sampled_cases_with_shared_mask_gr
     assert len(figure.axes) == 11  # filenames, one shared heading row, and panels
     headings = [text.get_text() for text in figure.axes[1].texts]
     assert headings[:2] == ["Original", "GT"]
-    assert "\n" in headings[2]
+    assert "2×" in headings
+    assert "1×" in headings
+    assert "unknown" not in headings
     assert figure.axes[4].get_xlabel().startswith("Dice=")
     assert np.asarray(figure.axes[4].images[0].get_array()).ndim == 2
     assert figure.axes[6].texts[0].get_text().endswith(".jpg")
@@ -1177,6 +1270,233 @@ def test_generic_model_predicts_semantic_export_and_saves_masks(
     assert commands[0][0] == "nnUNetv2_predict_from_modelfolder"
     saved = result.save(tmp_path / "saved-semantic-predictions")
     assert len(list((saved / "masks").glob("*.png"))) == 2
+
+
+def test_sampled_semantic_dataset_reuses_full_instance_cache_and_visualizes_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    exported = _semantic_export(tmp_path)
+    checkpoint = tmp_path / "sampled-instance.pt"
+    checkpoint.write_bytes(b"sampled-instance")
+    model = Model(checkpoint, task="segment", resolution=40)
+    calls = 0
+
+    def fake_predict_inputs(_model, inputs, **_kwargs):
+        nonlocal calls
+        calls += 1
+        prediction = Prediction(
+            class_id=0,
+            score=0.9,
+            bbox=(8.0, 6.0, 32.0, 24.0),
+            polygon=[(8.0, 6.0), (32.0, 6.0), (32.0, 24.0), (8.0, 24.0)],
+        )
+        return {
+            value.image_id: [prediction]
+            for value in inputs
+        }, "segment", {"synthetic": True}
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.inference.predict_model_inputs",
+        fake_predict_inputs,
+    )
+
+    full = model.predict(exported, split="val", progress=False)
+    sampled = exported.sample(n=1, split="val", seed=42)
+    reused = model.predict(sampled, progress=False)
+
+    assert calls == 1
+    assert full.cache_info["status"] == "fresh"
+    assert reused.cache_info["status"] == "image-compatible-subset-hit"
+    assert reused.task == "segment"
+    assert len(reused) == 1
+    assert reused.records[0].reference_mask_path is not None
+    assert reused.records[0].objects[0].polygon is not None
+
+    figure = reused.visualize(
+        columns=1,
+        panel_size=2.0,
+        zoom=True,
+        context_fraction=0.0,
+        minimum_context=10,
+        outline_width=0.8,
+    )
+    heading_text = [text.get_text() for text in figure.axes[0].texts]
+    assert "Original" in heading_text
+    assert "Annotation" in heading_text
+    assert "Prediction" in heading_text
+    assert len(figure.axes) == 4  # wrapped image key plus three image panels
+    assert reused.records[0].relative_path.split("/")[-1].split("_")[0] in (
+        figure.axes[0].texts[0].get_text().replace("\n", "")
+    )
+    assert all(
+        np.asarray(axis.images[0].get_array()).ndim == 3
+        for axis in figure.axes[1:]
+    )
+    assert abs(figure.axes[1].get_xlim()[1] - figure.axes[1].get_xlim()[0]) < 40
+    assert any(axis.patches or axis.lines for axis in figure.axes)
+    assert figure.axes[0].get_position().y0 >= figure.axes[1].get_position().y1
+    assert all(line.get_alpha() == 1.0 for line in figure.axes[3].lines)
+    assert all(line.get_linewidth() == 0.8 for line in figure.axes[3].lines)
+    plt.close(figure)
+
+
+def test_semantic_filter_and_add_retain_mask_metadata(tmp_path: Path) -> None:
+    exported = _semantic_export(tmp_path)
+    validation = [sample for sample in exported._samples if sample.split == "val"]
+    empty_sample = validation[1]
+    empty_mask = exported._mask_paths[empty_sample.image_path.resolve()]
+    Image.new("L", (empty_sample.width, empty_sample.height), 0).save(empty_mask)
+    exported._mask_statistics[empty_sample.image_path.resolve()] = {
+        "foreground_pixels": 0,
+        "total_pixels": empty_sample.width * empty_sample.height,
+    }
+
+    annotated = exported.filter(gt_annotated=True).sample(
+        n=1,
+        split="val",
+        seed=1,
+    )
+    empty = exported.filter(gt_annotated=False).sample(
+        n=1,
+        split="val",
+        seed=1,
+    )
+    combined = annotated.add(empty)
+
+    assert [sample.relative_path for sample in combined._samples] == [
+        validation[0].relative_path,
+        validation[1].relative_path,
+    ]
+    assert set(combined._mask_paths) == {
+        validation[0].image_path.resolve(),
+        validation[1].image_path.resolve(),
+    }
+    assert combined._sample_has_ground_truth(combined._samples[0])
+    assert not combined._sample_has_ground_truth(combined._samples[1])
+
+    repeated = annotated.add(annotated)
+    cases, _ = _freeze_cohort(repeated, "val", progress=False)
+    assert len(cases) == 1
+    assert cases[0].image_path == validation[0].image_path.resolve()
+
+
+def test_prediction_visualization_does_not_pad_wide_images_vertically(
+    tmp_path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    image = tmp_path / "wide-island.png"
+    Image.new("RGB", (800, 80), (25, 45, 65)).save(image)
+    mask = np.zeros((80, 800), dtype=bool)
+    mask[30:50, 200:600] = True
+    result = PredictionResult(
+        model_name="wide-model",
+        model_kind="ultralytics",
+        task="semantic_segment",
+        backend="native",
+        records=(
+            ImagePrediction(
+                image_id="wide",
+                image_path=image,
+                relative_path="wide-aoi/wide-island.png",
+                width=800,
+                height=80,
+                mask=mask,
+            ),
+        ),
+        inference_seconds=0.0,
+    )
+
+    figure = result.visualize(columns=1, panel_size=3.0)
+    key = figure.axes[0].get_position()
+    panels = [axis.get_position() for axis in figure.axes[1:]]
+
+    assert figure.get_size_inches()[1] < 1.5
+    assert key.y0 - max(panel.y1 for panel in panels) < 0.12
+    plt.close(figure)
+
+
+def test_prediction_visualization_uses_fixed_header_space_for_many_rows(
+    tmp_path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    image = tmp_path / "many-rows.png"
+    Image.new("RGB", (320, 240), (25, 45, 65)).save(image)
+    mask = np.zeros((240, 320), dtype=bool)
+    records = tuple(
+        ImagePrediction(
+            image_id=f"row-{index}",
+            image_path=image,
+            relative_path=f"aoi-{index}/many-rows.png",
+            width=320,
+            height=240,
+            mask=mask,
+        )
+        for index in range(10)
+    )
+    result = PredictionResult(
+        model_name="many-row-model",
+        model_kind="ultralytics",
+        task="semantic_segment",
+        backend="native",
+        records=records,
+        inference_seconds=0.0,
+    )
+
+    figure = result.visualize(columns=1, panel_size=3.0)
+    header_space_inches = (
+        1.0 - max(axis.get_position().y1 for axis in figure.axes)
+    ) * figure.get_size_inches()[1]
+
+    assert header_space_inches < 0.35
+    plt.close(figure)
+
+
+def test_prediction_visualization_shortens_keys_by_rendered_width(
+    tmp_path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    image = tmp_path / "key-width.png"
+    Image.new("RGB", (320, 240), (25, 45, 65)).save(image)
+    mask = np.zeros((240, 320), dtype=bool)
+    formerly_truncated = "aoi-" + "moderate-identifier-" * 5 + "/image.png"
+    too_wide = "aoi-" + "extremely-long-identifier-" * 40 + "/image.png"
+    result = PredictionResult(
+        model_name="key-width-model",
+        model_kind="ultralytics",
+        task="semantic_segment",
+        backend="native",
+        records=tuple(
+            ImagePrediction(
+                image_id=str(index),
+                image_path=image,
+                relative_path=relative_path,
+                width=320,
+                height=240,
+                mask=mask,
+            )
+            for index, relative_path in enumerate((formerly_truncated, too_wide))
+        ),
+        inference_seconds=0.0,
+    )
+
+    figure = result.visualize(columns=1, panel_size=3.0)
+    renderer = figure.canvas.get_renderer()
+    first_label = figure.axes[0].texts[0]
+    second_label = figure.axes[4].texts[0]
+
+    expected_first = Path(formerly_truncated)
+    assert first_label.get_text() == (
+        f"{expected_first.parent.as_posix()} / {expected_first.stem}"
+    )
+    assert "…" in second_label.get_text()
+    assert second_label.get_window_extent(renderer).width <= figure.bbox.width * 0.9
+    plt.close(figure)
 
 
 def test_semantic_predict_and_compare_share_raw_prediction_cache(
@@ -1240,6 +1560,89 @@ def test_semantic_predict_and_compare_share_raw_prediction_cache(
     assert (cache_entry / "raw-result").is_dir()
     compatible_entry = cache_entry.parent / reused.cache_info["compatible_key"]
     assert (compatible_entry / "evaluation.json").is_file()
+
+
+def test_completed_comparison_inference_is_durably_reused_across_thresholds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exported = _semantic_export(tmp_path)
+    checkpoint = tmp_path / "durable-semantic.pt"
+    checkpoint.write_bytes(b"durable-semantic")
+    calls = 0
+
+    def fake_predict_inputs(_model, inputs, **_kwargs):
+        nonlocal calls
+        calls += 1
+        values = {}
+        for value in inputs:
+            probability = np.full(
+                (value.height, value.width),
+                0.8,
+                dtype=np.float32,
+            )
+            values[value.image_id] = types.SimpleNamespace(
+                class_map=(probability >= 0.5).astype(np.uint8),
+                foreground_probability=probability,
+                probability_source="model-probabilities",
+            )
+        return values, "semantic_segment", {"synthetic": True}
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.inference.predict_model_inputs",
+        fake_predict_inputs,
+    )
+    Model(
+        checkpoint,
+        task="semantic",
+        resolution=64,
+        prediction_threshold=0.6,
+    ).compare(
+        exported,
+        split="val",
+        progress=True,
+        destination=tmp_path / "comparison-at-0p6",
+    )
+    first_output = capsys.readouterr().out
+    assert "Publishing prediction cache:" in first_output
+    assert "Prediction cache published:" in first_output
+    assert calls == 1
+
+    cache_root = default_cache_root(exported.location) / "semantic"
+    published = []
+    for manifest_path in cache_root.glob("*/raw-result/manifest.json"):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (manifest.get("identity") or {}).get("model_sha256") != Model(
+            checkpoint,
+            task="semantic",
+            resolution=64,
+        ).digest:
+            continue
+        published.append(manifest_path)
+        assert len(manifest["records"]) == 2
+        assert all(
+            record.get("foreground_probability")
+            for record in manifest["records"]
+        )
+        assert (manifest_path.parent / "complete.json").is_file()
+    assert len(published) == 1
+
+    Model(
+        checkpoint,
+        task="semantic",
+        resolution=64,
+        prediction_threshold=0.7,
+    ).compare(
+        exported,
+        split="val",
+        progress=True,
+        destination=tmp_path / "comparison-at-0p7",
+    )
+    second_output = capsys.readouterr().out
+    assert "Prediction cache hit:" in second_output
+    assert "running inference" not in second_output
+    assert calls == 1
 
 
 def test_nnunet_without_a_device_uses_runtime_device_resolution(

@@ -108,6 +108,7 @@ class PredictionCache:
         identity: Mapping[str, Any],
         inputs: Sequence["ModelInput"],
         allow_image_id_rebase: bool = False,
+        allow_input_subset: bool = False,
         progress: bool = False,
     ) -> "PredictionResult | None":
         """Load and validate one complete raw prediction result.
@@ -124,6 +125,11 @@ class PredictionCache:
             Accept different generated image IDs only when ordered relative
             paths, dimensions, and image bytes remain identical. Returned
             records are always rebased to ``inputs``.
+        allow_input_subset:
+            Accept a requested ordered subset of a larger stored result when
+            relative paths, dimensions, and image bytes match. This permits a
+            deterministic ``Dataset.sample(...)`` view to reuse full-cohort
+            predictions without treating partial inference as a full result.
         progress:
             Display per-image cache deserialization progress.
         """
@@ -151,17 +157,39 @@ class PredictionCache:
 
         expected = _input_manifest(inputs)
         stored_inputs = manifest.get("inputs")
-        if stored_inputs != expected and not (
-            allow_image_id_rebase
-            and _image_only_input_manifest(stored_inputs)
-            == _image_only_input_manifest(expected)
-        ):
-            return None
+        stored_images = _image_only_input_manifest(stored_inputs)
+        expected_images = _image_only_input_manifest(expected)
+        exact_or_rebased = stored_inputs == expected or (
+            allow_image_id_rebase and stored_images == expected_images
+        )
         result_value = manifest.get("result")
         records_value = manifest.get("records")
         if not isinstance(result_value, dict) or not isinstance(records_value, list):
             return None
-        if len(records_value) != len(inputs):
+        if not exact_or_rebased:
+            if not (
+                allow_input_subset
+                and allow_image_id_rebase
+                and stored_images is not None
+                and expected_images is not None
+            ):
+                return None
+            stored_positions: dict[str, int] = {}
+            for position, row in enumerate(stored_images):
+                token = prediction_cache_key({"image": row})
+                if token in stored_positions:
+                    return None
+                stored_positions[token] = position
+            selected_positions = []
+            for row in expected_images:
+                position = stored_positions.get(prediction_cache_key({"image": row}))
+                if position is None:
+                    return None
+                selected_positions.append(position)
+            selected_records = [records_value[position] for position in selected_positions]
+        else:
+            selected_records = records_value
+        if len(selected_records) != len(inputs):
             return None
 
         from .comparison.types import Prediction
@@ -173,7 +201,7 @@ class PredictionCache:
         )
         records: list[ImagePrediction] = []
         with tqdm(
-            zip(inputs, records_value),
+            zip(inputs, selected_records),
             total=len(inputs),
             desc=f"Loading {display_name} cache",
             unit="image",
@@ -181,7 +209,7 @@ class PredictionCache:
         ) as pairs:
             for source, stored in pairs:
                 if not isinstance(stored, dict) or (
-                    not allow_image_id_rebase
+                    not (allow_image_id_rebase or allow_input_subset)
                     and stored.get("image_id") != source.image_id
                 ):
                     return None
@@ -244,6 +272,7 @@ class PredictionCache:
                         objects=tuple(objects),
                         mask=mask,
                         native_mask=native_mask,
+                        reference_mask_path=source.mask_path,
                         foreground_probability=foreground_probability,
                         metadata=metadata,
                     )
@@ -261,6 +290,7 @@ class PredictionCache:
             "key": key,
             "namespace": namespace,
             "location": str(self.entry(key, namespace=namespace)),
+            "input_fingerprint": prediction_input_fingerprint(inputs),
         }
         return PredictionResult(
             model_name=str(result_value.get("model_name") or "cached-model"),
@@ -279,6 +309,8 @@ class PredictionCache:
         namespace: PredictionCacheNamespace,
         identity: Mapping[str, Any],
         inputs: Sequence["ModelInput"],
+        require_probability_maps: bool = False,
+        require_native_masks: bool = False,
         progress: bool = False,
     ) -> "PredictionResult | None":
         """Find a raw image-prediction cache with only generated IDs changed.
@@ -295,6 +327,11 @@ class PredictionCache:
         inputs:
             Ordered model inputs whose paths, geometry, and bytes must match
             the stored image manifest.
+        require_probability_maps:
+            Skip otherwise compatible semantic results that contain only
+            thresholded masks.
+        require_native_masks:
+            Skip otherwise compatible results without adapter-native masks.
         progress:
             Display per-image deserialization progress for a compatible hit.
         """
@@ -322,7 +359,16 @@ class PredictionCache:
             # canonical JSON conversion used by cache keys.
             if prediction_cache_key(functional) != prediction_cache_key(requested):
                 continue
-            if _image_only_input_manifest(manifest.get("inputs")) != expected_images:
+            stored_images = _image_only_input_manifest(manifest.get("inputs"))
+            if stored_images is None or expected_images is None:
+                continue
+            stored_tokens = {
+                prediction_cache_key({"image": row}) for row in stored_images
+            }
+            expected_tokens = [
+                prediction_cache_key({"image": row}) for row in expected_images
+            ]
+            if any(token not in stored_tokens for token in expected_tokens):
                 continue
             key = str(manifest.get("key") or "")
             if len(key) != 64 or any(
@@ -335,15 +381,28 @@ class PredictionCache:
                 identity=stored_identity,
                 inputs=inputs,
                 allow_image_id_rebase=True,
+                allow_input_subset=True,
                 progress=progress,
             )
             if loaded is None:
+                continue
+            if require_probability_maps and any(
+                record.foreground_probability is None for record in loaded.records
+            ):
+                continue
+            if require_native_masks and any(
+                record.native_mask is None for record in loaded.records
+            ):
                 continue
             return replace(
                 loaded,
                 cache_info={
                     **loaded.cache_info,
-                    "status": "image-compatible-hit",
+                    "status": (
+                        "image-compatible-hit"
+                        if len(stored_images) == len(expected_images)
+                        else "image-compatible-subset-hit"
+                    ),
                     "requested_key": prediction_cache_key(identity),
                 },
             )
@@ -459,14 +518,72 @@ class PredictionCache:
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
+        if not self._published_entry_is_complete(
+            key,
+            namespace=namespace,
+            identity=identity,
+            inputs=inputs,
+        ):
+            raise DatasetValidationError(
+                "Prediction cache publication completed without a readable, "
+                "verified entry"
+            )
         info = {
             "status": "fresh",
             "verified": True,
             "key": key,
             "namespace": namespace,
             "location": str(entry),
+            "input_fingerprint": prediction_input_fingerprint(inputs),
         }
         return replace(result, cache_info=info)
+
+    def _published_entry_is_complete(
+        self,
+        key: str,
+        *,
+        namespace: PredictionCacheNamespace,
+        identity: Mapping[str, Any],
+        inputs: Sequence["ModelInput"],
+    ) -> bool:
+        """Validate publication metadata and every referenced payload on disk."""
+
+        root = self.entry(key, namespace=namespace) / "raw-result"
+        manifest_path = root / "manifest.json"
+        complete_path = root / "complete.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            complete = json.loads(complete_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if (
+            not isinstance(manifest, dict)
+            or not isinstance(complete, dict)
+            or manifest.get("schema") != RAW_RESULT_CACHE_SCHEMA
+            or manifest.get("key") != key
+            or complete.get("key") != key
+            or complete.get("records") != len(inputs)
+            or prediction_cache_key(manifest.get("identity") or {}) != key
+            or prediction_cache_key(identity) != key
+            or manifest.get("inputs") != _input_manifest(inputs)
+        ):
+            return False
+        records = manifest.get("records")
+        if not isinstance(records, list) or len(records) != len(inputs):
+            return False
+        for record in records:
+            if not isinstance(record, dict):
+                return False
+            for field in (
+                "mask",
+                "native_mask",
+                "foreground_probability",
+                "objects",
+            ):
+                value = record.get(field)
+                if value is not None and not (root / str(value)).is_file():
+                    return False
+        return True
 
     def __repr__(self) -> str:
         return f"PredictionCache(location={str(self.location)!r})"

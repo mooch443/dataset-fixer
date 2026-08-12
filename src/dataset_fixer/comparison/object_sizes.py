@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import re
 import textwrap
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -13,6 +12,9 @@ from PIL import Image, ImageDraw
 from scipy import ndimage
 from scipy.optimize import linear_sum_assignment
 
+from ..utils import bounded_slug
+from .plot_labels import style_model_row_labels as _style_model_row_labels
+
 
 SIZE_GROUPS = ("small", "medium", "large")
 
@@ -23,15 +25,6 @@ _GROUP_SPLIT_COLORS = {
     "mixed": "#7C3AED",
     "other": "#4B5563",
 }
-
-_MODEL_TYPE_COLORS = {
-    "semantic": "#0F766E",
-    "instance": "#2563EB",
-    "yolox": "#C2410C",
-    "nnunet": "#7C3AED",
-    "other": "#4B5563",
-}
-
 
 def _group_split_values(
     group: str,
@@ -66,66 +59,6 @@ def _style_group_split_ticks(
         color_key = "mixed" if len(splits) > 1 else splits[0]
         tick.set_color(_GROUP_SPLIT_COLORS.get(color_key, _GROUP_SPLIT_COLORS["other"]))
         tick.set_fontweight("semibold")
-
-
-def _model_type_color(model_type: str) -> str:
-    normalized = model_type.lower()
-    if normalized.startswith("nnunet"):
-        return _MODEL_TYPE_COLORS["nnunet"]
-    if normalized.startswith("yolox"):
-        return _MODEL_TYPE_COLORS["yolox"]
-    if normalized.endswith("-sem") or "semantic" in normalized:
-        return _MODEL_TYPE_COLORS["semantic"]
-    if normalized.endswith("-seg") or "instance" in normalized:
-        return _MODEL_TYPE_COLORS["instance"]
-    return _MODEL_TYPE_COLORS["other"]
-
-
-def _model_display_name(
-    row: Mapping[str, Any],
-    labels: Mapping[str, str] | None,
-) -> str:
-    model = str(row["model"])
-    return labels.get(model, model) if labels is not None else model
-
-
-def _style_model_row_labels(
-    axis: Any,
-    ranking: list[dict[str, Any]],
-    labels: Mapping[str, str] | None,
-) -> None:
-    """Render model types as compact colored badges below model row labels."""
-
-    axis.set_yticks(
-        np.arange(len(ranking)),
-        [_model_display_name(row, labels) for row in ranking],
-        fontsize=8.5,
-    )
-    for row_index, (tick, row) in enumerate(
-        zip(axis.get_yticklabels(), ranking, strict=True)
-    ):
-        model_type = str(row.get("model_type") or "").strip()
-        if not model_type:
-            continue
-        tick.set_verticalalignment("bottom")
-        axis.annotate(
-            model_type,
-            xy=(0, row_index),
-            xycoords=("axes fraction", "data"),
-            xytext=(-6, -5),
-            textcoords="offset points",
-            horizontalalignment="right",
-            verticalalignment="top",
-            fontsize=7,
-            fontfamily="monospace",
-            color="white",
-            bbox={
-                "boxstyle": "round,pad=0.24",
-                "facecolor": _model_type_color(model_type),
-                "edgecolor": "none",
-            },
-            annotation_clip=False,
-        )
 
 
 def object_size_report_artifacts_exist(root: Path, manifest: Mapping[str, Any]) -> bool:
@@ -757,17 +690,17 @@ def render_segmentation_metric_breakdown(
     columns = (
         ("dice", "Mean Dice"),
         ("micro_dice", "Pooled foreground\nDice"),
-        ("foreground_precision", "Foreground\nprecision"),
-        ("foreground_recall", "Foreground\nrecall"),
+        ("foreground_precision", "Pixel\nprecision"),
+        ("foreground_recall", "Pixel\nrecall"),
         ("raw_presence_precision", "Presence precision\nraw"),
         (
             "component_filtered_presence_precision",
             "Presence precision\narea-filtered",
         ),
-        ("raw_positive_image_recall", "Positive recall\nraw"),
+        ("raw_positive_image_recall", "Positive-image recall\nraw"),
         (
             "component_filtered_positive_image_recall",
-            "Positive recall\narea-filtered",
+            "Positive-image recall\narea-filtered",
         ),
         ("raw_empty_image_specificity", "Empty specificity\nraw"),
         (
@@ -1132,7 +1065,7 @@ def render_large_object_examples(
             fontsize=13,
         )
         figure.tight_layout()
-        stem = _safe_stem(Path(component.relative_path).stem)
+        stem = bounded_slug(Path(component.relative_path).stem, max_length=96)
         path = output_root / f"{selection_index:02d}-{stem}.png"
         figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
         plt.close(figure)
@@ -1183,8 +1116,3 @@ def _show_component_panel(
         axis.contour(mask.astype(float), levels=[0.5], colors=["white"], linewidths=1)
     axis.set_title(title, fontsize=9)
     axis.axis("off")
-
-
-def _safe_stem(value: str) -> str:
-    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-.")
-    return normalized[:96] or "object"

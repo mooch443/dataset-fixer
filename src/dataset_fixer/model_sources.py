@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlparse
@@ -38,6 +39,65 @@ class ResolvedModelSource:
     geometry: Geometry = field(default_factory=Geometry)
     manifest: dict[str, Any] = field(default_factory=dict)
     source: str | None = None
+
+
+_CREATION_TIME_KEYS = (
+    "checkpoint_created_at",
+    "date",
+    "finished_at",
+    "completed_at",
+    "created_at",
+    "started_at",
+    "run_created_at",
+    "timestamp",
+)
+
+
+def _creation_time(*values: Any, run: Any = None) -> str | None:
+    """Return portable checkpoint/run provenance without consulting its name."""
+
+    candidates: list[Any] = []
+    if run is not None:
+        candidates.extend(
+            getattr(run, key, None)
+            for key in (
+                "created_at",
+                "finished_at",
+                "heartbeat_at",
+                "updated_at",
+            )
+        )
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        # Prefer checkpoint/training/run provenance nested in the bundle over
+        # the bundle's own packaging timestamp at the top level.
+        for section in (
+            "model",
+            "outcome",
+            "training_outcome",
+            "run",
+            "training",
+            "timing",
+        ):
+            nested = value.get(section)
+            if isinstance(nested, Mapping):
+                candidates.extend(nested.get(key) for key in _CREATION_TIME_KEYS)
+        candidates.extend(value.get(key) for key in _CREATION_TIME_KEYS)
+    for candidate in candidates:
+        if candidate is None or isinstance(candidate, bool):
+            continue
+        if isinstance(candidate, (int, float)):
+            try:
+                return datetime.fromtimestamp(
+                    float(candidate), timezone.utc
+                ).isoformat()
+            except (OverflowError, OSError, ValueError):
+                continue
+        text = str(candidate).strip()
+        if text:
+            return text
+    return None
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -251,6 +311,8 @@ def _resolve_bundle(path: Path, *, name: str | None, progress: bool) -> Resolved
         path.stem,
     )
     options: dict[str, Any] = {}
+    if created_at := _creation_time(manifest):
+        options["source_created_at"] = created_at
     source_dataset_zip = _source_dataset_zip(manifest)
     if source_dataset_zip is not None:
         options["source_dataset_zip"] = source_dataset_zip
@@ -554,6 +616,14 @@ def _checkpoint_metadata(path: Path) -> dict[str, Any]:
         train_args = dict(checkpoint.get("train_args") or {})
         serialized = checkpoint.get("model") or checkpoint.get("ema")
         model_args = dict(getattr(serialized, "args", {}) or {})
+        checkpoint_created_at = first_value(
+            checkpoint.get("checkpoint_created_at"),
+            checkpoint.get("date"),
+            checkpoint.get("created_at"),
+            checkpoint.get("finished_at"),
+        )
+        if checkpoint_created_at is not None:
+            values.setdefault("checkpoint_created_at", checkpoint_created_at)
         values.setdefault("train_args", train_args)
         values.setdefault("model_args", model_args)
     return values
@@ -601,6 +671,8 @@ def _resolve_checkpoint(
             )
         )
     options: dict[str, Any] = {"kind": "ultralytics"}
+    if created_at := _creation_time(metadata, run_config, run=run):
+        options["source_created_at"] = created_at
     source_dataset_zip = _source_dataset_zip(metadata, run_config)
     if source_dataset_zip is not None:
         options["source_dataset_zip"] = source_dataset_zip
@@ -689,6 +761,11 @@ def resolve_model_source(
                             else {}
                         ),
                         "folds": (fold,),
+                        **(
+                            {"source_created_at": created_at}
+                            if (created_at := _creation_time(metadata)) is not None
+                            else {}
+                        ),
                     },
                     geometry=from_metadata(metadata, source=str(parent)),
                     source=source_key,
@@ -722,6 +799,11 @@ def resolve_model_source(
                         ) is not None
                         else {}
                     ),
+                    **(
+                        {"source_created_at": created_at}
+                        if (created_at := _creation_time(metadata)) is not None
+                        else {}
+                    ),
                 },
                 geometry=from_metadata(metadata, source=str(path)),
                 source=source_key,
@@ -735,7 +817,10 @@ def resolve_model_source(
         )
     if path.suffix.lower() == ".zip":
         resolved = _resolve_bundle(path, name=resolved_name, progress=progress)
-        return replace(resolved, source=source_key)
+        options = dict(resolved.options)
+        if created_at := _creation_time(resolved.manifest, run=run):
+            options["source_created_at"] = created_at
+        return replace(resolved, source=source_key, options=options)
     if path.suffix.lower() == ".pt":
         resolved = _resolve_checkpoint(
             path,

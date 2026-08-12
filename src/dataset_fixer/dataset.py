@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Hashable, Iterable, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Hashable, Iterable, Literal, Mapping, Sequence
 
+import numpy as np
 from PIL import Image
 from tqdm.auto import tqdm
 
@@ -30,6 +32,7 @@ from .operations import (
 from .planning import (
     PlannedOperation,
     callback_description,
+    clone_sample,
     derived_name,
     plan_split,
     project_remove_classes,
@@ -44,6 +47,10 @@ from .utils import IMAGE_SUFFIXES, ensure_safe_destination, normalize_split, set
 from .validation import validate_dataset
 from .validation_audit import ValidationFailureExample, build_load_validation_audit
 from .visualization import visualize_samples, visualize_semantic_masks
+
+if TYPE_CHECKING:
+    from .model import Model, PredictionResult
+
 
 class Dataset:
     """A validated dataset or immutable virtual transformation pipeline.
@@ -1480,6 +1487,401 @@ class Dataset:
             columns=columns,
             save_to=destination,
             show=show,
+        )
+
+    def sample(
+        self,
+        n: int,
+        *,
+        split: Literal["train", "val", "test"] | None = "val",
+        seed: int = 42,
+    ) -> "Dataset":
+        """Return a deterministic, materialized view of at most ``n`` images.
+
+        The returned dataset retains the source images, annotations, masks,
+        geometry, and cache location without copying files. It is therefore
+        the standard low-cost input for :meth:`dataset_fixer.Model.predict`
+        when only a reproducible sample should be inferred.
+
+        Parameters:
+            n: Maximum number of images in the returned view.
+            split: Split to sample. ``None`` samples across all splits.
+            seed: Deterministic random seed.
+
+        Returns:
+            A materialized :class:`Dataset` view accepted anywhere the source
+            dataset is accepted. The source dataset is unchanged.
+        """
+
+        if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+            raise ValueError("n must be a positive integer")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("seed must be an integer")
+        if self._plan:
+            raise DatasetValidationError(
+                "Dataset.sample requires materialized images; export the pending "
+                "transformation pipeline first"
+            )
+        normalized = normalize_split(split) if split is not None else None
+        if normalized is not None and normalized not in self.splits:
+            raise ValueError(
+                f"Unknown split {split!r}; available splits are {self.splits}"
+            )
+        candidates = [
+            sample
+            for sample in self._samples
+            if normalized is None or sample.split == normalized
+        ]
+        if not candidates:
+            raise ValueError("The requested dataset sample contains no images")
+        count = min(n, len(candidates))
+        if count == len(candidates):
+            selected = list(candidates)
+        else:
+            indices = sorted(random.Random(seed).sample(range(len(candidates)), count))
+            selected = [candidates[index] for index in indices]
+        return self._materialized_view(
+            selected,
+            view={
+                "kind": "sample",
+                "n": len(selected),
+                "requested_n": n,
+                "split": normalized,
+                "seed": seed,
+            },
+        )
+
+    def filter(
+        self,
+        *,
+        gt_annotated: bool | None = None,
+        predictions: "PredictionResult | None" = None,
+        model: "Model | None" = None,
+        has_prediction: bool | None = None,
+        split: Literal["train", "val", "test"] | None = None,
+        progress: bool = True,
+    ) -> "Dataset":
+        """Return a materialized view selected by GT and prediction presence.
+
+        Ground-truth presence is read from vector annotations or semantic
+        masks. Prediction presence can use an explicit
+        :class:`dataset_fixer.PredictionResult`, or a model whose normal cache
+        is resolved before filtering. When a result covers only part of the
+        dataset, its image cohort defines the eligible records.
+
+        Parameters:
+            gt_annotated: Retain images with non-empty ground truth when
+                ``True``, or confirmed-empty ground truth when ``False``.
+            predictions: Prediction result used to evaluate
+                ``has_prediction`` without inference. Mutually exclusive with
+                ``model``.
+            model: Model used to resolve cached predictions. A cache miss runs
+                and publishes inference. Mutually exclusive with
+                ``predictions``. When ``has_prediction`` is omitted, the model
+                is accepted as inert context and no prediction is resolved.
+            has_prediction: Retain records with foreground predictions when
+                ``True`` or empty predictions when ``False``.
+            split: Optional eligible split. Model-backed prediction filtering
+                defaults to validation when this is omitted.
+            progress: Show prediction/cache progress for model-backed filters.
+
+        Returns:
+            An ordered, zero-copy :class:`Dataset` view. Source files and the
+            source dataset are unchanged.
+        """
+
+        for name, value in (
+            ("gt_annotated", gt_annotated),
+            ("has_prediction", has_prediction),
+        ):
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"{name} must be a boolean or None")
+        if gt_annotated is None and has_prediction is None:
+            raise ValueError("Dataset.filter requires at least one filter")
+        if not isinstance(progress, bool):
+            raise TypeError("progress must be a boolean")
+        if predictions is not None and model is not None:
+            raise ValueError("predictions and model are mutually exclusive")
+        if has_prediction is None and predictions is not None:
+            raise ValueError(
+                "predictions is only used when has_prediction is specified"
+            )
+        if has_prediction is not None and predictions is None and model is None:
+            raise ValueError(
+                "has_prediction requires predictions=PredictionResult or model=Model"
+            )
+        if self._plan:
+            raise DatasetValidationError(
+                "Dataset.filter requires materialized images; export the pending "
+                "transformation pipeline first"
+            )
+
+        normalized_split = normalize_split(split) if split is not None else None
+        if normalized_split is not None and normalized_split not in self.splits:
+            raise ValueError(
+                f"Unknown split {split!r}; available splits are {self.splits}"
+            )
+        if model is not None:
+            from .model import Model
+
+            if not isinstance(model, Model):
+                raise TypeError("model must be a Model")
+        if model is not None and has_prediction is not None:
+            prediction_split = normalized_split or "val"
+            if prediction_split not in self.splits:
+                raise ValueError(
+                    "Model-backed filtering defaults to split 'val', but available "
+                    f"splits are {self.splits}; specify split explicitly"
+                )
+            prediction_candidates = [
+                sample
+                for sample in self._samples
+                if sample.split == prediction_split
+                and (
+                    gt_annotated is None
+                    or self._sample_has_ground_truth(sample) is gt_annotated
+                )
+            ]
+            if not prediction_candidates:
+                raise ValueError("Dataset.filter matched no images before prediction")
+            prediction_source = (
+                self
+                if len(prediction_candidates) == len(self._samples)
+                else self._materialized_view(
+                    prediction_candidates,
+                    view={
+                        "kind": "filter",
+                        "n": len(prediction_candidates),
+                        "gt_annotated": gt_annotated,
+                        "has_prediction": None,
+                        "split": prediction_split,
+                        "stage": "prediction-candidates",
+                    },
+                )
+            )
+            predictions = model.predict(
+                prediction_source,
+                split=prediction_split,
+                progress=progress,
+                prediction_cache=True,
+            )
+            normalized_split = prediction_split
+
+        prediction_by_path: dict[Path, Any] = {}
+        if predictions is not None:
+            from .model import PredictionResult
+
+            if not isinstance(predictions, PredictionResult):
+                raise TypeError("predictions must be a PredictionResult")
+            for record in predictions:
+                path = record.image_path.resolve()
+                if path in prediction_by_path:
+                    raise ValueError(
+                        f"PredictionResult contains duplicate image path: {path}"
+                    )
+                prediction_by_path[path] = record
+            samples_by_path = {
+                sample.image_path.resolve(): sample for sample in self._samples
+            }
+            covered = 0
+            for path, record in prediction_by_path.items():
+                sample = samples_by_path.get(path)
+                if sample is None:
+                    continue
+                covered += 1
+                if (record.width, record.height) != (sample.width, sample.height):
+                    raise DatasetValidationError(
+                        "PredictionResult geometry does not match the dataset for "
+                        f"{sample.relative_path}: got {(record.width, record.height)}, "
+                        f"expected {(sample.width, sample.height)}"
+                    )
+                if record.mask is not None and record.mask.shape != (
+                    sample.height,
+                    sample.width,
+                ):
+                    raise DatasetValidationError(
+                        "PredictionResult mask shape does not match the dataset for "
+                        f"{sample.relative_path}: got {record.mask.shape}, expected "
+                        f"{(sample.height, sample.width)}"
+                    )
+            if covered == 0:
+                raise ValueError(
+                    "PredictionResult does not cover any image in this dataset view"
+                )
+
+        selected: list[Sample] = []
+        for sample in self._samples:
+            if normalized_split is not None and sample.split != normalized_split:
+                continue
+            if gt_annotated is not None and (
+                self._sample_has_ground_truth(sample) is not gt_annotated
+            ):
+                continue
+            if has_prediction is not None:
+                prediction = prediction_by_path.get(sample.image_path.resolve())
+                if prediction is None:
+                    continue
+                prediction_present = (
+                    bool(np.any(prediction.mask))
+                    if prediction.mask is not None
+                    else bool(prediction.objects)
+                )
+                if prediction_present is not has_prediction:
+                    continue
+            selected.append(sample)
+        if not selected:
+            raise ValueError("Dataset.filter matched no images")
+        return self._materialized_view(
+            selected,
+            view={
+                "kind": "filter",
+                "n": len(selected),
+                "gt_annotated": gt_annotated,
+                "has_prediction": has_prediction,
+                "split": normalized_split,
+                "prediction_model": (
+                    predictions.model_name if predictions is not None else None
+                ),
+            },
+        )
+
+    def add(self, other: "Dataset") -> "Dataset":
+        """Append another compatible view while preserving sample order.
+
+        Samples from this view are retained first. Previously unseen samples
+        from ``other`` are then appended in their existing order; overlapping
+        image paths are included once so prediction identities remain unique.
+
+        Parameters:
+            other: Materialized view of the same physical dataset, task, and
+                annotation format.
+
+        Returns:
+            The ordered unique union as a zero-copy :class:`Dataset` view.
+        """
+
+        if not isinstance(other, Dataset):
+            raise TypeError("other must be a Dataset")
+        if self._plan or other._plan:
+            raise DatasetValidationError(
+                "Dataset.add requires materialized dataset views"
+            )
+        if (
+            self.location != other.location
+            or self.task is not other.task
+            or self.format != other.format
+            or self.classes != other.classes
+        ):
+            raise ValueError(
+                "Dataset.add requires views of the same physical dataset, task, "
+                "and annotation format"
+            )
+        selected: list[Sample] = []
+        seen: set[Path] = set()
+        for sample in (*self._samples, *other._samples):
+            path = sample.image_path.resolve()
+            if path in seen:
+                continue
+            seen.add(path)
+            selected.append(sample)
+        return self._materialized_view(
+            selected,
+            view={
+                "kind": "add",
+                "n": len(selected),
+                "left_n": len(self._samples),
+                "right_n": len(other._samples),
+            },
+            related=(other,),
+        )
+
+    def _sample_has_ground_truth(self, sample: Sample) -> bool:
+        if self.format != "semantic_masks":
+            return bool(sample.annotations)
+        image_path = sample.image_path.resolve()
+        statistics = self._mask_statistics.get(image_path)
+        if statistics is None:
+            mask_path = self._mask_paths.get(image_path)
+            if mask_path is None or not mask_path.is_file():
+                raise DatasetValidationError(
+                    f"Semantic mask is unavailable for {sample.relative_path}"
+                )
+            with Image.open(mask_path) as opened:
+                histogram = opened.convert("L").histogram()
+            statistics = {
+                "foreground_pixels": int(sum(histogram[1:])),
+                "total_pixels": int(sample.width * sample.height),
+            }
+            self._mask_statistics[image_path] = statistics
+        return bool(statistics["foreground_pixels"])
+
+    def _materialized_view(
+        self,
+        selected: Sequence[Sample],
+        *,
+        view: Mapping[str, Any],
+        related: Sequence["Dataset"] = (),
+    ) -> "Dataset":
+        selected_samples = [clone_sample(sample) for sample in selected]
+        selected_paths = {sample.image_path.resolve() for sample in selected_samples}
+        selected_splits = tuple(
+            value
+            for value in ("train", "val", "test")
+            if any(sample.split == value for sample in selected_samples)
+        )
+        view_manifest = dict(self._manifest)
+        view_record = dict(view)
+        parent_view = self._manifest.get("view")
+        if parent_view is not None:
+            view_record["parent"] = parent_view
+        view_manifest["view"] = view_record
+        sources = (self, *related)
+        image_dirs = {
+            split: directory
+            for source in sources
+            for split, directory in source._image_dirs.items()
+            if split in selected_splits
+        }
+        mask_dirs = {
+            split: directory
+            for source in sources
+            for split, directory in source._mask_dirs.items()
+            if split in selected_splits
+        }
+        mask_paths = {
+            image: mask
+            for source in sources
+            for image, mask in source._mask_paths.items()
+            if image.resolve() in selected_paths
+        }
+        mask_statistics = {
+            image: statistics
+            for source in sources
+            for image, statistics in source._mask_statistics.items()
+            if image.resolve() in selected_paths
+        }
+        return Dataset(
+            location=self.location,
+            source_name=self._source_name,
+            name=self.name,
+            task=self.task,
+            metadata=self._metadata.copy(),
+            samples=selected_samples,
+            manifest=view_manifest,
+            data_yaml=self._data_yaml,
+            source_format=self._source_format,
+            warnings=list(self._warnings),
+            base=self._base or self,
+            projection_exact=True,
+            planned_splits=selected_splits,
+            errors=self._errors,
+            validation_audit=self._validation_audit,
+            validation_audit_visualization=self._validation_audit_visualization,
+            provenance={},
+            image_dirs=image_dirs,
+            mask_dirs=mask_dirs,
+            mask_paths=mask_paths,
+            mask_statistics=mask_statistics,
         )
 
     def assert_trainable(

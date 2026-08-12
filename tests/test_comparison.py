@@ -306,8 +306,8 @@ def test_native_inference_batches_honors_device_backs_off_and_reuses_runtime(
         device="mps",
         batch_size=-1,
     )
-    first = model.predict(images, progress=False)
-    second = model.predict(images, progress=False)
+    first = model.predict(images, progress=False, prediction_cache=False)
+    second = model.predict(images, progress=False, prediction_cache=False)
 
     assert initializations == 1
     assert calls == [5, 2, 2, 1, 2, 2, 1]
@@ -537,6 +537,16 @@ def test_collection_predict_uses_each_models_shared_batching_configuration(
         images.append(path)
     initializations: dict[str, int] = {}
     calls: dict[str, list[int]] = {}
+    normalizations = 0
+
+    from dataset_fixer import model as model_module
+
+    normalize_model_inputs = model_module.normalize_model_inputs
+
+    def counted_normalization(*args, **kwargs):
+        nonlocal normalizations
+        normalizations += 1
+        return normalize_model_inputs(*args, **kwargs)
 
     class FakeYOLO:
         task = "detect"
@@ -555,6 +565,7 @@ def test_collection_predict_uses_each_models_shared_batching_configuration(
             ]
 
     monkeypatch.setitem(sys.modules, "ultralytics", types.SimpleNamespace(YOLO=FakeYOLO))
+    monkeypatch.setattr(model_module, "normalize_model_inputs", counted_normalization)
     models = Model.load_many(
         {
             "first": {"path": checkpoints[0], "task": "detect", "batch_size": 2},
@@ -567,6 +578,7 @@ def test_collection_predict_uses_each_models_shared_batching_configuration(
     assert tuple(results) == models.names
     assert calls == {"first": [2, 2, 1], "second": [3, 2]}
     assert initializations == {"first": 1, "second": 1}
+    assert normalizations == 1
     assert all(len(result.records) == len(images) for result in results.values())
 
 
@@ -687,6 +699,18 @@ def test_model_load_many_returns_reusable_unbound_collection(
     assert models["baseline"].device == "mps"
     assert models["baseline"].confidence == pytest.approx(0.5)
     assert models["baseline"].postprocess == pytest.approx(0.5)
+    assert models.hashes == {
+        "baseline": {
+            "source": str(checkpoint),
+            "path": str(checkpoint.resolve()),
+            "sha256": models["baseline"].digest,
+        }
+    }
+    assert models.hash_for("baseline") == models["baseline"].digest
+    assert models.hash_for(checkpoint) == models["baseline"].digest
+    assert models.hash_for(models["baseline"]) == models["baseline"].digest
+    with pytest.raises(KeyError, match="No loaded model matches"):
+        models.hash_for("missing-model")
 
 
 def test_model_predict_opt_in_cache_round_trips_without_loading_runtime(
@@ -730,6 +754,7 @@ def test_model_predict_opt_in_cache_round_trips_without_loading_runtime(
         prediction_cache=cache,
     )
     assert first.cache_info["status"] == "fresh"
+    assert len(first.cache_info["input_fingerprint"]) == 64
     assert first.cache_info["location"].startswith(
         str(cache.location / "predictions")
     )
@@ -743,6 +768,9 @@ def test_model_predict_opt_in_cache_round_trips_without_loading_runtime(
         destination=tmp_path / "cached-output",
     )
     assert second.cache_info["status"] == "hit"
+    assert second.cache_info["input_fingerprint"] == first.cache_info[
+        "input_fingerprint"
+    ]
     assert second.model_name == "renamed"
     assert second.records[0].objects[0].bbox == pytest.approx((1, 2, 8, 9))
     assert FakeYOLO.calls == 1
@@ -1158,6 +1186,50 @@ def test_shared_semantic_cache_rebases_generated_ids_across_dataset_formats(
         prediction_cache=cache,
         progress=False,
     )
+
+    # A legacy exact-ID entry containing masks but no probabilities must not
+    # shadow the richer cross-format result above.
+    from dataset_fixer.model import normalize_model_inputs
+    from dataset_fixer.prediction_cache import prediction_input_fingerprint
+
+    vector_inputs, _, _ = normalize_model_inputs(vector, split="val")
+    rich_manifest = json.loads(
+        (
+            cache.entry(fresh.cache_info["key"], namespace="semantic")
+            / "raw-result"
+            / "manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    exact_identity = {
+        **rich_manifest["identity"],
+        "input_fingerprint": prediction_input_fingerprint(vector_inputs),
+    }
+    exact_key = prediction_cache_key(exact_identity)
+    cache.save(
+        exact_key,
+        PredictionResult(
+            model_name=model.name,
+            model_kind=model.kind,
+            task="semantic_segment",
+            backend="native",
+            records=tuple(
+                ImagePrediction(
+                    image_id=value.image_id,
+                    image_path=value.image_path,
+                    relative_path=value.relative_path,
+                    width=value.width,
+                    height=value.height,
+                    mask=np.ones((value.height, value.width), dtype=np.uint8),
+                    foreground_probability=None,
+                )
+                for value in vector_inputs
+            ),
+            inference_seconds=0.0,
+        ),
+        namespace="semantic",
+        identity=exact_identity,
+        inputs=vector_inputs,
+    )
     reused = model.predict(
         vector,
         split="val",
@@ -1171,7 +1243,7 @@ def test_shared_semantic_cache_rebases_generated_ids_across_dataset_formats(
     assert fresh.records[0].image_id != reused.records[0].image_id
     assert reused.cache_info["status"] == "image-compatible-hit"
     assert reused.cache_info["key"] == fresh.cache_info["key"]
-    assert reused.cache_info["requested_key"] != fresh.cache_info["key"]
+    assert reused.cache_info["requested_key"] == exact_key
     assert reused.records[0].image_path.is_relative_to(vector.location)
     assert reused.records[0].foreground_probability is not None
 
@@ -1241,6 +1313,20 @@ def test_shared_instance_cache_rebases_generated_ids_across_dataset_formats(
     assert reused.records[0].image_path.is_relative_to(vector.location)
     assert len(reused.records[0].objects) == 1
     assert reused.records[0].objects[0].score == pytest.approx(0.9)
+
+    projected = model.predict(
+        vector,
+        split="val",
+        prediction_cache=cache,
+        cache_only=True,
+        output_task="semantic_segment",
+        progress=False,
+    )
+    assert calls == 1
+    assert projected.task == "semantic_segment"
+    assert projected.records[0].mask is not None
+    assert projected.records[0].mask.any()
+    assert len(projected.records[0].objects) == 1
 
 
 def test_semantic_predict_cache_on_vector_dataset_reuses_complete_masks(

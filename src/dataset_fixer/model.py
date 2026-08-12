@@ -84,6 +84,9 @@ class ImagePrediction:
         objects: Object predictions for instance-style tasks.
         mask: Projected semantic prediction in output-image space.
         native_mask: Optional prediction in native adapter output space.
+        reference_mask_path: Optional semantic ground-truth mask associated
+            with this prediction input. Prediction never reads this path; it
+            is retained only for task-aware visualization and evaluation.
         foreground_probability: Optional canonical-space foreground
             probability map. Unlike ``mask``, this is independent of the
             selected semantic operating threshold and can therefore be reused
@@ -99,6 +102,7 @@ class ImagePrediction:
     objects: tuple[Any, ...] = ()
     mask: np.ndarray | None = field(default=None, repr=False, compare=False)
     native_mask: np.ndarray | None = field(default=None, repr=False, compare=False)
+    reference_mask_path: Path | None = field(default=None, repr=False, compare=False)
     foreground_probability: np.ndarray | None = field(
         default=None,
         repr=False,
@@ -213,6 +217,151 @@ class PredictionResult:
             for record in self.records
             if record.mask is not None
         }
+
+    def as_semantic(
+        self,
+        *,
+        prediction_threshold: float | None = None,
+    ) -> "PredictionResult":
+        """Project reusable predictions into binary semantic-mask space.
+
+        Native semantic predictions are returned unchanged unless an explicit
+        threshold requests re-thresholding of stored foreground probabilities.
+        Instance-segmentation polygons are rasterized without modifying the
+        cached native result: each pixel receives the maximum confidence of
+        any covering instance and is retained at ``prediction_threshold``.
+
+        Parameters:
+            prediction_threshold: Foreground probability or instance-score
+                cutoff. When omitted, use the result's recorded operating
+                threshold, semantic threshold, or confidence, in that order.
+
+        Returns:
+            A semantic :class:`PredictionResult`. Instance polygons remain
+            available on the projected in-memory records while ``mask`` and
+            ``foreground_probability`` expose the semantic projection.
+        """
+
+        if self.task not in {"segment", "semantic_segment"}:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Prediction task has no semantic-mask projection",
+                    source=self.model_name,
+                    value=self.task,
+                    expected="segment or semantic_segment",
+                )
+            )
+
+        configured_threshold = next(
+            (
+                self.settings[key]
+                for key in (
+                    "prediction_threshold",
+                    "foreground_probability_threshold",
+                    "confidence",
+                )
+                if self.settings.get(key) is not None
+            ),
+            None,
+        )
+        threshold = (
+            float(prediction_threshold)
+            if prediction_threshold is not None
+            else float(configured_threshold)
+            if configured_threshold is not None
+            else 0.5
+        )
+        if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+            raise ValueError("prediction_threshold must be finite and in [0, 1]")
+
+        if self.task == "semantic_segment" and prediction_threshold is None:
+            return self
+
+        projected: list[ImagePrediction] = []
+        for record in self.records:
+            if self.task == "semantic_segment":
+                if record.foreground_probability is None:
+                    existing = self.settings.get("prediction_threshold")
+                    if existing is None:
+                        existing = self.settings.get(
+                            "foreground_probability_threshold"
+                        )
+                    if existing is not None and math.isclose(
+                        float(existing),
+                        threshold,
+                    ):
+                        projected.append(record)
+                        continue
+                    raise PredictionScoreUnavailableError(
+                        f"Semantic re-thresholding for {self.model_name!r} requires "
+                        f"foreground probabilities for {record.image_id!r}",
+                        reason="missing-probability-maps",
+                    )
+                score_map = np.asarray(
+                    record.foreground_probability,
+                    dtype=np.float32,
+                )
+                projection = "native-semantic-probabilities"
+                probability_source = record.metadata.get(
+                    "probability_source",
+                    "model-probabilities",
+                )
+            else:
+                score_map = record.foreground_score_map()
+                if score_map is None:
+                    raise DatasetValidationError(
+                        ValidationIssue(
+                            "Instance predictions cannot be projected without polygons",
+                            source=f"{self.model_name}: {record.relative_path}",
+                            value=len(record.objects),
+                            expected="segmentation polygons or an empty prediction",
+                        )
+                    )
+                score_map = np.asarray(score_map, dtype=np.float32)
+                projection = "polygon-foreground-union"
+                probability_source = "rasterized-instance-confidence"
+
+            expected_shape = (record.height, record.width)
+            if score_map.shape != expected_shape or not np.all(np.isfinite(score_map)):
+                raise DatasetValidationError(
+                    f"Semantic score map for {self.model_name!r}/{record.image_id!r} "
+                    f"has shape {score_map.shape}; expected finite {expected_shape}"
+                )
+            score_map = np.clip(score_map, 0.0, 1.0)
+            projected.append(
+                replace(
+                    record,
+                    mask=(score_map >= threshold).astype(np.uint8),
+                    foreground_probability=score_map.astype(np.float16),
+                    metadata={
+                        **record.metadata,
+                        "semantic_projection": projection,
+                        "probability_source": probability_source,
+                        "prediction_threshold": threshold,
+                    },
+                )
+            )
+
+        projection = (
+            "polygon-foreground-union"
+            if self.task == "segment"
+            else "native-semantic-probabilities"
+        )
+        return replace(
+            self,
+            task="semantic_segment",
+            records=tuple(projected),
+            settings={
+                **self.settings,
+                "prediction_threshold": threshold,
+                "semantic_projection": projection,
+            },
+            cache_info={
+                **self.cache_info,
+                "semantic_projection": projection,
+                "projection_status": "derived-from-native-predictions",
+            },
+        )
 
     def save(
         self,
@@ -352,34 +501,80 @@ class PredictionResult:
     def visualize(
         self,
         *,
-        samples: int = 8,
-        columns: int = 2,
+        samples: int | None = None,
+        columns: int = 1,
         seed: int = 42,
         panel_size: float = 3.0,
+        zoom: bool = False,
+        context_fraction: float = 0.35,
+        minimum_context: int = 100,
+        outline_width: float = 1.0,
+        outline_alpha: float = 1.0,
         destination: str | Path | None = None,
     ) -> Any:
-        """Render sampled original/prediction pairs.
+        """Render compact original/annotation/prediction rows.
 
         Parameters:
-            samples: Maximum number of images to render.
-            columns: Number of independent image pairs per figure row.
+            samples: Maximum number of images to render. ``None`` renders all
+                records, making ``dataset.sample(...).predict(...).visualize()``
+                display exactly the sampled prediction cohort.
+            columns: Number of independent image rows placed side by side.
             seed: Deterministic sampling seed.
-            panel_size: Approximate width/height of each image panel in inches.
+            panel_size: Approximate width of each image panel in inches.
+            zoom: Crop each row to the union of its annotation and prediction.
+                Empty annotation/prediction pairs retain the full source image.
+            context_fraction: Extra crop context on each side, expressed as a
+                fraction of the foreground-union width or height.
+            minimum_context: Minimum total crop width and height in source
+                pixels when ``zoom`` is enabled.
+            outline_width: Annotation and prediction outline width. Overlays
+                are never filled, so source-image pixels remain visible.
+            outline_alpha: Annotation and prediction outline opacity in
+                ``[0, 1]``. The default is fully opaque.
             destination: Optional PNG output path.
 
         Returns:
             A Matplotlib figure.
         """
 
-        if samples <= 0 or columns <= 0:
-            raise ValueError("samples and columns must be positive")
+        if samples is not None and (
+            isinstance(samples, bool) or not isinstance(samples, int) or samples <= 0
+        ):
+            raise ValueError("samples must be a positive integer or None")
+        if columns <= 0:
+            raise ValueError("columns must be positive")
         if not math.isfinite(panel_size) or panel_size <= 0:
             raise ValueError("panel_size must be a positive finite number")
+        if not isinstance(zoom, bool):
+            raise TypeError("zoom must be a boolean")
+        if not math.isfinite(context_fraction) or context_fraction < 0:
+            raise ValueError("context_fraction must be a finite non-negative number")
+        if (
+            isinstance(minimum_context, bool)
+            or not isinstance(minimum_context, int)
+            or minimum_context <= 0
+        ):
+            raise ValueError("minimum_context must be a positive integer")
+        if not math.isfinite(outline_width) or outline_width <= 0:
+            raise ValueError("outline_width must be a positive finite number")
+        if not math.isfinite(outline_alpha) or not 0 <= outline_alpha <= 1:
+            raise ValueError("outline_alpha must be finite and in [0, 1]")
         if not self.records:
             raise ValueError("PredictionResult contains no images")
         import matplotlib.pyplot as plt
+        from matplotlib import font_manager
 
-        count = min(samples, len(self.records))
+        available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+        font_family = next(
+            (
+                candidate
+                for candidate in ("Arial", "Avenir Next", "Helvetica Neue")
+                if candidate in available_fonts
+            ),
+            "DejaVu Sans",
+        )
+
+        count = len(self.records) if samples is None else min(samples, len(self.records))
         if count == len(self.records):
             selected = list(self.records)
         else:
@@ -388,62 +583,216 @@ class PredictionResult:
                 rng.choice(len(self.records), size=count, replace=False).tolist()
             )
             selected = [self.records[index] for index in indices]
+
+        prepared: list[
+            tuple[ImagePrediction, tuple[int, int, int, int]]
+        ] = []
+        for record in selected:
+            with Image.open(record.image_path) as opened:
+                source_size = opened.size
+            if source_size != (record.width, record.height):
+                raise DatasetValidationError(
+                    f"Source image for {record.relative_path!r} has size "
+                    f"{source_size}; expected {(record.width, record.height)}"
+                )
+            reference_mask = _reference_outline_mask(record)
+            prediction_mask = _prediction_outline_mask(record)
+            foreground = prediction_mask.copy()
+            if reference_mask is not None:
+                foreground |= reference_mask
+            bounds = (
+                _foreground_crop_bounds(
+                    foreground,
+                    context_fraction=context_fraction,
+                    minimum_context=minimum_context,
+                )
+                if zoom and np.any(foreground)
+                else (0, 0, record.width, record.height)
+            )
+            prepared.append((record, bounds))
+
         rows = math.ceil(len(selected) / columns)
-        figure = plt.figure(
-            figsize=(panel_size * 2 * columns, (panel_size + 0.38) * rows)
+        row_heights: list[float] = []
+        for row in range(rows):
+            row_values = prepared[row * columns : (row + 1) * columns]
+            aspect = max(
+                (bounds[3] - bounds[1]) / max(bounds[2] - bounds[0], 1)
+                for _, bounds in row_values
+            )
+            # Each cell contains three panels, so each panel is approximately
+            # ``panel_size`` inches wide. Allocate the matching image height
+            # instead of imposing a tall minimum: wide satellite strips would
+            # otherwise be vertically centered inside a mostly empty row.
+            row_heights.append(panel_size * min(1.55, max(0.08, aspect)))
+        title_heights = [0.50 if row == 0 else 0.30 for row in range(rows)]
+        model_header_height = 0.26
+        bottom_margin = 0.04
+        figure_height = (
+            sum(row_heights)
+            + sum(title_heights)
+            + model_header_height
+            + bottom_margin
         )
-        figure.subplots_adjust(left=0.02, right=0.98, top=0.98, bottom=0.02)
-        outer = figure.add_gridspec(rows, columns, wspace=0.10, hspace=0.18)
-        for index, record in enumerate(selected):
+        figure = plt.figure(
+            figsize=(
+                panel_size * 3.0 * columns,
+                figure_height,
+            )
+        )
+        figure.subplots_adjust(
+            left=0.015,
+            right=0.995,
+            top=1.0 - model_header_height / figure_height,
+            bottom=bottom_margin / figure_height,
+        )
+        outer = figure.add_gridspec(
+            rows,
+            columns,
+            height_ratios=[
+                height + title_heights[row] for row, height in enumerate(row_heights)
+            ],
+            wspace=0.10,
+            hspace=0.045,
+        )
+        reference_color = "#D39A52"  # muted ochre
+        prediction_color = "#C86552"  # muted terracotta
+        key_labels: list[tuple[Any, Any]] = []
+        for index, (record, bounds) in enumerate(prepared):
             row = index // columns
             column = index % columns
+            x0, y0, x1, y1 = bounds
+            with Image.open(record.image_path) as opened:
+                image = np.asarray(opened.convert("RGB"))[y0:y1, x0:x1]
+            reference_mask = _reference_outline_mask(record)
+            prediction_mask = _prediction_outline_mask(record)
+            reference_crop = (
+                None if reference_mask is None else reference_mask[y0:y1, x0:x1]
+            )
+            prediction_crop = prediction_mask[y0:y1, x0:x1]
             cell = outer[row, column].subgridspec(
                 2,
-                2,
-                height_ratios=(0.10, 0.90),
-                hspace=0.02,
-                wspace=0.07,
+                3,
+                height_ratios=(title_heights[row], row_heights[row]),
+                hspace=0.015,
+                wspace=0.045,
             )
-            title = figure.add_subplot(cell[0, :])
-            title.set_axis_off()
-            title.text(
+            key = figure.add_subplot(cell[0, :])
+            key.set_axis_off()
+            key_label = key.text(
                 0.5,
-                0.5,
-                _shorten_middle(record.relative_path, 72),
+                0.70 if row == 0 else 0.5,
+                _prediction_key(record.relative_path),
                 ha="center",
                 va="center",
-                fontsize=9,
-                fontweight="semibold",
+                fontsize=8.2,
+                fontfamily=font_family,
+                color="#463D35",
+                linespacing=1.18,
             )
-            with Image.open(record.image_path) as opened:
-                image = np.asarray(opened.convert("RGB"))
+            key_labels.append((key, key_label))
+            if row == 0:
+                for x, heading in zip(
+                    (1 / 6, 1 / 2, 5 / 6),
+                    ("Original", "Annotation", "Prediction"),
+                    strict=True,
+                ):
+                    key.text(
+                        x,
+                        0.05,
+                        heading,
+                        ha="center",
+                        va="bottom",
+                        fontsize=9.2,
+                        fontweight="normal",
+                        fontfamily=font_family,
+                        color="#463D35",
+                    )
             original = figure.add_subplot(cell[1, 0])
             original.imshow(image)
-            prediction = figure.add_subplot(cell[1, 1])
+            reference = figure.add_subplot(cell[1, 1])
+            reference.imshow(image)
+            if reference_crop is not None:
+                _draw_mask_outline(
+                    reference,
+                    reference_crop,
+                    color=reference_color,
+                    linewidth=outline_width,
+                    alpha=outline_alpha,
+                )
+            prediction = figure.add_subplot(cell[1, 2])
+            prediction.imshow(image)
             if record.mask is not None:
-                mask = np.asarray(record.mask)
-                prediction.imshow(
-                    mask,
-                    cmap="gray" if int(mask.max(initial=0)) <= 1 else "tab20",
-                    vmin=0,
-                    vmax=max(int(mask.max(initial=0)), 1),
-                    interpolation="nearest",
+                _draw_mask_outline(
+                    prediction,
+                    prediction_crop,
+                    color=prediction_color,
+                    linewidth=outline_width,
+                    alpha=outline_alpha,
                 )
             else:
-                prediction.imshow(image)
-                _draw_object_predictions(prediction, record.objects)
-            for axis in (original, prediction):
+                _draw_object_predictions(
+                    prediction,
+                    record.objects,
+                    color=prediction_color,
+                    linewidth=outline_width,
+                    alpha=outline_alpha,
+                    x_offset=x0,
+                    y_offset=y0,
+                )
+            crop_aspect = (y1 - y0) / max(x1 - x0, 1)
+            for axis in (original, reference, prediction):
+                axis.set_xlim(-0.5, x1 - x0 - 0.5)
+                axis.set_ylim(y1 - y0 - 0.5, -0.5)
+                axis.set_box_aspect(crop_aspect)
                 axis.set_xticks([])
                 axis.set_yticks([])
                 for spine in axis.spines.values():
                     spine.set_visible(False)
-            if row == 0:
-                original.set_title("Original", fontsize=9, pad=4)
-                prediction.set_title(
-                    _shorten_middle(self.model_name, 28),
-                    fontsize=9,
-                    pad=4,
+            if reference_mask is None or not np.any(reference_mask):
+                reference.text(
+                    0.98,
+                    0.03,
+                    "no annotation",
+                    transform=reference.transAxes,
+                    ha="right",
+                    va="bottom",
+                    fontsize=7.5,
+                    color="#6B625A",
                 )
+            if not np.any(prediction_mask):
+                prediction.text(
+                    0.98,
+                    0.03,
+                    "no prediction",
+                    transform=prediction.transAxes,
+                    ha="right",
+                    va="bottom",
+                    fontsize=7.5,
+                    color="#6B625A",
+                )
+        figure.suptitle(
+            _shorten_middle(self.model_name, 76),
+            fontsize=9.5,
+            fontweight="normal",
+            fontfamily=font_family,
+            color="#5C5147",
+            y=1.0 - 0.04 / figure_height,
+        )
+        # Layout first, then use the renderer's actual font metrics. Complete
+        # identifiers remain untouched until they exceed 90% of the available
+        # figure width (or their cell width in a multi-column layout).
+        figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
+        figure_limit = figure.bbox.width * 0.9
+        for key_axis, key_label in key_labels:
+            cell_limit = key_axis.get_window_extent(renderer).width * 0.9
+            _fit_text_to_width(
+                key_label,
+                renderer,
+                maximum_width=(
+                    figure_limit if columns == 1 else min(figure_limit, cell_limit)
+                ),
+            )
         if destination is not None:
             path = Path(destination).expanduser().resolve()
             if path.suffix.lower() != ".png":
@@ -490,6 +839,8 @@ class Model:
             or ``nnunet-m``.
         source_dataset_zip: Portable training-dataset archive name used in
             automatically generated W&B model names.
+        source_created_at: Checkpoint or run creation timestamp retained for
+            stable, dataset-independent figure labels.
         resolution: Default Ultralytics image size.
         training_dataset: Optional training-data provenance path.
         inference: Default Ultralytics inference mode.
@@ -537,6 +888,7 @@ class Model:
         source_key: str | None = None,
         model_type: str | None = None,
         source_dataset_zip: str | None = None,
+        source_created_at: str | None = None,
         resolution: int | None = None,
         training_dataset: str | Path | None = None,
         inference: Literal["native", "sahi"] = "native",
@@ -628,6 +980,9 @@ class Model:
         )
         self._source_dataset_zip = (
             Path(str(source_dataset_zip)).name if source_dataset_zip else None
+        )
+        self._source_created_at = (
+            str(source_created_at).strip() if source_created_at else None
         )
         self._resolution = int(resolution) if resolution is not None else None
         self._inference = inference
@@ -848,6 +1203,12 @@ class Model:
         return self._source_dataset_zip
 
     @property
+    def source_created_at(self) -> str | None:
+        """Checkpoint/run creation timestamp retained from source provenance."""
+
+        return self._source_created_at
+
+    @property
     def path(self) -> Path:
         """Resolved checkpoint or trained-model folder."""
 
@@ -1066,6 +1427,7 @@ class Model:
             "source_key": self.source_key,
             "model_type": self.model_type,
             "source_dataset_zip": self.source_dataset_zip,
+            "source_created_at": self.source_created_at,
             "kind": self.kind,
             "task": self.task,
             "path": str(self.path),
@@ -1124,6 +1486,7 @@ class Model:
             "source_key": self.source_key,
             "model_type": self.model_type,
             "source_dataset_zip": self.source_dataset_zip,
+            "source_created_at": self.source_created_at,
             "resolution": self.resolution,
             "training_dataset": self.training_dataset,
             "inference": self.inference,
@@ -1191,9 +1554,10 @@ class Model:
         errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
         destination: str | Path | None = None,
-        prediction_cache: bool | str | Path | PredictionCache = False,
+        prediction_cache: bool | str | Path | PredictionCache = True,
         cache_only: bool = False,
         require_probability_maps: bool = False,
+        output_task: Literal["native", "semantic_segment"] = "native",
         settings: Mapping[str, Any] | None = None,
         sahi_slice_height: int | None = None,
         sahi_slice_width: int | None = None,
@@ -1242,16 +1606,22 @@ class Model:
                 with the configured native tile geometry.
             progress: Show package-managed progress bars.
             destination: Optional new/empty directory receiving saved output.
-            prediction_cache: Opt-in verified prediction caching. ``True`` uses
+            prediction_cache: Verified prediction caching. The default ``True`` uses
                 the dataset-local comparison cache for :class:`Dataset`
                 inputs and package-managed storage otherwise. A path is an
                 explicit cache base; :class:`PredictionCache` is also accepted.
+                Pass ``False`` only when persistent reuse is explicitly unwanted.
             cache_only: Never run inference. Raise
                 :class:`PredictionCacheMissError` when a complete compatible
                 cache entry is unavailable.
             require_probability_maps: Require canonical semantic foreground
                 probabilities rather than accepting a legacy hard-mask-only
                 cache. This is intended for threshold calibration.
+            output_task: Return native predictions by default. Set to
+                ``"semantic_segment"`` to project semantic probabilities or
+                scored instance polygons into binary semantic-mask space after
+                verified native-cache reuse. This does not change prediction
+                cache identity or discard cached polygons.
             settings: Additional per-call adapter overrides.
             sahi_slice_height: Optional SAHI tile height in source pixels.
             sahi_slice_width: Optional SAHI tile width in source pixels.
@@ -1271,6 +1641,8 @@ class Model:
         """
 
         errors = normalize_errors(errors)
+        if output_task not in {"native", "semantic_segment"}:
+            raise ValueError("output_task must be 'native' or 'semantic_segment'")
         cache_override = getattr(self, "_prediction_cache_override", None)
         if cache_override is None:
             cache_identity_override = None
@@ -1470,9 +1842,39 @@ class Model:
             progress=progress,
         )
         if cached_result is not None:
+            if "input_fingerprint" not in cached_result.cache_info:
+                # Every cache loader reaching this point has already verified
+                # the ordered inputs. Attach the public image-cohort identity
+                # even for compatible legacy entries so callers need not know
+                # which cache representation supplied the result.
+                from .prediction_cache import prediction_input_fingerprint
+
+                cached_result = replace(
+                    cached_result,
+                    cache_info={
+                        **cached_result.cache_info,
+                        "input_fingerprint": prediction_input_fingerprint(inputs),
+                    },
+                )
+            if progress and cache_request is not None:
+                print(
+                    f"Prediction cache hit: {self.name} "
+                    f"({len(cached_result)} completed native records)"
+                )
+            returned_result = (
+                cached_result.as_semantic(
+                    prediction_threshold=(
+                        effective_foreground_threshold
+                        if cached_result.task == "semantic_segment"
+                        else effective_confidence
+                    )
+                )
+                if output_task == "semantic_segment"
+                else cached_result
+            )
             if destination is not None:
-                cached_result.save(destination)
-            return cached_result
+                returned_result.save(destination)
+            return returned_result
         if cache_only:
             detail = (
                 "a verified cache entry with foreground probability maps"
@@ -1486,6 +1888,12 @@ class Model:
                     if require_probability_maps
                     else "missing"
                 ),
+            )
+
+        if progress and cache_request is not None:
+            print(
+                f"Prediction cache miss: {self.name} "
+                "(no compatible completed native predictions; running inference)"
             )
 
         started = time.perf_counter()
@@ -1563,6 +1971,7 @@ class Model:
                             width=value.width,
                             height=value.height,
                             mask=np.asarray(class_map),
+                            reference_mask_path=value.mask_path,
                             foreground_probability=(
                                 None
                                 if probability is None
@@ -1588,6 +1997,7 @@ class Model:
                         width=value.width,
                         height=value.height,
                         objects=tuple(by_id[value.image_id]),
+                        reference_mask_path=value.mask_path,
                         metadata={"backend": backend},
                     )
                     for value in inputs
@@ -1618,11 +2028,21 @@ class Model:
             inference_seconds=time.perf_counter() - started,
             settings=resolved_settings,
         )
+        if progress and cache_request is not None:
+            print(
+                f"Publishing prediction cache: {self.name} "
+                f"({len(result)} completed native records)"
+            )
         result = _save_prediction_cache_request(
             cache_request,
             inputs=inputs,
             result=result,
         )
+        if progress and cache_request is not None:
+            print(
+                f"Prediction cache published: {self.name} "
+                f"({result.cache_info.get('location')})"
+            )
         if result.task == "semantic_segment" and (
             effective_foreground_threshold is not None
             or require_probability_maps
@@ -1642,9 +2062,20 @@ class Model:
                     f"class maps for {len(missing_scores)} image(s)",
                     reason="backend-returned-no-semantic-probabilities",
                 )
+        returned_result = (
+            result.as_semantic(
+                prediction_threshold=(
+                    effective_foreground_threshold
+                    if result.task == "semantic_segment"
+                    else effective_confidence
+                )
+            )
+            if output_task == "semantic_segment"
+            else result
+        )
         if destination is not None:
-            result.save(destination)
-        return result
+            returned_result.save(destination)
+        return returned_result
 
     def compare(
         self,
@@ -1716,9 +2147,14 @@ class Model:
         *,
         split: Literal["train", "val", "test"] | None = None,
         samples: int = 8,
-        columns: int = 2,
+        columns: int = 1,
         seed: int = 42,
         panel_size: float = 3.0,
+        zoom: bool = False,
+        context_fraction: float = 0.35,
+        minimum_context: int = 100,
+        outline_width: float = 1.0,
+        outline_alpha: float = 1.0,
         destination: str | Path | None = None,
         errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
@@ -1730,9 +2166,17 @@ class Model:
             source: Any source accepted by :meth:`predict`.
             split: Dataset split. Direct image inputs ignore this value.
             samples: Maximum number of images to render.
-            columns: Number of image pairs per figure row.
+            columns: Number of independent image rows placed side by side.
             seed: Deterministic sampling seed.
-            panel_size: Width and height, in inches, of each image panel.
+            panel_size: Approximate width, in inches, of each image panel.
+            zoom: Crop each row to the union of its annotation and prediction.
+            context_fraction: Extra crop context on each side as a fraction
+                of the foreground-union width or height.
+            minimum_context: Minimum total crop width and height in source
+                pixels when ``zoom`` is enabled.
+            outline_width: Annotation and prediction outline width.
+            outline_alpha: Annotation and prediction outline opacity in
+                ``[0, 1]``. The default is fully opaque.
             destination: Optional PNG output path.
             errors: Oversized-input policy forwarded to :meth:`predict`.
             progress: Show package-managed progress bars.
@@ -1753,6 +2197,11 @@ class Model:
             columns=columns,
             seed=seed,
             panel_size=panel_size,
+            zoom=zoom,
+            context_fraction=context_fraction,
+            minimum_context=minimum_context,
+            outline_width=outline_width,
+            outline_alpha=outline_alpha,
             destination=destination,
         )
 
@@ -1841,6 +2290,7 @@ class Model:
                     "source_key",
                     "model_type",
                     "source_dataset_zip",
+                    "source_created_at",
                     "resolution",
                     "training_dataset",
                     "inference",
@@ -1945,6 +2395,58 @@ class ModelCollection:
 
         return tuple(model.name for model in self.models)
 
+    @property
+    def hashes(self) -> dict[str, dict[str, str]]:
+        """Map each unique model name to source, resolved path, and SHA-256.
+
+        Full digests are retained for provenance. Hash abbreviation is a
+        presentation concern handled by :func:`dataset_fixer.model_label`.
+        """
+
+        return {
+            model.name: {
+                "source": model.source_key,
+                "path": str(model.path),
+                "sha256": model.digest,
+            }
+            for model in self.models
+        }
+
+    def hash_for(self, identity: str | Path | Model) -> str:
+        """Return the full SHA-256 for a model name, source, or resolved path.
+
+        Parameters:
+            identity: Model object, collection name, source key, or resolved
+                checkpoint path.
+
+        Returns:
+            The unique model's full SHA-256 digest.
+        """
+
+        if isinstance(identity, Model):
+            matches = [model for model in self.models if model is identity]
+        else:
+            raw = str(identity)
+            expanded = (
+                raw
+                if raw.startswith("wandb:")
+                else str(Path(raw).expanduser().resolve())
+            )
+            matches = [
+                model
+                for model in self.models
+                if raw in {model.name, model.source_key, str(model.path)}
+                or expanded == str(model.path)
+            ]
+        if len(matches) == 1:
+            return matches[0].digest
+        if not matches:
+            raise KeyError(f"No loaded model matches {str(identity)!r}")
+        raise ValueError(
+            f"Model identity {str(identity)!r} is ambiguous across "
+            f"{len(matches)} loaded models; use the unique model name or resolved path"
+        )
+
     def __len__(self) -> int:
         return len(self.models)
 
@@ -1952,6 +2454,15 @@ class ModelCollection:
         return iter(self.models)
 
     def __getitem__(self, value: int | str) -> Model:
+        """Select a model by collection index or exact model name.
+
+        Parameters:
+            value: Zero-based collection index or exact model name.
+
+        Returns:
+            The selected lazy :class:`Model`.
+        """
+
         if isinstance(value, int):
             return self.models[value]
         for model in self.models:
@@ -2036,6 +2547,11 @@ class ModelCollection:
         split: Literal["train", "val", "test"] | None = None,
         errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
+        prediction_cache: bool | str | Path | PredictionCache = True,
+        cache_only: bool = False,
+        require_probability_maps: bool = False,
+        output_task: Literal["native", "semantic_segment"] = "native",
+        unload: bool = False,
     ) -> dict[str, PredictionResult]:
         """Run every independently configured model on the same inputs.
 
@@ -2048,6 +2564,14 @@ class ModelCollection:
             errors: Oversized-input policy applied independently using each
                 model's declared native size.
             progress: Show package-managed progress bars.
+            prediction_cache: Verified cache used by every model. The default
+                ``True`` selects the dataset-local cache for dataset inputs.
+            cache_only: Never infer a missing model; raise on a cache miss.
+            require_probability_maps: Require native semantic probabilities.
+            output_task: Return native predictions or intrinsic binary
+                semantic projections. Instance polygons remain cached and are
+                rasterized only in the returned result.
+            unload: Release each model runtime after producing its result.
 
         Returns:
             Prediction results keyed by model name. Resolution, backend,
@@ -2055,11 +2579,104 @@ class ModelCollection:
         """
 
         return {
-            model.name: model.predict(
-                source, split=split, errors=errors, progress=progress
+            model.name: result
+            for model, result in self.iter_predictions(
+                source,
+                split=split,
+                errors=errors,
+                progress=progress,
+                prediction_cache=prediction_cache,
+                cache_only=cache_only,
+                require_probability_maps=require_probability_maps,
+                output_task=output_task,
+                unload=unload,
             )
-            for model in self.models
         }
+
+    def iter_predictions(
+        self,
+        source: Any,
+        *,
+        split: Literal["train", "val", "test"] | None = None,
+        errors: Literal["raise", "skip"] = "raise",
+        progress: bool = True,
+        prediction_cache: bool | str | Path | PredictionCache = True,
+        cache_only: bool = False,
+        require_probability_maps: bool = False,
+        output_task: Literal["native", "semantic_segment"] = "native",
+        unload: bool = False,
+    ) -> Iterator[tuple[Model, PredictionResult]]:
+        """Yield one independently configured model result at a time.
+
+        This is the memory-bounded collection prediction API. Cache lookup,
+        native inference, and optional semantic projection remain internal to
+        :meth:`Model.predict`. Dataset inputs are normalized and frozen once so
+        every model consumes the identical cohort without repeating that work.
+        Callers can analyze or save each completed model before the next
+        heavyweight runtime is loaded.
+
+        Parameters:
+            source: Any source accepted by :meth:`Model.predict`.
+            split: Dataset split. Direct image inputs ignore this value.
+            errors: Oversized-input policy applied independently per model.
+            progress: Show package-managed progress bars and cache statuses.
+            prediction_cache: Verified cache used by every model.
+            cache_only: Never infer a missing model; raise on a cache miss.
+            require_probability_maps: Require native semantic probabilities.
+            output_task: Return native predictions or intrinsic binary
+                semantic projections.
+            unload: Release each model runtime after its yielded result has
+                been consumed and iteration resumes.
+
+        Returns:
+            An iterator of ``(model, prediction_result)`` pairs in collection
+            order.
+        """
+
+        # Dataset normalization can include freezing a semantic evaluation
+        # cohort. It is independent of the model, so do it once for the whole
+        # collection and let each Model.predict() consume the verified result.
+        # Besides avoiding repeated work and progress bars, materializing the
+        # inputs once guarantees that every model sees the identical cohort.
+        inputs, source_task, cache_context = normalize_model_inputs(
+            source,
+            split=split,
+            progress=progress,
+        )
+        normalized_override = (
+            source,
+            split,
+            tuple(inputs),
+            source_task,
+            dict(cache_context),
+        )
+        missing = object()
+
+        for model in self.models:
+            previous_override = getattr(
+                model,
+                "_normalized_prediction_override",
+                missing,
+            )
+            model._normalized_prediction_override = normalized_override
+            try:
+                yield model, model.predict(
+                    source,
+                    split=split,
+                    errors=errors,
+                    progress=progress,
+                    prediction_cache=prediction_cache,
+                    cache_only=cache_only,
+                    require_probability_maps=require_probability_maps,
+                    output_task=output_task,
+                )
+            finally:
+                if previous_override is missing:
+                    delattr(model, "_normalized_prediction_override")
+                else:
+                    model._normalized_prediction_override = previous_override
+                if unload:
+                    model.unload()
 
     def compare(
         self,
@@ -2636,6 +3253,7 @@ def _load_prediction_cache_request(
                     width=value.width,
                     height=value.height,
                     objects=tuple(by_image[value.image_id]),
+                    reference_mask_path=value.mask_path,
                     metadata={"backend": backend},
                 )
                 for value in inputs
@@ -2674,6 +3292,18 @@ def _load_prediction_cache_request(
         inputs=inputs,
         progress=progress,
     )
+    needs_probability_maps = bool(
+        require_probability_maps or foreground_probability_threshold is not None
+    )
+    if cached is not None and not _cached_prediction_has_required_payload(
+        cached,
+        require_probability_maps=needs_probability_maps,
+        require_native_masks=request.keep_native,
+    ):
+        # An older exact-identity entry may contain only thresholded masks.
+        # It must not shadow a richer image-compatible entry with reusable
+        # probabilities or native outputs.
+        cached = None
     if cached is None:
         from .prediction_cache import prediction_cache_key
 
@@ -2687,6 +3317,12 @@ def _load_prediction_cache_request(
                 progress=progress,
             )
             if compatible is None:
+                continue
+            if not _cached_prediction_has_required_payload(
+                compatible,
+                require_probability_maps=needs_probability_maps,
+                require_native_masks=request.keep_native,
+            ):
                 continue
             promoted = request.cache.save(
                 request.key,
@@ -2709,6 +3345,8 @@ def _load_prediction_cache_request(
             namespace=request.namespace,
             identity=request.identity,
             inputs=inputs,
+            require_probability_maps=needs_probability_maps,
+            require_native_masks=request.keep_native,
             progress=progress,
         )
     if cached is not None:
@@ -2834,6 +3472,25 @@ def _load_prediction_cache_request(
     return None
 
 
+def _cached_prediction_has_required_payload(
+    result: PredictionResult,
+    *,
+    require_probability_maps: bool,
+    require_native_masks: bool,
+) -> bool:
+    """Whether a complete cache result contains this request's rich payload."""
+
+    if require_native_masks and any(
+        record.native_mask is None for record in result.records
+    ):
+        return False
+    if require_probability_maps and any(
+        record.foreground_probability is None for record in result.records
+    ):
+        return False
+    return True
+
+
 def _save_prediction_cache_request(
     request: _PredictionCacheRequest | None,
     *,
@@ -2949,6 +3606,7 @@ def _load_legacy_semantic_prediction(
                 width=value.width,
                 height=value.height,
                 mask=mask,
+                reference_mask_path=value.mask_path,
                 metadata={"backend": backend, "legacy_semantic_cache": True},
             )
         )
@@ -3228,40 +3886,209 @@ def _shorten_middle(value: str, maximum: int) -> str:
     return f"{value[:left]}…{value[-right:]}"
 
 
-def _draw_object_predictions(axis: Any, values: tuple[Any, ...]) -> None:
+def _prediction_key(relative_path: str) -> str:
+    """Return the complete display key for a prediction row."""
+
+    path = Path(relative_path)
+    key = path.stem
+    if path.parent.as_posix() not in {"", "."}:
+        key = f"{path.parent.as_posix()} / {key}"
+    return key
+
+
+def _fit_text_to_width(
+    artist: Any,
+    renderer: Any,
+    *,
+    maximum_width: float,
+) -> None:
+    """Middle-shorten a text artist only when its rendered width overflows."""
+
+    value = artist.get_text()
+    if artist.get_window_extent(renderer).width <= maximum_width:
+        return
+    low = 2
+    high = len(value)
+    best = "…"
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = _shorten_middle(value, middle)
+        artist.set_text(candidate)
+        if artist.get_window_extent(renderer).width <= maximum_width:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    artist.set_text(best)
+
+
+def _prediction_outline_mask(record: ImagePrediction) -> np.ndarray:
+    """Rasterize any supported prediction task for outlines and crop bounds."""
+
+    if record.mask is not None:
+        mask = np.asarray(record.mask)
+        if mask.shape != (record.height, record.width):
+            raise DatasetValidationError(
+                f"Prediction mask for {record.relative_path!r} has shape "
+                f"{mask.shape}; expected {(record.height, record.width)}"
+            )
+        return mask > 0
+
+    canvas = Image.new("1", (record.width, record.height), 0)
+    draw = ImageDraw.Draw(canvas)
+    for value in record.objects:
+        polygons = value.polygons or ([value.polygon] if value.polygon else [])
+        for polygon in polygons:
+            if len(polygon) >= 3:
+                draw.polygon(
+                    [(float(x), float(y)) for x, y in polygon],
+                    fill=1,
+                )
+        if not polygons and value.bbox is not None:
+            draw.rectangle(tuple(float(item) for item in value.bbox), fill=1)
+        if not polygons and value.bbox is None and value.point is not None:
+            radius = max(float(value.radius or 2.0), 1.0)
+            x, y = (float(item) for item in value.point)
+            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=1)
+    return np.asarray(canvas, dtype=bool)
+
+
+def _reference_outline_mask(record: ImagePrediction) -> np.ndarray | None:
+    """Load and validate a semantic reference mask for visualization."""
+
+    if record.reference_mask_path is None:
+        return None
+    reference_path = Path(record.reference_mask_path)
+    if not reference_path.is_file():
+        raise FileNotFoundError(
+            f"Reference mask for {record.relative_path!r} is missing: "
+            f"{reference_path}"
+        )
+    with Image.open(reference_path) as opened_reference:
+        reference_mask = np.asarray(opened_reference.convert("L")) > 0
+    if reference_mask.shape != (record.height, record.width):
+        raise DatasetValidationError(
+            f"Reference mask for {record.relative_path!r} has shape "
+            f"{reference_mask.shape}; expected {(record.height, record.width)}"
+        )
+    return reference_mask
+
+
+def _foreground_crop_bounds(
+    foreground: np.ndarray,
+    *,
+    context_fraction: float,
+    minimum_context: int,
+) -> tuple[int, int, int, int]:
+    """Bound a foreground union with proportional padding and minimum extent."""
+
+    height, width = foreground.shape
+    ys, xs = np.nonzero(foreground)
+    if not len(xs):
+        return (0, 0, width, height)
+    object_x0 = int(xs.min())
+    object_x1 = int(xs.max()) + 1
+    object_y0 = int(ys.min())
+    object_y1 = int(ys.max()) + 1
+    object_width = object_x1 - object_x0
+    object_height = object_y1 - object_y0
+    target_width = min(
+        width,
+        max(
+            minimum_context,
+            object_width + 2 * int(math.ceil(object_width * context_fraction)),
+        ),
+    )
+    target_height = min(
+        height,
+        max(
+            minimum_context,
+            object_height + 2 * int(math.ceil(object_height * context_fraction)),
+        ),
+    )
+
+    def centered_bounds(start: int, end: int, target: int, maximum: int) -> tuple[int, int]:
+        center = (start + end) / 2.0
+        lower = int(math.floor(center - target / 2.0))
+        lower = min(max(lower, 0), maximum - target)
+        return lower, lower + target
+
+    x0, x1 = centered_bounds(object_x0, object_x1, target_width, width)
+    y0, y1 = centered_bounds(object_y0, object_y1, target_height, height)
+    return x0, y0, x1, y1
+
+
+def _draw_mask_outline(
+    axis: Any,
+    mask: np.ndarray,
+    *,
+    color: str,
+    linewidth: float,
+    alpha: float,
+) -> None:
+    """Draw only the boundary of a binary mask, leaving image pixels visible."""
+
+    if not np.any(mask):
+        return
+    padded = np.pad(np.asarray(mask, dtype=np.uint8), 1)
+    height, width = mask.shape
+    axis.contour(
+        np.arange(-1, width + 1),
+        np.arange(-1, height + 1),
+        padded,
+        levels=(0.5,),
+        colors=(color,),
+        linewidths=(linewidth,),
+        alpha=alpha,
+        antialiased=True,
+    )
+
+
+def _draw_object_predictions(
+    axis: Any,
+    values: tuple[Any, ...],
+    *,
+    color: str = "#9A4938",
+    linewidth: float = 1.0,
+    alpha: float = 1.0,
+    x_offset: int = 0,
+    y_offset: int = 0,
+) -> None:
     import matplotlib.pyplot as plt
 
-    color = "#00D084"
     for value in values:
-        if value.bbox is not None:
+        polygons = value.polygons or ([value.polygon] if value.polygon else [])
+        if value.bbox is not None and not polygons:
             x1, y1, x2, y2 = value.bbox
             axis.add_patch(
                 plt.Rectangle(
-                    (x1, y1),
+                    (x1 - x_offset, y1 - y_offset),
                     x2 - x1,
                     y2 - y1,
                     fill=False,
                     color=color,
-                    linewidth=1.5,
+                    linewidth=linewidth,
+                    alpha=alpha,
                 )
             )
-        polygons = value.polygons or ([value.polygon] if value.polygon else [])
         for raw_polygon in polygons:
             polygon = np.asarray(raw_polygon, dtype=float)
             axis.plot(
-                np.r_[polygon[:, 0], polygon[0, 0]],
-                np.r_[polygon[:, 1], polygon[0, 1]],
+                np.r_[polygon[:, 0], polygon[0, 0]] - x_offset,
+                np.r_[polygon[:, 1], polygon[0, 1]] - y_offset,
                 color=color,
-                linewidth=1.5,
+                linewidth=linewidth,
+                alpha=alpha,
             )
         if value.point is not None:
             axis.scatter(
-                value.point[0],
-                value.point[1],
+                value.point[0] - x_offset,
+                value.point[1] - y_offset,
                 s=25,
-                color=color,
-                edgecolor="white",
-                linewidth=0.6,
+                facecolors="none",
+                edgecolors=color,
+                linewidth=linewidth,
+                alpha=alpha,
             )
         if value.keypoints:
             keypoints = np.asarray(
@@ -3274,8 +4101,11 @@ def _draw_object_predictions(axis: Any, values: tuple[Any, ...]) -> None:
             )
             if len(keypoints):
                 axis.scatter(
-                    keypoints[:, 0],
-                    keypoints[:, 1],
+                    keypoints[:, 0] - x_offset,
+                    keypoints[:, 1] - y_offset,
                     s=14,
-                    color=color,
+                    facecolors="none",
+                    edgecolors=color,
+                    linewidth=linewidth,
+                    alpha=alpha,
                 )

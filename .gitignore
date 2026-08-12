@@ -11,3 +11,5 @@ src/dataset_fixer/_version.py
 graphify-out/
 .cache/
 evaluations/
+*.zip
+*.pt

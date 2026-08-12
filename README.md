@@ -480,11 +480,58 @@ segmenter = Model(
     upscale_factor=4,
     device="mps",
 )
-mask_predictions = segmenter.predict(masks, split="val")
+sample = masks.sample(n=50, split="val", seed=42)
+mask_predictions = segmenter.predict(sample)
+mask_predictions.visualize(
+    zoom=True,             # crop to the annotation/prediction union
+    outline_width=1.0,     # outlines only; image pixels are never filled
+    outline_alpha=1.0,     # fully opaque by default
+)
+```
 
-# Direct prediction caching is opt-in. Dataset inputs use the same cache base
-# as Model.compare(), so either operation can reuse compatible predictions.
-cached = segmenter.predict(masks, split="val", prediction_cache=True)
+`Dataset.sample()` is a deterministic, zero-copy dataset view, so prediction
+still uses the source dataset's verified cache. This also works across the
+common instance/semantic boundary: an instance-segmentation model predicted
+on a semantic-mask dataset returns its native polygons, while
+`PredictionResult.visualize()` renders the original image, semantic reference,
+and polygon prediction side by side. Use `output_task="semantic_segment"` only
+when an explicit rasterized semantic projection is required.
+
+Presence filters compose before sampling. Ground-truth presence is intrinsic
+to the dataset. Prediction presence can take an explicit result, or
+`model=segmenter` to resolve that model's normal prediction cache and run
+inference only on a cache miss. `add()` forms an ordered unique union:
+
+```python
+validation_predictions = segmenter.predict(masks, split="val")
+sample = (
+    masks.filter(
+        gt_annotated=True,
+        predictions=validation_predictions,
+        has_prediction=False,
+    )
+    .sample(n=5, split="val", seed=1335)
+    .add(
+        masks.filter(
+            gt_annotated=False,
+            predictions=validation_predictions,
+            has_prediction=True,
+        ).sample(n=5, split="val", seed=42)
+    )
+)
+review = segmenter.predict(sample)
+review.visualize(columns=1, panel_size=3, zoom=True)
+```
+
+The cache-or-infer shorthand is:
+
+```python
+false_positives = masks.filter(
+    gt_annotated=False,
+    has_prediction=True,
+    model=segmenter,
+    split="val",
+)
 ```
 
 `PredictionResult` preserves input ordering and stable image IDs. Object-style
@@ -494,14 +541,16 @@ utilities. Direct `Model.predict` defaults to native prediction. Configure a
 model with `inference="sahi"` to opt it into tiled inference; no
 availability-based selection or fallback is performed.
 
-Use `prediction_cache=True` when a direct prediction run should be retained.
-For explicit placement or reuse across calls, construct
+Direct prediction caching is enabled by default. Dataset inputs use the same
+cache base as `Model.compare()`, so either operation can reuse compatible
+predictions. Pass `prediction_cache=False` only when a result should not be
+retained. For explicit placement or reuse across calls, construct
 `PredictionCache("/cache/base")` and pass it as `prediction_cache=cache`.
 `PredictionCache.for_dataset(dataset)` resolves the established
 `<dataset>/.cache/evaluations` base, preserving the `predictions/`,
 `semantic/`, and `metrics/` namespaces used by comparison. `PredictionResult`
 records the verified cache status, key, namespace, and location in
-`cache_info`. Direct prediction remains uncached when the argument is omitted.
+`cache_info`.
 
 `prediction_threshold` is task-aware. Semantic models apply it to genuine
 foreground probabilities after full-image reconstruction; requesting that

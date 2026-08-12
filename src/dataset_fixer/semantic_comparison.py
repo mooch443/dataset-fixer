@@ -52,6 +52,11 @@ from .comparison.object_sizes import (
     semantic_components_for_cases,
     unavailable_object_size_summary,
 )
+from .comparison.plot_labels import (
+    model_badges,
+    model_label,
+    style_model_row_labels,
+)
 from .comparison.reporting import write_json
 from .errors import DatasetValidationError, ValidationIssue
 from .model import ImagePrediction, Model, ModelCollection, ModelInput
@@ -72,7 +77,7 @@ from .utils import (
 # Report presentation evolves independently from prediction/evaluation cache
 # identity. A report bump redraws output from completed caches without forcing
 # model inference to run again.
-SEMANTIC_REPORT_SCHEMA = 17
+SEMANTIC_REPORT_SCHEMA = 20
 SEMANTIC_PREDICTION_SCHEMA = 2
 SEMANTIC_EVALUATION_CACHE_SCHEMA = 2
 
@@ -723,7 +728,14 @@ def compare_nnunet_models(
                 "resolved_min_connected_component_area_px"
             ),
         )
-        _render_qualitative(reports, cases, prediction_dirs, model_rows, seed=seed)
+        _render_qualitative(
+            reports,
+            cases,
+            prediction_dirs,
+            model_rows,
+            ranking,
+            seed=seed,
+        )
         # Render only the cases the report keeps, so nothing is drawn that is
         # not also referenced in the manifest.
         worst_cases = _bounded_semantic_cases(per_case)
@@ -734,6 +746,7 @@ def compare_nnunet_models(
                 cases,
                 prediction_dirs,
                 model_rows,
+                ranking,
                 case_ids=[str(row["case_id"]) for row in worst_cases],
             )
         shutil.rmtree(temporary / "working", ignore_errors=True)
@@ -1318,7 +1331,14 @@ def compare_semantic_models(
                 "resolved_min_connected_component_area_px"
             ),
         )
-        _render_qualitative(reports, cases, prediction_dirs, model_rows, seed=seed)
+        _render_qualitative(
+            reports,
+            cases,
+            prediction_dirs,
+            model_rows,
+            ranking,
+            seed=seed,
+        )
         # Render only the cases the report keeps, so nothing is drawn that is
         # not also referenced in the manifest.
         worst_cases = _bounded_semantic_cases(per_case)
@@ -1329,6 +1349,7 @@ def compare_semantic_models(
                 cases,
                 prediction_dirs,
                 model_rows,
+                ranking,
                 case_ids=[str(row["case_id"]) for row in worst_cases],
             )
         shutil.rmtree(temporary / "working", ignore_errors=True)
@@ -1464,6 +1485,7 @@ def _project_semantic_predictions(
                     width=record.width,
                     height=record.height,
                     mask=mask,
+                    reference_mask_path=record.reference_mask_path,
                     metadata={**record.metadata, "semantic_projection": "native-semantic-mask"},
                 )
             )
@@ -1533,6 +1555,7 @@ def _project_semantic_predictions(
                 width=record.width,
                 height=record.height,
                 mask=score_map >= confidence,
+                reference_mask_path=record.reference_mask_path,
                 foreground_probability=score_map.astype(np.float16),
                 metadata={
                     "semantic_projection": "polygon-foreground-union",
@@ -1671,6 +1694,7 @@ def predict_nnunet_model(
                     height=value.height,
                     mask=mask,
                     native_mask=native_mask if keep_native else None,
+                    reference_mask_path=value.mask_path,
                     foreground_probability=foreground_probability,
                     metadata={
                         "backend": "native",
@@ -2127,6 +2151,7 @@ def _stitch_sahi_source(
         height=value.height,
         mask=mask,
         native_mask=native_mask if keep_native else None,
+        reference_mask_path=value.mask_path,
         foreground_probability=np.asarray(
             canonical_probabilities[1],
             dtype=np.float16,
@@ -2287,6 +2312,10 @@ def visualize_nnunet_models(
                 model_inputs,
                 device=spec._resolved_device(),
                 progress=progress,
+                # This legacy helper writes temporary sampled masks. The
+                # standard persistent path is now
+                # model.predict(dataset.sample(...)).visualize().
+                prediction_cache=False,
             )
             _write_semantic_prediction_masks(
                 result.records,
@@ -2306,6 +2335,13 @@ def visualize_nnunet_models(
             selected,
             prediction_dirs,
             rows_by_model,
+            model_metadata={
+                spec.name: {
+                    "model": spec.name,
+                    **_model_report_fields(spec),
+                }
+                for spec in cohort.models
+            },
             examples_per_row=examples_per_row,
             panel_size=panel_size,
             model_title_length=model_title_length,
@@ -2466,9 +2502,23 @@ def _freeze_cohort(
                 value={"images": str(image_root), "masks": str(mask_root)},
             )
         )
-    all_images = sorted(
-        path for path in image_root.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+    view = export.manifest.get("view")
+    materialized_view = (
+        isinstance(view, dict)
+        and view.get("kind") in {"sample", "filter", "add"}
     )
+    if materialized_view:
+        all_images = [
+            sample.image_path.resolve()
+            for sample in export._samples
+            if sample.split == split
+        ]
+    else:
+        all_images = sorted(
+            path
+            for path in image_root.rglob("*")
+            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+        )
     if not all_images:
         raise DatasetValidationError(f"No images found in semantic-mask split {split!r}")
     excluded = {
@@ -2476,7 +2526,20 @@ def _freeze_cohort(
         for row in getattr(export, "_geometry_skip_audit", ())
         if row.get("split") == split
     }
-    images = [path for path in all_images if str(path.resolve()) not in excluded]
+    if materialized_view:
+        selected_images = all_images
+        unexpected = [path for path in selected_images if image_root not in path.parents]
+        if unexpected:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Sampled semantic image lies outside its split image directory",
+                    source=split,
+                    value=[str(path) for path in unexpected],
+                )
+            )
+    else:
+        selected_images = all_images
+    images = [path for path in selected_images if str(path.resolve()) not in excluded]
     if not images:
         raise DatasetValidationError(
             f"No usable images remain in semantic-mask split {split!r}"
@@ -2542,22 +2605,27 @@ def _freeze_cohort(
         digest.update(mask_sha.encode("ascii"))
         cohort_progress.update(1)
     cohort_progress.close()
-    actual_masks = {
-        path.resolve()
-        for path in mask_root.rglob("*.png")
-        if path.is_file()
-    }
-    if actual_masks != expected_masks:
-        raise DatasetValidationError(
-            ValidationIssue(
-                "Semantic-mask split contains orphan or missing masks",
-                source=split,
-                value={
-                    "unexpected": [str(path) for path in sorted(actual_masks - expected_masks)],
-                    "missing": [str(path) for path in sorted(expected_masks - actual_masks)],
-                },
+    if not materialized_view:
+        actual_masks = {
+            path.resolve()
+            for path in mask_root.rglob("*.png")
+            if path.is_file()
+        }
+        if actual_masks != expected_masks:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Semantic-mask split contains orphan or missing masks",
+                    source=split,
+                    value={
+                        "unexpected": [
+                            str(path) for path in sorted(actual_masks - expected_masks)
+                        ],
+                        "missing": [
+                            str(path) for path in sorted(expected_masks - actual_masks)
+                        ],
+                    },
+                )
             )
-        )
     return cases, digest.hexdigest()
 
 
@@ -3230,6 +3298,7 @@ def _model_report_fields(model: Model) -> dict[str, Any]:
     checkpoint_hash = model.checkpoint_sha256 or model.digest
     return {
         "model_source": model.source_key,
+        "source_created_at": model.source_created_at,
         "source_dataset_zip": model.source_dataset_zip,
         "model_type": model.model_type,
         "effective_prediction_resolution": resolution_label,
@@ -3237,28 +3306,10 @@ def _model_report_fields(model: Model) -> dict[str, Any]:
         "checkpoint_sha256": checkpoint_hash,
         "checkpoint_sha256_short": checkpoint_hash[:8],
         "model_sha256_short": model.digest[:8],
+        "upscale_factor": model.upscale_factor,
+        "native_resolution": resolution_label,
+        "prediction_threshold": model.prediction_threshold,
     }
-
-
-def _shorten_plot_text(value: str, limit: int = 64) -> str:
-    if len(value) <= limit:
-        return value
-    left = (limit - 1) // 2
-    right = limit - left - 1
-    return f"{value[:left]}…{value[-right:]}"
-
-
-def _ranking_plot_label(row: Mapping[str, Any]) -> str:
-    name = str(row.get("model") or row.get("model_source") or "model")
-    parts = name.split("__")
-    if len(parts) >= 2:
-        return "\n".join(
-            (
-                _shorten_plot_text(parts[0]),
-                _shorten_plot_text("__".join(parts[1:])),
-            )
-        )
-    return _shorten_plot_text(name)
 
 
 def _case_composition(ranking: list[dict[str, Any]]) -> dict[str, int]:
@@ -3288,14 +3339,13 @@ def _render_ranking(
     figure, axis = plt.subplots(
         figsize=(11.5, max(4.0, 1.05 * len(ordered) + 1.5))
     )
-    names = [_ranking_plot_label(row) for row in ordered]
     scores = [
         float(row["dice"]) if math.isfinite(float(row["dice"])) else 0.0
         for row in ordered
     ]
     positions = np.arange(len(ordered))
     axis.barh(positions, scores, color="#0072B2")
-    axis.set_yticks(positions, names, fontsize=8.5, linespacing=1.15)
+    style_model_row_labels(axis, ordered)
     axis.set_xlim(0, 1)
     axis.set_xlabel(xlabel)
     axis.set_title(title)
@@ -3411,7 +3461,7 @@ def _analyze_semantic_object_sizes(
         ranking,
         reference,
         labels={
-            str(row["model"]): _ranking_plot_label(row)
+            str(row["model"]): model_label(row)
             for row in ranking
         },
     )
@@ -3489,14 +3539,14 @@ def _analyze_grouped_metrics(
         ranking,
         by_model,
         labels={
-            str(row["model"]): _ranking_plot_label(row)
+            str(row["model"]): model_label(row)
             for row in ranking
         },
         group_splits=group_splits,
     )
     if presence_available:
         plot_labels = {
-            str(row["model"]): _ranking_plot_label(row)
+            str(row["model"]): model_label(row)
             for row in ranking
         }
         for metric in presence_reports:
@@ -3547,7 +3597,7 @@ def _render_metric_breakdown(
         ranking,
         title="Semantic metric breakdown — final reconstructed source images",
         labels={
-            str(row["model"]): _ranking_plot_label(row)
+            str(row["model"]): model_label(row)
             for row in ranking
         },
         minimum_component_area=minimum_component_area,
@@ -3559,6 +3609,7 @@ def _render_qualitative(
     cases: list[_SemanticCase],
     prediction_dirs: dict[str, Path],
     rows_by_model: dict[str, list[dict[str, Any]]],
+    ranking: list[dict[str, Any]],
     *,
     seed: int,
 ) -> list[str]:
@@ -3574,6 +3625,7 @@ def _render_qualitative(
         selected,
         prediction_dirs,
         rows_by_model,
+        model_metadata={str(row["model"]): row for row in ranking},
         examples_per_row=1,
         panel_size=3.0,
         model_title_length=30,
@@ -3590,6 +3642,7 @@ def _render_semantic_prediction_grids(
     cases: list[_SemanticCase],
     prediction_dirs: dict[str, Path],
     rows_by_model: dict[str, list[dict[str, Any]]],
+    ranking: list[dict[str, Any]] | None = None,
     *,
     case_ids: Iterable[str] | None = None,
 ) -> list[str]:
@@ -3604,6 +3657,13 @@ def _render_semantic_prediction_grids(
     import matplotlib.pyplot as plt
 
     model_names = list(prediction_dirs)
+    model_metadata = {
+        str(row["model"]): row for row in (ranking or [])
+    }
+    model_metadata = {
+        name: model_metadata.get(name, {"model": name})
+        for name in model_names
+    }
     row_lookup = {
         name: {str(row["case_id"]): row for row in rows}
         for name, rows in rows_by_model.items()
@@ -3643,10 +3703,12 @@ def _render_semantic_prediction_grids(
             metric = row_lookup[name][case.case_id]
             axes[row, column].imshow(overlay.astype(np.uint8))
             axes[row, column].set_title(
-                f"{_multiline_model_title(name, 36)}\n"
+                f"{model_label(model_metadata[name])}\n"
                 f"Dice={_format_metric(metric['dice'])} · "
-                f"IoU={_format_metric(metric['iou'])}"
+                f"IoU={_format_metric(metric['iou'])}",
+                pad=30,
             )
+            _draw_panel_model_badges(axes[row, column], model_metadata[name])
             axes[row, column].axis("off")
         for index in range(len(model_names), rows * columns):
             row, column = divmod(index, columns)
@@ -3897,12 +3959,13 @@ def _load_compatible_semantic_cache(
                 )
                 print(
                     f"Cache hit: {model_name or 'semantic model'} "
-                    f"({len(cases)} completed masks; {detail})"
+                    f"(semantic evaluation/projection; {len(cases)} completed "
+                    f"masks; {detail})"
                 )
         elif progress:
             print(
                 f"Cache hit: {model_name or 'semantic model'} "
-                f"({len(cases)} completed masks)"
+                f"(semantic evaluation/projection; {len(cases)} completed masks)"
             )
         return candidate, cached
     if progress:
@@ -3912,7 +3975,8 @@ def _load_compatible_semantic_cache(
             )
         print(
             f"Cache miss: {model_name or 'semantic model'} "
-            "(no valid completed prediction cache; running inference)"
+            "(semantic evaluation/projection cache; resolving reusable native "
+            "predictions next)"
         )
     return cache_dir, None
 
@@ -4145,11 +4209,83 @@ def _binary_metric_breakdown(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return binary_metric_breakdown(rows)
 
 
+def _draw_grid_model_badges(
+    axis: Any,
+    metadata: Mapping[str, Any],
+    *,
+    panel_index: int,
+    panel_count: int,
+) -> None:
+    """Center compact colored model badges beneath one grid heading."""
+
+    badges = model_badges(metadata)
+    if not badges:
+        return
+    panel_left = panel_index / panel_count
+    panel_width = 1.0 / panel_count
+    weights = np.asarray([len(badge.text) + 2.5 for badge in badges], dtype=float)
+    gaps = 0.035 * panel_width * max(0, len(badges) - 1)
+    usable_width = 0.88 * panel_width - gaps
+    widths = usable_width * weights / float(np.sum(weights))
+    cursor = panel_left + (panel_width - usable_width - gaps) / 2
+    for badge, width in zip(badges, widths, strict=True):
+        axis.text(
+            cursor + width / 2,
+            0.18,
+            badge.text,
+            transform=axis.transAxes,
+            ha="center",
+            va="center",
+            fontsize=6.7,
+            fontfamily="monospace",
+            color="white",
+            bbox={
+                "boxstyle": "round,pad=0.22",
+                "facecolor": badge.color,
+                "edgecolor": "none",
+            },
+        )
+        cursor += width + 0.035 * panel_width
+
+
+def _draw_panel_model_badges(axis: Any, metadata: Mapping[str, Any]) -> None:
+    """Center the model-identity badges above one prediction panel."""
+
+    badges = model_badges(metadata)
+    if not badges:
+        return
+    weights = np.asarray([len(badge.text) + 2.5 for badge in badges], dtype=float)
+    gap = 0.025
+    usable_width = 0.82 - gap * max(0, len(badges) - 1)
+    widths = usable_width * weights / float(np.sum(weights))
+    cursor = (1.0 - usable_width - gap * max(0, len(badges) - 1)) / 2
+    for badge, width in zip(badges, widths, strict=True):
+        axis.text(
+            cursor + width / 2,
+            1.025,
+            badge.text,
+            transform=axis.transAxes,
+            ha="center",
+            va="bottom",
+            fontsize=7,
+            fontfamily="monospace",
+            color="white",
+            bbox={
+                "boxstyle": "round,pad=0.22",
+                "facecolor": badge.color,
+                "edgecolor": "none",
+            },
+            clip_on=False,
+        )
+        cursor += width + gap
+
+
 def _render_semantic_grid(
     cases: list[_SemanticCase],
     prediction_dirs: dict[str, Path],
     rows_by_model: dict[str, list[dict[str, Any]]],
     *,
+    model_metadata: Mapping[str, Mapping[str, Any]] | None = None,
     examples_per_row: int,
     panel_size: float,
     model_title_length: int,
@@ -4166,11 +4302,15 @@ def _render_semantic_grid(
         name: {row["case_id"]: row for row in rows}
         for name, rows in rows_by_model.items()
     }
+    metadata = {
+        name: dict((model_metadata or {}).get(name) or {"model": name})
+        for name in model_names
+    }
     column_titles = [
         "Original",
         "GT",
         *[
-            _multiline_model_title(name, model_title_length)
+            _shorten_middle(model_label(metadata[name]), model_title_length)
             for name in model_names
         ],
     ]
@@ -4179,7 +4319,7 @@ def _render_semantic_grid(
     grid_rows = math.ceil(len(cases) / examples_per_row)
     group_width = panel_size * panel_count
     image_title_height = 0.28
-    heading_height = max(0.3, 0.18 * heading_lines)
+    heading_height = max(0.5, 0.18 * heading_lines)
     group_height = panel_size + image_title_height + heading_height
     figure = plt.figure(
         figsize=(
@@ -4225,15 +4365,23 @@ def _render_semantic_grid(
             heading_axis = figure.add_subplot(cell[1, :])
             heading_axis.set_axis_off()
             for panel_index, heading in enumerate(column_titles):
+                heading_y = 0.5 if panel_index < 2 else 0.72
                 heading_axis.text(
                     (panel_index + 0.5) / panel_count,
-                    0.45,
+                    heading_y,
                     heading,
                     ha="center",
                     va="center",
                     fontsize=8,
                     linespacing=1.15,
                 )
+                if panel_index >= 2:
+                    _draw_grid_model_badges(
+                        heading_axis,
+                        metadata[model_names[panel_index - 2]],
+                        panel_index=panel_index,
+                        panel_count=panel_count,
+                    )
 
         with Image.open(case.image_path) as opened_image:
             image = np.asarray(opened_image.convert("RGB"))

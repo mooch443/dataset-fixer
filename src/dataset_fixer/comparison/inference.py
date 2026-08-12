@@ -155,6 +155,9 @@ def run_inference(
             postprocess=threshold,
             device=device,
             progress=progress,
+            # Comparison owns its schema-5 threshold shards. Avoid a second
+            # package-default direct-prediction cache for this internal call.
+            prediction_cache=False,
             settings=settings,
         )
         by_image = {
@@ -186,6 +189,7 @@ def _run_native(
         postprocess=threshold,
         device=device,
         progress=progress,
+        prediction_cache=False,
         settings=settings,
     )
     return {record.image_id: list(record.objects) for record in result.records}
@@ -570,6 +574,7 @@ def _run_sahi(
         postprocess=threshold,
         device=device,
         progress=progress,
+        prediction_cache=False,
         settings=settings,
     )
     return {record.image_id: list(record.objects) for record in result.records}

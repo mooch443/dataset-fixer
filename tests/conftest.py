@@ -7,6 +7,27 @@ import yaml
 from PIL import Image
 
 
+@pytest.fixture(autouse=True)
+def isolated_direct_prediction_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep default direct-prediction caches local to each test."""
+
+    monkeypatch.setattr(
+        "dataset_fixer.prediction_cache.package_cache_root",
+        lambda: tmp_path / "package-cache",
+    )
+    monkeypatch.setattr(
+        "dataset_fixer.sources.cache_root",
+        lambda: tmp_path / "package-cache",
+    )
+    monkeypatch.setattr(
+        "dataset_fixer.model_sources.cache_root",
+        lambda: tmp_path / "package-cache",
+    )
+
+
 def make_image(path: Path, size: tuple[int, int] = (160, 120), color=(70, 110, 150)) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", size, color).save(path)
