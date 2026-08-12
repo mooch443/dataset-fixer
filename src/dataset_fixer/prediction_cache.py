@@ -106,6 +106,7 @@ class PredictionCache:
         namespace: PredictionCacheNamespace,
         identity: Mapping[str, Any],
         inputs: Sequence["ModelInput"],
+        allow_image_id_rebase: bool = False,
     ) -> "PredictionResult | None":
         """Load and validate one complete raw prediction result.
 
@@ -117,6 +118,10 @@ class PredictionCache:
             Complete identity payload expected to hash to ``key``.
         inputs:
             Ordered model inputs that the result must cover.
+        allow_image_id_rebase:
+            Accept different generated image IDs only when ordered relative
+            paths, dimensions, and image bytes remain identical. Returned
+            records are always rebased to ``inputs``.
         """
 
         root = self.entry(key, namespace=namespace) / "raw-result"
@@ -141,7 +146,12 @@ class PredictionCache:
             return None
 
         expected = _input_manifest(inputs)
-        if manifest.get("inputs") != expected:
+        stored_inputs = manifest.get("inputs")
+        if stored_inputs != expected and not (
+            allow_image_id_rebase
+            and _image_only_input_manifest(stored_inputs)
+            == _image_only_input_manifest(expected)
+        ):
             return None
         result_value = manifest.get("result")
         records_value = manifest.get("records")
@@ -155,7 +165,10 @@ class PredictionCache:
 
         records: list[ImagePrediction] = []
         for source, stored in zip(inputs, records_value):
-            if not isinstance(stored, dict) or stored.get("image_id") != source.image_id:
+            if not isinstance(stored, dict) or (
+                not allow_image_id_rebase
+                and stored.get("image_id") != source.image_id
+            ):
                 return None
             if (
                 stored.get("relative_path") != source.relative_path
@@ -242,6 +255,78 @@ class PredictionCache:
             settings=dict(result_value.get("settings") or {}),
             cache_info=info,
         )
+
+    def find_image_compatible(
+        self,
+        *,
+        namespace: PredictionCacheNamespace,
+        identity: Mapping[str, Any],
+        inputs: Sequence["ModelInput"],
+    ) -> "PredictionResult | None":
+        """Find a raw image-prediction cache with only generated IDs changed.
+
+        This is a bounded compatibility probe over published manifests in one
+        namespace. It never rewrites, duplicates, or deletes the matching
+        cache entry.
+
+        namespace:
+            Cache namespace to inspect.
+        identity:
+            Requested image-prediction identity; only its generated-ID-based
+            input fingerprint may differ from a stored identity.
+        inputs:
+            Ordered model inputs whose paths, geometry, and bytes must match
+            the stored image manifest.
+        """
+
+        requested = dict(identity)
+        if requested.get("space") != "semantic-image-prediction":
+            return None
+        requested.pop("input_fingerprint", None)
+        expected_images = _image_only_input_manifest(_input_manifest(inputs))
+        for manifest_path in sorted(
+            self.namespace(namespace).glob("*/raw-result/manifest.json")
+        ):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(manifest, dict):
+                continue
+            stored_identity = manifest.get("identity")
+            if not isinstance(stored_identity, dict):
+                continue
+            functional = dict(stored_identity)
+            functional.pop("input_fingerprint", None)
+            # Manifests deserialize tuples as lists. Compare through the same
+            # canonical JSON conversion used by cache keys.
+            if prediction_cache_key(functional) != prediction_cache_key(requested):
+                continue
+            if _image_only_input_manifest(manifest.get("inputs")) != expected_images:
+                continue
+            key = str(manifest.get("key") or "")
+            if len(key) != 64 or any(
+                character not in "0123456789abcdef" for character in key
+            ):
+                continue
+            loaded = self.load(
+                key,
+                namespace=namespace,
+                identity=stored_identity,
+                inputs=inputs,
+                allow_image_id_rebase=True,
+            )
+            if loaded is None:
+                continue
+            return replace(
+                loaded,
+                cache_info={
+                    **loaded.cache_info,
+                    "status": "image-compatible-hit",
+                    "requested_key": prediction_cache_key(identity),
+                },
+            )
+        return None
 
     def save(
         self,
@@ -414,6 +499,17 @@ def _input_manifest(inputs: Sequence["ModelInput"]) -> list[dict[str, Any]]:
         }
         for value in inputs
     ]
+
+
+def _image_only_input_manifest(value: Any) -> list[dict[str, Any]] | None:
+    """Remove generated record IDs while retaining image-content identity."""
+
+    if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
+        return None
+    required = ("relative_path", "width", "height", "image_sha256")
+    if any(any(key not in row for key in required) for row in value):
+        return None
+    return [{key: row[key] for key in required} for row in value]
 
 
 def _save_mask(

@@ -2405,6 +2405,41 @@ def _prepare_prediction_cache_request(
             ),
         )
 
+    # An explicit cache belonging to another Dataset is a shared, image-level
+    # cache. Use the same semantic namespace as full-image comparison so
+    # instance polygons and semantic probabilities can cross reference-label
+    # variants without changing ordinary Dataset.compare() defaults.
+    from .dataset import Dataset
+
+    shared_dataset_cache = (
+        isinstance(source, Dataset)
+        and cache.location != PredictionCache.for_dataset(source).location
+        and next(
+            cache.namespace("semantic").glob("*/raw-result/manifest.json"),
+            None,
+        )
+        is not None
+    )
+    if shared_dataset_cache:
+        image_identity = _semantic_image_prediction_cache_identity(
+            model,
+            inputs=inputs,
+            inference=inference,
+            resolution=resolution,
+            confidence=confidence,
+            postprocess=postprocess,
+            combined_settings=combined_settings,
+            resolved_sahi=resolved_sahi,
+        )
+        return _PredictionCacheRequest(
+            cache=cache,
+            key=prediction_cache_key(image_identity),
+            identity=image_identity,
+            namespace="semantic",
+            postprocess=postprocess,
+            keep_native=keep_native,
+        )
+
     semantic_cohort = cache_context.get("semantic_cohort_fingerprint")
     if semantic_cohort:
         image_identity = _semantic_image_prediction_cache_identity(
@@ -2665,6 +2700,12 @@ def _load_prediction_cache_request(
                 },
             )
             break
+    if cached is None and request.namespace == "semantic":
+        cached = request.cache.find_image_compatible(
+            namespace=request.namespace,
+            identity=request.identity,
+            inputs=inputs,
+        )
     if cached is not None:
         if request.keep_native and any(
             record.native_mask is None for record in cached.records

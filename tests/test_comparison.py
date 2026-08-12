@@ -1109,6 +1109,140 @@ def test_semantic_probability_cache_is_shared_across_reference_variants(
     assert reused.records[0].image_path.is_relative_to(second.location)
 
 
+def test_shared_semantic_cache_rebases_generated_ids_across_dataset_formats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "cross-format-image-identity",
+        task="segment",
+        names=["school"],
+        train_rows=[""],
+        val_rows=["0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"],
+        size=(12, 12),
+    )
+    vector = Dataset.open(source, task="segment", progress=False)
+    semantic = vector.export(
+        destination=tmp_path / "cross-format-semantic",
+        format="semantic_masks",
+        visualize=False,
+        progress=False,
+    )
+    checkpoint = tmp_path / "cross-format-semantic.pt"
+    checkpoint.write_bytes(b"cross-format-semantic")
+    model = Model(checkpoint, task="semantic", resolution=12)
+    cache = PredictionCache(tmp_path / "shared-cross-format-cache")
+    calls = 0
+
+    def semantic_output(_model: object, inputs: object, **_options: object):
+        nonlocal calls
+        calls += 1
+        return {
+            value.image_id: types.SimpleNamespace(
+                class_map=np.ones((value.height, value.width), dtype=np.uint8),
+                foreground_probability=np.full(
+                    (value.height, value.width), 0.7, dtype=np.float32
+                ),
+                probability_source="model-probabilities",
+            )
+            for value in inputs  # type: ignore[union-attr]
+        }, "semantic_segment", {}
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.inference.predict_model_inputs",
+        semantic_output,
+    )
+    fresh = model.predict(
+        semantic,
+        split="val",
+        prediction_cache=cache,
+        progress=False,
+    )
+    reused = model.predict(
+        vector,
+        split="val",
+        prediction_cache=cache,
+        cache_only=True,
+        require_probability_maps=True,
+        progress=False,
+    )
+
+    assert calls == 1
+    assert fresh.records[0].image_id != reused.records[0].image_id
+    assert reused.cache_info["status"] == "image-compatible-hit"
+    assert reused.cache_info["key"] == fresh.cache_info["key"]
+    assert reused.cache_info["requested_key"] != fresh.cache_info["key"]
+    assert reused.records[0].image_path.is_relative_to(vector.location)
+    assert reused.records[0].foreground_probability is not None
+
+
+def test_shared_instance_cache_rebases_generated_ids_across_dataset_formats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "cross-format-instance-identity",
+        task="segment",
+        names=["school"],
+        train_rows=[""],
+        val_rows=["0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"],
+        size=(12, 12),
+    )
+    vector = Dataset.open(source, task="segment", progress=False)
+    semantic = vector.export(
+        destination=tmp_path / "cross-format-instance-semantic",
+        format="semantic_masks",
+        visualize=False,
+        progress=False,
+    )
+    checkpoint = tmp_path / "cross-format-instance.pt"
+    checkpoint.write_bytes(b"cross-format-instance")
+    model = Model(checkpoint, task="segment", resolution=12)
+    cache = PredictionCache(tmp_path / "shared-cross-format-instance-cache")
+    calls = 0
+
+    def instance_output(_model: object, inputs: object, **_options: object):
+        nonlocal calls
+        calls += 1
+        prediction = Prediction(
+            class_id=0,
+            score=0.9,
+            bbox=(2.0, 2.0, 9.0, 9.0),
+            polygon=[(2.0, 2.0), (9.0, 2.0), (9.0, 9.0), (2.0, 9.0)],
+        )
+        return {
+            value.image_id: [prediction]
+            for value in inputs  # type: ignore[union-attr]
+        }, "segment", {}
+
+    monkeypatch.setattr(
+        "dataset_fixer.comparison.inference.predict_model_inputs",
+        instance_output,
+    )
+    fresh = model.predict(
+        semantic,
+        split="val",
+        prediction_cache=cache,
+        progress=False,
+    )
+    reused = model.predict(
+        vector,
+        split="val",
+        prediction_cache=cache,
+        cache_only=True,
+        progress=False,
+    )
+
+    assert calls == 1
+    assert fresh.records[0].image_id != reused.records[0].image_id
+    assert reused.cache_info["status"] == "image-compatible-hit"
+    assert reused.cache_info["key"] == fresh.cache_info["key"]
+    assert reused.cache_info["requested_key"] != fresh.cache_info["key"]
+    assert reused.records[0].image_path.is_relative_to(vector.location)
+    assert len(reused.records[0].objects) == 1
+    assert reused.records[0].objects[0].score == pytest.approx(0.9)
+
+
 def test_semantic_predict_cache_on_vector_dataset_reuses_complete_masks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
