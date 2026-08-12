@@ -1467,6 +1467,7 @@ class Model:
             resolved_sahi=resolved_sahi.as_dict(),
             foreground_probability_threshold=effective_foreground_threshold,
             require_probability_maps=require_probability_maps,
+            progress=progress,
         )
         if cached_result is not None:
             if destination is not None:
@@ -2610,6 +2611,7 @@ def _load_prediction_cache_request(
     resolved_sahi: Mapping[str, Any],
     foreground_probability_threshold: float | None,
     require_probability_maps: bool,
+    progress: bool,
 ) -> PredictionResult | None:
     if request is None:
         return None
@@ -2622,7 +2624,7 @@ def _load_prediction_cache_request(
             root,
             request.cohort,
             (request.postprocess,),
-            progress=False,
+            progress=progress,
         )
         if complete:
             by_image = loaded[float(request.postprocess)]
@@ -2670,6 +2672,7 @@ def _load_prediction_cache_request(
         namespace=request.namespace,
         identity=request.identity,
         inputs=inputs,
+        progress=progress,
     )
     if cached is None:
         from .prediction_cache import prediction_cache_key
@@ -2681,6 +2684,7 @@ def _load_prediction_cache_request(
                 namespace=request.namespace,
                 identity=compatible_identity,
                 inputs=inputs,
+                progress=progress,
             )
             if compatible is None:
                 continue
@@ -2705,6 +2709,7 @@ def _load_prediction_cache_request(
             namespace=request.namespace,
             identity=request.identity,
             inputs=inputs,
+            progress=progress,
         )
     if cached is not None:
         if request.keep_native and any(

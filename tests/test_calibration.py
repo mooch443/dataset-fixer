@@ -117,6 +117,12 @@ def test_grouped_threshold_calibration_uses_cached_probabilities_only(
     ]
     assert (result.location / "recommendations.json").is_file()
     assert (result.location / "threshold-curves.png").is_file()
+    assert (result.location / "calibration-improvements.csv").is_file()
+    improvement = result.improvements[0]
+    assert improvement["baseline_threshold"] == pytest.approx(0.4)
+    assert improvement["recommended_threshold"] == pytest.approx(0.5)
+    assert improvement["cv_macro_dice_gain"] > 0
+    assert improvement["cv_macro_dice_relative_gain_pct"] > 0
 
 
 def test_probability_map_rerun_requires_explicit_switch(

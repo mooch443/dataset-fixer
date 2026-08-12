@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from PIL import Image
+from tqdm.auto import tqdm
 
 from .dataset import Dataset
 from .errors import PredictionCacheMissError, PredictionScoreUnavailableError
@@ -29,6 +30,8 @@ class ThresholdCalibrationResult:
         cache_audit: Per-model cache reuse or rerun decisions.
         threshold_scores: Whole-cohort metrics for every tested threshold.
         fold_scores: Held-out grouped-fold metrics at fold-selected thresholds.
+        improvements: Baseline-to-calibrated F1/Dice gains, including grouped
+            held-out estimates suitable for concise reporting.
     """
 
     location: Path
@@ -36,6 +39,7 @@ class ThresholdCalibrationResult:
     cache_audit: tuple[dict[str, Any], ...]
     threshold_scores: tuple[dict[str, Any], ...]
     fold_scores: tuple[dict[str, Any], ...]
+    improvements: tuple[dict[str, Any], ...]
 
 
 def calibrate_prediction_thresholds(
@@ -90,7 +94,8 @@ def calibrate_prediction_thresholds(
             compatible scored-instance cache is absent.
         destination: Directory for audit tables, scores, recommendations, and
             the threshold plot.
-        progress: Whether permitted inference displays progress.
+        progress: Display cohort preparation, cache loading, threshold
+            scoring, and any permitted inference progress.
 
     Returns:
         Calibration artifacts and task-aware per-model recommendations.
@@ -110,15 +115,28 @@ def calibrate_prediction_thresholds(
     )
     root.mkdir(parents=True, exist_ok=True)
 
-    inputs, paths, cache_context = _calibration_cohort(dataset, split)
+    inputs, paths, cache_context = _calibration_cohort(
+        dataset,
+        split,
+        progress=progress,
+    )
     groups = [str(group_by(path)) for path in paths]
     fold_ids = _grouped_folds(groups, folds=folds, seed=seed)
     cache_audit: list[dict[str, Any]] = []
     threshold_scores: list[dict[str, Any]] = []
     fold_scores: list[dict[str, Any]] = []
+    improvements: list[dict[str, Any]] = []
     recommendations: dict[str, float] = {}
 
-    for model in collection:
+    model_progress = tqdm(
+        collection,
+        total=len(collection),
+        desc="Calibrating thresholds",
+        unit="model",
+        disable=not progress,
+    )
+    for model in model_progress:
+        model_progress.set_postfix_str(model.name)
         is_semantic = model._uses_semantic_prediction_threshold()
         allow_rerun = (
             rerun_missing_probability_maps
@@ -235,15 +253,37 @@ def calibrate_prediction_thresholds(
                 "rerun": cache_status == "rerun",
             }
         )
-        per_threshold_rows = {
-            value: _case_rows_for_prediction_threshold(
-                result,
-                inputs,
-                threshold=value,
+        baseline_threshold = float(model.prediction_threshold)
+        baseline_available = candidate_floor is None or (
+            baseline_threshold >= candidate_floor - 1e-12
+        )
+        scored_thresholds = tuple(
+            sorted(
+                set(grid)
+                | ({baseline_threshold} if baseline_available else set())
             )
-            for value in grid
-        }
-        for value in grid:
+        )
+        display_name = (
+            model.name
+            if len(model.name) <= 42
+            else f"{model.name[:20]}…{model.name[-21:]}"
+        )
+        per_threshold_rows: dict[float, tuple[dict[str, int | float], ...]] = {}
+        with tqdm(
+            total=len(scored_thresholds) * len(inputs),
+            desc=f"Scoring {display_name}",
+            unit="case-threshold",
+            disable=not progress,
+            leave=False,
+        ) as score_progress:
+            for value in scored_thresholds:
+                per_threshold_rows[value] = _case_rows_for_prediction_threshold(
+                    result,
+                    inputs,
+                    threshold=value,
+                    progress_bar=score_progress,
+                )
+        for value in scored_thresholds:
             metrics = _summarize_rows(per_threshold_rows[value])
             threshold_scores.append(
                 {
@@ -252,11 +292,19 @@ def calibrate_prediction_thresholds(
                     "task": model.task,
                     "prediction_threshold": value,
                     "candidate_floor": candidate_floor,
+                    "is_candidate": value in grid,
+                    "is_baseline": math.isclose(
+                        value,
+                        baseline_threshold,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    ),
                     **metrics,
                 }
             )
 
         unique_folds = sorted(set(fold_ids))
+        model_fold_rows: list[dict[str, Any]] = []
         for fold_id in unique_folds:
             train_indices = [
                 index for index, value in enumerate(fold_ids) if value != fold_id
@@ -271,21 +319,38 @@ def calibrate_prediction_thresholds(
                     value,
                 ),
             )
-            fold_scores.append(
-                {
-                    "model": model.name,
-                    "fold": fold_id,
-                    "train_groups": len(
-                        {groups[index] for index in train_indices}
-                    ),
-                    "test_groups": len({groups[index] for index in test_indices}),
-                    "prediction_threshold": selected,
-                    **_summarize_rows(
-                        per_threshold_rows[selected],
-                        test_indices,
-                    ),
-                }
+            selected_metrics = _summarize_rows(
+                per_threshold_rows[selected],
+                test_indices,
             )
+            baseline_metrics = (
+                _summarize_rows(
+                    per_threshold_rows[baseline_threshold],
+                    test_indices,
+                )
+                if baseline_available
+                else {}
+            )
+            fold_row = {
+                "model": model.name,
+                "fold": fold_id,
+                "train_groups": len({groups[index] for index in train_indices}),
+                "test_groups": len({groups[index] for index in test_indices}),
+                "prediction_threshold": selected,
+                "baseline_threshold": baseline_threshold,
+                **selected_metrics,
+                **{
+                    f"baseline_{key}": value
+                    for key, value in baseline_metrics.items()
+                },
+            }
+            for metric in ("macro_dice", "micro_dice", "presence_f1"):
+                fold_row[f"{metric}_gain"] = _metric_difference(
+                    selected_metrics.get(metric),
+                    baseline_metrics.get(metric),
+                )
+            model_fold_rows.append(fold_row)
+            fold_scores.append(fold_row)
 
         recommended = max(
             grid,
@@ -295,6 +360,23 @@ def calibrate_prediction_thresholds(
             ),
         )
         recommendations[model.name] = float(recommended)
+        baseline_metrics = (
+            _summarize_rows(per_threshold_rows[baseline_threshold])
+            if baseline_available
+            else {}
+        )
+        recommended_metrics = _summarize_rows(per_threshold_rows[recommended])
+        improvement = _calibration_improvement_row(
+            model=model,
+            baseline_threshold=baseline_threshold,
+            recommended_threshold=float(recommended),
+            baseline_metrics=baseline_metrics,
+            recommended_metrics=recommended_metrics,
+            fold_rows=model_fold_rows,
+        )
+        improvements.append(improvement)
+        if progress:
+            tqdm.write(_format_improvement(improvement))
         if not is_semantic:
             _publish_instance_threshold_alias(
                 model,
@@ -312,6 +394,7 @@ def calibrate_prediction_thresholds(
         cache_audit=cache_audit,
         threshold_scores=threshold_scores,
         fold_scores=fold_scores,
+        improvements=improvements,
         recommendations=recommendations,
         groups=groups,
         fold_ids=fold_ids,
@@ -324,12 +407,15 @@ def calibrate_prediction_thresholds(
         cache_audit=tuple(cache_audit),
         threshold_scores=tuple(threshold_scores),
         fold_scores=tuple(fold_scores),
+        improvements=tuple(improvements),
     )
 
 
 def _calibration_cohort(
     dataset: Dataset,
     split: str,
+    *,
+    progress: bool,
 ) -> tuple[
     tuple[Any, ...],
     tuple[Path, ...],
@@ -337,7 +423,11 @@ def _calibration_cohort(
 ]:
     from .model import normalize_model_inputs
 
-    inputs, _, context = normalize_model_inputs(dataset, split=split, progress=False)
+    inputs, _, context = normalize_model_inputs(
+        dataset,
+        split=split,
+        progress=progress,
+    )
     paths: list[Path] = []
     for value in inputs:
         if value.mask_path is None:
@@ -474,6 +564,7 @@ def _case_rows_for_prediction_threshold(
     inputs: Sequence[Any],
     *,
     threshold: float,
+    progress_bar: Any | None = None,
 ) -> tuple[dict[str, int | float], ...]:
     rows: list[dict[str, int | float]] = []
     by_id = result.by_id
@@ -487,6 +578,8 @@ def _case_rows_for_prediction_threshold(
                 )
             prediction = np.asarray(record.foreground_probability) >= threshold
             rows.append(_case_row(_load_reference_mask(value), prediction))
+            if progress_bar is not None:
+                progress_bar.update(1)
         return tuple(rows)
 
     for value in inputs:
@@ -499,6 +592,8 @@ def _case_rows_for_prediction_threshold(
             )
         prediction = score_map >= threshold
         rows.append(_case_row(_load_reference_mask(value), prediction))
+        if progress_bar is not None:
+            progress_bar.update(1)
     return tuple(rows)
 
 
@@ -581,12 +676,114 @@ def _selection_key(metrics: Mapping[str, float | int], threshold: float) -> tupl
     )
 
 
+def _finite_number(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return math.nan
+    return number if math.isfinite(number) else math.nan
+
+
+def _metric_difference(selected: Any, baseline: Any) -> float:
+    selected_value = _finite_number(selected)
+    baseline_value = _finite_number(baseline)
+    if not math.isfinite(selected_value) or not math.isfinite(baseline_value):
+        return math.nan
+    return selected_value - baseline_value
+
+
+def _relative_gain_percent(selected: Any, baseline: Any) -> float:
+    selected_value = _finite_number(selected)
+    baseline_value = _finite_number(baseline)
+    if (
+        not math.isfinite(selected_value)
+        or not math.isfinite(baseline_value)
+        or baseline_value == 0
+    ):
+        return math.nan
+    return 100.0 * (selected_value - baseline_value) / baseline_value
+
+
+def _mean_finite(rows: Sequence[Mapping[str, Any]], key: str) -> float:
+    values = [_finite_number(row.get(key)) for row in rows]
+    finite = [value for value in values if math.isfinite(value)]
+    return float(np.mean(finite)) if finite else math.nan
+
+
+def _calibration_improvement_row(
+    *,
+    model: Model,
+    baseline_threshold: float,
+    recommended_threshold: float,
+    baseline_metrics: Mapping[str, Any],
+    recommended_metrics: Mapping[str, Any],
+    fold_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Summarize apparent and held-out threshold-calibration gains."""
+
+    row: dict[str, Any] = {
+        "model": model.name,
+        "model_type": model.model_type,
+        "task": model.task,
+        "baseline_threshold": baseline_threshold,
+        "recommended_threshold": recommended_threshold,
+        "fold_selected_threshold_min": min(
+            (float(value["prediction_threshold"]) for value in fold_rows),
+            default=math.nan,
+        ),
+        "fold_selected_threshold_max": max(
+            (float(value["prediction_threshold"]) for value in fold_rows),
+            default=math.nan,
+        ),
+    }
+    for metric in ("macro_dice", "micro_dice", "presence_f1"):
+        baseline = _finite_number(baseline_metrics.get(metric))
+        calibrated = _finite_number(recommended_metrics.get(metric))
+        row[f"cohort_baseline_{metric}"] = baseline
+        row[f"cohort_calibrated_{metric}"] = calibrated
+        row[f"cohort_{metric}_gain"] = _metric_difference(calibrated, baseline)
+        row[f"cohort_{metric}_relative_gain_pct"] = _relative_gain_percent(
+            calibrated,
+            baseline,
+        )
+
+        cv_baseline = _mean_finite(fold_rows, f"baseline_{metric}")
+        cv_calibrated = _mean_finite(fold_rows, metric)
+        row[f"cv_baseline_{metric}"] = cv_baseline
+        row[f"cv_calibrated_{metric}"] = cv_calibrated
+        row[f"cv_{metric}_gain"] = _metric_difference(
+            cv_calibrated,
+            cv_baseline,
+        )
+        row[f"cv_{metric}_relative_gain_pct"] = _relative_gain_percent(
+            cv_calibrated,
+            cv_baseline,
+        )
+    return row
+
+
+def _format_improvement(row: Mapping[str, Any]) -> str:
+    """Format the primary held-out pixel-F1 result for notebook progress."""
+
+    before = _finite_number(row.get("cv_baseline_macro_dice"))
+    after = _finite_number(row.get("cv_calibrated_macro_dice"))
+    gain = _finite_number(row.get("cv_macro_dice_gain"))
+    relative = _finite_number(row.get("cv_macro_dice_relative_gain_pct"))
+    if not all(math.isfinite(value) for value in (before, after, gain, relative)):
+        return f"{row['model']}: grouped-CV macro Dice/F1 improvement unavailable"
+    return (
+        f"{row['model']}: grouped-CV macro Dice/F1 {before:.3f} → {after:.3f} "
+        f"({gain * 100:+.2f} percentage points; {relative:+.1f}% relative)"
+    )
+
+
 def _write_calibration_artifacts(
     root: Path,
     *,
     cache_audit: list[dict[str, Any]],
     threshold_scores: list[dict[str, Any]],
     fold_scores: list[dict[str, Any]],
+    improvements: list[dict[str, Any]],
     recommendations: dict[str, float],
     groups: Sequence[str],
     fold_ids: Sequence[int],
@@ -597,6 +794,10 @@ def _write_calibration_artifacts(
     scores = pd.DataFrame(threshold_scores)
     scores.to_csv(root / "threshold-scores.csv", index=False)
     pd.DataFrame(fold_scores).to_csv(root / "grouped-cv-folds.csv", index=False)
+    pd.DataFrame(improvements).to_csv(
+        root / "calibration-improvements.csv",
+        index=False,
+    )
     pd.DataFrame({"group": groups, "fold": fold_ids}).drop_duplicates().to_csv(
         root / "grouped-cv-assignments.csv",
         index=False,
@@ -611,6 +812,7 @@ def _write_calibration_artifacts(
             name: {"prediction_threshold": threshold}
             for name, threshold in recommendations.items()
         },
+        "improvements": improvements,
         "cache_audit": cache_audit,
     }
     (root / "recommendations.json").write_text(

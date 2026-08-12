@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
+from tqdm.auto import tqdm
 
 from .errors import DatasetValidationError
 from .sources import cache_root as package_cache_root
@@ -107,6 +108,7 @@ class PredictionCache:
         identity: Mapping[str, Any],
         inputs: Sequence["ModelInput"],
         allow_image_id_rebase: bool = False,
+        progress: bool = False,
     ) -> "PredictionResult | None":
         """Load and validate one complete raw prediction result.
 
@@ -122,6 +124,8 @@ class PredictionCache:
             Accept different generated image IDs only when ordered relative
             paths, dimensions, and image bytes remain identical. Returned
             records are always rebased to ``inputs``.
+        progress:
+            Display per-image cache deserialization progress.
         """
 
         root = self.entry(key, namespace=namespace) / "raw-result"
@@ -163,74 +167,87 @@ class PredictionCache:
         from .comparison.types import Prediction
         from .model import ImagePrediction, PredictionResult
 
+        model_name = str(result_value.get("model_name") or "model")
+        display_name = (
+            model_name if len(model_name) <= 48 else f"{model_name[:23]}…{model_name[-24:]}"
+        )
         records: list[ImagePrediction] = []
-        for source, stored in zip(inputs, records_value):
-            if not isinstance(stored, dict) or (
-                not allow_image_id_rebase
-                and stored.get("image_id") != source.image_id
-            ):
-                return None
-            if (
-                stored.get("relative_path") != source.relative_path
-                or stored.get("width") != source.width
-                or stored.get("height") != source.height
-            ):
-                return None
-            try:
-                metadata = dict(stored.get("metadata") or {})
-            except (TypeError, ValueError):
-                return None
-
-            mask = _load_mask(root, stored.get("mask"), source.width, source.height)
-            if stored.get("mask") is not None and mask is None:
-                return None
-            native_mask = _load_mask(root, stored.get("native_mask"), None, None)
-            if stored.get("native_mask") is not None and native_mask is None:
-                return None
-            foreground_probability = _load_probability(
-                root,
-                stored.get("foreground_probability"),
-                source.width,
-                source.height,
-            )
-            if (
-                stored.get("foreground_probability") is not None
-                and foreground_probability is None
-            ):
-                return None
-
-            objects: list[Prediction] = []
-            raw_objects = stored.get("objects") or []
-            if isinstance(raw_objects, str):
-                objects_path = root / raw_objects
-                if not objects_path.is_file():
+        with tqdm(
+            zip(inputs, records_value),
+            total=len(inputs),
+            desc=f"Loading {display_name} cache",
+            unit="image",
+            disable=not progress,
+        ) as pairs:
+            for source, stored in pairs:
+                if not isinstance(stored, dict) or (
+                    not allow_image_id_rebase
+                    and stored.get("image_id") != source.image_id
+                ):
+                    return None
+                if (
+                    stored.get("relative_path") != source.relative_path
+                    or stored.get("width") != source.width
+                    or stored.get("height") != source.height
+                ):
                     return None
                 try:
-                    raw_objects = json.loads(objects_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
+                    metadata = dict(stored.get("metadata") or {})
+                except (TypeError, ValueError):
                     return None
-            if not isinstance(raw_objects, list):
-                return None
-            try:
-                for value in raw_objects:
-                    objects.append(_prediction_from_json(value))
-                _validate_prediction_geometry(objects, source.width, source.height)
-            except (TypeError, ValueError, KeyError):
-                return None
-            records.append(
-                ImagePrediction(
-                    image_id=source.image_id,
-                    image_path=source.image_path,
-                    relative_path=source.relative_path,
-                    width=source.width,
-                    height=source.height,
-                    objects=tuple(objects),
-                    mask=mask,
-                    native_mask=native_mask,
-                    foreground_probability=foreground_probability,
-                    metadata=metadata,
+
+                mask = _load_mask(root, stored.get("mask"), source.width, source.height)
+                if stored.get("mask") is not None and mask is None:
+                    return None
+                native_mask = _load_mask(root, stored.get("native_mask"), None, None)
+                if stored.get("native_mask") is not None and native_mask is None:
+                    return None
+                foreground_probability = _load_probability(
+                    root,
+                    stored.get("foreground_probability"),
+                    source.width,
+                    source.height,
                 )
-            )
+                if (
+                    stored.get("foreground_probability") is not None
+                    and foreground_probability is None
+                ):
+                    return None
+
+                objects: list[Prediction] = []
+                raw_objects = stored.get("objects") or []
+                if isinstance(raw_objects, str):
+                    objects_path = root / raw_objects
+                    if not objects_path.is_file():
+                        return None
+                    try:
+                        raw_objects = json.loads(
+                            objects_path.read_text(encoding="utf-8")
+                        )
+                    except (OSError, json.JSONDecodeError):
+                        return None
+                if not isinstance(raw_objects, list):
+                    return None
+                try:
+                    for value in raw_objects:
+                        objects.append(_prediction_from_json(value))
+                    _validate_prediction_geometry(objects, source.width, source.height)
+                except (TypeError, ValueError, KeyError):
+                    return None
+                records.append(
+                    ImagePrediction(
+                        image_id=source.image_id,
+                        image_path=source.image_path,
+                        relative_path=source.relative_path,
+                        width=source.width,
+                        height=source.height,
+                        objects=tuple(objects),
+                        mask=mask,
+                        native_mask=native_mask,
+                        foreground_probability=foreground_probability,
+                        metadata=metadata,
+                    )
+                )
 
         try:
             inference_seconds = float(result_value.get("inference_seconds", 0.0))
@@ -262,6 +279,7 @@ class PredictionCache:
         namespace: PredictionCacheNamespace,
         identity: Mapping[str, Any],
         inputs: Sequence["ModelInput"],
+        progress: bool = False,
     ) -> "PredictionResult | None":
         """Find a raw image-prediction cache with only generated IDs changed.
 
@@ -277,6 +295,8 @@ class PredictionCache:
         inputs:
             Ordered model inputs whose paths, geometry, and bytes must match
             the stored image manifest.
+        progress:
+            Display per-image deserialization progress for a compatible hit.
         """
 
         requested = dict(identity)
@@ -315,6 +335,7 @@ class PredictionCache:
                 identity=stored_identity,
                 inputs=inputs,
                 allow_image_id_rebase=True,
+                progress=progress,
             )
             if loaded is None:
                 continue
