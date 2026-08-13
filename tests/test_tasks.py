@@ -386,6 +386,145 @@ def test_polo_coverage_reports_and_visual_audit(tmp_path: Path) -> None:
     assert all(annotation.radius == 10 for sample in tiled._samples for annotation in sample.annotations)
 
 
+def test_coverage_reports_final_output_label_positions(tmp_path: Path) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "output_position_source",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.8 0.25 0.1 0.1"],
+        val_rows=["0 0.8 0.25 0.1 0.1"],
+        size=(200, 100),
+    )
+    tiled = Dataset.open(source, task="detect", progress=False).tile(
+        mode="coverage",
+        tile_size=100,
+        large_image_threshold=50,
+        scale_range=(1.0, 1.0),
+        target_appearances_per_object=2,
+        sparse_appearances_per_object=2,
+        background_ratio=0,
+        seed=17,
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "output_position_tiles",
+        visualize=False,
+        progress=False,
+    )
+
+    coverage = _audit(tiled, "coverage.source_coverage")
+    source_positions = coverage["label_positions"]
+    output_positions = coverage["output_label_positions"]
+    assert (source_positions["columns"], source_positions["rows"]) == (24, 12)
+    assert (output_positions["columns"], output_positions["rows"]) == (12, 12)
+    assert output_positions["coordinate_space"] == "normalized output image"
+
+    expected = Counter()
+    total = 0
+    for sample in tiled._samples:
+        for annotation in sample.annotations:
+            assert annotation.bbox is not None
+            x1, y1, x2, y2 = annotation.bbox
+            column = min(11, int(12 * ((x1 + x2) / 2) / sample.width))
+            row = min(11, int(12 * ((y1 + y2) / 2) / sample.height))
+            expected[(row, column)] += 1
+            total += 1
+    actual = Counter(
+        {
+            (row, column): count
+            for row, values in enumerate(output_positions["labels"])
+            for column, count in enumerate(values)
+            if count
+        }
+    )
+    assert actual == expected
+    assert output_positions["output_annotations"] == total
+    assert output_positions["annotated_output_images"] == sum(
+        bool(sample.annotations) for sample in tiled._samples
+    )
+
+
+def test_visualize_and_tiling_preview_labels_accept_path_callbacks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from matplotlib import pyplot as plt
+    from dataset_fixer import dataset as dataset_module
+
+    source = make_yolo_dataset(
+        tmp_path / "preview_label_source",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.5 0.5 0.2 0.2"],
+        val_rows=["0 0.5 0.5 0.2 0.2"],
+        size=(96, 80),
+    )
+    dataset = Dataset.open(source, task="detect", progress=False)
+    seen: list[Path] = []
+
+    def direct_label(path: Path) -> str:
+        seen.append(path)
+        return f"custom:{path.stem}"
+
+    figure = dataset.visualize(
+        split="train",
+        n=1,
+        label_fn=direct_label,
+        show=False,
+    )
+    assert figure.axes[0].get_title().startswith("custom:train_0")
+    assert seen and all(isinstance(path, Path) for path in seen)
+    plt.close(figure)
+
+    untitled = dataset.visualize(
+        split="train",
+        n=1,
+        label_fn=lambda _path: None,
+        show=False,
+    )
+    assert untitled.axes[0].get_title() == ""
+    plt.close(untitled)
+
+    displayed_reports: list[Path] = []
+    monkeypatch.setattr(dataset_module, "display_report", displayed_reports.append)
+    tiled = dataset.tile(
+        tile_size=64,
+        visualize_kwargs={"label_fn": lambda path: f"tile:{path.stem}"},
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "preview_label_tiles",
+        visualize=True,
+        visualize_kwargs={"line_width": 1, "outline_width": 3},
+        progress=False,
+    )
+    assert displayed_reports == [tiled.location / "reports" / "plots.png"]
+    assert tiled.provenance
+    assert all(
+        str(record["display_label"]).startswith("tile:")
+        for record in tiled.provenance.values()
+    )
+    persisted = tiled.visualize(split="train", n=1, show=False)
+    assert persisted.axes[0].get_title().startswith("tile:")
+    plt.close(persisted)
+
+    with pytest.raises(TypeError, match="string or None"):
+        dataset.visualize(
+            split="train",
+            n=1,
+            label_fn=lambda _path: 42,  # type: ignore[return-value]
+            show=False,
+        )
+    with pytest.raises(TypeError, match="Unknown visualize_kwargs"):
+        dataset.tile(visualize_kwargs={"future_typo": 1})
+    with pytest.raises(ValueError, match="positive number"):
+        dataset.export(
+            destination=tmp_path / "invalid_visualization_width",
+            visualize_kwargs={"line_width": 0},
+            dry_run=True,
+        )
+
+
 def test_coverage_resamples_tiles_that_cut_annotations(tmp_path: Path) -> None:
     rows = ["0 0.15 0.5 0.1 0.2\n0 0.65 0.5 0.1 0.2"]
     source = make_yolo_dataset(
@@ -464,48 +603,169 @@ def test_coverage_writes_source_pixel_and_label_jpg_audits(tmp_path: Path) -> No
     assert tiled._manifest["visuals"] == ["reports/plots.png"]
 
 
-def test_an_annotation_larger_than_any_crop_is_still_covered_once(tmp_path: Path) -> None:
-    """allow_lossy=False must not cost a label its only appearance.
-
-    The annotation is 160px wide but no crop can exceed 100px, so a complete
-    copy is impossible. Clipping it is the lesser loss, and the relaxation is
-    recorded rather than applied silently.
-    """
+@pytest.mark.parametrize(
+    ("task", "row"),
+    [
+        ("detect", "0 0.5 0.5 0.8 0.2"),
+        ("segment", "0 0.1 0.4 0.9 0.4 0.9 0.6 0.1 0.6"),
+    ],
+)
+def test_strict_coverage_uses_lossless_full_source_letterbox_fallback(
+    tmp_path: Path,
+    task: str,
+    row: str,
+) -> None:
+    """A strict crop may relax its framing, but never clip source geometry."""
 
     source = make_yolo_dataset(
         tmp_path / "uncroppable_source",
-        task="detect",
+        task=task,
         names=["fruit"],
-        train_rows=["0 0.5 0.5 0.8 0.2"],
-        val_rows=["0 0.5 0.5 0.8 0.2"],
+        train_rows=[row],
+        val_rows=[row],
+        size=(200, 100),
+    )
+
+    plan = Dataset.open(source, task=task, progress=False).tile(
+        mode="coverage",
+        tile_size=100,
+        large_image_threshold=50,
+        scale_range=(1.0, 1.0),
+        target_appearances_per_object=1,
+        sparse_appearances_per_object=1,
+        max_attempts_per_target=3,
+        background_ratio=0,
+        allow_lossy=False,
+        visualize=False,
+        progress=False,
+    )
+
+    assert plan.history[-1]["settings"]["min_area_ratio"] == 1.0
+    tiled = plan.export(
+        destination=tmp_path / f"uncroppable_{task}",
+        visualize=False,
+        progress=False,
+    )
+
+    assert len(tiled._samples) == 2
+    assert all(sample.annotations for sample in tiled._samples)
+    assert all(sample.width == 100 and sample.height == 100 for sample in tiled._samples)
+    assert all(
+        sample.annotations[0].bbox == pytest.approx((10.0, 45.0, 90.0, 55.0))
+        for sample in tiled._samples
+    )
+    assert all(
+        record["coverage_relaxation"] == "full_source_letterbox"
+        and record["tile_mode"] == "coverage-full-source-letterbox"
+        and record["lossy_clipping"] is False
+        for record in tiled.provenance.values()
+    )
+    coverage = _audit(tiled, "coverage.source_coverage")
+    assert coverage["source_labels_never_covered"] == 0
+
+
+@pytest.mark.parametrize(
+    ("task", "rows"),
+    [
+        (
+            "detect",
+            "0 0.25 0.5 0.3 0.2\n0 0.5 0.5 0.4 0.2",
+        ),
+        (
+            "segment",
+            (
+                "0 0.1 0.4 0.4 0.4 0.4 0.6 0.1 0.6\n"
+                "0 0.3 0.4 0.7 0.4 0.7 0.6 0.3 0.6"
+            ),
+        ),
+    ],
+)
+def test_coverage_not_focal_clips_incidental_annotations_but_counts_full_focus(
+    tmp_path: Path,
+    task: str,
+    rows: str,
+) -> None:
+    source = make_yolo_dataset(
+        tmp_path / f"not_focal_{task}",
+        task=task,
+        names=["fruit"],
+        train_rows=[rows],
+        val_rows=[rows],
         size=(200, 100),
     )
 
     tiled = (
-        Dataset.open(source, task="detect", progress=False)
+        Dataset.open(source, task=task, progress=False)
         .tile(
             mode="coverage",
+            splits=["train"],
             tile_size=100,
             large_image_threshold=50,
             scale_range=(1.0, 1.0),
             target_appearances_per_object=1,
             sparse_appearances_per_object=1,
-            max_attempts_per_target=3,
+            min_area_ratio=0.25,
             background_ratio=0,
-            allow_lossy=False,
+            allow_lossy="not_focal",
+            seed=11,
             visualize=False,
             progress=False,
         )
-        .export(destination=tmp_path / "uncroppable", visualize=False, progress=False)
+        .export(
+            destination=tmp_path / f"not_focal_{task}_output",
+            visualize=False,
+            progress=False,
+        )
     )
 
-    coverage = tiled.manifest["audits"]["coverage.source_coverage"]
-    assert coverage["source_labels_never_covered"] == 0
-    assert coverage["source_label_coverage_percent"] == 100.0
-    assert all(
-        record["coverage_relaxation"] == "allow_clipped_geometry"
-        for record in tiled.provenance.values()
+    assert len(tiled._samples) == 2
+    assert all(len(sample.annotations) == 2 for sample in tiled._samples)
+    for record in tiled.provenance.values():
+        focal = record["focal_annotation_index"]
+        assert record["lossy_policy"] == "not_focal"
+        assert record["lossy_clipping"] is True
+        assert focal not in record["lossy_annotation_indices"]
+        assert record["lossy_non_focal_indices"] == [1 - focal]
+        assert "coverage_relaxation" not in record
+
+    coverage = _audit(tiled, "coverage.label_coverage")
+    assert [int(row["actual_coverages"]) for row in coverage] == [1, 1]
+
+
+def test_tile_rejects_mode_incompatible_and_ineffective_settings(
+    tmp_path: Path,
+) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "tile_setting_validation",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.5 0.5 0.2 0.2"],
+        val_rows=["0 0.5 0.5 0.2 0.2"],
     )
+    dataset = Dataset.open(source, task="detect", progress=False)
+
+    with pytest.raises(ValueError, match="negative_tiles.*grid"):
+        dataset.tile(mode="coverage", negative_tiles="all")
+    with pytest.raises(ValueError, match="overlap.*grid"):
+        dataset.tile(mode="coverage", overlap=0.2)
+    with pytest.raises(ValueError, match="min_area_ratio must be omitted"):
+        dataset.tile(
+            mode="coverage",
+            min_area_ratio=0.5,
+            allow_lossy=False,
+        )
+    with pytest.raises(ValueError, match="background_ratio=0"):
+        dataset.tile(
+            mode="coverage",
+            background_ratio=0,
+            background_filter=lambda image: True,
+        )
+    with pytest.raises(ValueError, match="only when mode='coverage'.*background_ratio"):
+        dataset.tile(mode="grid", background_ratio=0.2)
+    with pytest.raises(ValueError, match="only when mode='coverage'.*not_focal"):
+        dataset.tile(mode="grid", allow_lossy="not_focal")
+    with pytest.raises(TypeError, match="False, True, or 'not_focal'"):
+        dataset.tile(mode="coverage", allow_lossy="focal")  # type: ignore[arg-type]
 
 
 def test_coverage_visual_keeps_legend_off_image_and_boxes_segmentations(
@@ -622,15 +882,120 @@ def test_coverage_background_ratio_applies_to_complete_output(tmp_path: Path) ->
     assert class_counts["annotation_counts"]["result"]["0"] == 6
 
 
-def test_coverage_balances_background_source_types(tmp_path: Path) -> None:
-    positive = "0 0.5 0.5 0.1 0.1"
+def test_coverage_background_ratio_none_is_per_split_best_effort(
+    tmp_path: Path,
+) -> None:
+    positive = "0 0.5 0.5 0.2 0.2"
     source = make_yolo_dataset(
-        tmp_path / "coverage_background_source_mix",
+        tmp_path / "coverage_per_split_best_effort",
         task="detect",
         names=["fruit"],
-        train_rows=[positive, positive, "", ""],
-        val_rows=[positive, positive, "", ""],
-        size=(300, 260),
+        train_rows=[positive, ""],
+        val_rows=[positive, "", "", ""],
+        size=(100, 100),
+    )
+    for image_path in sorted((source / "val" / "images").glob("val_[1-3].jpg")):
+        Image.new("RGB", (100, 100), (0, 0, 0)).save(image_path)
+
+    tiled = (
+        Dataset.open(source, task="detect", progress=False)
+        .tile(
+            mode="coverage",
+            tile_size=100,
+            large_image_threshold=200,
+            background_ratio={"train": 0.5, "val": None},
+            background_filter=lambda candidate: candidate.getbbox() is not None,
+            visualize=False,
+            progress=False,
+        )
+        .export(
+            destination=tmp_path / "coverage_per_split_best_effort_output",
+            visualize=False,
+            progress=False,
+        )
+    )
+
+    train = [sample for sample in tiled._samples if sample.split == "train"]
+    val = [sample for sample in tiled._samples if sample.split == "val"]
+    assert len(train) == 2
+    assert sum(not sample.annotations for sample in train) == 1
+    assert len(val) == 1
+    assert not any(not sample.annotations for sample in val)
+
+    sampling = _audit(tiled, "coverage.background_sampling")
+    assert sampling["splits"]["train"]["status"] == "target met"
+    assert sampling["splits"]["val"]["mode"] == "best_effort_source_fraction"
+    assert sampling["splits"]["val"]["source_background_fraction"] == 0.75
+    assert sampling["splits"]["val"]["target_background_images"] == 3
+    assert sampling["splits"]["val"]["actual_background_images"] == 0
+    assert sampling["splits"]["val"]["status"] == "best-effort target missed"
+
+
+def test_coverage_background_ratio_range_accepts_target_shortfall_above_minimum(
+    tmp_path: Path,
+) -> None:
+    positive = "0 0.5 0.5 0.2 0.2"
+    source = make_yolo_dataset(
+        tmp_path / "coverage_background_range",
+        task="detect",
+        names=["fruit"],
+        train_rows=[positive, ""],
+        val_rows=[positive],
+        size=(100, 100),
+    )
+    dataset = Dataset.open(source, task="detect", progress=False)
+
+    tiled = dataset.tile(
+        mode="coverage",
+        splits=["train"],
+        tile_size=100,
+        large_image_threshold=200,
+        background_ratio={"train": [0.25, 0.75]},
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "coverage_background_range_output",
+        visualize=False,
+        progress=False,
+    )
+
+    output = list(tiled._samples)
+    assert len(output) == 2
+    assert sum(not sample.annotations for sample in output) == 1
+    sampling = _audit(tiled, "coverage.background_sampling")["splits"]["train"]
+    assert sampling["status"] == "within accepted range"
+    assert sampling["target_background_images"] == 3
+    assert sampling["minimum_accepted_background_images"] == 1
+    assert sampling["actual_background_fraction"] == 0.5
+
+    with pytest.raises(
+        DatasetValidationError,
+        match="cannot reach the minimum accepted background fraction",
+    ):
+        dataset.tile(
+            mode="coverage",
+            splits=["train"],
+            tile_size=100,
+            large_image_threshold=200,
+            background_ratio={"train": [0.6, 0.75]},
+            visualize=False,
+            progress=False,
+        ).export(
+            destination=tmp_path / "coverage_background_range_too_low",
+            visualize=False,
+            progress=False,
+        )
+
+
+def test_coverage_samples_background_sources_uniformly(tmp_path: Path) -> None:
+    positive = "0 0.5 0.5 0.1 0.1"
+    source = make_yolo_dataset(
+        tmp_path / "coverage_uniform_background_sources",
+        task="detect",
+        names=["fruit"],
+        train_rows=[positive, *("" for _ in range(9))],
+        val_rows=[positive, *("" for _ in range(9))],
+        size=(1000, 1000),
     )
 
     tiled = (
@@ -640,39 +1005,126 @@ def test_coverage_balances_background_source_types(tmp_path: Path) -> None:
             tile_size=100,
             large_image_threshold=200,
             scale_range=(1.0, 1.0),
-            target_appearances_per_object=1,
-            sparse_appearances_per_object=1,
-            background_ratio=0.5,
+            target_appearances_per_object=5,
+            sparse_appearances_per_object=5,
+            background_ratio=0.8,
             seed=13,
             visualize=False,
             progress=False,
         )
         .export(
-            destination=tmp_path / "coverage_balanced_background_sources",
+            destination=tmp_path / "coverage_uniform_background_output",
             visualize=False,
             progress=False,
         )
     )
 
     sampling = _audit(tiled, "coverage.background_sampling")
+    assert "uniformly over currently eligible source images" in sampling["source_policy"]
     for split in ("train", "val"):
         details = sampling["splits"][split]
-        assert details["status"] == "target and equal source mix met"
-        assert details["target_background_images"] == 2
-        assert details["actual_background_images"] == 2
-        assert details["actual_from_empty_source_images"] == 1
-        assert details["actual_from_populated_image_space"] == 1
-        assert details["actual_background_fraction"] == 0.5
+        assert details["status"] == "target met"
+        assert details["target_background_images"] == 20
+        assert details["actual_background_images"] == 20
+        assert details["candidate_empty_source_images"] == 9
+        assert details["candidate_populated_source_images"] == 1
+        assert details["actual_from_empty_source_images"] >= 15
+        assert details["actual_from_populated_image_space"] <= 5
+        assert details["actual_background_fraction"] == 0.8
+        assert "target_from_empty_source_images" not in details
+        assert "target_from_populated_image_space" not in details
 
     background_sources = Counter(
         record.get("background_source")
         for record in tiled.provenance.values()
         if record.get("output_annotation_count") == 0
     )
-    assert background_sources == {
-        "empty_source_image": 2,
-        "populated_image_empty_space": 2,
-    }
+    assert background_sources["empty_source_image"] >= 30
+    assert background_sources["populated_image_empty_space"] <= 10
+
+
+def test_coverage_progress_reports_post_source_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "coverage_progress_source",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.5 0.5 0.1 0.1", ""],
+        val_rows=["0 0.5 0.5 0.1 0.1", ""],
+        size=(100, 100),
+    )
+
+    bars = []
+
+    class RecordingBar:
+        def __init__(
+            self,
+            iterable=None,
+            *,
+            total=None,
+            desc=None,
+            disable=False,
+            **kwargs,
+        ) -> None:
+            self.iterable = iterable
+            self.total = total if total is not None else len(iterable)
+            self.desc = desc
+            self.disable = disable
+            self.n = 0
+            self.postfixes: list[dict] = []
+            bars.append(self)
+
+        def __iter__(self):
+            for value in self.iterable:
+                yield value
+                self.n += 1
+
+        def update(self, count=1) -> None:
+            self.n += count
+
+        def set_postfix(self, **values) -> None:
+            values.pop("refresh", None)
+            self.postfixes.append(values)
+
+        def set_postfix_str(self, value, **kwargs) -> None:
+            self.postfixes.append({"stage": value})
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(tiling_module, "tqdm", RecordingBar)
+
+    (
+        Dataset.open(source, task="detect", progress=False)
+        .tile(
+            mode="coverage",
+            tile_size=100,
+            large_image_threshold=200,
+            target_appearances_per_object=1,
+            sparse_appearances_per_object=1,
+            background_ratio=0.5,
+            visualize=False,
+            progress=True,
+        )
+        .export(
+            destination=tmp_path / "coverage_progress_output",
+            visualize=False,
+            progress=True,
+        )
+    )
+
+    active = {bar.desc: bar for bar in bars if not bar.disable}
+    for split in ("train", "val"):
+        sampling = active[f"Sampling {split} backgrounds"]
+        assert sampling.n == sampling.total == 1
+        assert sampling.postfixes[-1] == {"attempts": 1, "rejected": 0}
+        writing = active[f"Writing {split} background copies"]
+        assert writing.n == writing.total == 1
+    assert active["Computing source coverage"].n == 4
+    reports = active["Building coverage reports"]
+    assert reports.n == reports.total == 2
 
 
 def test_coverage_background_filter_discards_black_crop_candidates(

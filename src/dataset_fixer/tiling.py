@@ -9,7 +9,7 @@ import re
 import statistics
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -28,6 +28,7 @@ from .writer import PUBLISHES_OPERATION_VISUALS
 from .visualization import (
     save_coverage_annotated_original,
     save_label_coverage_summary,
+    save_label_position_summary,
     save_source_pixel_coverage_summary,
     save_tiling_count_summary,
     save_tiling_preview,
@@ -52,11 +53,15 @@ def tile_dataset(
     overlap: float,
     min_area_ratio: float,
     negative_tiles: str | float,
-    allow_lossy: bool,
+    seed: int,
+    jpeg_quality: int,
+    allow_lossy: bool | str,
     background_filter: Callable[[Image.Image], bool] | None,
     background_filter_description: dict[str, Any] | None,
     errors: str,
     visualize: bool,
+    visualize_kwargs: Mapping[str, Any],
+    visualize_kwargs_description: Mapping[str, Any],
     progress: bool,
     dry_run: bool,
     settings: dict[str, Any],
@@ -73,11 +78,15 @@ def tile_dataset(
             overlap=overlap,
             min_area_ratio=min_area_ratio,
             negative_tiles=negative_tiles,
+            seed=seed,
+            jpeg_quality=jpeg_quality,
             allow_lossy=allow_lossy,
             background_filter=background_filter,
             background_filter_description=background_filter_description,
             errors=errors,
             visualize=visualize,
+            visualize_kwargs=visualize_kwargs,
+            visualize_kwargs_description=visualize_kwargs_description,
             progress=progress,
             dry_run=dry_run,
             validate_output=validate_output,
@@ -95,6 +104,8 @@ def tile_dataset(
             background_filter_description=background_filter_description,
             errors=errors,
             visualize=visualize,
+            visualize_kwargs=visualize_kwargs,
+            visualize_kwargs_description=visualize_kwargs_description,
             progress=progress,
             dry_run=dry_run,
             overrides=settings,
@@ -134,17 +145,23 @@ def _tile_grid(
     overlap: float,
     min_area_ratio: float,
     negative_tiles: str | float,
+    seed: int,
+    jpeg_quality: int,
     allow_lossy: bool,
     background_filter: Callable[[Image.Image], bool] | None,
     background_filter_description: dict[str, Any] | None,
     errors: str,
     visualize: bool,
+    visualize_kwargs: Mapping[str, Any],
+    visualize_kwargs_description: Mapping[str, Any],
     progress: bool,
     dry_run: bool,
     validate_output: bool,
 ) -> "Dataset":
     if not 0 <= min_area_ratio <= 1:
         raise ValueError("min_area_ratio must be in [0, 1]")
+    if not 1 <= int(jpeg_quality) <= 100:
+        raise ValueError("jpeg_quality must be in [1, 100]")
     selected = {normalize_split(s) for s in splits} if splits else set(dataset.splits)
     samples = [s for s in dataset._samples if s.split in selected]
     total_tiles = sum(len(grid_boxes(s.width, s.height, tile_size, overlap)) for s in samples)
@@ -154,14 +171,18 @@ def _tile_grid(
         "overlap": overlap,
         "min_area_ratio": min_area_ratio,
         "negative_tiles": negative_tiles,
+        "seed": seed,
+        "jpeg_quality": jpeg_quality,
         "allow_lossy": allow_lossy,
         "background_filter": background_filter_description,
         "errors": errors,
         "splits": sorted(selected),
         "visualize": visualize,
+        "visualize_kwargs": dict(visualize_kwargs_description),
         "estimated_tiles": total_tiles,
     }
     builder = _builder(dataset, destination, name, "tile-grid", op_settings)
+    builder.visualize_kwargs = dict(visualize_kwargs)
     _clear_inherited_tiling_reports(builder)
     try:
         _print_start(builder, samples, op_settings)
@@ -254,6 +275,7 @@ def _tile_grid(
                             relative_path=rel,
                             annotations=transformed,
                             provenance=provenance,
+                            jpeg_quality=int(jpeg_quality),
                         )
                         positive_counts[sample.split] += 1
                     else:
@@ -324,7 +346,7 @@ def _tile_grid(
                 chosen = (
                     candidates
                     if count == len(candidates)
-                    else random.Random(f"42:{split}").sample(candidates, count)
+                    else random.Random(f"{seed}:{split}").sample(candidates, count)
                 )
             else:
                 raise ValueError(
@@ -334,7 +356,15 @@ def _tile_grid(
         for sample, crop, rel, provenance in chosen_negatives:
             with Image.open(sample.image_path) as opened:
                 image = ImageOps.exif_transpose(opened).convert("RGB").crop(crop)
-            builder.add_image(sample, image, split=sample.split, relative_path=rel, annotations=[], provenance=provenance)
+            builder.add_image(
+                sample,
+                image,
+                split=sample.split,
+                relative_path=rel,
+                annotations=[],
+                provenance=provenance,
+                jpeg_quality=int(jpeg_quality),
+            )
         _write_tiling_skip_report(builder, errors, skipped_geometry)
         _write_background_filter_report(
             builder,
@@ -383,9 +413,15 @@ def _tile_grid(
                     dataset._metadata,
                     builder.reports_dir / "grid_preview.jpg",
                     mode="grid",
+                    visualize_kwargs=visualize_kwargs,
                 )
                 builder.visuals.append(str(preview.relative_to(builder.staging)))
-            _save_staging_contact_sheet(builder, dataset.task, "reports/grid_tiles_audit.jpg")
+            _save_staging_contact_sheet(
+                builder,
+                dataset.task,
+                "reports/grid_tiles_audit.jpg",
+                visualize_kwargs=visualize_kwargs,
+            )
         return _publish(builder, progress=progress, validate_output=validate_output)
     except Exception:
         builder.cleanup()
@@ -890,11 +926,13 @@ def _tile_coverage(
     splits: Iterable[str] | None,
     tile_size: int,
     min_area_ratio: float,
-    allow_lossy: bool,
+    allow_lossy: bool | str,
     background_filter: Callable[[Image.Image], bool] | None,
     background_filter_description: dict[str, Any] | None,
     errors: str,
     visualize: bool,
+    visualize_kwargs: Mapping[str, Any],
+    visualize_kwargs_description: Mapping[str, Any],
     progress: bool,
     dry_run: bool,
     overrides: dict[str, Any],
@@ -905,17 +943,23 @@ def _tile_coverage(
     cfg = dict(overrides)
     cfg["tile_size"] = int(tile_size)
     cfg["min_area_ratio"] = float(min_area_ratio)
-    cfg["allow_lossy"] = bool(allow_lossy)
+    cfg["allow_lossy"] = allow_lossy
     cfg["background_filter"] = background_filter_description
     cfg["errors"] = errors
+    cfg["visualize_kwargs"] = dict(visualize_kwargs_description)
+    cfg["splits"] = sorted(selected)
     if cfg["large_image_threshold"] is None:
         cfg["large_image_threshold"] = int(tile_size)
     _validate_coverage_settings(cfg)
     if cfg["dense_neighbor_radius_px"] is None:
         cfg["dense_neighbor_radius_px"] = tile_size * 0.5
     cfg["mode"] = "coverage"
-    cfg["splits"] = sorted(selected)
     cfg["visualize"] = visualize
+    cfg["background_ratio_policy"] = _resolve_background_ratio_policies(
+        samples,
+        selected,
+        cfg["background_ratio"],
+    )
     dense_target = max(
         int(cfg["target_appearances_per_object"]),
         int(cfg["sparse_appearances_per_object"]),
@@ -929,6 +973,7 @@ def _tile_coverage(
     )
     rng = random.Random(int(cfg["seed"]))
     builder = _builder(dataset, destination, name, "tile-coverage", cfg)
+    builder.visualize_kwargs = dict(visualize_kwargs)
     _clear_inherited_tiling_reports(builder)
     try:
         _print_start(builder, samples, cfg)
@@ -1023,7 +1068,7 @@ def _tile_coverage(
                         continue
                     if candidate is None:
                         continue
-                    indices = candidate["indices"]
+                    indices = _candidate_coverage_indices(candidate)
                     if any(provisional[idx] >= targets[idx] for idx in indices):
                         crop_transform_stats["rejected_already_satisfied"] += 1
                         continue
@@ -1045,10 +1090,11 @@ def _tile_coverage(
                 )
                 if candidate is None:
                     continue
-                if any(provisional[idx] >= targets[idx] for idx in candidate["indices"]):
+                coverage_indices = _candidate_coverage_indices(candidate)
+                if any(provisional[idx] >= targets[idx] for idx in coverage_indices):
                     continue
                 generated.append(candidate)
-                provisional.update(candidate["indices"])
+                provisional.update(coverage_indices)
 
             # Guarantee pass. Any annotation still without a single appearance
             # is retried on its own budget, escalating the relaxation ladder so
@@ -1080,7 +1126,7 @@ def _tile_coverage(
                 if level:
                     crop_transform_stats[f"guaranteed_by_{COVERAGE_RELAXATIONS[level]}"] += 1
                 generated.append(candidate)
-                provisional.update(candidate["indices"])
+                provisional.update(_candidate_coverage_indices(candidate))
             generated_before_cap = len(generated)
             cap = cfg["max_tiles_per_source_image"]
             if cap is not None and len(generated) > int(cap):
@@ -1116,7 +1162,7 @@ def _tile_coverage(
                     jpeg_quality=int(cfg["jpeg_quality"]),
                 )
                 builder.warnings.extend(tile.get("warnings", []))
-                counts.update(tile["indices"])
+                counts.update(_candidate_coverage_indices(tile))
             split_summary[sample.split].update(
                 total_output_images=len(generated),
                 positive_output_images=len(generated),
@@ -1186,18 +1232,42 @@ def _tile_coverage(
                     )
             missed = sum(max(0, targets[i] - counts[i]) for i in targets)
             if missed:
+                coverage_suffix = (
+                    "every label is still covered at least once"
+                    if not uncovered
+                    else f"{len(uncovered)} label(s) remain uncovered"
+                )
                 builder.warnings.append(
                     f"{sample.split}/{sample.relative_path}: missed {missed} requested "
-                    "object appearances after candidate rejection; every label is still "
-                    "covered at least once; see reports/dataset-info.json#audits.tiling_skips"
+                    f"object appearances after candidate rejection; {coverage_suffix}; "
+                    "see reports/dataset-info.json#audits.tiling_skips"
                 )
 
         for split in selected:
             positive_count = int(split_summary[split]["positive_output_images"])
-            desired = _background_images_for_ratio(
-                positive_count,
-                float(cfg["background_ratio"]),
-            )
+            background_policy = cfg["background_ratio_policy"][split]
+            split_background_ratio = float(background_policy["target_fraction"])
+            if split_background_ratio >= 1:
+                desired = max(1, int(background_policy["source_empty_images"]))
+            elif background_policy["mode"] == "range":
+                desired = _maximum_background_images_for_ratio(
+                    positive_count,
+                    split_background_ratio,
+                )
+            else:
+                desired = _background_images_for_ratio(
+                    positive_count,
+                    split_background_ratio,
+                )
+            if background_policy["mode"] == "exact":
+                minimum_accepted = desired
+            elif background_policy["mode"] == "range":
+                minimum_accepted = _minimum_background_images_for_ratio(
+                    positive_count,
+                    float(background_policy["minimum_fraction"]),
+                )
+            else:
+                minimum_accepted = 0
             candidates = small_backgrounds[split]
             split_records = [r for r in records if r["sample"].split == split]
             empty_source_records = [
@@ -1207,129 +1277,53 @@ def _tile_coverage(
                 record for record in split_records if record["sample"].annotations
             ]
 
-            # Reserve half of the final background-image target for each source
-            # type. For odd totals, wholly empty sources receive the extra image.
-            target_from_empty_sources = (desired + 1) // 2
-            target_from_populated_space = desired // 2
             kept_sources: list[Sample] = []
-            unused_source_candidates = list(candidates)
-
-            def take_empty_source_images(count: int) -> int:
-                if count <= 0 or not unused_source_candidates:
-                    return 0
-                if background_filter is None:
-                    selected_count = min(count, len(unused_source_candidates))
-                    selected = (
-                        list(unused_source_candidates)
-                        if selected_count == len(unused_source_candidates)
-                        else rng.sample(unused_source_candidates, selected_count)
-                    )
-                    evaluated = selected
-                else:
-                    ordered = list(unused_source_candidates)
-                    rng.shuffle(ordered)
-                    selected = []
-                    evaluated = []
-                    for candidate in ordered:
-                        if len(selected) >= count:
-                            break
-                        evaluated.append(candidate)
-                        with Image.open(candidate.image_path) as opened:
-                            candidate_image = ImageOps.exif_transpose(opened).convert(
-                                "RGB"
-                            )
-                        if _background_candidate_is_accepted(
-                            candidate_image,
-                            background_filter,
-                            sample=candidate,
-                            crop=(0, 0, candidate.width, candidate.height),
-                            origin="coverage-background-copy",
-                            stats=background_filter_stats,
-                        ):
-                            selected.append(candidate)
-                evaluated_paths = {str(sample.image_path) for sample in evaluated}
-                unused_source_candidates[:] = [
-                    sample
-                    for sample in unused_source_candidates
-                    if str(sample.image_path) not in evaluated_paths
-                ]
-                kept_sources.extend(selected)
-                return len(selected)
-
-            empty_source_count = take_empty_source_images(target_from_empty_sources)
-            empty_source_count += _allocate_backgrounds(
-                empty_source_records,
-                target_from_empty_sources - empty_source_count,
-                dataset.task,
-                cfg,
-                rng,
-                origin="empty_source_image",
-                flip_idx=dataset._metadata.flip_idx,
-                stats=crop_transform_stats,
-                background_filter=background_filter,
-                filter_stats=background_filter_stats,
+            background_sampling_progress = tqdm(
+                total=desired,
+                desc=f"Sampling {split} backgrounds",
+                unit="tile",
+                disable=not progress or desired == 0,
             )
-            populated_space_count = _allocate_backgrounds(
-                populated_records,
-                target_from_populated_space,
-                dataset.task,
-                cfg,
-                rng,
-                origin="populated_image_empty_space",
-                flip_idx=dataset._metadata.flip_idx,
-                stats=crop_transform_stats,
-                background_filter=background_filter,
-                filter_stats=background_filter_stats,
-            )
-
-            fallback_reasons: list[str] = []
-            if empty_source_count < target_from_empty_sources:
-                fallback_reasons.append(
-                    "wholly empty source images could not supply their equal share"
-                )
-            if populated_space_count < target_from_populated_space:
-                fallback_reasons.append(
-                    "populated images did not provide enough object-free crop locations"
-                )
-
-            # Preserve the overall fraction even if one source type cannot meet
-            # its half by cross-filling from any remaining candidate pool.
-            remaining = desired - empty_source_count - populated_space_count
-            if remaining > 0:
-                added = take_empty_source_images(remaining)
-                empty_source_count += added
-                remaining -= added
-            if remaining > 0:
-                added = _allocate_backgrounds(
-                    empty_source_records,
-                    remaining,
+            try:
+                _allocate_backgrounds(
+                    split_records,
+                    desired,
                     dataset.task,
                     cfg,
                     rng,
-                    origin="empty_source_image",
+                    origin=_coverage_background_origin,
                     flip_idx=dataset._metadata.flip_idx,
                     stats=crop_transform_stats,
                     background_filter=background_filter,
                     filter_stats=background_filter_stats,
+                    copy_candidates=candidates,
+                    kept_copy_sources=kept_sources,
+                    progress_bar=background_sampling_progress,
                 )
-                empty_source_count += added
-                remaining -= added
-            if remaining > 0:
-                added = _allocate_backgrounds(
-                    populated_records,
-                    remaining,
-                    dataset.task,
-                    cfg,
-                    rng,
-                    origin="populated_image_empty_space",
-                    flip_idx=dataset._metadata.flip_idx,
-                    stats=crop_transform_stats,
-                    background_filter=background_filter,
-                    filter_stats=background_filter_stats,
-                )
-                populated_space_count += added
-                remaining -= added
+            finally:
+                background_sampling_progress.close()
 
+            background_origins = Counter(
+                origin
+                for record in split_records
+                for origin in (
+                    *record["background_box_origins"],
+                    *(tile["origin"] for tile in record.get("background_tiles", [])),
+                )
+            )
+            empty_source_count = len(kept_sources) + int(
+                background_origins["empty_source_image"]
+            )
+            populated_space_count = int(
+                background_origins["populated_image_empty_space"]
+            )
+
+            background_copy_progress = tqdm(
+                total=len(kept_sources),
+                desc=f"Writing {split} background copies",
+                unit="image",
+                disable=not progress or not kept_sources,
+            )
             for sample in kept_sources:
                 with Image.open(sample.image_path) as opened:
                     image = ImageOps.exif_transpose(opened).convert("RGB")
@@ -1358,51 +1352,44 @@ def _tile_coverage(
                     copied_background_images=1,
                 )
                 small_preview_sources.append(sample)
+                background_copy_progress.update(1)
+            background_copy_progress.close()
 
             actual = empty_source_count + populated_space_count
-            balanced = (
-                empty_source_count == target_from_empty_sources
-                and populated_space_count == target_from_populated_space
-            )
             split_summary[split].update(
                 target_background_images=desired,
+                minimum_accepted_background_images=minimum_accepted,
                 actual_background_images=actual,
-                target_background_from_empty_source_images=target_from_empty_sources,
-                target_background_from_populated_image_space=target_from_populated_space,
                 background_from_empty_source_images=empty_source_count,
                 background_from_populated_image_space=populated_space_count,
-                background_source_balance_fallback_images=(
-                    abs(empty_source_count - target_from_empty_sources)
-                    if actual == desired
-                    else 0
-                ),
                 candidate_empty_source_images=len(candidates) + len(empty_source_records),
                 candidate_populated_source_images=len(populated_records),
                 dropped_background_source_images=len(candidates) - len(kept_sources),
                 missed_background_images=max(0, desired - actual),
             )
-            if actual == desired and not balanced:
-                builder.warnings.append(
-                    f"{split}: reached the requested {float(cfg['background_ratio']):.1%} "
-                    "background fraction, but could not use an equal mix of wholly empty "
-                    "source images and empty regions from populated images: "
-                    + "; ".join(fallback_reasons)
+            if actual < minimum_accepted:
+                issue_message = (
+                    "Coverage tiling cannot satisfy the requested final background fraction"
+                    if background_policy["mode"] == "exact"
+                    else "Coverage tiling cannot reach the minimum accepted background fraction"
                 )
-            if actual < desired:
                 raise DatasetValidationError(
                     ValidationIssue(
-                        "Coverage tiling cannot satisfy the requested final background fraction",
+                        issue_message,
                         source=split,
                         value={
                             "positive_output_images": positive_count,
                             "produced_background_images": actual,
                             "requested_background_images": desired,
-                            "background_ratio": float(cfg["background_ratio"]),
-                            "requested_from_empty_source_images": target_from_empty_sources,
+                            "minimum_accepted_background_images": minimum_accepted,
+                            "background_ratio": background_policy["requested"],
+                            "target_background_ratio": split_background_ratio,
+                            "minimum_background_ratio": background_policy[
+                                "minimum_fraction"
+                            ],
                             "produced_from_empty_source_images": empty_source_count,
                             "available_small_empty_source_images": len(candidates),
                             "large_empty_source_images": len(empty_source_records),
-                            "requested_from_populated_image_space": target_from_populated_space,
                             "produced_from_populated_image_space": populated_space_count,
                             "populated_source_images": len(populated_records),
                             "background_filter": background_filter_description,
@@ -1412,10 +1399,19 @@ def _tile_coverage(
                             "max_background_tiles_per_source_image": cfg.get(
                                 "max_background_tiles_per_source_image"
                             ),
-                            "reason": "; ".join(fallback_reasons)
-                            or "all background candidate pools were exhausted",
+                            "source_policy": "uniform over eligible source images",
+                            "reason": (
+                                "the uniform source pool did not provide enough accepted "
+                                "candidates under the configured caps and crop constraints"
+                            ),
                         },
-                        expected="enough object-free source images or crop locations to reach the requested final fraction",
+                        expected=(
+                            "enough object-free source images or crop locations to "
+                            "reach the requested final fraction"
+                            if background_policy["mode"] == "exact"
+                            else "enough object-free source images or crop locations to "
+                            "reach the minimum accepted fraction"
+                        ),
                         suggestion=(
                             "lower background_ratio, raise max_background_attempts_per_tile or "
                             "max_tiles_per_source_image, "
@@ -1435,6 +1431,17 @@ def _tile_coverage(
                         ),
                     )
                 )
+            cropped_background_count = sum(
+                len(record["background_boxes"])
+                + len(record.get("background_tiles", []))
+                for record in split_records
+            )
+            background_crop_progress = tqdm(
+                total=cropped_background_count,
+                desc=f"Writing {split} background crops",
+                unit="tile",
+                disable=not progress or cropped_background_count == 0,
+            )
             for record in split_records:
                 sample = record["sample"]
                 with Image.open(sample.image_path) as opened:
@@ -1469,6 +1476,7 @@ def _tile_coverage(
                         )
                         record["next_tile_idx"] += 1
                         split_summary[split].update(total_output_images=1, empty_output_images=1, tiled_output_images=1, empty_tiled_images=1)
+                        background_crop_progress.update(1)
                 for tile in record["background_tiles"]:
                     index = record["next_tile_idx"]
                     rel = sample.relative_path.parent / f"{sample.relative_path.stem}_tile_{index}.jpg"
@@ -1496,6 +1504,7 @@ def _tile_coverage(
                         tiled_output_images=1,
                         empty_tiled_images=1,
                     )
+                    background_crop_progress.update(1)
                 if (
                     visualize
                     and PUBLISHES_OPERATION_VISUALS
@@ -1512,6 +1521,7 @@ def _tile_coverage(
                         cfg,
                     )
                     builder.visuals.append(str(output.relative_to(builder.staging)))
+            background_crop_progress.close()
 
         _write_tiling_skip_report(builder, errors, skipped_geometry)
         _write_background_filter_report(
@@ -1525,14 +1535,31 @@ def _tile_coverage(
             background_filter_stats,
         )
         _raise_if_every_tile_was_skipped(builder, errors, skipped_geometry)
-        source_pixel_rows = _source_pixel_coverage_rows(samples, builder.records)
+        source_pixel_rows = _source_pixel_coverage_rows(
+            samples,
+            builder.records,
+            progress=progress,
+        )
         builder.coverage_summary = _source_coverage_summary(
             coverage_rows,
             source_pixel_rows,
             selected,
+            output_samples=builder.output_samples,
         )
         if uncovered_labels:
             builder.coverage_summary["uncovered_labels"] = uncovered_labels
+        report_stage_count = (
+            2
+            + int(cfg.get("crop_pipeline") is not None)
+            + int(visualize and PUBLISHES_OPERATION_VISUALS)
+        )
+        report_progress = tqdm(
+            total=report_stage_count,
+            desc="Building coverage reports",
+            unit="stage",
+            disable=not progress,
+        )
+        report_progress.set_postfix_str("coverage summaries", refresh=True)
         coverage_visuals = _write_coverage_reports(
             builder.staging / "coverage_summary",
             coverage_rows,
@@ -1541,13 +1568,17 @@ def _tile_coverage(
             class_totals,
             split_summary,
             selected,
-            background_ratio=float(cfg["background_ratio"]),
+            output_samples=builder.output_samples,
+            background_ratio=cfg["background_ratio"],
+            background_ratio_policy=cfg["background_ratio_policy"],
             visualize=visualize,
         )
         builder.visuals.extend(
             str(output.relative_to(builder.staging)) for output in coverage_visuals
         )
+        report_progress.update(1)
         if cfg.get("crop_pipeline") is not None:
+            report_progress.set_postfix_str("crop augmentation audit", refresh=True)
             accepted_virtual_records = [
                 record
                 for record in builder.records
@@ -1613,13 +1644,17 @@ def _tile_coverage(
                     "augment_val=False; set augment_val=True to sample a fresh virtual camera "
                     "for every produced validation crop"
                 )
+            report_progress.update(1)
+        report_progress.set_postfix_str("class counts", refresh=True)
         _write_tiling_class_counts(
             builder,
             samples,
             dataset._metadata.names,
             visualize=visualize,
         )
+        report_progress.update(1)
         if visualize and PUBLISHES_OPERATION_VISUALS:
+            report_progress.set_postfix_str("visual audits", refresh=True)
             boxes_by_source = {
                 str(record["sample"].image_path): [
                     *record["tile_boxes"],
@@ -1643,23 +1678,31 @@ def _tile_coverage(
                     dataset._metadata,
                     builder.reports_dir / "coverage_preview.jpg",
                     mode="coverage",
+                    visualize_kwargs=visualize_kwargs,
                 )
                 builder.visuals.append(str(preview.relative_to(builder.staging)))
-            _save_staging_contact_sheet(builder, dataset.task, "coverage_summary/random_tile_contact_sheet.jpg")
+            _save_staging_contact_sheet(
+                builder,
+                dataset.task,
+                "coverage_summary/random_tile_contact_sheet.jpg",
+                visualize_kwargs=visualize_kwargs,
+            )
+            report_progress.update(1)
+        report_progress.close()
         return _publish(builder, progress=progress, validate_output=validate_output)
     except Exception:
         builder.cleanup()
         raise
 
 
-# Progressive relaxations applied, per object, only when an annotation would
-# otherwise receive no coverage at all. Losing a label entirely is worse than
-# covering it with a relaxed crop, so each step is taken in order and recorded.
+# Progressive relaxations applied per object when it would otherwise receive
+# no coverage. These may remove camera/window constraints, but never override
+# the caller's allow_lossy contract.
 COVERAGE_RELAXATIONS = (
     "none",
     "no_virtual_camera",
     "shrink_window_to_image",
-    "allow_clipped_geometry",
+    "full_source_letterbox",
 )
 
 
@@ -1682,9 +1725,27 @@ def _relaxed_cfg(cfg: dict[str, Any], level: int) -> dict[str, Any]:
     relaxed = dict(cfg)
     if level >= 2:
         relaxed["require_requested_crop_size"] = False
-    if level >= 3:
-        relaxed["allow_lossy"] = True
     return relaxed
+
+
+def _allows_focal_clipping(cfg: Mapping[str, Any]) -> bool:
+    return cfg.get("allow_lossy") is True
+
+
+def _allows_non_focal_clipping(cfg: Mapping[str, Any]) -> bool:
+    return cfg.get("allow_lossy") is True or cfg.get("allow_lossy") == "not_focal"
+
+
+def _allows_annotation_clipping(
+    cfg: Mapping[str, Any],
+    annotation_index: int,
+    focus_index: int,
+) -> bool:
+    return (
+        _allows_focal_clipping(cfg)
+        if annotation_index == focus_index
+        else _allows_non_focal_clipping(cfg)
+    )
 
 
 def _cap_tiles_preserving_coverage(
@@ -1708,15 +1769,22 @@ def _cap_tiles_preserving_coverage(
     chosen: list[int] = []
     covered: set[int] = set()
     while remaining and len(chosen) < cap:
-        best = max(remaining, key=lambda i: len(set(generated[i]["indices"]) - covered))
-        if not set(generated[best]["indices"]) - covered:
+        best = max(
+            remaining,
+            key=lambda i: len(set(_candidate_coverage_indices(generated[i])) - covered),
+        )
+        if not set(_candidate_coverage_indices(generated[best])) - covered:
             break
         chosen.append(best)
-        covered |= set(generated[best]["indices"])
+        covered |= set(_candidate_coverage_indices(generated[best]))
         remaining.remove(best)
     if len(chosen) < cap and remaining:
         chosen += rng.sample(remaining, min(cap - len(chosen), len(remaining)))
     return [generated[index] for index in sorted(chosen)]
+
+
+def _candidate_coverage_indices(candidate: dict[str, Any]) -> list[int]:
+    return list(candidate.get("coverage_indices", candidate["indices"]))
 
 
 def _coverage_targets(sample: Sample, cfg: dict[str, Any]) -> dict[int, int]:
@@ -1782,26 +1850,36 @@ def _plain_positive_candidate(
     if crop is None:
         stats["rejected_no_containing_crop"] += 1
         return None
-    allow_lossy = bool(cfg["allow_lossy"])
-    if not allow_lossy and any(
-        _annotation_is_cut_by_crop(annotation, crop, task, cfg)
-        for annotation in sample.annotations
+    cut_indices = {
+        index
+        for index, annotation in enumerate(sample.annotations)
+        if _annotation_is_cut_by_crop(annotation, crop, task, cfg)
+    }
+    if any(
+        not _allows_annotation_clipping(cfg, index, focus_idx)
+        for index in cut_indices
     ):
         stats["rejected_strict_annotation_cut"] += 1
         return None
     adjusted: list[Annotation] = []
     indices: list[int] = []
+    coverage_indices: list[int] = []
     scale = int(cfg["tile_size"]) / (crop[2] - crop[0])
     candidate_warnings: list[str] = []
     try:
         for index, annotation in enumerate(sample.annotations):
             source_annotation = _coverage_source_annotation(annotation, task, cfg)
+            annotation_allow_lossy = _allows_annotation_clipping(
+                cfg,
+                index,
+                focus_idx,
+            )
             transformed = _transform_annotation(
                 source_annotation,
                 crop,
                 task,
                 float(cfg["min_area_ratio"]),
-                allow_lossy,
+                annotation_allow_lossy,
                 candidate_warnings,
                 source_image=sample.image_path,
                 annotation_index=index,
@@ -1816,6 +1894,8 @@ def _plain_positive_candidate(
                     )
                 )
                 indices.append(index)
+                if cfg["allow_lossy"] != "not_focal" or index not in cut_indices:
+                    coverage_indices.append(index)
     except _SkippableTileGeometryError as exc:
         if errors == "raise":
             raise
@@ -1834,10 +1914,20 @@ def _plain_positive_candidate(
     if not indices:
         stats["rejected_empty_after_crop"] += 1
         return None
+    if cut_indices:
+        stats["accepted_cut_annotations"] += len(cut_indices)
     return {
         "box": crop,
         "annotations": adjusted,
         "indices": indices,
+        "coverage_indices": coverage_indices,
+        "provenance": {
+            "lossy_policy": cfg["allow_lossy"],
+            "focal_annotation_index": focus_idx,
+            "lossy_annotation_indices": sorted(cut_indices),
+            "lossy_non_focal_indices": sorted(cut_indices - {focus_idx}),
+            "lossy_clipping": bool(cut_indices),
+        },
         "warnings": candidate_warnings,
     }
 
@@ -1868,6 +1958,21 @@ def _guaranteed_candidate(
 
     budget = max(1, int(cfg["max_attempts_per_target"]))
     for level in range(len(COVERAGE_RELAXATIONS)):
+        if COVERAGE_RELAXATIONS[level] == "full_source_letterbox":
+            candidate = _full_source_letterbox_candidate(
+                sample,
+                focus_idx,
+                task,
+                cfg,
+                builder=builder,
+                skipped_geometry=skipped_geometry,
+                stats=stats,
+                errors=errors,
+                attempt=attempt_base + level * budget + 1,
+            )
+            if candidate is not None and focus_idx in _candidate_coverage_indices(candidate):
+                return candidate, level
+            continue
         level_cfg = _relaxed_cfg(cfg, level)
         virtual = use_virtual_camera and level < 1
         if virtual and source_image is None:
@@ -1915,9 +2020,168 @@ def _guaranteed_candidate(
                     errors=errors,
                     attempt=attempt,
                 )
-            if candidate is not None and focus_idx in candidate["indices"]:
+            if candidate is not None and focus_idx in _candidate_coverage_indices(candidate):
                 return candidate, level
     return None, len(COVERAGE_RELAXATIONS) - 1
+
+
+def _full_source_letterbox_candidate(
+    sample: Sample,
+    focus_idx: int,
+    task: Task,
+    cfg: dict[str, Any],
+    *,
+    builder: Any,
+    skipped_geometry: list[dict[str, Any]],
+    stats: Counter[str],
+    errors: str,
+    attempt: int,
+) -> dict[str, Any] | None:
+    """Fit the complete source into one square tile without clipping labels."""
+
+    full_crop = (0, 0, sample.width, sample.height)
+    source_annotations: list[Annotation] = []
+    try:
+        for index, annotation in enumerate(sample.annotations):
+            transformed = _transform_annotation(
+                _coverage_source_annotation(annotation, task, cfg),
+                full_crop,
+                task,
+                1.0,
+                False,
+                [],
+                source_image=sample.image_path,
+                annotation_index=index,
+            )
+            if transformed is None:
+                stats["rejected_full_source_annotation"] += 1
+                return None
+            source_annotations.append(transformed)
+    except _SkippableTileGeometryError as exc:
+        if errors == "raise":
+            raise
+        _record_skipped_geometry(
+            builder,
+            skipped_geometry,
+            exc,
+            sample=sample,
+            crop=full_crop,
+            mode="coverage-full-source-letterbox",
+            attempt=attempt,
+            focus_annotation_index=None,
+        )
+        stats["rejected_geometry"] += 1
+        stats["rejected_full_source_geometry"] += 1
+        return None
+
+    tile_size = int(cfg["tile_size"])
+    uniform_scale = tile_size / max(sample.width, sample.height)
+    resized_width = max(1, min(tile_size, int(round(sample.width * uniform_scale))))
+    resized_height = max(1, min(tile_size, int(round(sample.height * uniform_scale))))
+    scale_x = resized_width / sample.width
+    scale_y = resized_height / sample.height
+    pad_left = (tile_size - resized_width) // 2
+    pad_top = (tile_size - resized_height) // 2
+    pad_right = tile_size - resized_width - pad_left
+    pad_bottom = tile_size - resized_height - pad_top
+
+    with Image.open(sample.image_path) as opened:
+        source = ImageOps.exif_transpose(opened).convert("RGB")
+        resized = source.resize(
+            (resized_width, resized_height),
+            Image.Resampling.BILINEAR,
+        )
+    output = Image.new("RGB", (tile_size, tile_size), (0, 0, 0))
+    output.paste(resized, (pad_left, pad_top))
+
+    annotations = [
+        _scale_and_translate_annotation(
+            annotation,
+            scale_x=scale_x,
+            scale_y=scale_y,
+            offset_x=pad_left,
+            offset_y=pad_top,
+            task=task,
+            radius_multiplier=float(cfg["radius_multiplier"]),
+        )
+        for annotation in source_annotations
+    ]
+    indices = list(range(len(annotations)))
+    stats["accepted_full_source_letterbox"] += 1
+    return {
+        "box": full_crop,
+        "annotations": annotations,
+        "indices": indices,
+        "coverage_indices": indices,
+        "image": output,
+        "provenance": {
+            "tile_mode": "coverage-full-source-letterbox",
+            "crop_coordinate_space": "source",
+            "source_context": list(full_crop),
+            "letterbox_padding_output_px": [
+                pad_left,
+                pad_top,
+                pad_right,
+                pad_bottom,
+            ],
+            "letterbox_scale_xy": [scale_x, scale_y],
+            "lossy_policy": cfg["allow_lossy"],
+            "focal_annotation_index": focus_idx,
+            "lossy_annotation_indices": [],
+            "lossy_non_focal_indices": [],
+            "zoom": min(scale_x, scale_y),
+            "scale": min(scale_x, scale_y),
+            "lossy_clipping": False,
+        },
+        "warnings": [],
+    }
+
+
+def _scale_and_translate_annotation(
+    annotation: Annotation,
+    *,
+    scale_x: float,
+    scale_y: float,
+    offset_x: float,
+    offset_y: float,
+    task: Task,
+    radius_multiplier: float,
+) -> Annotation:
+    updates: dict[str, Any] = {}
+    if annotation.bbox is not None:
+        x1, y1, x2, y2 = annotation.bbox
+        updates["bbox"] = (
+            x1 * scale_x + offset_x,
+            y1 * scale_y + offset_y,
+            x2 * scale_x + offset_x,
+            y2 * scale_y + offset_y,
+        )
+    if annotation.polygon is not None:
+        updates["polygon"] = [
+            (x * scale_x + offset_x, y * scale_y + offset_y)
+            for x, y in annotation.polygon
+        ]
+    if annotation.keypoints is not None:
+        updates["keypoints"] = [
+            (
+                x * scale_x + offset_x,
+                y * scale_y + offset_y,
+                visibility,
+            )
+            for x, y, visibility in annotation.keypoints
+        ]
+    if annotation.point is not None:
+        updates["point"] = (
+            annotation.point[0] * scale_x + offset_x,
+            annotation.point[1] * scale_y + offset_y,
+        )
+    if task is Task.POLO and annotation.radius is not None:
+        updates["radius"] = (
+            annotation.radius
+            * min(scale_x, scale_y)
+            * radius_multiplier
+        )
+    return annotation.clone(**updates)
 
 
 def _virtual_positive_candidate(
@@ -1985,28 +2249,40 @@ def _virtual_positive_candidate(
     if not _crop_is_fully_valid(validity, crop):
         stats["rejected_invalid_source_pixels"] += 1
         return None
-    if not bool(cfg["allow_lossy"]):
-        for annotation, source_index in zip(view_annotations, source_indices):
-            if not _annotation_intersects_crop(annotation, crop, task, view_cfg):
-                continue
-            if source_index in partial_indices or _annotation_is_cut_by_crop(
-                annotation, crop, task, view_cfg
-            ):
-                stats["rejected_strict_annotation_cut"] += 1
-                return None
+    cut_indices = {
+        source_index
+        for annotation, source_index in zip(view_annotations, source_indices)
+        if source_index in partial_indices
+        or (
+            _annotation_intersects_crop(annotation, crop, task, view_cfg)
+            and _annotation_is_cut_by_crop(annotation, crop, task, view_cfg)
+        )
+    }
+    if any(
+        not _allows_annotation_clipping(cfg, source_index, focus_idx)
+        for source_index in cut_indices
+    ):
+        stats["rejected_strict_annotation_cut"] += 1
+        return None
 
     adjusted: list[Annotation] = []
     indices: list[int] = []
+    coverage_indices: list[int] = []
     scale = int(cfg["tile_size"]) / (crop[2] - crop[0])
     accepted_warnings = list(transform_warnings)
     for annotation, source_index in zip(view_annotations, source_indices):
         crop_warnings: list[str] = []
+        annotation_allow_lossy = _allows_annotation_clipping(
+            cfg,
+            source_index,
+            focus_idx,
+        )
         transformed = _transform_annotation(
             annotation,
             crop,
             task,
             float(cfg["min_area_ratio"]),
-            bool(cfg["allow_lossy"]),
+            annotation_allow_lossy,
             crop_warnings,
             source_image=sample.image_path,
             annotation_index=source_index,
@@ -2022,6 +2298,8 @@ def _virtual_positive_candidate(
             )
         )
         indices.append(source_index)
+        if cfg["allow_lossy"] != "not_focal" or source_index not in cut_indices:
+            coverage_indices.append(source_index)
         accepted_warnings.extend(crop_warnings)
         if source_index in partial_indices:
             accepted_warnings.append(
@@ -2032,6 +2310,8 @@ def _virtual_positive_candidate(
         return None
     if accepted_warnings:
         stats["accepted_lossy_annotations"] += len(accepted_warnings)
+    if cut_indices:
+        stats["accepted_cut_annotations"] += len(cut_indices)
     cropped = Image.fromarray(view_image).crop(crop)
     tile_size = int(cfg["tile_size"])
     if cropped.size != (tile_size, tile_size):
@@ -2040,6 +2320,7 @@ def _virtual_positive_candidate(
         "box": crop,
         "annotations": adjusted,
         "indices": indices,
+        "coverage_indices": coverage_indices,
         "image": cropped,
         "provenance": {
             "tile_mode": "coverage-augmented",
@@ -2053,7 +2334,11 @@ def _virtual_positive_candidate(
             "valid_pixel_fraction": 1.0,
             "validity_result": "all_output_pixels_map_to_source",
             "crop_transform_warnings": accepted_warnings,
-            "lossy_clipping": bool(accepted_warnings),
+            "lossy_policy": cfg["allow_lossy"],
+            "focal_annotation_index": focus_idx,
+            "lossy_annotation_indices": sorted(cut_indices),
+            "lossy_non_focal_indices": sorted(cut_indices - {focus_idx}),
+            "lossy_clipping": bool(accepted_warnings or cut_indices),
         },
         "warnings": accepted_warnings,
     }
@@ -2178,7 +2463,7 @@ def _make_crop_containing(
     crop_dim = min(requested_dim, width, height)
     x1, y1, x2, y2 = _annotation_bounds(annotation, task, cfg)
     if x2 - x1 > crop_dim or y2 - y1 > crop_dim:
-        if not bool(cfg.get("allow_lossy")):
+        if not _allows_focal_clipping(cfg):
             return None
         # Lossy coverage still anchors the candidate on the requested object,
         # but permits the final crop to clip geometry larger than the sampled
@@ -2278,6 +2563,14 @@ def _boxes_intersect(a: tuple[int, int, int, int], b: tuple[int, int, int, int])
     return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
 
 
+def _coverage_background_origin(sample: Sample) -> str:
+    return (
+        "populated_image_empty_space"
+        if sample.annotations
+        else "empty_source_image"
+    )
+
+
 def _allocate_backgrounds(
     records: list[dict[str, Any]],
     desired: int,
@@ -2285,41 +2578,90 @@ def _allocate_backgrounds(
     cfg: dict[str, Any],
     rng: random.Random,
     *,
-    origin: str,
+    origin: str | Callable[[Sample], str],
     flip_idx: list[int] | None = None,
     stats: Counter[str] | None = None,
     background_filter: Callable[[Image.Image], bool] | None = None,
     filter_stats: Counter[str] | None = None,
+    copy_candidates: list[Sample] | None = None,
+    kept_copy_sources: list[Sample] | None = None,
+    progress_bar: Any | None = None,
 ) -> int:
     allocated = 0
     stats = stats if stats is not None else Counter()
     filter_stats = filter_stats if filter_stats is not None else Counter()
+    kept_copy_sources = (
+        kept_copy_sources if kept_copy_sources is not None else []
+    )
     cap = cfg["max_tiles_per_source_image"]
     background_cap = cfg.get("max_background_tiles_per_source_image")
     source_cache: dict[str, np.ndarray] = {}
+    remaining_copy_candidates = list(copy_candidates or [])
+    reported_allocated = 0
+    attempts_used = 0
+
+    def report_progress(attempt: int, *, force: bool = False) -> None:
+        nonlocal reported_allocated
+        if progress_bar is None:
+            return
+        newly_allocated = allocated - reported_allocated
+        if newly_allocated:
+            progress_bar.update(newly_allocated)
+            reported_allocated = allocated
+        if force or newly_allocated or attempt == 1 or attempt % 25 == 0:
+            progress_bar.set_postfix(
+                attempts=attempt,
+                rejected=max(0, attempt - allocated),
+                refresh=True,
+            )
 
     def background_count(record: dict[str, Any]) -> int:
         return len(record["background_boxes"]) + len(record.get("background_tiles", []))
 
+    def record_is_eligible(record: dict[str, Any]) -> bool:
+        return (
+            cap is None
+            or record["next_tile_idx"] + background_count(record) < int(cap)
+        ) and (
+            background_cap is None
+            or background_count(record) < int(background_cap)
+        )
+
+    eligible_records = [record for record in records if record_is_eligible(record)]
+
     for attempt in range(1, desired * int(cfg["max_background_attempts_per_tile"]) + 1):
+        if attempts_used:
+            report_progress(attempts_used)
         if allocated >= desired:
             break
-        eligible = [
-            record
-            for record in records
-            if (
-                cap is None
-                or record["next_tile_idx"] + background_count(record) < int(cap)
-            )
-            and (
-                background_cap is None
-                or background_count(record) < int(background_cap)
-            )
-        ]
-        if not eligible:
+        candidate_count = len(remaining_copy_candidates) + len(eligible_records)
+        if not candidate_count:
             break
-        record = rng.choice(eligible)
+        attempts_used = attempt
+        candidate_index = rng.randrange(candidate_count)
+        if candidate_index < len(remaining_copy_candidates):
+            sample = remaining_copy_candidates.pop(candidate_index)
+            if background_filter is not None:
+                with Image.open(sample.image_path) as opened:
+                    candidate_image = ImageOps.exif_transpose(opened).convert("RGB")
+                if not _background_candidate_is_accepted(
+                    candidate_image,
+                    background_filter,
+                    sample=sample,
+                    crop=(0, 0, sample.width, sample.height),
+                    origin="coverage-background-copy",
+                    stats=filter_stats,
+                ):
+                    continue
+            kept_copy_sources.append(sample)
+            stats["accepted_background_copies"] += 1
+            allocated += 1
+            continue
+
+        record_index = candidate_index - len(remaining_copy_candidates)
+        record = eligible_records[record_index]
         sample = record["sample"]
+        source_origin = origin(sample) if callable(origin) else origin
         if _crop_pipeline_enabled(sample.split, cfg):
             cache_key = str(sample.image_path)
             source_image = source_cache.get(cache_key)
@@ -2331,7 +2673,7 @@ def _allocate_backgrounds(
             seed = _virtual_crop_seed(
                 int(cfg["seed"]),
                 sample,
-                f"background-{origin}",
+                f"background-{source_origin}",
                 attempt,
                 None,
             )
@@ -2385,7 +2727,7 @@ def _allocate_backgrounds(
                 background_filter,
                 sample=sample,
                 crop=crop,
-                origin=f"coverage-virtual-{origin}",
+                origin=f"coverage-virtual-{source_origin}",
                 stats=filter_stats,
             ):
                 continue
@@ -2393,7 +2735,7 @@ def _allocate_backgrounds(
                 {
                     "box": crop,
                     "image": crop_image,
-                    "origin": origin,
+                    "origin": source_origin,
                     "provenance": {
                         "crop_coordinate_space": "transformed_view",
                         "source_context": [0, 0, sample.width, sample.height],
@@ -2417,6 +2759,8 @@ def _allocate_backgrounds(
             )
             stats["accepted_background_tiles"] += 1
             allocated += 1
+            if not record_is_eligible(record):
+                eligible_records.pop(record_index)
             continue
         crop = _random_crop(sample.width, sample.height, cfg, rng)
         if crop is None:
@@ -2446,13 +2790,16 @@ def _allocate_backgrounds(
                 background_filter,
                 sample=sample,
                 crop=crop,
-                origin=f"coverage-{origin}",
+                origin=f"coverage-{source_origin}",
                 stats=filter_stats,
             ):
                 continue
         record["background_boxes"].append(crop)
-        record["background_box_origins"].append(origin)
+        record["background_box_origins"].append(source_origin)
         allocated += 1
+        if not record_is_eligible(record):
+            eligible_records.pop(record_index)
+    report_progress(attempts_used, force=True)
     return allocated
 
 
@@ -2470,6 +2817,71 @@ def _background_images_for_ratio(positive_images: int, background_ratio: float) 
             count,
         ),
     )
+
+
+def _background_ratio_spec_for_split(
+    background_ratio: float | Mapping[str, Any],
+    split: str,
+) -> float | tuple[float, float] | None:
+    if isinstance(background_ratio, Mapping):
+        return background_ratio[split]
+    return float(background_ratio)
+
+
+def _resolve_background_ratio_policies(
+    samples: list[Sample],
+    splits: set[str],
+    background_ratio: float | Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    policies: dict[str, dict[str, Any]] = {}
+    for split in sorted(splits):
+        split_samples = [sample for sample in samples if sample.split == split]
+        source_empty_images = sum(not sample.annotations for sample in split_samples)
+        source_fraction = (
+            source_empty_images / len(split_samples) if split_samples else 0.0
+        )
+        requested = _background_ratio_spec_for_split(background_ratio, split)
+        if requested is None:
+            mode = "best_effort_source_fraction"
+            target_fraction = source_fraction
+            minimum_fraction = None
+        elif isinstance(requested, (list, tuple)):
+            mode = "range"
+            minimum_fraction, target_fraction = map(float, requested)
+        else:
+            mode = "exact"
+            target_fraction = float(requested)
+            minimum_fraction = target_fraction
+        policies[split] = {
+            "mode": mode,
+            "requested": requested,
+            "source_images": len(split_samples),
+            "source_empty_images": source_empty_images,
+            "source_background_fraction": source_fraction,
+            "target_fraction": target_fraction,
+            "minimum_fraction": minimum_fraction,
+        }
+    return policies
+
+
+def _minimum_background_images_for_ratio(
+    positive_images: int,
+    background_ratio: float,
+) -> int:
+    if positive_images <= 0 or background_ratio <= 0:
+        return 0
+    exact = positive_images * background_ratio / (1.0 - background_ratio)
+    return int(math.ceil(exact - 1e-12))
+
+
+def _maximum_background_images_for_ratio(
+    positive_images: int,
+    background_ratio: float,
+) -> int:
+    if positive_images <= 0 or background_ratio <= 0:
+        return 0
+    exact = positive_images * background_ratio / (1.0 - background_ratio)
+    return int(math.floor(exact + 1e-12))
 
 
 def _append_coverage_rows(
@@ -2750,13 +3162,21 @@ def _source_footprint(
 def _source_pixel_coverage_rows(
     samples: list[Sample],
     records: list[dict[str, Any]],
+    *,
+    progress: bool = False,
 ) -> list[dict[str, Any]]:
     by_parent: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
         by_parent[str(Path(record["parent_image"]).resolve())].append(record)
 
     rows: list[dict[str, Any]] = []
-    for sample in samples:
+    iterator = tqdm(
+        samples,
+        desc="Computing source coverage",
+        unit="image",
+        disable=not progress,
+    )
+    for sample in iterator:
         parent = str(sample.image_path.resolve())
         source_records = by_parent.get(parent, [])
         footprints: list[Any] = []
@@ -2838,6 +3258,8 @@ def _source_coverage_summary(
     coverage_rows: list[dict[str, Any]],
     source_pixel_rows: list[dict[str, Any]],
     splits: set[str],
+    *,
+    output_samples: Iterable[Sample] = (),
 ) -> dict[str, Any]:
     """Summarize how much of the source dataset reached the destination.
 
@@ -2882,6 +3304,7 @@ def _source_coverage_summary(
         ),
         "splits": {},
         "label_positions": _label_position_histogram(coverage_rows),
+        "output_label_positions": _output_label_position_histogram(output_samples),
         **block(coverage_rows, source_pixel_rows),
     }
     for split in sorted(splits):
@@ -2926,6 +3349,40 @@ def _label_position_histogram(
     }
 
 
+def _output_label_position_histogram(
+    samples: Iterable[Sample],
+    *,
+    columns: int = 12,
+    rows: int = 12,
+) -> dict[str, Any]:
+    """Bin final annotation anchors in normalized output-image coordinates."""
+
+    total = [[0] * columns for _ in range(rows)]
+    output_annotations = 0
+    annotated_images = 0
+    for sample in samples:
+        if sample.annotations:
+            annotated_images += 1
+        for annotation in sample.annotations:
+            x, y = _annotation_anchor(annotation)
+            x_norm = min(max(float(x) / sample.width, 0.0), 0.999999)
+            y_norm = min(max(float(y) / sample.height, 0.0), 0.999999)
+            total[int(y_norm * rows)][int(x_norm * columns)] += 1
+            output_annotations += 1
+    return {
+        "definition": (
+            "Counts of exported annotation anchors binned by their normalized "
+            "position in the final output image after transforms, cropping, and resizing."
+        ),
+        "coordinate_space": "normalized output image",
+        "columns": columns,
+        "rows": rows,
+        "labels": total,
+        "output_annotations": output_annotations,
+        "annotated_output_images": annotated_images,
+    }
+
+
 def _write_coverage_reports(
     root: Path,
     coverage_rows: list[dict[str, Any]],
@@ -2935,7 +3392,9 @@ def _write_coverage_reports(
     split_summary: dict[str, Counter],
     splits: set[str],
     *,
-    background_ratio: float,
+    output_samples: Iterable[Sample] = (),
+    background_ratio: float | Mapping[str, Any],
+    background_ratio_policy: Mapping[str, Mapping[str, Any]],
     visualize: bool,
 ) -> list[Path]:
     visuals: list[Path] = []
@@ -3002,9 +3461,14 @@ def _write_coverage_reports(
 
     def tile_row(split: str, summary: Counter) -> dict[str, Any]:
         total = summary["total_output_images"]
+        policy = background_ratio_policy.get(split)
         return {
             "split": split,
             **{key: summary[key] for key in keys},
+            "background_ratio_mode": policy["mode"] if policy else "aggregate",
+            "requested_background_fraction": policy["requested"] if policy else None,
+            "target_background_fraction": policy["target_fraction"] if policy else None,
+            "minimum_background_fraction": policy["minimum_fraction"] if policy else None,
             "background_fraction": summary["empty_output_images"] / total if total else 0.0,
         }
 
@@ -3015,11 +3479,14 @@ def _write_coverage_reports(
     tile_rows.append(tile_row("all", combined))
     _write_csv(root / "tile_summary.csv", tile_rows)
     _write_csv(root / "source_pixel_coverage.csv", source_pixel_rows)
+    source_coverage_payload = _source_coverage_summary(
+        coverage_rows,
+        source_pixel_rows,
+        splits,
+        output_samples=output_samples,
+    )
     (root / "source_coverage.json").write_text(
-        json.dumps(
-            _source_coverage_summary(coverage_rows, source_pixel_rows, splits),
-            indent=2,
-        ),
+        json.dumps(source_coverage_payload, indent=2),
         encoding="utf-8",
     )
     (root / "source_pixel_coverage.json").write_text(
@@ -3031,6 +3498,12 @@ def _write_coverage_reports(
         encoding="utf-8",
     )
     if visualize and PUBLISHES_OPERATION_VISUALS:
+        visuals.append(
+            save_label_position_summary(
+                source_coverage_payload,
+                root / "label_positions.jpg",
+            )
+        )
         visuals.append(
             save_source_pixel_coverage_summary(
                 source_pixel_rows,
@@ -3051,12 +3524,13 @@ def _write_coverage_reports(
         ),
         "requested_background_fraction": background_ratio,
         "target_formula": (
-            "nearest whole number to "
-            "positive_output_images * background_ratio / (1 - background_ratio)"
+            "exact values use the nearest whole-image count; ranges aim for the "
+            "largest whole-image count at or below their upper bound; None targets "
+            "the input split's empty-image fraction on a best-effort basis"
         ),
         "source_policy": (
-            "target an equal mix of wholly empty source images and object-free "
-            "regions cropped from populated images, then cross-fill if one source is insufficient"
+            "sample uniformly over currently eligible source images; wholly empty "
+            "and populated sources share one pool without source-type quotas"
         ),
         "splits": {},
     }
@@ -3068,39 +3542,54 @@ def _write_coverage_reports(
         total = int(summary["total_output_images"])
         target = int(summary["target_background_images"])
         actual = int(summary["actual_background_images"])
-        target_empty = int(summary["target_background_from_empty_source_images"])
-        target_populated = int(summary["target_background_from_populated_image_space"])
         actual_empty = int(summary["background_from_empty_source_images"])
         actual_populated = int(summary["background_from_populated_image_space"])
-        if actual < target:
+        policy = background_ratio_policy.get(split)
+        minimum = int(summary["minimum_accepted_background_images"])
+        if policy is None:
+            status = "aggregate target met" if actual >= target else "aggregate below target"
+            reason = None
+        elif policy["mode"] == "best_effort_source_fraction":
+            status = (
+                "best-effort target met"
+                if actual >= target
+                else "best-effort target missed"
+            )
+            reason = (
+                None
+                if actual >= target
+                else "the available accepted candidates were exhausted; this split is best-effort"
+            )
+        elif policy["mode"] == "range" and actual >= minimum:
+            status = "upper target met" if actual >= target else "within accepted range"
+            reason = None
+        elif actual < target:
             status = "target missed"
             reason = (
-                "candidate pools were exhausted; inspect missed_background_images "
+                "the uniform candidate pool was exhausted; inspect missed_background_images "
                 "and the candidate-source counts"
             )
-        elif actual_empty == target_empty and actual_populated == target_populated:
-            status = "target and equal source mix met"
-            reason = None
         else:
-            status = "overall target met with source fallback"
-            deficient = []
-            if actual_empty < target_empty:
-                deficient.append("wholly empty source images")
-            if actual_populated < target_populated:
-                deficient.append("object-free regions in populated images")
-            reason = f"insufficient candidates from {', '.join(deficient)}"
+            status = "target met"
+            reason = None
         sampling_payload["splits"][split] = {
             "status": status,
             "reason": reason,
+            "mode": policy["mode"] if policy else "aggregate",
+            "requested_background_fraction": policy["requested"] if policy else None,
+            "source_background_fraction": (
+                policy["source_background_fraction"] if policy else None
+            ),
+            "target_background_fraction": policy["target_fraction"] if policy else None,
+            "minimum_background_fraction": policy["minimum_fraction"] if policy else None,
             "positive_output_images": int(summary["positive_output_images"]),
             "target_background_images": target,
+            "minimum_accepted_background_images": minimum,
             "actual_background_images": actual,
             "total_output_images": total,
             "actual_background_fraction": actual / total if total else 0.0,
-            "target_from_empty_source_images": target_empty,
             "actual_from_empty_source_images": actual_empty,
             "candidate_empty_source_images": int(summary["candidate_empty_source_images"]),
-            "target_from_populated_image_space": target_populated,
             "actual_from_populated_image_space": actual_populated,
             "candidate_populated_source_images": int(summary["candidate_populated_source_images"]),
         }
@@ -3285,6 +3774,8 @@ def _clear_inherited_tiling_reports(builder: Any) -> None:
 def _validate_coverage_settings(cfg: dict[str, Any]) -> None:
     if int(cfg["tile_size"]) <= 0:
         raise ValueError("tile_size must be positive")
+    if not isinstance(cfg["allow_lossy"], bool) and cfg["allow_lossy"] != "not_focal":
+        raise ValueError("allow_lossy must be False, True, or 'not_focal'")
     try:
         low, high = map(float, cfg["scale_range"])
     except (TypeError, ValueError) as exc:
@@ -3312,7 +3803,44 @@ def _validate_coverage_settings(cfg: dict[str, Any]) -> None:
     background_cap = cfg.get("max_background_tiles_per_source_image")
     if background_cap is not None and int(background_cap) <= 0:
         raise ValueError("max_background_tiles_per_source_image must be positive or None")
-    if not 0 <= float(cfg["background_ratio"]) < 1:
+    background_ratio = cfg["background_ratio"]
+    if isinstance(background_ratio, Mapping):
+        if set(background_ratio) != set(cfg["splits"]):
+            raise ValueError(
+                "background_ratio mapping must contain exactly the selected splits"
+            )
+        invalid = {}
+        for split, ratio in background_ratio.items():
+            if ratio is None:
+                continue
+            if isinstance(ratio, (list, tuple)):
+                if len(ratio) != 2:
+                    invalid[split] = ratio
+                    continue
+                low, high = ratio
+                if (
+                    not isinstance(low, (int, float))
+                    or isinstance(low, bool)
+                    or not isinstance(high, (int, float))
+                    or isinstance(high, bool)
+                    or not math.isfinite(float(low))
+                    or not math.isfinite(float(high))
+                    or not 0 <= float(low) <= float(high) < 1
+                ):
+                    invalid[split] = ratio
+            elif (
+                not isinstance(ratio, (int, float))
+                or isinstance(ratio, bool)
+                or not math.isfinite(float(ratio))
+                or not 0 <= float(ratio) < 1
+            ):
+                invalid[split] = ratio
+        if invalid:
+            raise ValueError(
+                "background_ratio mapping values must be None, finite fractions "
+                "in [0, 1), or ascending two-value fraction ranges"
+            )
+    elif not 0 <= float(background_ratio) < 1:
         raise ValueError("background_ratio must be in [0, 1)")
     if not 0 <= float(cfg["min_area_ratio"]) <= 1:
         raise ValueError("min_area_ratio must be in [0, 1]")
@@ -3323,11 +3851,25 @@ def _validate_coverage_settings(cfg: dict[str, Any]) -> None:
             raise ValueError(f"object_appearance_overrides[{source_id!r}] must be positive")
 
 
-def _save_staging_contact_sheet(builder, task: Task, relative_output: str) -> None:
+def _save_staging_contact_sheet(
+    builder,
+    task: Task,
+    relative_output: str,
+    *,
+    visualize_kwargs: Mapping[str, Any] | None = None,
+) -> None:
     from .dataset import Dataset
 
     builder.write_yaml()
     staged = Dataset.open(builder.staging, task=task, progress=False)
     output = builder.staging / relative_output
-    staged.visualize(split=None, n=12, seed=42, columns=3, save_to=output, show=False)
+    staged.visualize(
+        split=None,
+        n=12,
+        seed=42,
+        columns=3,
+        save_to=output,
+        show=False,
+        **dict(visualize_kwargs or {}),
+    )
     builder.visuals.append(str(output.relative_to(builder.staging)))

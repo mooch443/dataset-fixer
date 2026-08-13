@@ -5,7 +5,7 @@ import random
 import re
 import textwrap
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
@@ -26,6 +26,132 @@ ANNOTATION_COLORS = (
     "#ffff00",  # yellow
     "#ff1493",  # deep pink
 )
+
+_VISUALIZE_KWARGS = {"label_fn", "line_width", "outline_width"}
+
+
+def normalize_visualize_kwargs(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate options shared by direct, operation, and report visualization."""
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError("visualize_kwargs must be a mapping or None")
+    unknown = sorted(set(value) - _VISUALIZE_KWARGS)
+    if unknown:
+        raise TypeError(
+            "Unknown visualize_kwargs: "
+            + ", ".join(unknown)
+            + "; supported keys are "
+            + ", ".join(sorted(_VISUALIZE_KWARGS))
+        )
+    normalized = dict(value)
+    label_fn = normalized.get("label_fn")
+    if label_fn is not None and not callable(label_fn):
+        raise TypeError("visualize_kwargs['label_fn'] must be callable or None")
+    for key in ("line_width", "outline_width"):
+        width = normalized.get(key)
+        if width is None:
+            continue
+        if (
+            not isinstance(width, (int, float))
+            or isinstance(width, bool)
+            or not math.isfinite(float(width))
+            or float(width) <= 0
+        ):
+            raise ValueError(f"visualize_kwargs[{key!r}] must be a positive number")
+        normalized[key] = float(width)
+    return normalized
+
+
+def draw_label_position_heatmap(
+    draw: ImageDraw.ImageDraw,
+    box: tuple[float, float, float, float],
+    histogram: Mapping[str, Any],
+    *,
+    border: str = "#d3d9e0",
+) -> tuple[int, bool, tuple[float, float, float, float]]:
+    """Draw one density grid without distorting its row/column aspect ratio."""
+
+    left, top, right, bottom = box
+    grid = histogram.get("labels") or []
+    uncovered = histogram.get("uncovered") or []
+    rows = len(grid)
+    columns = len(grid[0]) if rows else 0
+    if not rows or not columns:
+        return 0, False, (left, top, right, bottom)
+    peak = max((max(line) for line in grid), default=0)
+    available_width = right - left
+    available_height = bottom - top
+    grid_aspect = columns / rows
+    if available_width / available_height > grid_aspect:
+        map_width = available_height * grid_aspect
+        map_height = available_height
+    else:
+        map_width = available_width
+        map_height = available_width / grid_aspect
+    map_left = left + (available_width - map_width) / 2
+    map_top = top
+    map_right = map_left + map_width
+    map_bottom = map_top + map_height
+    cell_width = map_width / columns
+    cell_height = map_height / rows
+    for row_index in range(rows):
+        for column_index in range(columns):
+            count = grid[row_index][column_index]
+            missing = uncovered[row_index][column_index] if uncovered else 0
+            x0 = map_left + column_index * cell_width
+            y0 = map_top + row_index * cell_height
+            cell = (x0, y0, x0 + cell_width - 1, y0 + cell_height - 1)
+            if missing:
+                colour: Any = "#b00020"
+            elif count:
+                weight = count / peak if peak else 0.0
+                colour = (
+                    round(226 - 179 * weight),
+                    round(236 - 125 * weight),
+                    round(247 - 71 * weight),
+                )
+            else:
+                colour = "#f1f4f8"
+            draw.rectangle(cell, fill=colour)
+    draw.rectangle((map_left, map_top, map_right, map_bottom), outline=border, width=1)
+    has_uncovered = bool(uncovered and any(any(line) for line in uncovered))
+    return peak, has_uncovered, (map_left, map_top, map_right, map_bottom)
+
+
+def save_label_position_summary(
+    coverage: Mapping[str, Any],
+    output: Path,
+) -> Path:
+    """Save the source/output position comparison used by the dataset report."""
+
+    image = Image.new("RGB", (1400, 520), "white")
+    draw = ImageDraw.Draw(image)
+    try:
+        title_font = ImageFont.truetype("DejaVuSans.ttf", 28)
+        caption_font = ImageFont.truetype("DejaVuSans.ttf", 18)
+    except OSError:
+        title_font = ImageFont.load_default()
+        caption_font = ImageFont.load_default()
+    panels = (
+        ("source label positions", coverage.get("label_positions"), (40, 70, 850, 440)),
+        ("output label positions", coverage.get("output_label_positions"), (900, 70, 1360, 440)),
+    )
+    for title, histogram, box in panels:
+        draw.text((box[0], 24), title, fill="#111827", font=title_font)
+        if not histogram:
+            continue
+        peak, has_uncovered, map_box = draw_label_position_heatmap(draw, box, histogram)
+        caption = f"densest cell: {peak:,} label(s)"
+        if has_uncovered:
+            caption += " · red cells were never covered"
+        draw.text((box[0], map_box[3] + 10), caption, fill="#5b6572", font=caption_font)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output, quality=95)
+    return output
 
 
 def visualize_validation_failures(
@@ -367,6 +493,9 @@ def visualize_samples(
     n: int,
     seed: int,
     columns: int,
+    label_fn: Callable[[Path], str | None] | None = None,
+    line_width: float | None = None,
+    outline_width: float | None = None,
     save_to: Path | None = None,
     show: bool = True,
 ):
@@ -377,7 +506,15 @@ def visualize_samples(
     fig, axes = plt.subplots(rows, columns, figsize=(6 * columns, 5 * rows), squeeze=False)
     flat = axes.flatten()
     for ax, sample in zip(flat, chosen):
-        _draw_sample(ax, sample, task, metadata)
+        _draw_sample(
+            ax,
+            sample,
+            task,
+            metadata,
+            label_fn=label_fn,
+            line_width=line_width,
+            outline_width=outline_width,
+        )
     for ax in flat[len(chosen) :]:
         ax.axis("off")
     title_split = split or "all splits"
@@ -399,6 +536,7 @@ def visualize_semantic_masks(
     n: int,
     seed: int,
     columns: int,
+    label_fn: Callable[[Path], str | None] | None = None,
     save_to: Path | None = None,
     show: bool = True,
 ):
@@ -423,10 +561,16 @@ def visualize_semantic_masks(
         foreground = sum(mask.histogram()[1:])
         fraction = foreground / (mask.width * mask.height) if mask.width and mask.height else 0.0
         ax.imshow(overlay)
-        ax.set_title(
-            f"{sample.split} · {sample.relative_path}\nforeground: {fraction:.1%}",
-            fontsize=8,
+        title = _sample_title(
+            sample,
+            label_fn,
+            default=(
+                f"{sample.split} · {sample.relative_path}\n"
+                f"foreground: {fraction:.1%}"
+            ),
         )
+        if title is not None:
+            ax.set_title(title, fontsize=8)
         ax.axis("off")
     for ax in flat[len(chosen) :]:
         ax.axis("off")
@@ -441,69 +585,117 @@ def visualize_semantic_masks(
     return fig
 
 
-def _draw_sample(ax, sample: Sample, task: Task, metadata: DatasetMetadata) -> None:
+def _draw_sample(
+    ax,
+    sample: Sample,
+    task: Task,
+    metadata: DatasetMetadata,
+    *,
+    label_fn: Callable[[Path], str | None] | None = None,
+    line_width: float | None = None,
+    outline_width: float | None = None,
+) -> None:
+    ax.imshow(
+        render_annotated_sample(
+            sample,
+            task,
+            metadata,
+            line_width=line_width,
+            outline_width=outline_width,
+        )
+    )
+    title = _sample_title(
+        sample,
+        label_fn,
+        default=(
+            f"{sample.relative_path}\n{sample.width}×{sample.height} | "
+            f"{len(sample.annotations)} annotations | {sample.split}"
+        ),
+    )
+    if title is not None:
+        ax.set_title(title, fontsize=8)
+    ax.axis("off")
+
+
+def _sample_title(
+    sample: Sample,
+    label_fn: Callable[[Path], str | None] | None,
+    *,
+    default: str,
+) -> str | None:
+    if label_fn is not None:
+        label = label_fn(sample.image_path)
+    elif sample.provenance is not None and "display_label" in sample.provenance:
+        label = sample.provenance["display_label"]
+    else:
+        return default
+    if label is not None and not isinstance(label, str):
+        raise TypeError("label_fn must return a string or None")
+    return label
+
+
+def render_annotated_sample(
+    sample: Sample,
+    task: Task,
+    metadata: DatasetMetadata,
+    *,
+    resize_to: tuple[int, int] | None = None,
+    show_names: bool = True,
+    line_width: float | None = None,
+    outline_width: float | None = None,
+) -> Image.Image:
+    """Render one sample for both public visualization and report previews."""
+
     with Image.open(sample.image_path) as opened:
         image = ImageOps.exif_transpose(opened).convert("RGB")
-        ax.imshow(image)
+    if resize_to is not None and image.size != resize_to:
+        image = image.resize(resize_to, Image.Resampling.LANCZOS)
+    scale_x = image.width / max(1, sample.width)
+    scale_y = image.height / max(1, sample.height)
+    draw = ImageDraw.Draw(image)
+    short_side = min(image.size)
+    colour_width = (
+        max(1, round(float(line_width)))
+        if line_width is not None
+        else max(2, round(max(3, short_side / 140) * 0.45))
+    )
+    resolved_outline_width = (
+        max(1, round(float(outline_width)))
+        if outline_width is not None
+        else max(colour_width + 1, round(short_side / 140))
+    )
+    marker_radius = max(3, round(short_side / 120))
+    font = ImageFont.load_default()
+
     for annotation in sample.annotations:
         color = ANNOTATION_COLORS[annotation.class_id % len(ANNOTATION_COLORS)]
         name = metadata.names.get(annotation.class_id, str(annotation.class_id))
         if annotation.bbox is not None and task in {Task.DETECT, Task.POSE}:
             x1, y1, x2, y2 = annotation.bbox
-            ax.add_patch(
-                patches.Rectangle(
-                    (x1, y1),
-                    x2 - x1,
-                    y2 - y1,
-                    fill=False,
-                    edgecolor="white",
-                    linewidth=3.5,
+            box = (x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y)
+            draw.rectangle(box, outline="white", width=resolved_outline_width)
+            draw.rectangle(box, outline=color, width=colour_width)
+            if show_names:
+                text_box = draw.textbbox((box[0], box[1]), name, font=font)
+                text_height = text_box[3] - text_box[1]
+                text_width = text_box[2] - text_box[0]
+                text_top = max(0, box[1] - text_height - 4)
+                draw.rectangle(
+                    (box[0], text_top, box[0] + text_width + 4, text_top + text_height + 4),
+                    fill=color,
                 )
-            )
-            ax.add_patch(
-                patches.Rectangle(
-                    (x1, y1),
-                    x2 - x1,
-                    y2 - y1,
-                    fill=False,
-                    edgecolor=color,
-                    linewidth=1.8,
-                )
-            )
-            ax.text(x1, max(0, y1 - 3), name, color="white", fontsize=7, bbox={"facecolor": color, "alpha": 0.8, "pad": 2})
+                draw.text((box[0] + 2, text_top + 2), name, fill="white", font=font)
         if annotation.polygon:
-            ax.add_patch(
-                patches.Polygon(
-                    annotation.polygon,
-                    closed=True,
-                    fill=False,
-                    edgecolor="white",
-                    linewidth=3.5,
+            points = [(x * scale_x, y * scale_y) for x, y in annotation.polygon]
+            if len(points) >= 2:
+                closed = [*points, points[0]]
+                draw.line(
+                    closed,
+                    fill="white",
+                    width=resolved_outline_width,
+                    joint="curve",
                 )
-            )
-            ax.add_patch(
-                patches.Polygon(
-                    annotation.polygon,
-                    closed=True,
-                    fill=False,
-                    edgecolor=color,
-                    linewidth=1.8,
-                )
-            )
-            xs, ys = zip(*annotation.polygon)
-            left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
-            for outline, line_width in (("white", 3.2), (color, 1.6)):
-                ax.add_patch(
-                    patches.Rectangle(
-                        (left, top),
-                        right - left,
-                        bottom - top,
-                        fill=False,
-                        edgecolor=outline,
-                        linewidth=line_width,
-                        linestyle="--",
-                    )
-                )
+                draw.line(closed, fill=color, width=colour_width, joint="curve")
         if annotation.keypoints:
             names = metadata.kpt_names.get(annotation.class_id, [])
             skeleton_value = metadata.extra.get("skeleton", [])
@@ -519,23 +711,37 @@ def _draw_sample(ax, sample: Sample, task: Task, metadata: DatasetMetadata) -> N
                 x1, y1, v1 = annotation.keypoints[first]
                 x2, y2, v2 = annotation.keypoints[second]
                 if v1 != 0 and v2 != 0:
-                    ax.plot([x1, x2], [y1, y2], color=color, linewidth=1.0, alpha=0.8)
+                    draw.line(
+                        (x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y),
+                        fill=color,
+                        width=colour_width,
+                    )
             for idx, (x, y, visibility) in enumerate(annotation.keypoints):
                 if visibility == 0:
                     continue
-                ax.scatter([x], [y], s=18, c=[color], edgecolors="white", linewidths=0.5)
-                if idx < len(names):
-                    ax.text(x + 2, y + 2, names[idx], fontsize=5, color="white", bbox={"facecolor": "black", "alpha": 0.5, "pad": 1})
+                px, py = x * scale_x, y * scale_y
+                draw.ellipse(
+                    (px - marker_radius, py - marker_radius, px + marker_radius, py + marker_radius),
+                    fill=color,
+                    outline="white",
+                    width=1,
+                )
+                if show_names and idx < len(names):
+                    draw.text((px + marker_radius + 1, py + 1), names[idx], fill="white", font=font)
         if annotation.point and annotation.radius is not None:
-            ax.add_patch(
-                patches.Circle(annotation.point, radius=annotation.radius, linewidth=1.0, edgecolor="red", facecolor="none")
+            x, y = annotation.point[0] * scale_x, annotation.point[1] * scale_y
+            radius_x = annotation.radius * scale_x
+            radius_y = annotation.radius * scale_y
+            draw.ellipse(
+                (x - radius_x, y - radius_y, x + radius_x, y + radius_y),
+                outline="red",
+                width=colour_width,
             )
-            ax.scatter([annotation.point[0]], [annotation.point[1]], s=8, c="red")
-    ax.set_title(
-        f"{sample.relative_path}\n{sample.width}×{sample.height} | {len(sample.annotations)} annotations | {sample.split}",
-        fontsize=8,
-    )
-    ax.axis("off")
+            draw.ellipse(
+                (x - marker_radius, y - marker_radius, x + marker_radius, y + marker_radius),
+                fill="red",
+            )
+    return image
 
 
 def save_split_preview(
@@ -952,6 +1158,7 @@ def save_tiling_preview(
     output: Path,
     *,
     mode: str,
+    visualize_kwargs: Mapping[str, Any] | None = None,
 ) -> Path:
     """Show one small pass-through source and up to three tiled sources."""
 
@@ -959,8 +1166,15 @@ def save_tiling_preview(
     rows = max(1, math.ceil(len(items) / columns))
     fig, axes = plt.subplots(rows, columns, figsize=(14, 6 * rows), squeeze=False)
     flat = axes.flatten()
+    visualization_options = normalize_visualize_kwargs(visualize_kwargs)
     for ax, (sample, boxes, status) in zip(flat, items):
-        _draw_sample(ax, sample, task, metadata)
+        _draw_sample(
+            ax,
+            sample,
+            task,
+            metadata,
+            **visualization_options,
+        )
         for index, (left, top, right, bottom) in enumerate(boxes):
             ax.add_patch(
                 patches.Rectangle(
@@ -991,11 +1205,18 @@ def save_tiling_preview(
                 fontsize=9,
                 bbox={"facecolor": "#167c3a", "alpha": 0.9, "pad": 4},
             )
-        ax.set_title(
-            f"{status} · {sample.split} · {sample.width}×{sample.height}\n"
-            f"{sample.relative_path} · {len(sample.annotations)} annotations",
-            fontsize=8,
+        title = _sample_title(
+            sample,
+            visualization_options.get("label_fn"),
+            default=(
+                f"{status} · {sample.split} · {sample.width}×{sample.height}\n"
+                f"{sample.relative_path} · {len(sample.annotations)} annotations"
+            ),
         )
+        if title is None:
+            ax.set_title("")
+        else:
+            ax.set_title(title, fontsize=8)
     for ax in flat[len(items) :]:
         ax.axis("off")
     pass_through = sum(not boxes for _, boxes, _ in items)
@@ -1293,11 +1514,26 @@ def save_coverage_annotated_original(
         lines.append(
             "No source annotations; this image is useful only as background imagery."
         )
+    configured_background_ratio = settings["background_ratio"]
+    if isinstance(configured_background_ratio, Mapping):
+        configured_background_ratio = configured_background_ratio[sample.split]
+    background_policy = settings.get("background_ratio_policy", {}).get(sample.split)
+    if background_policy and background_policy["mode"] == "best_effort_source_fraction":
+        background_target = (
+            f"best effort at input {float(background_policy['target_fraction']):.1%}"
+        )
+    elif isinstance(configured_background_ratio, (list, tuple)):
+        low, high = map(float, configured_background_ratio)
+        background_target = f"{low:.1%}–{high:.1%} (aim {high:.1%})"
+    elif configured_background_ratio is None:
+        background_target = "best effort at input fraction"
+    else:
+        background_target = f"{float(configured_background_ratio):.1%}"
     lines.extend(
         [
             (
                 f"Background crops from this source: {len(background_boxes)} | "
-                f"dataset target: {float(settings['background_ratio']):.1%} | "
+                f"dataset target: {background_target} | "
                 f"max tiles/source: {cap if cap is not None else 'disabled'}"
             ),
             (
@@ -1362,3 +1598,25 @@ def _display_or_print(fig, save_to: Path | None) -> None:
     if save_to and not displayed:
         print(f"Visualization: {save_to}")
     plt.close(fig)
+
+
+def display_report(path: Path) -> None:
+    """Display the canonical report PNG inline without redrawing its contents."""
+
+    try:
+        from IPython import get_ipython
+
+        if get_ipython() is None:
+            print(f"Visualization: {path}")
+            return
+    except Exception:
+        print(f"Visualization: {path}")
+        return
+    with Image.open(path) as opened:
+        report = opened.convert("RGB").copy()
+    aspect = report.height / max(1, report.width)
+    fig = plt.figure(figsize=(16, 16 * aspect), frameon=False)
+    ax = fig.add_axes((0, 0, 1, 1))
+    ax.imshow(report)
+    ax.axis("off")
+    _display_or_print(fig, path)

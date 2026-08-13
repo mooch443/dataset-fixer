@@ -143,24 +143,14 @@ def resolve_removed_classes(
     *,
     merge_into: str | int | None = None,
 ) -> tuple[set[int], dict[int, int], DatasetMetadata]:
+    removed = resolve_class_selectors(
+        metadata,
+        selectors,
+        empty_message="At least one class must be removed",
+    )
     reverse: dict[str, list[int]] = defaultdict(list)
     for class_id, class_name in metadata.names.items():
         reverse[class_name].append(class_id)
-    removed: set[int] = set()
-    for selector in selectors:
-        if isinstance(selector, int):
-            if selector not in metadata.names:
-                raise ValueError(f"Unknown class ID {selector}; available IDs are {sorted(metadata.names)}")
-            removed.add(selector)
-        else:
-            matches = reverse.get(selector, [])
-            if len(matches) != 1:
-                raise ValueError(
-                    f"Class name {selector!r} matched {len(matches)} classes; available names are {list(reverse)}"
-                )
-            removed.add(matches[0])
-    if not removed:
-        raise ValueError("At least one class must be removed")
     merge_target: int | None = None
     if merge_into is not None:
         if isinstance(merge_into, int):
@@ -196,6 +186,35 @@ def resolve_removed_classes(
         if old in metadata.kpt_names
     }
     return removed, mapping, projected
+
+
+def resolve_class_selectors(
+    metadata: DatasetMetadata,
+    selectors: Iterable[str | int],
+    *,
+    empty_message: str = "At least one class must be selected",
+) -> set[int]:
+    """Resolve class names or IDs without changing the class schema."""
+
+    reverse: dict[str, list[int]] = defaultdict(list)
+    for class_id, class_name in metadata.names.items():
+        reverse[class_name].append(class_id)
+    resolved: set[int] = set()
+    for selector in selectors:
+        if isinstance(selector, int):
+            if selector not in metadata.names:
+                raise ValueError(f"Unknown class ID {selector}; available IDs are {sorted(metadata.names)}")
+            resolved.add(selector)
+        else:
+            matches = reverse.get(selector, [])
+            if len(matches) != 1:
+                raise ValueError(
+                    f"Class name {selector!r} matched {len(matches)} classes; available names are {list(reverse)}"
+                )
+            resolved.add(matches[0])
+    if not resolved:
+        raise ValueError(empty_message)
+    return resolved
 
 
 def resolve_renamed_classes(
@@ -248,12 +267,19 @@ def project_remove_classes(
     samples: list[Sample],
     *,
     selected_splits: set[str],
+    removed_classes: set[int],
     mapping: dict[int, int],
     drop_empty_images: bool,
+    drop_containing_images: bool,
 ) -> list[Sample]:
     projected: list[Sample] = []
     for sample in samples:
         if sample.split not in selected_splits:
+            continue
+        if drop_containing_images and any(
+            annotation.class_id in removed_classes
+            for annotation in sample.annotations
+        ):
             continue
         annotations = [
             annotation.clone(class_id=mapping[annotation.class_id])
@@ -264,6 +290,147 @@ def project_remove_classes(
             continue
         projected.append(clone_sample(sample, annotations=annotations))
     return projected
+
+
+def project_move_images_with_classes(
+    samples: list[Sample],
+    *,
+    selected_splits: set[str],
+    class_ids: set[int],
+    to_split: str,
+    group_by: Callable[[Path], Hashable] | None,
+) -> tuple[list[Sample], dict[str, Any], dict[str, dict[str, Any]]]:
+    """Move matching images and every member of a matching physical group."""
+
+    before = Counter(sample.split for sample in samples)
+    groups, group_for_path = _group_samples(samples, group_by)
+    matched_paths = {
+        str(sample.image_path)
+        for sample in samples
+        if sample.split in selected_splits
+        and any(annotation.class_id in class_ids for annotation in sample.annotations)
+    }
+    triggered_groups = {
+        group_for_path[path]
+        for path in matched_paths
+    }
+    matched = len(matched_paths)
+    if not matched:
+        raise ValueError(
+            "No images containing the selected classes were found in source_splits"
+        )
+
+    projected: list[Sample] = []
+    details: dict[str, dict[str, Any]] = {}
+    for sample in samples:
+        path = str(sample.image_path)
+        group = group_for_path[path]
+        selected_by_group = group in triggered_groups
+        target = to_split if selected_by_group else sample.split
+        projected.append(clone_sample(sample, split=target))
+        details[path] = {
+            "group": repr(group),
+            "direct_class_match": path in matched_paths,
+            "selected_by_group": selected_by_group,
+            "from_split": sample.split,
+            "to_split": target,
+            "moved": sample.split != target,
+        }
+    moved = sum(detail["moved"] for detail in details.values())
+    if not moved:
+        raise ValueError(
+            f"All triggered groups are already in split {to_split!r}"
+        )
+    after = Counter(sample.split for sample in projected)
+    selected_group_images = sum(len(groups[group]) for group in triggered_groups)
+    return projected, {
+        "matched_images": matched,
+        "matched_groups": len(triggered_groups),
+        "selected_group_images": selected_group_images,
+        "group_expansion_images": selected_group_images - matched,
+        "moved_images": moved,
+        "already_in_target_images": selected_group_images - moved,
+        "distribution_before": dict(sorted(before.items())),
+        "distribution_after": dict(sorted(after.items())),
+    }, details
+
+
+def project_move_n_groups(
+    samples: list[Sample],
+    *,
+    n: int,
+    from_split: str,
+    to_split: str,
+    group_by: Callable[[Path], Hashable],
+    seed: int,
+) -> tuple[list[Sample], dict[str, Any], dict[str, dict[str, Any]]]:
+    """Select source groups deterministically and move every group member."""
+
+    if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+        raise ValueError("n must be a positive integer")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an integer")
+    if from_split == to_split:
+        raise ValueError("from_split and to_split must be different")
+    groups, group_for_path = _group_samples(samples, group_by)
+    eligible = [
+        group
+        for group, group_samples in groups.items()
+        if any(sample.split == from_split for sample in group_samples)
+    ]
+    if n > len(eligible):
+        raise ValueError(
+            f"Requested {n} groups from {from_split!r}, but only {len(eligible)} are available"
+        )
+    selected_groups = set(random.Random(seed).sample(eligible, n))
+    before = Counter(sample.split for sample in samples)
+    projected: list[Sample] = []
+    details: dict[str, dict[str, Any]] = {}
+    for sample in samples:
+        path = str(sample.image_path)
+        group = group_for_path[path]
+        selected = group in selected_groups
+        target = to_split if selected else sample.split
+        projected.append(clone_sample(sample, split=target))
+        details[path] = {
+            "group": repr(group),
+            "selected": selected,
+            "from_split": sample.split,
+            "to_split": target,
+            "moved": sample.split != target,
+        }
+    after = Counter(sample.split for sample in projected)
+    selected_images = sum(len(groups[group]) for group in selected_groups)
+    moved_images = sum(detail["moved"] for detail in details.values())
+    return projected, {
+        "requested_groups": n,
+        "eligible_groups": len(eligible),
+        "selected_groups": n,
+        "selected_group_images": selected_images,
+        "moved_images": moved_images,
+        "already_in_target_images": selected_images - moved_images,
+        "distribution_before": dict(sorted(before.items())),
+        "distribution_after": dict(sorted(after.items())),
+    }, details
+
+
+def _group_samples(
+    samples: list[Sample],
+    group_by: Callable[[Path], Hashable] | None,
+) -> tuple[dict[Hashable, list[Sample]], dict[str, Hashable]]:
+    groups: dict[Hashable, list[Sample]] = defaultdict(list)
+    group_for_path: dict[str, Hashable] = {}
+    for sample in samples:
+        group = group_by(sample.image_path) if group_by else str(sample.image_path)
+        try:
+            hash(group)
+        except TypeError as exc:
+            raise TypeError(
+                f"group_by must return a hashable value, got {type(group).__name__}"
+            ) from exc
+        groups[group].append(sample)
+        group_for_path[str(sample.image_path)] = group
+    return groups, group_for_path
 
 
 def select_empty_images(
@@ -306,6 +473,17 @@ def derived_name(current: str, operation: str, settings: dict[str, Any]) -> str:
     if operation == "split":
         detail = "split-" + "-".join(
             f"{key}{int(value * 100)}" for key, value in settings["ratios"].items()
+        )
+    elif operation == "move-images-with-classes":
+        selected = "-".join(
+            slugify(value)
+            for value in list(settings["selected_classes"].values())[:3]
+        )
+        detail = f"move-{selected}-to-{settings['to_split']}"
+    elif operation == "move-n-groups":
+        detail = (
+            f"move-{settings['selected_groups']}-groups-"
+            f"{settings['from_split']}-to-{settings['to_split']}"
         )
     elif operation == "remove-classes":
         removed = "-".join(

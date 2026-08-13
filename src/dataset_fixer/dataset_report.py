@@ -9,11 +9,16 @@ so a dataset derived from a dataset does not accumulate nested history sheets.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .models import DatasetMetadata, Task
+from .models import DatasetMetadata, Sample, Task
+from .visualization import (
+    draw_label_position_heatmap,
+    normalize_visualize_kwargs,
+    render_annotated_sample,
+)
 
 
 REPORT_WIDTH = 2400
@@ -28,18 +33,10 @@ _ANNOTATED = "#2f9e5f"
 _BACKGROUND = "#b9c2cd"
 _LETTERBOX = "#f4f6f9"
 _MASK_OVERLAY = (255, 45, 45)
-_ANNOTATION_COLORS = (
-    "#ff00ff",
-    "#7fff00",
-    "#ff5f00",
-    "#ffff00",
-    "#ff1493",
-)
-
 _OUTER = 48
 _INNER = 32
 _GAP = 24
-_COVERAGE_DETAIL_HEIGHT = 260
+_COVERAGE_DETAIL_HEIGHT = 320
 
 
 def render_dataset_report(
@@ -53,6 +50,7 @@ def render_dataset_report(
     output: Path,
     metadata: DatasetMetadata | None = None,
     coverage: Mapping[str, Any] | None = None,
+    visualize_kwargs: Mapping[str, Any] | None = None,
     width: int = REPORT_WIDTH,
 ) -> Path | None:
     """Draw ``output`` from the images and labels physically present in ``root``.
@@ -64,7 +62,12 @@ def render_dataset_report(
     Returns the written path, or ``None`` when no split holds a readable image.
     """
 
-    splits = _split_views(root, records)
+    visualization_options = normalize_visualize_kwargs(visualize_kwargs)
+    splits = _split_views(
+        root,
+        records,
+        label_fn=visualization_options.get("label_fn"),
+    )
     if not splits:
         return None
 
@@ -85,6 +88,7 @@ def render_dataset_report(
             format_name=format_name,
             classes=classes,
             metadata=metadata,
+            visualize_kwargs=visualization_options,
         )
         for view in splits
     ]
@@ -112,7 +116,12 @@ class _SplitView:
         self.examples = _deterministic_examples(rows)
 
 
-def _split_views(root: Path, records: Iterable[Mapping[str, Any]]) -> list[_SplitView]:
+def _split_views(
+    root: Path,
+    records: Iterable[Mapping[str, Any]],
+    *,
+    label_fn: Callable[[Path], str | None] | None = None,
+) -> list[_SplitView]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for record in records:
         relative = str(record.get("output_image") or "")
@@ -125,12 +134,24 @@ def _split_views(root: Path, records: Iterable[Mapping[str, Any]]) -> list[_Spli
         if annotated is None:
             annotated = int(record.get("output_annotation_count") or 0) > 0
         mask = record.get("output_mask")
-        grouped.setdefault(str(record.get("output_split") or "unknown"), []).append(
+        split = str(record.get("output_split") or "unknown")
+        if label_fn is not None:
+            display_label = label_fn(image_path)
+            if display_label is not None and not isinstance(display_label, str):
+                raise TypeError("label_fn must return a string or None")
+            display_label_set = True
+        else:
+            display_label = record.get("display_label")
+            display_label_set = "display_label" in record
+        grouped.setdefault(split, []).append(
             {
                 "relative": relative,
                 "image_path": image_path,
                 "mask_path": (root / str(mask)) if mask else None,
                 "annotated": bool(annotated),
+                "split": split,
+                "display_label": display_label,
+                "display_label_set": display_label_set,
             }
         )
     order = ("train", "val", "test")
@@ -211,6 +232,8 @@ def _render_coverage(coverage: Mapping[str, Any], *, width: int) -> Image.Image:
         + caption_gap + bar_height
         + row_gap
         + caption_gap + bar_height
+        + row_gap
+        + caption_gap + bar_height
         + row_gap + 8 + _COVERAGE_DETAIL_HEIGHT
         + 30
     )
@@ -232,6 +255,11 @@ def _render_coverage(coverage: Mapping[str, Any], *, width: int) -> Image.Image:
     never = int(coverage.get("source_labels_never_covered") or 0)
     label_pct = float(coverage.get("source_label_coverage_percent") or 0.0)
     space_pct = float(coverage.get("source_image_space_coverage_percent") or 0.0)
+    source_images = int(coverage.get("source_images") or 0)
+    represented_images = int(coverage.get("source_images_represented") or 0)
+    represented_pct = float(
+        coverage.get("source_image_representation_percent") or 0.0
+    )
 
     y = 26 + 46 + row_gap
     draw.text(
@@ -270,6 +298,27 @@ def _render_coverage(coverage: Mapping[str, Any], *, width: int) -> Image.Image:
         fill="#2f6fb0",
     )
 
+    y += bar_height + row_gap
+    draw.text(
+        (left, y),
+        (
+            f"{represented_images:,} of {source_images:,} source images are "
+            "represented by at least one output tile"
+        ),
+        fill=_MUTED,
+        font=body_font,
+    )
+    y += caption_gap
+    _draw_ratio_bar(
+        draw,
+        (left, y, right, y + bar_height),
+        fraction=represented_pct / 100.0,
+        filled_label=f"images represented {represented_pct:.1f}%",
+        empty_label=f"not represented {100 - represented_pct:.1f}%",
+        font=caption_font,
+        fill="#8a5cd6",
+    )
+
     y += bar_height + row_gap + 8
     column = (right - left - _GAP) // 2
     _draw_split_distribution(
@@ -279,14 +328,39 @@ def _render_coverage(coverage: Mapping[str, Any], *, width: int) -> Image.Image:
         body_font=body_font,
         caption_font=caption_font,
     )
-    _draw_position_heatmap(
-        panel,
-        draw,
-        (right - column, y, right, y + _COVERAGE_DETAIL_HEIGHT),
-        coverage.get("label_positions"),
-        body_font=body_font,
-        caption_font=caption_font,
-    )
+    positions_left = right - column
+    output_positions = coverage.get("output_label_positions")
+    if output_positions:
+        source_width = round((column - _GAP) * 2 / 3)
+        source_right = positions_left + source_width
+        _draw_position_heatmap(
+            panel,
+            draw,
+            (positions_left, y, source_right, y + _COVERAGE_DETAIL_HEIGHT),
+            coverage.get("label_positions"),
+            title="source label positions",
+            body_font=body_font,
+            caption_font=caption_font,
+        )
+        _draw_position_heatmap(
+            panel,
+            draw,
+            (source_right + _GAP, y, right, y + _COVERAGE_DETAIL_HEIGHT),
+            output_positions,
+            title="output label positions",
+            body_font=body_font,
+            caption_font=caption_font,
+        )
+    else:
+        _draw_position_heatmap(
+            panel,
+            draw,
+            (positions_left, y, right, y + _COVERAGE_DETAIL_HEIGHT),
+            coverage.get("label_positions"),
+            title="source label positions",
+            body_font=body_font,
+            caption_font=caption_font,
+        )
     return panel
 
 
@@ -344,12 +418,7 @@ def _draw_split_distribution(
         font=caption_font,
     )
 
-    images = int(coverage.get("source_images") or 0)
-    represented = int(coverage.get("source_images_represented") or 0)
-    lines = [
-        f"source images represented: {represented:,} of {images:,} "
-        f"({float(coverage.get('source_image_representation_percent') or 0.0):.1f}%)"
-    ]
+    lines = []
     missing_area = int(coverage.get("source_images_without_exact_area") or 0)
     if missing_area:
         lines.append(
@@ -367,15 +436,16 @@ def _draw_position_heatmap(
     box: tuple[int, int, int, int],
     histogram: Mapping[str, Any] | None,
     *,
+    title: str,
     body_font: ImageFont.ImageFont,
     caption_font: ImageFont.ImageFont,
 ) -> None:
-    """Show where labels sit in the source frame, flagging uncovered cells."""
+    """Show a label-position grid at its coordinate frame's aspect ratio."""
 
     left, top, right, bottom = box
     draw.text(
         (left, top),
-        "source label positions",
+        title,
         fill=_TEXT,
         font=body_font,
     )
@@ -387,36 +457,26 @@ def _draw_position_heatmap(
     columns = len(grid[0]) if rows else 0
     if not rows or not columns:
         return
-    peak = max((max(line) for line in grid), default=0)
-    map_top = top + 44
-    map_bottom = bottom - 26
-    cell_width = (right - left) / columns
-    cell_height = (map_bottom - map_top) / rows
-    for row_index in range(rows):
-        for column_index in range(columns):
-            count = grid[row_index][column_index]
-            missing = uncovered[row_index][column_index] if uncovered else 0
-            x0 = left + column_index * cell_width
-            y0 = map_top + row_index * cell_height
-            cell = (x0, y0, x0 + cell_width - 1, y0 + cell_height - 1)
-            if missing:
-                colour = "#b00020"
-            elif count:
-                weight = count / peak if peak else 0.0
-                # Light to saturated blue, so density reads without a legend.
-                colour = (
-                    round(226 - 179 * weight),
-                    round(236 - 125 * weight),
-                    round(247 - 71 * weight),
-                )
-            else:
-                colour = "#f1f4f8"
-            draw.rectangle(cell, fill=colour)
-    draw.rectangle((left, map_top, right, map_bottom), outline=_BORDER, width=1)
+    available_top = top + 44
+    available_bottom = bottom - 32
+    peak, has_uncovered, (_, _, _, map_bottom) = draw_label_position_heatmap(
+        draw,
+        (left, available_top, right, available_bottom),
+        histogram,
+        border=_BORDER,
+    )
     draw.text(
         (left, map_bottom + 6),
-        f"densest cell: {peak:,} label(s)"
-        + ("   ·   red cells were never covered" if any(any(line) for line in uncovered) else ""),
+        _fit(
+            f"densest cell: {peak:,} label(s)"
+            + (
+                "   ·   red cells were never covered"
+                if has_uncovered
+                else ""
+            ),
+            caption_font,
+            right - left,
+        ),
         fill=_MUTED,
         font=caption_font,
     )
@@ -455,6 +515,7 @@ def _render_split(
     format_name: str,
     classes: Mapping[int, str],
     metadata: DatasetMetadata | None,
+    visualize_kwargs: Mapping[str, Any],
 ) -> Image.Image:
     title_font = _font(38)
     body_font = _font(28)
@@ -504,7 +565,7 @@ def _render_split(
         font=caption_font,
     )
 
-    row_top = bar_top + bar_height + 34
+    row_top = bar_top + bar_height + 34 + caption_height
     for index in range(EXAMPLES_PER_SPLIT):
         cell_left = left + index * (cell_width + _GAP)
         if index >= len(view.examples):
@@ -523,6 +584,7 @@ def _render_split(
             task=task,
             format_name=format_name,
             metadata=metadata,
+            visualize_kwargs=visualize_kwargs,
         )
         panel.paste(thumbnail, (cell_left, row_top))
         draw.rectangle(
@@ -530,18 +592,28 @@ def _render_split(
             outline=_BORDER,
             width=1,
         )
-        label = "annotated" if example["annotated"] else "background"
-        draw.text(
-            (cell_left, row_top + cell_height + 8),
-            _fit_middle(
-                f"{example['relative']}  ·  {label}",
-                caption_font,
-                cell_width,
-                keep_suffix=len(label) + 5,
-            ),
-            fill=_MUTED,
-            font=caption_font,
-        )
+        state = "annotated" if example["annotated"] else "background"
+        if example["display_label_set"]:
+            label = example["display_label"]
+        else:
+            label = f"{example['relative']}  ·  {state}"
+        if label is not None:
+            fitted_label = (
+                _fit(str(label), caption_font, cell_width)
+                if example["display_label_set"]
+                else _fit_middle(
+                    str(label),
+                    caption_font,
+                    cell_width,
+                    keep_suffix=len(state) + 5,
+                )
+            )
+            draw.text(
+                (cell_left, row_top - caption_height + 4),
+                fitted_label,
+                fill=_MUTED,
+                font=caption_font,
+            )
     return panel
 
 
@@ -604,6 +676,7 @@ def _example_thumbnail(
     task: str,
     format_name: str,
     metadata: DatasetMetadata | None,
+    visualize_kwargs: Mapping[str, Any],
 ) -> Image.Image:
     cell_width, cell_height = size
     canvas = Image.new("RGB", size, _LETTERBOX)
@@ -622,14 +695,30 @@ def _example_thumbnail(
     if format_name == "semantic_masks":
         image = _apply_mask_overlay(image, example.get("mask_path"), target)
     else:
-        _draw_annotations(
-            image,
+        annotations = _read_annotations(
             example["image_path"],
             source_size=source_size,
-            scale=scale,
             task=task,
             metadata=metadata,
         )
+        parsed_task = Task.parse(task)
+        if parsed_task is not None:
+            image = render_annotated_sample(
+                Sample(
+                    image_path=example["image_path"],
+                    relative_path=Path(example["relative"]),
+                    split=str(example["split"]),
+                    width=source_size[0],
+                    height=source_size[1],
+                    annotations=annotations,
+                ),
+                parsed_task,
+                metadata or DatasetMetadata(names={}),
+                resize_to=target,
+                show_names=False,
+                line_width=visualize_kwargs.get("line_width"),
+                outline_width=visualize_kwargs.get("outline_width"),
+            )
     canvas.paste(image, ((cell_width - target[0]) // 2, (cell_height - target[1]) // 2))
     return canvas
 
@@ -648,47 +737,6 @@ def _apply_mask_overlay(
         return image
     tinted = Image.composite(Image.new("RGB", target, _MASK_OVERLAY), image, mask)
     return Image.blend(image, tinted, 0.55)
-
-
-def _draw_annotations(
-    image: Image.Image,
-    image_path: Path,
-    *,
-    source_size: tuple[int, int],
-    scale: float,
-    task: str,
-    metadata: DatasetMetadata | None,
-) -> None:
-    annotations = _read_annotations(
-        image_path,
-        source_size=source_size,
-        task=task,
-        metadata=metadata,
-    )
-    if not annotations:
-        return
-    draw = ImageDraw.Draw(image)
-    for annotation in annotations:
-        color = _ANNOTATION_COLORS[annotation.class_id % len(_ANNOTATION_COLORS)]
-        if annotation.polygon and len(annotation.polygon) >= 3:
-            points = [(x * scale, y * scale) for x, y in annotation.polygon]
-            draw.line([*points, points[0]], fill="#000000", width=5, joint="curve")
-            draw.line([*points, points[0]], fill=color, width=2, joint="curve")
-        elif annotation.bbox is not None:
-            x1, y1, x2, y2 = (value * scale for value in annotation.bbox)
-            draw.rectangle((x1, y1, x2, y2), outline="#000000", width=5)
-            draw.rectangle((x1, y1, x2, y2), outline=color, width=2)
-        if annotation.point is not None:
-            x, y = annotation.point[0] * scale, annotation.point[1] * scale
-            radius = max(3.0, (annotation.radius or 0.0) * scale)
-            draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline="#000000", width=5)
-            draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=color, width=2)
-        for keypoint in annotation.keypoints or ():
-            x, y, visibility = keypoint
-            if visibility == 0:
-                continue
-            px, py = x * scale, y * scale
-            draw.ellipse((px - 5, py - 5, px + 5, py + 5), fill=color, outline="#000000", width=2)
 
 
 def _read_annotations(

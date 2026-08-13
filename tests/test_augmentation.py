@@ -422,6 +422,55 @@ def test_virtual_background_filter_sees_final_transformed_crop(
     }
 
 
+def test_virtual_coverage_not_focal_keeps_each_focal_annotation_complete(
+    tmp_path: Path,
+) -> None:
+    rows = "0 0.25 0.5 0.3 0.2\n0 0.5 0.5 0.4 0.2"
+    source = make_yolo_dataset(
+        tmp_path / "virtual_not_focal",
+        task="detect",
+        names=["fruit"],
+        train_rows=[rows],
+        val_rows=[rows],
+        size=(200, 100),
+    )
+
+    tiled = Dataset.open(source, task="detect", progress=False).tile(
+        mode="coverage",
+        splits=["train"],
+        tile_size=100,
+        large_image_threshold=50,
+        scale_range=(1.0, 1.0),
+        target_appearances_per_object=1,
+        sparse_appearances_per_object=1,
+        min_area_ratio=0.25,
+        background_ratio=0,
+        allow_lossy="not_focal",
+        crop_transforms=A.NoOp(p=1.0),
+        seed=11,
+        visualize=False,
+        progress=False,
+    ).export(
+        destination=tmp_path / "virtual_not_focal_output",
+        visualize=False,
+        progress=False,
+    )
+
+    assert len(tiled._samples) == 2
+    assert all(
+        sample.provenance["tile_mode"] == "coverage-augmented"
+        for sample in tiled._samples
+    )
+    for record in tiled.provenance.values():
+        focal = record["focal_annotation_index"]
+        assert focal not in record["lossy_annotation_indices"]
+        assert record["lossy_non_focal_indices"] == [1 - focal]
+    assert [
+        int(row["actual_coverages"])
+        for row in _audit(tiled, "coverage.label_coverage")
+    ] == [1, 1]
+
+
 def test_coverage_crop_pipeline_can_change_canvas_and_augment_validation(
     tmp_path: Path,
 ) -> None:

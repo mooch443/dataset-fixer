@@ -15,6 +15,9 @@ from .errors import DatasetValidationError, ValidationIssue
 from .models import Annotation, DatasetMetadata, Sample, Task
 from .planning import (
     normalize_split_ratios,
+    project_move_images_with_classes,
+    project_move_n_groups,
+    resolve_class_selectors,
     resolve_removed_classes,
     resolve_renamed_classes,
     select_empty_images,
@@ -46,7 +49,7 @@ def split_dataset(
     destination: str | Path | None,
     name: str | None,
     source_splits: Iterable[str] | None,
-    group_by: Callable[[Path], Hashable] | None,
+    group_by: Callable[[Path], Hashable],
     assign: Callable[[Path], str | None] | None,
     seed: int,
     visualize: bool,
@@ -196,6 +199,205 @@ def split_dataset(
         raise
 
 
+def move_images_with_classes(
+    dataset: "Dataset",
+    classes: Iterable[str | int],
+    *,
+    to_split: str,
+    destination: str | Path | None,
+    name: str | None,
+    source_splits: Iterable[str] | None,
+    group_by: Callable[[Path], Hashable] | None,
+    visualize: bool,
+    progress: bool,
+    dry_run: bool,
+    validate_output: bool = True,
+) -> "Dataset":
+    """Materialize an annotation-aware whole-image split move."""
+
+    target = normalize_split(to_split)
+    selected = (
+        {normalize_split(split) for split in source_splits}
+        if source_splits is not None
+        else set(dataset.splits)
+    )
+    if not selected:
+        raise ValueError("source_splits must select at least one split")
+    class_ids = resolve_class_selectors(dataset._metadata, classes)
+    projected, summary, details = project_move_images_with_classes(
+        dataset._samples,
+        selected_splits=selected,
+        class_ids=class_ids,
+        to_split=target,
+        group_by=group_by,
+    )
+    settings = {
+        "selected_classes": {
+            class_id: dataset._metadata.names[class_id]
+            for class_id in sorted(class_ids)
+        },
+        "source_splits": sorted(selected),
+        "to_split": target,
+        "group_by": _callback_description(group_by),
+        **summary,
+        "visualize": visualize,
+    }
+    assignments = {
+        str(source.image_path): output.split
+        for source, output in zip(dataset._samples, projected)
+    }
+    builder = _builder(
+        dataset,
+        destination,
+        name,
+        "move-images-with-classes",
+        settings,
+    )
+    try:
+        _print_start(builder, dataset._samples, settings)
+        if dry_run:
+            print("Dry run complete; no dataset was published.")
+            builder.cleanup()
+            return dataset
+        iterator = tqdm(
+            dataset._samples,
+            desc="Moving class-containing images",
+            unit="image",
+            disable=not progress,
+        )
+        for sample in iterator:
+            path = str(sample.image_path)
+            target_for_sample = assignments[path]
+            detail = details[path]
+            matched_class_ids = sorted(
+                {
+                    annotation.class_id
+                    for annotation in sample.annotations
+                    if annotation.class_id in class_ids
+                }
+            ) if sample.split in selected else []
+            provenance = {"split_group": detail["group"]}
+            if detail["selected_by_group"]:
+                provenance["class_move"] = {
+                    "matched_class_ids": matched_class_ids,
+                    "matched_class_names": [
+                        dataset._metadata.names[class_id]
+                        for class_id in matched_class_ids
+                    ],
+                    "direct_class_match": detail["direct_class_match"],
+                    "group_expansion": not detail["direct_class_match"],
+                    "group": detail["group"],
+                    "from_split": sample.split,
+                    "to_split": target_for_sample,
+                    "moved": sample.split != target_for_sample,
+                }
+            builder.add_copy(
+                sample,
+                split=target_for_sample,
+                provenance=provenance or None,
+            )
+        (builder.reports_dir / "class_move_summary.json").write_text(
+            json.dumps(settings, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        if visualize:
+            summary_path = save_split_summary(
+                dataset._samples,
+                assignments,
+                builder.reports_dir / "class_move_summary.jpg",
+            )
+            builder.visuals.append(str(summary_path.relative_to(builder.staging)))
+        return _publish(builder, progress=progress, validate_output=validate_output)
+    except Exception:
+        builder.cleanup()
+        raise
+
+
+def move_n_groups(
+    dataset: "Dataset",
+    *,
+    n: int,
+    from_split: str,
+    to_split: str,
+    group_by: Callable[[Path], Hashable],
+    seed: int,
+    destination: str | Path | None,
+    name: str | None,
+    visualize: bool,
+    progress: bool,
+    dry_run: bool,
+    validate_output: bool = True,
+) -> "Dataset":
+    """Materialize a deterministic, group-atomic split move."""
+
+    source = normalize_split(from_split)
+    target = normalize_split(to_split)
+    projected, summary, details = project_move_n_groups(
+        dataset._samples,
+        n=n,
+        from_split=source,
+        to_split=target,
+        group_by=group_by,
+        seed=seed,
+    )
+    settings = {
+        "from_split": source,
+        "to_split": target,
+        "group_by": _callback_description(group_by),
+        "seed": seed,
+        **summary,
+        "visualize": visualize,
+    }
+    assignments = {
+        str(input_sample.image_path): output_sample.split
+        for input_sample, output_sample in zip(dataset._samples, projected)
+    }
+    builder = _builder(dataset, destination, name, "move-n-groups", settings)
+    try:
+        _print_start(builder, dataset._samples, settings)
+        if dry_run:
+            print("Dry run complete; no dataset was published.")
+            builder.cleanup()
+            return dataset
+        iterator = tqdm(
+            dataset._samples,
+            desc="Moving physical groups",
+            unit="image",
+            disable=not progress,
+        )
+        for sample in iterator:
+            path = str(sample.image_path)
+            detail = details[path]
+            provenance: dict[str, Any] = {"split_group": detail["group"]}
+            if detail["selected"]:
+                provenance["group_move"] = {
+                    "group": detail["group"],
+                    "from_split": sample.split,
+                    "to_split": assignments[path],
+                    "moved": detail["moved"],
+                }
+            builder.add_copy(
+                sample,
+                split=assignments[path],
+                provenance=provenance,
+            )
+        (builder.reports_dir / "group_move_summary.json").write_text(
+            json.dumps(settings, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        if visualize:
+            summary_path = save_split_summary(
+                dataset._samples,
+                assignments,
+                builder.reports_dir / "group_move_summary.jpg",
+            )
+            builder.visuals.append(str(summary_path.relative_to(builder.staging)))
+        return _publish(builder, progress=progress, validate_output=validate_output)
+    except Exception:
+        builder.cleanup()
+        raise
+
+
 def remove_classes(
     dataset: "Dataset",
     classes: Iterable[str | int],
@@ -205,11 +407,16 @@ def remove_classes(
     splits: Iterable[str] | None,
     merge_into: str | int | None = None,
     drop_empty_images: bool,
+    drop_containing_images: bool,
     visualize: bool,
     progress: bool,
     dry_run: bool,
     validate_output: bool = True,
 ) -> "Dataset":
+    if drop_containing_images and merge_into is not None:
+        raise ValueError(
+            "drop_containing_images and merge_into are mutually exclusive"
+        )
     selected_splits = {normalize_split(s) for s in splits} if splits else set(dataset.splits)
     selected_samples = [s for s in dataset._samples if s.split in selected_splits]
     removed, mapping, metadata = resolve_removed_classes(
@@ -221,6 +428,12 @@ def remove_classes(
         "removed_classes": {class_id: dataset._metadata.names[class_id] for class_id in sorted(removed)},
         "splits": sorted(selected_splits),
         "drop_empty_images": drop_empty_images,
+        "drop_containing_images": drop_containing_images,
+        "dropped_containing_images": sum(
+            sample.split in selected_splits
+            and any(annotation.class_id in removed for annotation in sample.annotations)
+            for sample in dataset._samples
+        ) if drop_containing_images else 0,
         "class_mapping": mapping,
         "visualize": visualize,
     }
@@ -254,8 +467,14 @@ def remove_classes(
         before_background = sum(not sample.annotations for sample in selected_samples)
         after_counts: Counter[int] = Counter()
         after_background = 0
+        dropped_containing = 0
         iterator = tqdm(selected_samples, desc="Removing classes", unit="image", disable=not progress)
         for sample in iterator:
+            if drop_containing_images and any(
+                annotation.class_id in removed for annotation in sample.annotations
+            ):
+                dropped_containing += 1
+                continue
             annotations = [a.clone(class_id=mapping[a.class_id]) for a in sample.annotations if a.class_id in mapping]
             if drop_empty_images and not annotations:
                 continue
@@ -273,6 +492,11 @@ def remove_classes(
                     "after": {
                         **{str(class_id): after_counts.get(class_id, 0) for class_id in sorted(metadata.names)},
                         "background": after_background,
+                    },
+                    "images": {
+                        "before": len(selected_samples),
+                        "after": len(builder.records),
+                        "dropped_containing_removed_classes": dropped_containing,
                     },
                     "names_before": {
                         **{str(class_id): class_name for class_id, class_name in sorted(dataset._metadata.names.items())},
@@ -323,6 +547,8 @@ def export_dataset(
     splits: Iterable[str] | None,
     allow_lossy: bool,
     visualize: bool,
+    visualize_kwargs: Mapping[str, Any],
+    visualize_kwargs_description: Mapping[str, Any],
     progress: bool,
     dry_run: bool,
     validate_output: bool = True,
@@ -334,18 +560,17 @@ def export_dataset(
         exported_splits=selected,
     )
     print_split_group_audit(group_report)
-    settings = {"splits": sorted(selected), "allow_lossy": allow_lossy, "visualize": visualize}
+    settings = {
+        "splits": sorted(selected),
+        "allow_lossy": allow_lossy,
+        "visualize": visualize,
+        "visualize_kwargs": dict(visualize_kwargs_description),
+    }
     builder = _builder(dataset, destination, name, "export", settings)
+    builder.visualize_kwargs = dict(visualize_kwargs)
     builder.validation_details["split_group_isolation"] = group_validation
     try:
         write_split_group_audit(builder.reports_dir, group_report)
-        if visualize and samples:
-            from .visualization import visualize_samples
-
-            path = builder.reports_dir / "export_preview.jpg"
-            visualize_samples(samples, dataset.task, dataset._metadata, split=samples[0].split, n=1, seed=42, columns=1, save_to=path, show=False)
-            builder.visuals.append(str(path.relative_to(builder.staging)))
-            print(f"Export sanity preview: {path}")
         _print_start(builder, samples, settings)
         if dry_run:
             builder.cleanup()
@@ -548,6 +773,18 @@ def _builder(
 def _operation_detail(operation: str, settings: dict[str, Any]) -> str:
     if operation == "split":
         return "split-" + "-".join(f"{k}{int(v * 100)}" for k, v in settings["ratios"].items())
+    if operation == "move-images-with-classes":
+        values = list(settings["selected_classes"].values())
+        return (
+            "move-"
+            + "-".join(map(slugify, values[:3]))
+            + f"-to-{settings['to_split']}"
+        )
+    if operation == "move-n-groups":
+        return (
+            f"move-{settings['selected_groups']}-groups-"
+            f"{settings['from_split']}-to-{settings['to_split']}"
+        )
     if operation == "remove-classes":
         values = list(settings["removed_classes"].values())
         return "remove-" + "-".join(map(slugify, values[:3]))

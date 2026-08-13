@@ -6,7 +6,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
 from PIL import Image, ImageDraw
 from tqdm.auto import tqdm
@@ -55,6 +55,8 @@ def export_semantic_masks(
     name: str | None,
     splits: Iterable[str] | None,
     visualize: bool,
+    visualize_kwargs: Mapping[str, Any],
+    visualize_kwargs_description: Mapping[str, Any],
     progress: bool,
     dry_run: bool,
 ) -> "Dataset":
@@ -106,6 +108,7 @@ def export_semantic_masks(
         "class_handling": "foreground_union",
         "layout": "<split>/images and <split>/masks/0",
         "visualize": visualize,
+        "visualize_kwargs": dict(visualize_kwargs_description),
     }
     fingerprint = settings_fingerprint(settings)
     final_name = slugify(name or f"{dataset.name}__semantic-masks__{fingerprint}")
@@ -157,17 +160,22 @@ def export_semantic_masks(
                 draw.polygon(annotation.polygon, fill=255)
             has_foreground = mask.getbbox() is not None
             mask.save(mask_output, format="PNG", optimize=False)
-            records.append(
-                _provenance_record(
-                    dataset,
-                    sample,
-                    image_output,
-                    mask_output,
-                    staging,
-                    settings,
-                    has_foreground=has_foreground,
-                )
+            record = _provenance_record(
+                dataset,
+                sample,
+                image_output,
+                mask_output,
+                staging,
+                settings,
+                has_foreground=has_foreground,
             )
+            label_fn = visualize_kwargs.get("label_fn")
+            if label_fn is not None:
+                display_label = label_fn(image_output)
+                if display_label is not None and not isinstance(display_label, str):
+                    raise TypeError("label_fn must return a string or None")
+                record["display_label"] = display_label
+            records.append(record)
 
         _validate_semantic_tree(staging, records)
         audits = dict(dataset._manifest.get("audits") or {})
@@ -175,6 +183,8 @@ def export_semantic_masks(
         if group_validation.get("status") == "not_applicable":
             audits.pop("split_group_audit", None)
         prune_report_directory(reports)
+        report_visualize_kwargs = dict(visualize_kwargs)
+        report_visualize_kwargs.pop("label_fn", None)
         plot = render_dataset_report(
             staging,
             records,
@@ -186,6 +196,7 @@ def export_semantic_masks(
             # Source coverage is inherited from the operation that produced the
             # polygons, so a mask export reports it exactly like a YOLO export.
             coverage=audits.get("coverage.source_coverage"),
+            visualize_kwargs=report_visualize_kwargs,
         )
         visuals = ["reports/plots.png"] if plot is not None else []
         if load_validation.get("skipped_count", 0):
@@ -384,6 +395,7 @@ def _provenance_record(
             "crop_transform_warnings",
             "lossy_clipping",
             "split_group",
+            "display_label",
         )
         if key in parent
     }
@@ -481,4 +493,3 @@ def _validate_semantic_tree(staging: Path, records: list[dict[str, Any]]) -> Non
                 },
             )
         )
-

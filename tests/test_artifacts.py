@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from dataset_fixer import Dataset, DatasetTrace, DatasetValidationError
 from dataset_fixer.artifacts import (
@@ -19,6 +19,7 @@ from dataset_fixer.artifacts import (
     write_lineage,
 )
 from dataset_fixer.dataset_report import render_dataset_report
+from dataset_fixer.visualization import draw_label_position_heatmap
 from dataset_fixer.validation_audit import stage_load_validation_audit
 from conftest import make_yolo_dataset
 
@@ -223,6 +224,64 @@ def test_report_captions_are_trimmed_to_fit_their_column() -> None:
     short = "val/images/a.png  ·  annotated"
     assert _fit_middle(short, font, 540, keep_suffix=14) == short
     assert _text_width(_fit("x" * 400, font, 300), font) <= 300
+
+
+def test_label_position_heatmaps_preserve_coordinate_frame_aspect_ratio() -> None:
+    canvas = Image.new("RGB", (500, 250), "white")
+    draw = ImageDraw.Draw(canvas)
+    source = {"labels": [[0] * 24 for _ in range(12)], "uncovered": []}
+    output = {"labels": [[0] * 12 for _ in range(12)]}
+
+    _, _, source_box = draw_label_position_heatmap(
+        draw,
+        (0, 0, 400, 200),
+        source,
+    )
+    _, _, output_box = draw_label_position_heatmap(
+        draw,
+        (0, 0, 400, 200),
+        output,
+    )
+
+    source_width = source_box[2] - source_box[0]
+    source_height = source_box[3] - source_box[1]
+    output_width = output_box[2] - output_box[0]
+    output_height = output_box[3] - output_box[1]
+    assert source_width / source_height == pytest.approx(2.0)
+    assert output_width / output_height == pytest.approx(1.0)
+
+
+def test_coverage_panel_includes_source_image_representation_bar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataset_fixer import dataset_report
+
+    bars: list[dict[str, object]] = []
+
+    def capture_bar(_draw, _box, **kwargs) -> None:
+        bars.append(kwargs)
+
+    monkeypatch.setattr(dataset_report, "_draw_ratio_bar", capture_bar)
+    dataset_report._render_coverage(
+        {
+            "source_labels": 10,
+            "source_labels_covered_at_least_once": 10,
+            "source_label_coverage_percent": 100.0,
+            "source_image_space_coverage_percent": 12.5,
+            "source_images": 20,
+            "source_images_represented": 15,
+            "source_image_representation_percent": 75.0,
+            "splits": {},
+        },
+        width=2400,
+    )
+
+    represented = next(
+        bar for bar in bars if str(bar["filled_label"]).startswith("images represented")
+    )
+    assert represented["fraction"] == pytest.approx(0.75)
+    assert represented["filled_label"] == "images represented 75.0%"
+    assert represented["empty_label"] == "not represented 25.0%"
 
 
 def test_semantic_dataset_report_overlays_masks_in_red(tmp_path: Path) -> None:

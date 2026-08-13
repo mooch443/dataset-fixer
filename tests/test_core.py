@@ -641,6 +641,208 @@ def test_remove_classes_compacts_and_chains_original(detect_dataset: Path, tmp_p
     assert (clean.location / "reports" / "plots.png").is_file()
 
 
+def test_remove_classes_can_drop_every_image_containing_removed_class(
+    detect_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+
+    planned = dataset.remove_classes(
+        [1],
+        drop_containing_images=True,
+        visualize=False,
+        progress=False,
+    )
+
+    # Class 1 occurs on three images. One of them also contains class 0, and
+    # must still be dropped because matching is image-level.
+    assert {sample.image_path.name for sample in planned._samples} == {
+        "train_1.jpg",
+        "train_3.jpg",
+        "val_0.jpg",
+    }
+    assert planned.classes == {0: "fruit"}
+    assert planned.history[-1]["settings"]["dropped_containing_images"] == 3
+    assert all(
+        annotation.class_id == 0
+        for sample in planned._samples
+        for annotation in sample.annotations
+    )
+
+    exported = planned.export(
+        destination=tmp_path / "drop-containing",
+        visualize=False,
+        progress=False,
+    )
+
+    assert len(exported._samples) == 3
+    counts = _audit(exported, "class_counts")
+    assert counts["images"] == {
+        "result": 3,
+        "dropped_containing_removed_classes": 3,
+    }
+
+
+def test_remove_classes_rejects_drop_containing_with_merge(
+    detect_dataset: Path,
+) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        dataset.remove_classes(
+            [1],
+            merge_into=0,
+            drop_containing_images=True,
+            visualize=False,
+        )
+
+
+def test_move_images_with_classes_moves_whole_images_and_preserves_labels(
+    detect_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+    original_annotations = {
+        sample.image_path.name: [annotation.class_id for annotation in sample.annotations]
+        for sample in dataset._samples
+    }
+
+    planned = dataset.move_images_with_classes(
+        ["damaged"],
+        to_split="test",
+        group_by=lambda path: path.name,
+        visualize=False,
+        progress=False,
+    )
+
+    assert planned.splits == ("train", "val", "test")
+    assert planned.classes == dataset.classes
+    assert planned.history[-1]["settings"]["matched_images"] == 3
+    assert planned.history[-1]["settings"]["moved_images"] == 3
+    for sample in planned._samples:
+        if 1 in original_annotations[sample.image_path.name]:
+            assert sample.split == "test"
+        else:
+            assert sample.split in {"train", "val"}
+        assert [annotation.class_id for annotation in sample.annotations] == (
+            original_annotations[sample.image_path.name]
+        )
+
+    exported = planned.export(
+        destination=tmp_path / "class-quarantine",
+        visualize=False,
+        progress=False,
+    )
+
+    assert len(exported._samples) == len(dataset._samples)
+    moved_records = [
+        record
+        for record in exported.provenance.values()
+        if record.get("class_move", {}).get("moved")
+    ]
+    assert len(moved_records) == 3
+    assert all(record["output_split"] == "test" for record in moved_records)
+    summary = _audit(exported, "class_move_summary")
+    assert summary["distribution"] == {"test": 3, "train": 2, "val": 1}
+
+
+def test_move_images_with_classes_honours_source_splits(
+    detect_dataset: Path,
+) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+
+    planned = dataset.move_images_with_classes(
+        [1],
+        to_split="test",
+        group_by=lambda path: path.name,
+        source_splits=("train",),
+        visualize=False,
+        progress=False,
+    )
+
+    assert {
+        sample.image_path.name: sample.split for sample in planned._samples
+    }["val_1.jpg"] == "val"
+    assert sum(sample.split == "test" for sample in planned._samples) == 2
+
+
+def test_move_images_with_classes_expands_to_complete_groups(
+    detect_dataset: Path,
+) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+
+    planned = dataset.move_images_with_classes(
+        [1],
+        to_split="test",
+        source_splits=("train",),
+        group_by=lambda path: path.parent.name,
+        visualize=False,
+        progress=False,
+    )
+
+    # Both train groups contain one class-1 trigger, so their class-0 group
+    # mates move as well. Validation never triggered a move and stays put.
+    assert {sample.split for sample in planned._samples if sample.image_path.name.startswith("train_")} == {"test"}
+    assert {sample.split for sample in planned._samples if sample.image_path.name.startswith("val_")} == {"val"}
+    settings = planned.history[-1]["settings"]
+    assert settings["matched_images"] == 2
+    assert settings["matched_groups"] == 2
+    assert settings["selected_group_images"] == 4
+    assert settings["group_expansion_images"] == 2
+
+
+def test_move_n_groups_is_deterministic_and_group_atomic(
+    detect_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    dataset = Dataset.open(detect_dataset, task="detect", progress=False)
+
+    def get_group(path: Path) -> str:
+        return path.parent.name
+
+    first = dataset.move_n_groups(
+        n=1,
+        from_split="train",
+        to_split="test",
+        group_by=get_group,
+        seed=17,
+        visualize=False,
+        progress=False,
+    )
+    second = dataset.move_n_groups(
+        n=1,
+        from_split="train",
+        to_split="test",
+        group_by=get_group,
+        seed=17,
+        visualize=False,
+        progress=False,
+    )
+
+    first_test = {sample.image_path.name for sample in first._samples if sample.split == "test"}
+    second_test = {sample.image_path.name for sample in second._samples if sample.split == "test"}
+    assert first_test == second_test
+    assert len(first_test) == 2
+    assert first.history[-1]["settings"]["selected_groups"] == 1
+    assert first.history[-1]["settings"]["moved_images"] == 2
+
+    exported = first.export(
+        destination=tmp_path / "one-group",
+        visualize=False,
+        progress=False,
+    )
+    report = _audit(exported, "split_group_audit")
+    assert report["status"] == "passed"
+    assert report["overlap_count"] == 0
+    assert len(
+        {
+            record["group_move"]["group"]
+            for record in exported.provenance.values()
+            if "group_move" in record
+        }
+    ) == 1
+
+
 @pytest.mark.parametrize(
     ("removed", "merge_into", "expected_name"),
     [

@@ -42,6 +42,8 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
         "provenance",
         "training_ready",
         "split",
+        "move_images_with_classes",
+        "move_n_groups",
         "remove_classes",
         "rename_classes",
         "rebalance_empty",

@@ -24,6 +24,8 @@ from .io import _label_path_for_image, load_source
 from .models import DatasetMetadata, Sample, Task
 from .operations import (
     export_dataset,
+    move_images_with_classes as materialize_move_images_with_classes,
+    move_n_groups as materialize_move_n_groups,
     rebalance_empty_dataset,
     remove_classes as materialize_remove_classes,
     rename_classes as materialize_rename_classes,
@@ -35,7 +37,10 @@ from .planning import (
     clone_sample,
     derived_name,
     plan_split,
+    project_move_images_with_classes,
+    project_move_n_groups,
     project_remove_classes,
+    resolve_class_selectors,
     resolve_removed_classes,
     resolve_renamed_classes,
     select_empty_images,
@@ -46,10 +51,22 @@ from .tracing import DatasetTrace, trace_dataset
 from .utils import IMAGE_SUFFIXES, ensure_safe_destination, normalize_split, settings_fingerprint, slugify
 from .validation import validate_dataset
 from .validation_audit import ValidationFailureExample, build_load_validation_audit
-from .visualization import visualize_samples, visualize_semantic_masks
+from .visualization import (
+    display_report,
+    normalize_visualize_kwargs,
+    visualize_samples,
+    visualize_semantic_masks,
+)
 
 if TYPE_CHECKING:
     from .model import Model, PredictionResult
+
+
+def _visualize_kwargs_description(options: Mapping[str, Any]) -> dict[str, Any]:
+    description = dict(options)
+    if "label_fn" in description:
+        description["label_fn"] = callback_description(options["label_fn"])
+    return description
 
 
 class Dataset:
@@ -683,6 +700,171 @@ class Dataset:
             planned_splits=tuple(split for split in ("train", "val", "test") if settings["ratios"].get(split, 0) > 0),
         )
 
+    def move_images_with_classes(
+        self,
+        classes: Iterable[str | int],
+        *,
+        to_split: Literal["train", "val", "test"],
+        group_by: Callable[[Path], Hashable],
+        name: str | None = None,
+        source_splits: Iterable[Literal["train", "val", "test"]] | None = None,
+        visualize: bool = True,
+        progress: bool = True,
+    ) -> "Dataset":
+        """Move whole images containing selected classes to one split.
+
+        A selected annotation triggers a move of the complete image with all
+        annotations intact. Every image sharing its ``group_by`` key moves
+        with it, including group mates outside
+        ``source_splits``. Nonmatching, ungrouped images retain their split.
+
+        Parameters:
+            classes: Class names or integer IDs whose presence selects an image.
+            to_split: Destination split for every matching image.
+            name: Optional virtual-derivative name.
+            source_splits: Existing splits eligible for matching. ``None``
+                checks every split. This restricts class-match triggers, not
+                expansion to the rest of a triggered physical group.
+            group_by: Callback from image path to a stable, hashable group key.
+                If one image triggers a move, its complete group moves.
+            visualize: Produce before/after split-count audits at export.
+            progress: Show export-time progress.
+
+        Returns:
+            A virtual dataset with projected split membership.
+        """
+
+        self._require_vector_annotations("Dataset.move_images_with_classes")
+        if not callable(group_by):
+            raise TypeError("group_by must be callable")
+        selectors = tuple(classes)
+        class_ids = resolve_class_selectors(self._metadata, selectors)
+        target = normalize_split(to_split)
+        source_split_values = (
+            tuple(source_splits) if source_splits is not None else None
+        )
+        selected = (
+            {normalize_split(split) for split in source_split_values}
+            if source_split_values is not None
+            else set(self.splits)
+        )
+        if not selected:
+            raise ValueError("source_splits must select at least one split")
+        projected, summary, _ = project_move_images_with_classes(
+            self._samples,
+            selected_splits=selected,
+            class_ids=class_ids,
+            to_split=target,
+            group_by=group_by,
+        )
+        settings = {
+            "selected_classes": {
+                class_id: self._metadata.names[class_id]
+                for class_id in sorted(class_ids)
+            },
+            "source_splits": sorted(selected),
+            "to_split": target,
+            "group_by": callback_description(group_by),
+            **summary,
+            "visualize": visualize,
+        }
+        operation = PlannedOperation(
+            "move-images-with-classes",
+            {
+                "classes": selectors,
+                "to_split": target,
+                "source_splits": source_split_values,
+                "group_by": group_by,
+                "visualize": visualize,
+            },
+            settings,
+        )
+        present = {sample.split for sample in projected}
+        return self._with_plan(
+            operation,
+            samples=projected,
+            name=name,
+            planned_splits=tuple(
+                split for split in ("train", "val", "test") if split in present
+            ),
+        )
+
+    def move_n_groups(
+        self,
+        *,
+        n: int,
+        from_split: Literal["train", "val", "test"],
+        to_split: Literal["train", "val", "test"],
+        group_by: Callable[[Path], Hashable],
+        seed: int = 42,
+        name: str | None = None,
+        visualize: bool = True,
+        progress: bool = True,
+    ) -> "Dataset":
+        """Move a deterministic sample of complete physical groups.
+
+        Groups are eligible when at least one member is currently in
+        ``from_split``. Selecting a group moves every one of its members to
+        ``to_split``, including members currently found in another split, so
+        the operation cannot create cross-split group leakage.
+
+        Parameters:
+            n: Exact number of distinct eligible groups to select.
+            from_split: Split whose members make a group eligible.
+            to_split: Destination for every member of each selected group.
+            group_by: Callback from image path to a stable, hashable group key.
+            seed: Deterministic group-sampling seed.
+            name: Optional virtual-derivative name.
+            visualize: Produce before/after split-count audits at export.
+            progress: Show export-time progress.
+
+        Returns:
+            A virtual dataset with projected group-atomic split membership.
+        """
+
+        self._require_vector_annotations("Dataset.move_n_groups")
+        if not callable(group_by):
+            raise TypeError("group_by must be callable")
+        source = normalize_split(from_split)
+        target = normalize_split(to_split)
+        projected, summary, _ = project_move_n_groups(
+            self._samples,
+            n=n,
+            from_split=source,
+            to_split=target,
+            group_by=group_by,
+            seed=seed,
+        )
+        settings = {
+            "from_split": source,
+            "to_split": target,
+            "group_by": callback_description(group_by),
+            "seed": seed,
+            **summary,
+            "visualize": visualize,
+        }
+        operation = PlannedOperation(
+            "move-n-groups",
+            {
+                "n": n,
+                "from_split": source,
+                "to_split": target,
+                "group_by": group_by,
+                "seed": seed,
+                "visualize": visualize,
+            },
+            settings,
+        )
+        present = {sample.split for sample in projected}
+        return self._with_plan(
+            operation,
+            samples=projected,
+            name=name,
+            planned_splits=tuple(
+                split for split in ("train", "val", "test") if split in present
+            ),
+        )
+
     def remove_classes(
         self,
         classes: Iterable[str | int],
@@ -691,6 +873,7 @@ class Dataset:
         name: str | None = None,
         splits: Iterable[Literal["train", "val", "test"]] | None = None,
         drop_empty_images: bool = False,
+        drop_containing_images: bool = False,
         visualize: bool = True,
         progress: bool = True,
     ) -> "Dataset":
@@ -708,6 +891,10 @@ class Dataset:
             drop_empty_images: Remove every selected output image with no
                 remaining annotations, including inputs that were already
                 empty. Otherwise they remain negative/background examples.
+            drop_containing_images: Remove a whole selected image when any of
+                its original annotations belongs to a removed class. This also
+                removes mixed-class images; the match is evaluated before
+                annotations are discarded or class IDs are compacted.
             visualize: Produce before/after class-count audits at export.
             progress: Show export-time progress.
 
@@ -716,6 +903,14 @@ class Dataset:
         """
 
         self._require_vector_annotations("Dataset.remove_classes")
+        if not isinstance(drop_empty_images, bool):
+            raise TypeError("drop_empty_images must be a bool")
+        if not isinstance(drop_containing_images, bool):
+            raise TypeError("drop_containing_images must be a bool")
+        if drop_containing_images and merge_into is not None:
+            raise ValueError(
+                "drop_containing_images and merge_into are mutually exclusive"
+            )
         selectors = tuple(classes)
         split_values = tuple(splits) if splits is not None else None
         removed, mapping, metadata = resolve_removed_classes(
@@ -725,11 +920,23 @@ class Dataset:
         )
         selected = {normalize_split(split) for split in split_values} if split_values else set(self.splits)
         projected = project_remove_classes(
-            self._samples, selected_splits=selected, mapping=mapping, drop_empty_images=drop_empty_images
+            self._samples,
+            selected_splits=selected,
+            removed_classes=removed,
+            mapping=mapping,
+            drop_empty_images=drop_empty_images,
+            drop_containing_images=drop_containing_images,
         )
+        dropped_containing_images = sum(
+            sample.split in selected
+            and any(annotation.class_id in removed for annotation in sample.annotations)
+            for sample in self._samples
+        ) if drop_containing_images else 0
         settings = {
             "removed_classes": {class_id: self._metadata.names[class_id] for class_id in sorted(removed)},
             "splits": sorted(selected), "drop_empty_images": drop_empty_images,
+            "drop_containing_images": drop_containing_images,
+            "dropped_containing_images": dropped_containing_images,
             "class_mapping": mapping, "visualize": visualize,
         }
         if merge_into is not None:
@@ -744,7 +951,9 @@ class Dataset:
             {
                 "classes": selectors, "splits": split_values,
                 "merge_into": merge_into,
-                "drop_empty_images": drop_empty_images, "visualize": visualize,
+                "drop_empty_images": drop_empty_images,
+                "drop_containing_images": drop_containing_images,
+                "visualize": visualize,
             },
             settings,
         )
@@ -753,7 +962,11 @@ class Dataset:
             samples=projected,
             metadata=metadata,
             name=name,
-            planned_splits=tuple(split for split in ("train", "val", "test") if split in selected),
+            planned_splits=tuple(
+                split
+                for split in ("train", "val", "test")
+                if any(sample.split == split for sample in projected)
+            ),
         )
 
     def rename_classes(
@@ -862,32 +1075,33 @@ class Dataset:
         name: str | None = None,
         splits: Iterable[Literal["train", "val", "test"]] | None = None,
         tile_size: int = 480,
-        overlap: float = 0.2,
-        min_area_ratio: float = 0.1,
-        negative_tiles: Literal["all", "none"] | float = "all",
-        scale_range: tuple[float, float] = (0.75, 1.25),
-        target_appearances_per_object: int = 5,
-        sparse_appearances_per_object: int = 1,
+        overlap: float | None = None,
+        min_area_ratio: float | None = None,
+        negative_tiles: Literal["all", "none"] | float | None = None,
+        scale_range: tuple[float, float] | None = None,
+        target_appearances_per_object: int | None = None,
+        sparse_appearances_per_object: int | None = None,
         object_appearance_overrides: Mapping[str | int, int] | None = None,
-        min_nearby_objects_for_full_coverage: int = 5,
+        min_nearby_objects_for_full_coverage: int | None = None,
         dense_neighbor_radius_px: float | None = None,
-        background_ratio: float = 0.1,
+        background_ratio: float | Mapping[str, float | Sequence[float] | None] | None = None,
         large_image_threshold: int | None = None,
-        max_attempts_per_target: int = 15,
-        max_background_attempts_per_tile: int = 15,
+        max_attempts_per_target: int | None = None,
+        max_background_attempts_per_tile: int | None = None,
         max_tiles_per_source_image: int | None = 100,
         max_background_tiles_per_source_image: int | None = None,
         polo_radius_px: float | None = 15.0,
-        radius_multiplier: float = 1.0,
+        radius_multiplier: float | None = None,
         seed: int = 42,
         jpeg_quality: int = 95,
-        allow_lossy: bool = False,
+        allow_lossy: bool | Literal["not_focal"] = False,
         crop_transforms: Any | None = None,
         val_crop_transforms: Any | None = None,
         augment_val: bool = False,
         background_filter: Callable[[Image.Image], bool] | None = None,
         errors: Literal["raise", "skip"] = "raise",
         visualize: bool = True,
+        visualize_kwargs: Mapping[str, Any] | None = None,
         progress: bool = True,
     ) -> "Dataset":
         """Plan task-aware grid tiles or coverage-targeted random crops.
@@ -915,13 +1129,20 @@ class Dataset:
             tile_size: Grid window edge or coverage output edge, in pixels.
             min_area_ratio: Minimum retained fraction of an object's original
                 box/mask area. Applies to clipped detection, segmentation, and
-                pose annotations in either mode.
-            allow_lossy: Permit dropping RLE/multipart masks or keeping the
-                largest polygon fragment when one YOLO polygon cannot represent
-                the crop exactly. In coverage mode, ``False`` also rejects and
-                resamples crops that cut through any source annotation; export
-                raises rather than returning fewer requested appearances when
-                no lossless replacement can be found.
+                pose annotations in grid mode and lossy coverage mode. It must
+                be omitted when coverage uses ``allow_lossy=False``, because
+                strict coverage rejects every partial annotation.
+            allow_lossy: ``False`` rejects coverage crops that cut any source
+                annotation. ``"not_focal"`` requires the annotation targeted by
+                the crop to remain complete, while allowing incidental
+                annotations crossing the crop boundary to be clipped or
+                dropped according to ``min_area_ratio``. ``True`` also permits
+                clipping the focal annotation. Lossy segmentation conversion
+                may keep the largest polygon fragment when one YOLO row cannot
+                represent every component. If no square crop can cover a label,
+                the final strict fallback letterboxes the complete source image
+                into one tile without clipping. Export can still fail for
+                invalid or otherwise non-representable source geometry.
             crop_transforms: Optional serializable Albumentations pipeline
                 applied to a virtual full-source view before each coverage
                 crop is selected. This is supported only in coverage mode.
@@ -945,6 +1166,12 @@ class Dataset:
                 candidate, records the detailed reason, and continues sampling
                 coverage replacements or omits the affected grid window.
             visualize: Generate previews and audit images during export.
+            visualize_kwargs: Options forwarded to preview rendering. Supported
+                keys currently include ``label_fn``, ``line_width``, and
+                ``outline_width``. A label callback receives each preview image
+                path and may return ``None`` to suppress its title. Resolved
+                titles are retained in output lineage for later reports and
+                :meth:`visualize` calls.
             progress: Show materialization progress during export.
 
         Grid parameters:
@@ -971,15 +1198,27 @@ class Dataset:
                 counting; defaults to half ``tile_size``.
             background_ratio: Target fraction of all output images that contain
                 no annotations, applied independently to each selected split.
+                Pass a mapping to configure splits separately; it must contain
+                exactly the selected splits. A ``None`` value targets that
+                split's input empty-image fraction on a best-effort basis. A
+                two-value sequence defines an accepted ``[minimum, maximum]``
+                range: sampling aims for the maximum and raises only when it
+                cannot reach the minimum. For example,
+                ``{"train": 0.75, "test": None}`` keeps train exact while
+                preserving test's input composition as closely as possible;
+                ``{"train": 0.75, "test": [0.25, 0.75]}`` accepts a test
+                background fraction from 25% through 75%.
                 This includes copied small images and generated crops. Existing
                 empty images and object-free regions cropped from populated
-                images are sampled in an equal 50/50 mix where possible. If
-                one source type cannot supply its half, the other type fills
-                the remainder and the export records a warning and exact counts
-                in ``coverage_summary/tile_summary.csv``.
-                The nearest achievable whole-image count is used, and export
-                raises rather than silently returning a different count when
-                insufficient object-free crops exist. Must be in ``[0, 1)``.
+                images share one candidate pool; every currently eligible source
+                image has equal sampling probability, independent of whether it
+                contains annotations. Exact source-type counts are recorded in
+                ``coverage_summary/tile_summary.csv``.
+                Exact values use the nearest achievable whole-image count and
+                raise when it cannot be produced. Ranges use whole-image counts
+                inside their bounds and raise only below the lower bound;
+                ``None`` never raises for a missed background target. Numeric
+                fractions and range endpoints must be in ``[0, 1)``.
             large_image_threshold: Images whose largest edge is at or below
                 this value are copied once instead of coverage-sampled.
                 ``None`` uses ``tile_size``.
@@ -1007,6 +1246,14 @@ class Dataset:
         mode = mode.lower()
         if mode not in {"grid", "coverage"}:
             raise ValueError("mode must be 'grid' or 'coverage'")
+        split_values = tuple(splits) if splits is not None else None
+        selected_splits = (
+            {normalize_split(split) for split in split_values}
+            if split_values is not None
+            else set(self.splits)
+        )
+        if not isinstance(allow_lossy, bool) and allow_lossy != "not_focal":
+            raise TypeError("allow_lossy must be False, True, or 'not_focal'")
         errors = errors.lower()
         if errors not in {"raise", "skip"}:
             raise ValueError("errors must be 'raise' or 'skip'")
@@ -1027,8 +1274,243 @@ class Dataset:
             raise ValueError(
                 "val_crop_transforms is supported only when mode='coverage'"
             )
+        if augment_val and "val" not in selected_splits:
+            raise ValueError(
+                "augment_val=True has no effect when the selected splits exclude val"
+            )
+        if val_crop_transforms is not None and "val" not in selected_splits:
+            raise ValueError(
+                "val_crop_transforms has no effect when the selected splits exclude val"
+            )
+        if crop_transforms is not None and not (
+            "train" in selected_splits
+            or ("val" in selected_splits and augment_val)
+        ):
+            raise ValueError(
+                "crop_transforms has no effect for the selected splits; it applies "
+                "to train and to val only when augment_val=True"
+            )
         if background_filter is not None and not callable(background_filter):
             raise TypeError("background_filter must be callable or None")
+        visualization_options = normalize_visualize_kwargs(visualize_kwargs)
+        visualization_description = _visualize_kwargs_description(
+            visualization_options
+        )
+        if self.task is Task.POLO and min_area_ratio is not None:
+            raise ValueError(
+                "min_area_ratio does not apply to POLO circles; use "
+                "allow_lossy to control radius clipping"
+            )
+
+        if mode == "coverage":
+            if overlap is not None:
+                raise ValueError("overlap is supported only when mode='grid'")
+            if negative_tiles is not None:
+                raise ValueError(
+                    "negative_tiles is supported only when mode='grid'; "
+                    "use background_ratio in coverage mode"
+                )
+            if allow_lossy is False and min_area_ratio is not None:
+                raise ValueError(
+                    "min_area_ratio must be omitted when mode='coverage' and "
+                    "allow_lossy=False; strict coverage rejects partial annotations"
+                )
+        else:
+            incompatible: list[str] = []
+            for parameter, value in (
+                ("scale_range", scale_range),
+                ("target_appearances_per_object", target_appearances_per_object),
+                ("sparse_appearances_per_object", sparse_appearances_per_object),
+                ("object_appearance_overrides", object_appearance_overrides),
+                (
+                    "min_nearby_objects_for_full_coverage",
+                    min_nearby_objects_for_full_coverage,
+                ),
+                ("dense_neighbor_radius_px", dense_neighbor_radius_px),
+                ("background_ratio", background_ratio),
+                ("large_image_threshold", large_image_threshold),
+                ("max_attempts_per_target", max_attempts_per_target),
+                (
+                    "max_background_attempts_per_tile",
+                    max_background_attempts_per_tile,
+                ),
+                (
+                    "max_background_tiles_per_source_image",
+                    max_background_tiles_per_source_image,
+                ),
+                ("radius_multiplier", radius_multiplier),
+            ):
+                if value is not None:
+                    incompatible.append(parameter)
+            if max_tiles_per_source_image != 100:
+                incompatible.append("max_tiles_per_source_image")
+            if polo_radius_px != 15.0:
+                incompatible.append("polo_radius_px")
+            if allow_lossy == "not_focal":
+                incompatible.append("allow_lossy='not_focal'")
+            elif allow_lossy and self.task in {Task.DETECT, Task.POSE}:
+                incompatible.append("allow_lossy")
+            if incompatible:
+                raise ValueError(
+                    "These parameters are supported only when mode='coverage': "
+                    + ", ".join(incompatible)
+                )
+
+        effective_overlap = 0.2 if overlap is None else float(overlap)
+        effective_min_area_ratio = (
+            0.1
+            if min_area_ratio is None and (mode == "grid" or allow_lossy is not False)
+            else 1.0
+            if min_area_ratio is None
+            else float(min_area_ratio)
+        )
+        effective_negative_tiles: Literal["all", "none"] | float = (
+            "all" if negative_tiles is None else negative_tiles
+        )
+        effective_scale_range = (
+            (0.75, 1.25) if scale_range is None else scale_range
+        )
+        effective_target_appearances = (
+            5 if target_appearances_per_object is None else target_appearances_per_object
+        )
+        effective_sparse_appearances = (
+            1 if sparse_appearances_per_object is None else sparse_appearances_per_object
+        )
+        effective_min_nearby = (
+            5
+            if min_nearby_objects_for_full_coverage is None
+            else min_nearby_objects_for_full_coverage
+        )
+        raw_background_ratio = 0.1 if background_ratio is None else background_ratio
+        if isinstance(raw_background_ratio, Mapping):
+            effective_background_ratio: float | dict[
+                str, float | tuple[float, float] | None
+            ] = {}
+            for raw_split, raw_ratio in raw_background_ratio.items():
+                if not isinstance(raw_split, str):
+                    raise TypeError("background_ratio mapping keys must be split names")
+                split = normalize_split(raw_split)
+                if split in effective_background_ratio:
+                    raise ValueError(
+                        f"background_ratio contains duplicate entries for split {split!r}"
+                    )
+                if raw_ratio is None:
+                    effective_background_ratio[split] = None
+                elif isinstance(raw_ratio, (list, tuple)):
+                    if len(raw_ratio) != 2:
+                        raise ValueError(
+                            "background_ratio ranges must contain exactly two values"
+                        )
+                    low, high = raw_ratio
+                    if (
+                        not isinstance(low, (int, float))
+                        or isinstance(low, bool)
+                        or not isinstance(high, (int, float))
+                        or isinstance(high, bool)
+                        or not math.isfinite(float(low))
+                        or not math.isfinite(float(high))
+                        or not 0 <= float(low) <= float(high) < 1
+                    ):
+                        raise ValueError(
+                            "background_ratio ranges must be finite ascending "
+                            "fractions in [0, 1)"
+                        )
+                    effective_background_ratio[split] = (
+                        float(low),
+                        float(high),
+                    )
+                elif (
+                    isinstance(raw_ratio, (int, float))
+                    and not isinstance(raw_ratio, bool)
+                    and math.isfinite(float(raw_ratio))
+                    and 0 <= float(raw_ratio) < 1
+                ):
+                    effective_background_ratio[split] = float(raw_ratio)
+                else:
+                    raise ValueError(
+                        "background_ratio mapping values must be None, finite "
+                        "fractions in [0, 1), or two-value fraction ranges"
+                    )
+            missing = sorted(selected_splits - effective_background_ratio.keys())
+            extra = sorted(effective_background_ratio.keys() - selected_splits)
+            if missing or extra:
+                raise ValueError(
+                    "background_ratio mapping must contain exactly the selected splits; "
+                    f"missing={missing}, unselected={extra}"
+                )
+        else:
+            if (
+                not isinstance(raw_background_ratio, (int, float))
+                or isinstance(raw_background_ratio, bool)
+                or not math.isfinite(float(raw_background_ratio))
+                or not 0 <= float(raw_background_ratio) < 1
+            ):
+                raise ValueError(
+                    "background_ratio must be a finite final background fraction "
+                    "in [0, 1), or a per-split mapping of fractions, ranges, or None"
+                )
+            effective_background_ratio = float(raw_background_ratio)
+        effective_max_attempts = 15 if max_attempts_per_target is None else max_attempts_per_target
+        effective_max_background_attempts = (
+            15
+            if max_background_attempts_per_tile is None
+            else max_background_attempts_per_tile
+        )
+        effective_radius_multiplier = 1.0 if radius_multiplier is None else radius_multiplier
+        background_ratios = (
+            list(effective_background_ratio.values())
+            if isinstance(effective_background_ratio, dict)
+            else [effective_background_ratio]
+        )
+        if mode == "coverage" and all(
+            ratio == 0
+            or (
+                isinstance(ratio, tuple)
+                and ratio[1] == 0
+            )
+            for ratio in background_ratios
+        ):
+            unused_background = []
+            if max_background_attempts_per_tile is not None:
+                unused_background.append("max_background_attempts_per_tile")
+            if max_background_tiles_per_source_image is not None:
+                unused_background.append("max_background_tiles_per_source_image")
+            if background_filter is not None:
+                unused_background.append("background_filter")
+            if unused_background:
+                raise ValueError(
+                    "background_ratio=0 disables background sampling in every selected "
+                    "split, making these parameters ineffective: "
+                    + ", ".join(unused_background)
+                )
+        if mode == "coverage" and self.task is not Task.POLO:
+            polo_only = []
+            if polo_radius_px != 15.0:
+                polo_only.append("polo_radius_px")
+            if radius_multiplier is not None:
+                polo_only.append("radius_multiplier")
+            if polo_only:
+                raise ValueError(
+                    "These parameters apply only to POLO datasets: "
+                    + ", ".join(polo_only)
+                )
+        if mode == "grid" and background_filter is not None and (
+            effective_negative_tiles == "none"
+            or (
+                isinstance(effective_negative_tiles, (int, float))
+                and not isinstance(effective_negative_tiles, bool)
+                and float(effective_negative_tiles) == 0
+            )
+        ):
+            raise ValueError(
+                "background_filter has no effect when grid tiling keeps no negative tiles"
+            )
+        if mode == "grid" and seed != 42 and not isinstance(
+            effective_negative_tiles, (int, float)
+        ):
+            raise ValueError(
+                "seed affects grid tiling only when negative_tiles is a numeric fraction"
+            )
         crop_pipeline = serialize_pipeline(crop_transforms, {}) if crop_transforms is not None else None
         val_crop_pipeline = (
             serialize_pipeline(val_crop_transforms, {})
@@ -1038,23 +1520,17 @@ class Dataset:
         background_filter_description = callback_description(background_filter)
         if mode == "grid":
             if not (
-                negative_tiles in {"all", "none"}
+                effective_negative_tiles in {"all", "none"}
                 or (
-                    isinstance(negative_tiles, (int, float))
-                    and not isinstance(negative_tiles, bool)
-                    and math.isfinite(float(negative_tiles))
-                    and 0 <= float(negative_tiles) < 1
+                    isinstance(effective_negative_tiles, (int, float))
+                    and not isinstance(effective_negative_tiles, bool)
+                    and math.isfinite(float(effective_negative_tiles))
+                    and 0 <= float(effective_negative_tiles) < 1
                 )
             ):
                 raise ValueError(
                     "negative_tiles must be 'all', 'none', or a finite final background fraction in [0, 1)"
                 )
-        elif (
-            not math.isfinite(float(background_ratio))
-            or not 0 <= float(background_ratio) < 1
-        ):
-            raise ValueError("background_ratio must be a finite final background fraction in [0, 1)")
-        split_values = tuple(splits) if splits is not None else None
         appearance_overrides = dict(object_appearance_overrides or {})
         if mode == "coverage" and appearance_overrides and self._projection_exact:
             source_ids = {
@@ -1071,20 +1547,20 @@ class Dataset:
                     "use annotation source IDs from load warnings or coverage reports"
                 )
         coverage_settings = {
-            "scale_range": tuple(scale_range),
-            "target_appearances_per_object": target_appearances_per_object,
-            "sparse_appearances_per_object": sparse_appearances_per_object,
+            "scale_range": tuple(effective_scale_range),
+            "target_appearances_per_object": effective_target_appearances,
+            "sparse_appearances_per_object": effective_sparse_appearances,
             "object_appearance_overrides": appearance_overrides,
-            "min_nearby_objects_for_full_coverage": min_nearby_objects_for_full_coverage,
+            "min_nearby_objects_for_full_coverage": effective_min_nearby,
             "dense_neighbor_radius_px": dense_neighbor_radius_px,
-            "background_ratio": background_ratio,
+            "background_ratio": effective_background_ratio,
             "large_image_threshold": large_image_threshold,
-            "max_attempts_per_target": max_attempts_per_target,
-            "max_background_attempts_per_tile": max_background_attempts_per_tile,
+            "max_attempts_per_target": effective_max_attempts,
+            "max_background_attempts_per_tile": effective_max_background_attempts,
             "max_tiles_per_source_image": max_tiles_per_source_image,
             "max_background_tiles_per_source_image": max_background_tiles_per_source_image,
             "polo_radius_px": polo_radius_px,
-            "radius_multiplier": radius_multiplier,
+            "radius_multiplier": effective_radius_multiplier,
             "seed": seed,
             "jpeg_quality": jpeg_quality,
             "crop_pipeline": crop_pipeline,
@@ -1092,21 +1568,37 @@ class Dataset:
             "val_crop_pipeline": val_crop_pipeline,
         }
         public_settings = {
-            "mode": mode, "tile_size": tile_size, "overlap": overlap,
-            "min_area_ratio": min_area_ratio, "negative_tiles": negative_tiles,
+            "mode": mode, "tile_size": tile_size,
+            "min_area_ratio": effective_min_area_ratio,
             "allow_lossy": allow_lossy,
             "background_filter": background_filter_description,
             "errors": errors,
-            "splits": sorted({normalize_split(split) for split in split_values} if split_values else set(self.splits)),
+            "splits": sorted(selected_splits),
             "visualize": visualize,
-            **(coverage_settings if mode == "coverage" else {}),
+            "visualize_kwargs": visualization_description,
+            **(
+                coverage_settings
+                if mode == "coverage"
+                else {
+                    "overlap": effective_overlap,
+                    "negative_tiles": effective_negative_tiles,
+                    "seed": seed,
+                    "jpeg_quality": jpeg_quality,
+                }
+            ),
         }
         operation = PlannedOperation(
             "tile",
             {
                 "mode": mode, "splits": split_values, "tile_size": tile_size,
-                "overlap": overlap, "min_area_ratio": min_area_ratio, "negative_tiles": negative_tiles,
+                "overlap": effective_overlap,
+                "min_area_ratio": effective_min_area_ratio,
+                "negative_tiles": effective_negative_tiles,
+                "seed": seed,
+                "jpeg_quality": jpeg_quality,
                 "allow_lossy": allow_lossy, "visualize": visualize,
+                "visualize_kwargs": visualization_options,
+                "visualize_kwargs_description": visualization_description,
                 "background_filter": background_filter,
                 "background_filter_description": background_filter_description,
                 "errors": errors,
@@ -1261,6 +1753,7 @@ class Dataset:
         splits: Iterable[Literal["train", "val", "test"]] | None = None,
         allow_lossy: bool = False,
         visualize: bool = True,
+        visualize_kwargs: Mapping[str, Any] | None = None,
         progress: bool = True,
         dry_run: bool = False,
     ) -> "Dataset":
@@ -1283,7 +1776,10 @@ class Dataset:
                 every available split. Unselected splits are omitted.
             allow_lossy: Permit explicit lossy conversion of COCO RLE/multipart
                 masks to one YOLO polygon.
-            visualize: Render pending operation audits and final reports.
+            visualize: Render pending operation audits and display the final
+                canonical ``reports/plots.png`` inline when possible.
+            visualize_kwargs: Options forwarded to final report rendering;
+                currently ``label_fn``, ``line_width``, and ``outline_width``.
             progress: Show copying, transformation, and validation progress.
             dry_run: Validate the plan and print destinations/settings without
                 writing a dataset.
@@ -1299,38 +1795,54 @@ class Dataset:
             raise ValueError("format must be 'yolo' or 'semantic_masks'")
         if format == "semantic_masks" and allow_lossy:
             raise ValueError("allow_lossy applies only to YOLO export; semantic masks use polygon unions directly")
+        visualization_options = normalize_visualize_kwargs(visualize_kwargs)
+        visualization_description = _visualize_kwargs_description(
+            visualization_options
+        )
 
         if self._plan:
-            return self._export_plan(
+            exported = self._export_plan(
                 destination=destination,
                 name=name,
                 format=format,
                 splits=splits,
                 allow_lossy=allow_lossy,
                 visualize=visualize,
+                visualize_kwargs=visualization_options,
+                visualize_kwargs_description=visualization_description,
                 progress=progress,
                 dry_run=dry_run,
             )
-        if format == "semantic_masks":
-            return export_semantic_masks(
+        elif format == "semantic_masks":
+            exported = export_semantic_masks(
                 self,
                 destination=destination,
                 name=name,
                 splits=splits,
                 visualize=visualize,
+                visualize_kwargs=visualization_options,
+                visualize_kwargs_description=visualization_description,
                 progress=progress,
                 dry_run=dry_run,
             )
-        return export_dataset(
-            self,
-            destination=destination,
-            name=name,
-            splits=splits,
-            allow_lossy=allow_lossy,
-            visualize=visualize,
-            progress=progress,
-            dry_run=dry_run,
-        )
+        else:
+            exported = export_dataset(
+                self,
+                destination=destination,
+                name=name,
+                splits=splits,
+                allow_lossy=allow_lossy,
+                visualize=visualize,
+                visualize_kwargs=visualization_options,
+                visualize_kwargs_description=visualization_description,
+                progress=progress,
+                dry_run=dry_run,
+            )
+        if visualize and not dry_run:
+            report = exported.location / "reports" / "plots.png"
+            if report.is_file():
+                display_report(report)
+        return exported
 
     def export_formats(
         self,
@@ -1340,6 +1852,7 @@ class Dataset:
         splits: Iterable[Literal["train", "val", "test"]] | None = None,
         allow_lossy: bool = False,
         visualize: bool = True,
+        visualize_kwargs: Mapping[str, Any] | None = None,
         progress: bool = True,
         dry_run: bool = False,
     ) -> "dict[str, Dataset]":
@@ -1358,7 +1871,10 @@ class Dataset:
             splits: Splits published in every requested format.
             allow_lossy: Permit lossy conversion for the YOLO output. This is
                 rejected when YOLO is not requested.
-            visualize: Render pending operation audits and final reports.
+            visualize: Render pending operation audits and display each final
+                canonical report inline when possible.
+            visualize_kwargs: Options forwarded to report rendering; currently
+                ``label_fn``, ``line_width``, and ``outline_width``.
             progress: Show export progress and ETA.
             dry_run: Validate and print every export without writing outputs.
 
@@ -1410,6 +1926,7 @@ class Dataset:
                 splits=selected_splits,
                 allow_lossy=allow_lossy,
                 visualize=visualize,
+                visualize_kwargs=visualize_kwargs,
                 progress=progress,
                 dry_run=dry_run,
             )
@@ -1424,6 +1941,7 @@ class Dataset:
                 format="semantic_masks",
                 splits=selected_splits,
                 visualize=visualize,
+                visualize_kwargs=visualize_kwargs,
                 progress=progress,
                 dry_run=dry_run,
             )
@@ -1437,6 +1955,9 @@ class Dataset:
         n: int = 12,
         seed: int = 42,
         columns: int = 3,
+        label_fn: Callable[[Path], str | None] | None = None,
+        line_width: float | None = None,
+        outline_width: float | None = None,
         save_to: str | Path | None = None,
         show: bool = True,
     ) -> Any:
@@ -1447,6 +1968,12 @@ class Dataset:
             n: Maximum number of images.
             seed: Deterministic image-sampling seed.
             columns: Contact-sheet column count.
+            label_fn: Optional callback receiving an image path and returning
+                the title shown above that image. Return ``None`` to show no
+                title. When omitted, a title retained by a producing operation
+                is reused before falling back to the standard filename title.
+            line_width: Annotation-colour line width in rendered preview pixels.
+            outline_width: White annotation-outline width in preview pixels.
             save_to: Optional PNG/JPEG/PDF output path.
             show: Display in an active notebook or interactive backend.
 
@@ -1462,6 +1989,17 @@ class Dataset:
             )
         if n <= 0 or columns <= 0:
             raise ValueError("n and columns must be positive")
+        visualization_options = normalize_visualize_kwargs(
+            {
+                key: value
+                for key, value in {
+                    "label_fn": label_fn,
+                    "line_width": line_width,
+                    "outline_width": outline_width,
+                }.items()
+                if value is not None
+            }
+        )
         normalized = normalize_split(split) if split is not None else None
         if normalized is not None and normalized not in self.splits:
             raise ValueError(f"Unknown split {split!r}; available splits are {self.splits}")
@@ -1474,6 +2012,7 @@ class Dataset:
                 n=n,
                 seed=seed,
                 columns=columns,
+                label_fn=visualization_options.get("label_fn"),
                 save_to=destination,
                 show=show,
             )
@@ -1485,6 +2024,7 @@ class Dataset:
             n=n,
             seed=seed,
             columns=columns,
+            **visualization_options,
             save_to=destination,
             show=show,
         )
@@ -2362,6 +2902,8 @@ class Dataset:
         splits: Iterable[str] | None,
         allow_lossy: bool,
         visualize: bool,
+        visualize_kwargs: Mapping[str, Any],
+        visualize_kwargs_description: Mapping[str, Any],
         progress: bool,
         dry_run: bool,
     ) -> "Dataset":
@@ -2404,6 +2946,10 @@ class Dataset:
                 kwargs["validate_output"] = False
                 if operation.kind == "split":
                     current = split_dataset(current, **kwargs)
+                elif operation.kind == "move-images-with-classes":
+                    current = materialize_move_images_with_classes(current, **kwargs)
+                elif operation.kind == "move-n-groups":
+                    current = materialize_move_n_groups(current, **kwargs)
                 elif operation.kind == "remove-classes":
                     current = materialize_remove_classes(current, **kwargs)
                 elif operation.kind == "rename-classes":
@@ -2424,6 +2970,8 @@ class Dataset:
                     name=final_name,
                     splits=splits,
                     visualize=visualize,
+                    visualize_kwargs=visualize_kwargs,
+                    visualize_kwargs_description=visualize_kwargs_description,
                     progress=progress,
                     dry_run=False,
                 )
@@ -2434,6 +2982,8 @@ class Dataset:
                 splits=splits,
                 allow_lossy=allow_lossy,
                 visualize=visualize,
+                visualize_kwargs=visualize_kwargs,
+                visualize_kwargs_description=visualize_kwargs_description,
                 progress=progress,
                 dry_run=False,
             )

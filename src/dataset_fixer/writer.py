@@ -73,6 +73,7 @@ class OutputBuilder:
         self.validation_details: dict[str, Any] = {}
         self.visuals: list[str] = []
         self.warnings: list[str] = []
+        self.visualize_kwargs: dict[str, Any] = {}
         # Set by operations that can leave part of the source behind, so the
         # published report can state source coverage without re-deriving it.
         self.coverage_summary: dict[str, Any] | None = None
@@ -158,6 +159,8 @@ class OutputBuilder:
                 "background_filter_result",
                 "class_mapping",
                 "class_renames",
+                "class_move",
+                "group_move",
                 "split_group",
                 "empty_image",
                 "augmentation_index",
@@ -175,7 +178,14 @@ class OutputBuilder:
                 "validity_result",
                 "crop_transform_warnings",
                 "lossy_clipping",
+                "lossy_policy",
+                "focal_annotation_index",
+                "lossy_annotation_indices",
+                "lossy_non_focal_indices",
                 "coverage_relaxation",
+                "letterbox_padding_output_px",
+                "letterbox_scale_xy",
+                "display_label",
             )
             if key in parent
         }
@@ -207,6 +217,12 @@ class OutputBuilder:
             **inherited,
             **operation_provenance,
         }
+        label_fn = self.visualize_kwargs.get("label_fn")
+        if label_fn is not None:
+            display_label = label_fn(output)
+            if display_label is not None and not isinstance(display_label, str):
+                raise TypeError("label_fn must return a string or None")
+            record["display_label"] = display_label
         self.records.append(record)
 
     def write_yaml(self) -> None:
@@ -300,6 +316,8 @@ class OutputBuilder:
                 }
             )
         prune_report_directory(self.reports_dir, extra_roots=(coverage_dir,))
+        report_visualize_kwargs = dict(self.visualize_kwargs)
+        report_visualize_kwargs.pop("label_fn", None)
         plot = render_dataset_report(
             self.staging,
             self.records,
@@ -310,6 +328,7 @@ class OutputBuilder:
             output=self.reports_dir / "plots.png",
             metadata=self.metadata,
             coverage=self.coverage_summary or audits.get("coverage.source_coverage"),
+            visualize_kwargs=report_visualize_kwargs,
         )
         self.visuals = ["reports/plots.png"] if plot is not None else []
         operation_record["visuals"] = list(self.visuals)

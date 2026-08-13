@@ -27,7 +27,7 @@ print(exported.location)
 print(exported.data_yaml)
 ```
 
-`split()`, `remove_classes()`, `rebalance_empty()`, `augment()`, and `tile()` are immutable
+`split()`, `move_images_with_classes()`, `move_n_groups()`, `remove_classes()`, `rebalance_empty()`, `augment()`, and `tile()` are immutable
 in-memory planning operations. Only `export()` writes files. Export validates
 before atomic publication, records every effective setting and tool/environment
 version, and maps each output image back to its parent and ultimate original in
@@ -43,7 +43,13 @@ per class. Use `deep=True` to add SHA-256 duplicate detection across splits.
 ```python
 dataset = Dataset.open("/datasets/orchard/data.yaml", task="pose", deep=True)
 dataset.assert_trainable()  # also checks Ultralytics when it is installed
-dataset.visualize(split="train", n=12, seed=42, columns=3)
+dataset.visualize(
+    split="train",
+    n=12,
+    seed=42,
+    columns=3,
+    label_fn=lambda path: path.stem,  # return None to suppress an image title
+)
 ```
 
 Validation errors identify the file, label row or COCO annotation, bad value,
@@ -84,6 +90,22 @@ resplit = dataset.split(
 )
 
 clean = resplit.remove_classes(["damaged"], visualize=True)
+strict_clean = resplit.remove_classes(
+    ["damaged"],
+    drop_containing_images=True,
+)
+quarantined = resplit.move_images_with_classes(
+    ["damaged"],
+    to_split="test",
+    group_by=lambda path: path.parent.name,
+)
+group_sampled = quarantined.move_n_groups(
+    n=2,
+    from_split="train",
+    to_split="test",
+    group_by=lambda path: path.parent.name,
+    seed=42,
+)
 merged = resplit.remove_classes(["damaged"], merge_into="fruit")
 renamed = resplit.rename_classes({"damaged": "blemished"})
 grid = clean.tile(mode="grid", tile_size=480, overlap=0.2)
@@ -101,7 +123,22 @@ metadata is written by `export()`.
 `remove_classes()` normally discards annotations belonging to the selected
 classes. Pass `merge_into=` with a surviving class name or integer ID to retain
 those annotations under that class; surviving class IDs are still compacted in
-the exported dataset.
+the exported dataset. Pass `drop_empty_images=True` to remove outputs with no
+remaining annotations, or `drop_containing_images=True` to remove the complete
+original image whenever it contains a selected class, including mixed-class
+images. `drop_containing_images` and `merge_into` are mutually exclusive.
+
+`move_images_with_classes()` moves each complete matching image, with all of
+its annotations intact, to `to_split`. Its required `group_by=` callback makes
+the move group-atomic: every image with the same group key follows a matching
+image, even when that group mate is currently in another split. Use
+`source_splits=` to restrict which images may trigger the move; it does not
+restrict group expansion.
+
+`move_n_groups()` deterministically samples exactly `n` group keys represented
+in `from_split` and moves every member of each selected group to `to_split`.
+Moving complete groups prevents a physical AOI, subject, or acquisition from
+being split across evaluation partitions.
 
 Albumentations is installed with `pip install dataset-fixer`; pass either a transform sequence,
 an `A.Compose`, or an `A.to_dict()` result:
@@ -155,9 +192,28 @@ coverage = dataset.tile(
     background_ratio=0.10,
     # The predicate receives the final RGB background candidate. True keeps it.
     background_filter=lambda tile: tile.getbbox() is not None,
+    # Shared with tiling previews and retained for later report titles.
+    visualize_kwargs={
+        "label_fn": lambda path: get_aoi(path),
+        "line_width": 2,
+    },
     seed=42,
 )
+
+exported = coverage.export(
+    destination="/datasets/orchard_tiles",
+    visualize=True,
+    visualize_kwargs={
+        "label_fn": lambda path: get_aoi(path),  # None suppresses the row title
+        "line_width": 2,
+        "outline_width": 4,
+    },
+)
 ```
+
+With `visualize=True`, `export()` and `export_formats()` display the exact
+saved `reports/plots.png` inline in a notebook. The same visualization options
+are accepted by direct `dataset.visualize()` calls as named arguments.
 
 Coverage crops can also sample a fresh Albumentations virtual camera view for
 each output. The complete source image and synchronized annotations are
@@ -183,8 +239,18 @@ tracked separately and never accepted inside an output tile, even when a
 transform requests reflection or fill. With `allow_lossy=False`, transformed
 views or final crops that cut annotations are resampled. With `allow_lossy=True`,
 representable geometry is clipped; disconnected segment results retain their
-largest YOLO-representable polygon with an explicit warning. Small coverage
-pass-through images are unchanged. Tiling defaults to `errors="raise"`, whose
+largest YOLO-representable polygon with an explicit warning. The intermediate
+`allow_lossy="not_focal"` policy keeps the crop's focal annotation complete but
+allows other annotations crossing its boundary to be clipped or dropped using
+`min_area_ratio`. A clipped incidental annotation is written to that tile but
+does not satisfy its own coverage target; it must still receive a complete
+focal appearance. Small coverage
+pass-through images are unchanged. When strict coverage cannot place a label
+inside any square crop, its final fallback letterboxes the complete source into
+one tile. This bypasses the requested crop scale only for the guarantee tile,
+keeps every source annotation, and records
+`coverage_relaxation="full_source_letterbox"` with `lossy_clipping=false`.
+Tiling defaults to `errors="raise"`, whose
 diagnostic includes the source image, annotation index, crop coordinates, and
 the exact Shapely result and component types. Set `errors="skip"` to reject
 those whole candidates instead: coverage mode resamples replacements, grid
@@ -203,11 +269,17 @@ Set both appearance parameters to the same value to request a uniform count for
 every object. `object_appearance_overrides={source_id: count}` overrides
 individual annotations. `background_ratio=0.10` targets 10% annotation-free
 images across the complete coverage output of each split, including copied
-small images and newly generated crops. Half of the target is sampled from
-wholly empty source images and half from object-free regions of populated
-images where possible. If either source cannot supply its half, the other
-cross-fills the target and the exact counts and reason are recorded in the
-dataset information report. IDEs can autocomplete the literal
+small images and newly generated crops. A per-split mapping can mix policies:
+`{"train": 0.75, "test": None}` keeps train exact while test best-effort
+targets its input empty-image fraction, and
+`{"train": 0.75, "test": [0.25, 0.75]}` aims for 75% test backgrounds but
+accepts any whole-image result from 25% through 75%. Exact targets and range
+minimums raise when they cannot be met; best-effort targets do not. Wholly
+empty source images and object-free regions of populated images share one
+candidate pool. Every currently eligible source image is sampled with equal
+probability, independent of whether it contains annotations; per-source caps
+still apply. The exact counts by source type are recorded in the dataset
+information report. IDEs can autocomplete the literal
 choices for `mode`, `negative_tiles`, `errors`, tasks, splits, comparison
 protocols, and inference backends; all coverage controls are explicit `tile()`
 parameters. `background_filter` also applies to negative grid windows, copied

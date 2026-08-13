@@ -149,7 +149,11 @@ def print_split_group_audit(report: dict[str, Any] | None) -> None:
 
 def _latest_split_record(history: Iterable[Any]) -> dict[str, Any] | None:
     for record in reversed(list(history)):
-        if isinstance(record, dict) and record.get("operation") == "split":
+        if isinstance(record, dict) and record.get("operation") in {
+            "split",
+            "move-images-with-classes",
+            "move-n-groups",
+        }:
             return record
     return None
 
