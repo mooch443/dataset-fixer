@@ -87,11 +87,9 @@ def test_semantic_mask_export_writes_foreground_union_and_empty_masks(tmp_path: 
     assert "images: 3 | masks: 3 | non-empty: 2 | empty: 1 (33.3%)" in summary
     assert "Mask statistics" in summary
     assert "class handling: foreground union" in summary
-    from matplotlib import pyplot as plt
-
-    figure = reopened.visualize(split="train", n=1, show=False)
-    assert figure.axes
-    plt.close(figure)
+    preview = tmp_path / "reopened-semantic.svg"
+    assert reopened.visualize(split="train", samples=1, destination=preview, show=False) is None
+    assert preview.is_file() and preview.stat().st_size > 0
     assert exported.manifest_path is not None
     assert Dataset.open(exported.manifest_path, progress=False).location == exported.location
     assert "manifest=" not in repr(reopened)
@@ -226,8 +224,6 @@ def test_semantic_open_defers_lineage_until_provenance_is_requested(
 def test_semantic_mask_dataset_open_skips_invalid_pairs_and_closes_audit_figure(
     tmp_path: Path,
 ) -> None:
-    from matplotlib import pyplot as plt
-
     source = make_yolo_dataset(
         tmp_path / "invalid-pair-source",
         task="segment",
@@ -247,7 +243,6 @@ def test_semantic_mask_dataset_open_skips_invalid_pairs_and_closes_audit_figure(
     with Image.open(invalid_mask) as opened:
         opened.convert("RGB").save(invalid_mask)
 
-    open_figures = set(plt.get_fignums())
     reopened = Dataset.open(exported.location, errors="skip", progress=False)
 
     assert reopened.format == "semantic_masks"
@@ -255,7 +250,6 @@ def test_semantic_mask_dataset_open_skips_invalid_pairs_and_closes_audit_figure(
     assert reopened.validation_audit["status"] == "passed_with_skips"
     assert reopened.validation_audit["skipped_count"] == 1
     assert any("invalid semantic-mask pair" in warning for warning in reopened.warnings)
-    assert set(plt.get_fignums()) == open_figures
 
 
 def test_export_formats_materializes_yolo_then_semantic_masks(tmp_path: Path) -> None:

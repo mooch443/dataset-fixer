@@ -21,9 +21,9 @@ classifiers = [
 ]
 dependencies = [
   "albumentations>=2.0.8,<3",
+  "altair[save]>=6.2,<7",
   "batchgeneratorsv2>=0.3.2",
   "ipython>=7.34",
-  "matplotlib>=3.7",
   "nnunetv2>=2.8.1,<3",
   "numpy>=1.24",
   "opencv-python>=4.12",

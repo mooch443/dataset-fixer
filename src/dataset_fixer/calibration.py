@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -21,6 +20,7 @@ from .dataset import Dataset
 from .errors import PredictionCacheMissError, PredictionScoreUnavailableError
 from .model import ImagePrediction, Model, ModelCollection, PredictionResult
 from .prediction_cache import PredictionCache
+from .static_rendering import finite_rows, save_chart
 from .utils import to_jsonable
 
 
@@ -1387,47 +1387,47 @@ def _write_calibration_artifacts(
     )
     if scores.empty:
         return
+    import altair as alt
+
     models = list(dict.fromkeys(scores["model"].tolist()))
-    figure, axes = plt.subplots(
-        len(models),
-        1,
-        figsize=(9, max(3.0, 2.6 * len(models))),
-        squeeze=False,
-        sharex=True,
+    metric_fields = {
+        "macro_dice": "macro Dice",
+        "micro_dice": "micro Dice",
+        "area_filtered_component_f1": "area-filtered component F1",
+        "area_filtered_component_precision": "area-filtered component precision",
+    }
+    long_rows = [
+        {
+            "model": row["model"],
+            "prediction_threshold": row["prediction_threshold"],
+            "metric": label,
+            "value": row[field],
+            "selected": recommendations[row["model"]],
+        }
+        for row in threshold_scores
+        for field, label in metric_fields.items()
+    ]
+    data = alt.Data(values=finite_rows(long_rows))
+    lines = (
+        alt.Chart()
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("prediction_threshold:Q", title="prediction threshold"),
+            y=alt.Y("value:Q", scale=alt.Scale(domain=[0, 1]), title="score"),
+            color=alt.Color("metric:N"),
+            tooltip=["model:N", "metric:N", "prediction_threshold:Q", alt.Tooltip("value:Q", format=".3f")],
+        )
+        .properties(width=680, height=190)
     )
-    for axis, model_name in zip(axes[:, 0], models, strict=True):
-        selected = scores[scores["model"] == model_name]
-        axis.plot(
-            selected["prediction_threshold"],
-            selected["macro_dice"],
-            marker="o",
-            label="macro Dice",
-        )
-        axis.plot(
-            selected["prediction_threshold"],
-            selected["micro_dice"],
-            marker="o",
-            label="micro Dice",
-        )
-        axis.plot(
-            selected["prediction_threshold"],
-            selected["area_filtered_component_f1"],
-            marker="o",
-            label="area-filtered component F1",
-        )
-        axis.plot(
-            selected["prediction_threshold"],
-            selected["area_filtered_component_precision"],
-            marker="o",
-            label="area-filtered component precision",
-        )
-        axis.axvline(recommendations[model_name], color="#d95f02", linestyle="--")
-        axis.set_title(model_name, fontsize=9)
-        axis.set_ylim(0, 1)
-        axis.grid(alpha=0.2)
-        axis.legend(frameon=False, loc="best")
-    axes[-1, 0].set_xlabel("prediction_threshold")
-    figure.suptitle("Full-image threshold calibration (grouped CV cohort)")
-    figure.tight_layout()
-    figure.savefig(root / "threshold-curves.png", dpi=180, bbox_inches="tight")
-    plt.close(figure)
+    rules = (
+        alt.Chart()
+        .mark_rule(color="#d95f02", strokeDash=[6, 4], strokeWidth=2)
+        .encode(x="selected:Q")
+    )
+    chart = (
+        alt.layer(lines, rules, data=data)
+        .facet(row=alt.Row("model:N", sort=models, title=None, header=alt.Header(labelFontSize=12)))
+        .properties(title="Full-image threshold calibration (grouped CV cohort)")
+        .resolve_scale(x="shared", y="shared")
+    )
+    save_chart(chart, root / "threshold-curves.png")

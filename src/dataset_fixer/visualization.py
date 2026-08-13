@@ -4,16 +4,27 @@ import math
 import random
 import re
 import textwrap
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence, TypeVar
 
-import matplotlib.patches as patches
-import matplotlib.pyplot as plt
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+import cv2
+import numpy as np
+from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps
 from shapely.geometry import Polygon
 from shapely.validation import explain_validity
 
 from .models import Annotation, DatasetMetadata, Sample, Task
+from .static_rendering import (
+    LabelMode,
+    card,
+    concat_grid,
+    display_image,
+    finish_chart,
+    format_label,
+    save_chart,
+    text_region,
+)
 
 if TYPE_CHECKING:
     from .validation_audit import ValidationFailureExample
@@ -27,7 +38,299 @@ ANNOTATION_COLORS = (
     "#ff1493",  # deep pink
 )
 
-_VISUALIZE_KWARGS = {"label_fn", "line_width", "outline_width"}
+_VISUALIZE_KWARGS = {"label_fn", "label_mode", "line_width", "outline_width"}
+
+COMMON_VISUALIZE_PARAMETERS = frozenset(
+    "samples columns seed panel_size zoom context_fraction minimum_context "
+    "label_fn label_mode line_width outline_width outline_alpha destination show".split()
+)
+
+
+@dataclass(frozen=True)
+class VisualizationOptions:
+    samples: int | None = None
+    columns: int = 1
+    seed: int = 42
+    panel_size: float = 3.0
+    zoom: bool = False
+    context_fraction: float = 0.35
+    minimum_context: int = 100
+    label_fn: Callable[[Path], str | None] | None = None
+    label_mode: LabelMode = "middle"
+    line_width: float | None = None
+    outline_width: float = 1.0
+    outline_alpha: float = 1.0
+    destination: Path | None = None
+    show: bool = True
+
+
+@dataclass(frozen=True)
+class VisualizationPanel:
+    title: str
+    image: np.ndarray
+    mask: np.ndarray | None = None
+    color: str = "#C86552"
+    footer: str | None = None
+
+
+@dataclass(frozen=True)
+class VisualizationItem:
+    image_path: Path
+    label: str
+    panels: tuple[VisualizationPanel, ...]
+    foreground: np.ndarray
+
+
+_VisualRecord = TypeVar("_VisualRecord")
+
+
+def visualize_records(
+    records: Sequence[_VisualRecord],
+    *,
+    options: VisualizationOptions,
+    prepare: Callable[[_VisualRecord], VisualizationItem],
+    title: str | Callable[[int], str] | None = None,
+) -> Any:
+    if not records:
+        raise ValueError("At least one image is required for visualization")
+    count = len(records) if options.samples is None else min(options.samples, len(records))
+    if count == len(records):
+        selected = list(records)
+    else:
+        selected = random.Random(options.seed).sample(list(records), count)
+    items = [prepare(record) for record in selected]
+    panel_count = len(items[0].panels)
+    if panel_count == 0 or any(len(item.panels) != panel_count for item in items):
+        raise ValueError("Every visualization item must have the same non-zero panel count")
+
+    prepared: list[tuple[VisualizationItem, tuple[int, int, int, int]]] = []
+    for item in items:
+        foreground = np.asarray(item.foreground, dtype=bool)
+        height, width = foreground.shape
+        bounds = (
+            foreground_crop_bounds(
+                foreground,
+                context_fraction=options.context_fraction,
+                minimum_context=options.minimum_context,
+            )
+            if options.zoom and np.any(foreground)
+            else (0, 0, width, height)
+        )
+        prepared.append((item, bounds))
+
+    import altair as alt
+
+    viewport = max(144, round(options.panel_size * 96))
+    item_charts: list[Any] = []
+    for item, bounds in prepared:
+        x0, y0, x1, y1 = bounds
+        label = (
+            options.label_fn(item.image_path)
+            if options.label_fn is not None
+            else item.label
+        )
+        if label is not None and not isinstance(label, str):
+            raise TypeError("label_fn must return a string or None")
+        panel_charts: list[Any] = []
+        for panel in item.panels:
+            image = np.asarray(panel.image)[y0:y1, x0:x1]
+            mask_crop = (
+                None
+                if panel.mask is None
+                else np.asarray(panel.mask, dtype=bool)[y0:y1, x0:x1]
+            )
+            if mask_crop is not None:
+                image = draw_mask_outline(
+                    image,
+                    mask_crop,
+                    color=panel.color,
+                    line_width=options.line_width,
+                    outline_width=options.outline_width,
+                    alpha=options.outline_alpha,
+                )
+            panel_charts.append(
+                card(
+                    image,
+                    width=viewport,
+                    height=viewport,
+                    heading=format_label(
+                        panel.title,
+                        mode=options.label_mode,
+                        maximum=max(18, viewport // 7),
+                    ),
+                    footer=format_label(
+                        panel.footer or "",
+                        mode=options.label_mode,
+                        maximum=max(18, viewport // 7),
+                    ),
+                )
+            )
+        panel_row = alt.hconcat(*panel_charts, spacing=8)
+        label_lines = format_label(
+            label or "",
+            mode=options.label_mode,
+            maximum=max(24, (viewport * panel_count) // 7),
+        )
+        regions: list[Any] = []
+        if label_lines:
+            regions.append(
+                text_region(
+                    label_lines,
+                    width=viewport * panel_count + 8 * (panel_count - 1),
+                    font_size=12,
+                )
+            )
+        regions.append(panel_row)
+        item_charts.append(alt.vconcat(*regions, spacing=5))
+    resolved_title = title(len(items)) if callable(title) else title
+    return concat_grid(
+        item_charts,
+        columns=options.columns,
+        spacing=20,
+        title=resolved_title,
+    )
+
+
+def visualization_options(**overrides: Any) -> VisualizationOptions:
+    unknown = sorted(set(overrides) - COMMON_VISUALIZE_PARAMETERS)
+    if unknown:
+        raise TypeError("Unknown visualization options: " + ", ".join(unknown))
+    defaults = VisualizationOptions()
+    values = {
+        name: getattr(defaults, name)
+        for name in COMMON_VISUALIZE_PARAMETERS
+    }
+    values.update(overrides)
+    for name in ("columns", "minimum_context"):
+        value = values[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    samples = values["samples"]
+    if samples is not None and (
+        isinstance(samples, bool) or not isinstance(samples, int) or samples < 1
+    ):
+        raise ValueError("samples must be a positive integer or None")
+    seed = values["seed"]
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an integer")
+    if not isinstance(values["zoom"], bool) or not isinstance(values["show"], bool):
+        raise TypeError("zoom and show must be booleans")
+    if values["label_mode"] not in {"middle", "wrap"}:
+        raise ValueError("label_mode must be 'middle' or 'wrap'")
+    label_fn = values["label_fn"]
+    if label_fn is not None and not callable(label_fn):
+        raise TypeError("label_fn must be callable or None")
+    numeric = {
+        "panel_size": (0.0, None),
+        "context_fraction": (0.0, None),
+        "outline_alpha": (0.0, 1.0),
+        "line_width": (0.0, None),
+        "outline_width": (0.0, None),
+    }
+    for name, (minimum, maximum) in numeric.items():
+        value = values[name]
+        if value is None and name in {"line_width", "outline_width"}:
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < minimum
+            or (
+                name in {"panel_size", "line_width", "outline_width"}
+                and float(value) == 0
+            )
+            or (maximum is not None and float(value) > maximum)
+        ):
+            raise ValueError(f"{name} must be a valid finite value")
+        values[name] = float(value)
+    values["outline_width"] = values["outline_width"] or 1.0
+    values["line_width"] = values["line_width"] or values["outline_width"]
+    destination = values["destination"]
+    values["destination"] = (
+        Path(destination).expanduser().resolve() if destination is not None else None
+    )
+    return VisualizationOptions(**values)
+
+
+def foreground_crop_bounds(
+    foreground: np.ndarray,
+    *,
+    context_fraction: float,
+    minimum_context: int,
+) -> tuple[int, int, int, int]:
+    mask = np.asarray(foreground, dtype=bool)
+    if mask.ndim != 2:
+        raise ValueError("visualization foreground must be a 2D mask")
+    height, width = mask.shape
+    ys, xs = np.nonzero(mask)
+    if not len(xs):
+        return 0, 0, width, height
+    left, right = int(xs.min()), int(xs.max()) + 1
+    top, bottom = int(ys.min()), int(ys.max()) + 1
+    crop_width = min(
+        width,
+        max(minimum_context, math.ceil((right - left) * (1 + 2 * context_fraction))),
+    )
+    crop_height = min(
+        height,
+        max(minimum_context, math.ceil((bottom - top) * (1 + 2 * context_fraction))),
+    )
+    x0 = max(0, min(width - crop_width, round((left + right - crop_width) / 2)))
+    y0 = max(0, min(height - crop_height, round((top + bottom - crop_height) / 2)))
+    return x0, y0, x0 + crop_width, y0 + crop_height
+
+
+def draw_mask_outline(
+    image: Image.Image | np.ndarray,
+    mask: np.ndarray,
+    *,
+    color: str,
+    line_width: float | None,
+    outline_width: float,
+    alpha: float,
+) -> np.ndarray:
+    """Burn a double-stroked boundary into a copy of an RGB image."""
+
+    base = np.asarray(image.convert("RGB") if isinstance(image, Image.Image) else image)
+    if base.ndim == 2:
+        base = np.repeat(base[..., None], 3, axis=2)
+    base = np.ascontiguousarray(base[..., :3], dtype=np.uint8).copy()
+    values = np.asarray(mask, dtype=bool)
+    if not np.any(values) or alpha <= 0:
+        return base
+    if values.shape != base.shape[:2]:
+        raise ValueError("mask and image dimensions must match")
+    contours, _ = cv2.findContours(
+        values.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return base
+    resolved_line_width = max(1, round(outline_width if line_width is None else line_width))
+    halo_width = max(resolved_line_width + 2, round(outline_width))
+    overlay = base.copy()
+    cv2.drawContours(overlay, contours, -1, (255, 255, 255), halo_width)
+    cv2.drawContours(
+        overlay,
+        contours,
+        -1,
+        ImageColor.getrgb(color),
+        resolved_line_width,
+    )
+    if alpha >= 1:
+        return overlay
+    return np.uint8(np.round(base * (1 - alpha) + overlay * alpha))
+
+
+def finish_visualization(chart: Any, options: VisualizationOptions) -> None:
+    finish_chart(
+        chart,
+        destination=options.destination,
+        show=options.show,
+        overwrite=False,
+    )
 
 
 def normalize_visualize_kwargs(
@@ -51,6 +354,9 @@ def normalize_visualize_kwargs(
     label_fn = normalized.get("label_fn")
     if label_fn is not None and not callable(label_fn):
         raise TypeError("visualize_kwargs['label_fn'] must be callable or None")
+    label_mode = normalized.get("label_mode")
+    if label_mode is not None and label_mode not in {"middle", "wrap"}:
+        raise ValueError("visualize_kwargs['label_mode'] must be 'middle' or 'wrap'")
     for key in ("line_width", "outline_width"):
         width = normalized.get(key)
         if width is None:
@@ -163,14 +469,12 @@ def visualize_validation_failures(
     dataset_name: str,
     save_to: Path,
     show: bool = True,
-):
+) -> None:
     """Render a bounded grid of load-time validation failures."""
 
     columns = 1 if len(examples) == 1 else 2
-    rows = max(1, math.ceil(max(1, len(examples)) / columns))
-    fig, axes = plt.subplots(rows, columns, figsize=(7 * columns, 5.6 * rows), squeeze=False)
-    flat = axes.flatten()
-    for ax, example in zip(flat, examples):
+
+    def prepare(example: "ValidationFailureExample") -> VisualizationItem:
         annotations = (
             [example.annotation]
             if example.annotation is not None and example.annotation.polygon is None
@@ -191,24 +495,18 @@ def visualize_validation_failures(
                 annotations=annotations,
             )
             try:
-                _draw_sample(ax, sample, task, metadata)
+                rendered = render_annotated_sample(sample, task, metadata)
                 if example.annotation is not None:
-                    _focus_invalid_annotation(
-                        ax,
-                        example.annotation,
-                        width=example.width,
-                        height=example.height,
-                    )
-                    _highlight_invalid_annotation(
-                        ax,
+                    rendered = _highlight_invalid_annotation(
+                        rendered,
                         example.annotation,
                         width=example.width,
                         height=example.height,
                     )
             except Exception:
-                _draw_failure_placeholder(ax)
+                rendered = _draw_failure_placeholder()
         else:
-            _draw_failure_placeholder(ax)
+            rendered = _draw_failure_placeholder()
         source = (
             str(example.relative_path)
             if example.relative_path is not None
@@ -220,42 +518,57 @@ def visualize_validation_failures(
             max_lines=2,
             placeholder=" …",
         )
-        ax.set_title(
-            f"Skipped · {example.split or 'unknown split'} · "
-            f"{textwrap.shorten(source, width=78, placeholder='…')}\n{message}",
-            color="#7f1d1d",
-            fontsize=9,
-            pad=8,
+        foreground = np.ones(np.asarray(rendered).shape[:2], dtype=bool)
+        if example.annotation is not None and example.annotation.polygon:
+            foreground = _annotation_focus_mask(
+                example.annotation,
+                width=rendered.width,
+                height=rendered.height,
+            )
+        return VisualizationItem(
+            image_path=example.image_path or Path("unavailable"),
+            label=(
+                f"Skipped · {example.split or 'unknown split'} · "
+                f"{textwrap.shorten(source, width=78, placeholder='…')}\n{message}"
+            ),
+            panels=(VisualizationPanel(title="Validation failure", image=np.asarray(rendered)),),
+            foreground=foreground,
         )
-    for ax in flat[len(examples) :]:
-        ax.axis("off")
-    fig.suptitle(
-        f"Load validation skips — {dataset_name} — {total_count} failed item(s); "
-        f"showing {len(examples)}",
-        fontsize=13,
+
+    options = VisualizationOptions(
+        samples=None,
+        columns=columns,
+        panel_size=4.6,
+        zoom=True,
+        label_mode="wrap",
+        destination=save_to,
+        show=show,
     )
-    fig.subplots_adjust(top=0.88, hspace=0.38, wspace=0.08)
-    save_to.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(save_to, bbox_inches="tight", dpi=140)
-    if show:
-        _display_or_print(fig, save_to)
-    return fig
+    chart = visualize_records(
+        examples,
+        options=options,
+        prepare=prepare,
+        title=(
+            f"Load validation skips — {dataset_name} — {total_count} failed item(s); "
+            f"showing {len(examples)}"
+        ),
+    )
+    finish_chart(chart, destination=save_to, show=show, overwrite=True)
 
 
-def _draw_failure_placeholder(ax) -> None:
-    ax.set_facecolor("#242830")
-    ax.text(
-        0.5,
-        0.5,
-        "No readable image\navailable for this failure",
-        transform=ax.transAxes,
-        ha="center",
-        va="center",
-        color="white",
-        fontsize=11,
+def _draw_failure_placeholder() -> Image.Image:
+    image = Image.new("RGB", (720, 480), "#242830")
+    draw = ImageDraw.Draw(image)
+    message = "No readable image\navailable for this failure"
+    draw.multiline_text(
+        (image.width / 2, image.height / 2),
+        message,
+        fill="white",
+        font=_font(24),
+        anchor="mm",
+        align="center",
     )
-    ax.set_xticks([])
-    ax.set_yticks([])
+    return image
 
 
 def _polygon_invalidity_details(
@@ -323,23 +636,26 @@ def _polygon_invalidity_details(
 
 
 def _highlight_invalid_annotation(
-    ax,
+    image: Image.Image,
     annotation: Annotation,
     *,
     width: int,
     height: int,
-) -> None:
+) -> Image.Image:
     """Overlay ordered vertices and explicit defects on a rejected polygon."""
 
     if annotation.polygon is None:
-        return
+        return image
     reasons, markers = _polygon_invalidity_details(
         annotation.polygon,
         width=width,
         height=height,
     )
     if not reasons:
-        return
+        return image
+
+    rendered = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(rendered)
 
     finite_polygon = [
         (x, y)
@@ -350,106 +666,38 @@ def _highlight_invalid_annotation(
         closed_polygon = finite_polygon + (
             [finite_polygon[0]] if len(finite_polygon) >= 3 else []
         )
-        ax.plot(
-            [point[0] for point in closed_polygon],
-            [point[1] for point in closed_polygon],
-            color="#dc2626",
-            linewidth=2.0,
-            zorder=8,
-        )
+        draw.line(closed_polygon, fill="#dc2626", width=4, joint="curve")
     if finite_polygon:
-        ax.scatter(
-            [point[0] for point in finite_polygon],
-            [point[1] for point in finite_polygon],
-            marker="o",
-            s=42,
-            facecolors="white",
-            edgecolors="#dc2626",
-            linewidths=1.5,
-            zorder=9,
-        )
         for index, (x, y) in enumerate(finite_polygon):
-            ax.annotate(
-                str(index),
-                xy=(x, y),
-                xytext=(5, 5),
-                textcoords="offset points",
-                color="#111827",
-                fontsize=7,
-                bbox={
-                    "boxstyle": "round,pad=0.16",
-                    "facecolor": "white",
-                    "edgecolor": "#d1d5db",
-                    "alpha": 0.92,
-                },
-                zorder=10,
-            )
+            draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill="white", outline="#dc2626", width=2)
+            draw.text((x + 7, y + 7), str(index), fill="#111827", font=_font(13))
     for x, y, label in markers:
-        ax.scatter(
-            [x],
-            [y],
-            marker="o",
-            s=110,
-            facecolors="none",
-            edgecolors="#f59e0b",
-            linewidths=2.2,
-            zorder=11,
-            clip_on=False,
-        )
-        ax.scatter([x], [y], marker="o", s=18, c="#f59e0b", zorder=12)
-        ax.annotate(
-            label,
-            xy=(x, y),
-            xytext=(9, 11),
-            textcoords="offset points",
-            color="#111827",
-            fontsize=8,
-            bbox={
-                "boxstyle": "round,pad=0.24",
-                "facecolor": "white",
-                "edgecolor": "#f59e0b",
-                "alpha": 0.94,
-            },
-            arrowprops={"arrowstyle": "->", "color": "#f59e0b", "linewidth": 1.2},
-            zorder=13,
-        )
-    ax.text(
-        0.02,
-        0.02,
-        "Invalid polygon\n" + "\n".join(reasons),
-        transform=ax.transAxes,
-        ha="left",
-        va="bottom",
-        color="#7f1d1d",
-        fontsize=8,
-        bbox={
-            "boxstyle": "round,pad=0.3",
-            "facecolor": "#fff7ed",
-            "edgecolor": "#fca5a5",
-            "alpha": 0.94,
-        },
-        zorder=14,
-    )
+        draw.ellipse((x - 10, y - 10, x + 10, y + 10), outline="#f59e0b", width=4)
+        draw.text((x + 12, y + 12), label.replace("\n", " "), fill="#111827", font=_font(13), stroke_width=3, stroke_fill="white")
+    message = "Invalid polygon: " + "; ".join(reasons)
+    box = draw.textbbox((14, rendered.height - 28), message, font=_font(14), stroke_width=2)
+    draw.rectangle((8, box[1] - 5, min(rendered.width - 8, box[2] + 8), rendered.height - 6), fill="#fff7ed", outline="#fca5a5", width=2)
+    draw.text((14, rendered.height - 28), message, fill="#7f1d1d", font=_font(14))
+    return rendered
 
 
 def _focus_invalid_annotation(
-    ax,
     annotation: Annotation,
     *,
     width: int,
     height: int,
-) -> None:
+) -> tuple[int, int, int, int]:
     """Zoom to the finite polygon vertices while retaining nearby image context."""
 
     if annotation.polygon is None:
-        return
+        return (0, 0, width, height)
     points = [
         (float(x), float(y))
         for x, y in annotation.polygon
         if math.isfinite(x) and math.isfinite(y)
     ]
     if not points or width <= 0 or height <= 0:
-        return
+        return (0, 0, width, height)
 
     clipped_x = [min(max(x, 0.0), float(width)) for x, _ in points]
     clipped_y = [min(max(y, 0.0), float(height)) for _, y in points]
@@ -479,9 +727,29 @@ def _focus_invalid_annotation(
 
     left, right = bounded_window(center_x, window_width, float(width))
     top, bottom = bounded_window(center_y, window_height, float(height))
-    ax.set_xlim(left, right)
-    # imshow uses an upper-left origin, so increasing data y runs downward.
-    ax.set_ylim(bottom, top)
+    return round(left), round(top), round(right), round(bottom)
+
+
+def _annotation_focus_mask(
+    annotation: Annotation,
+    *,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    mask = Image.new("1", (width, height), 0)
+    draw = ImageDraw.Draw(mask)
+    if annotation.polygon:
+        points = [
+            (min(max(float(x), 0.0), width - 1), min(max(float(y), 0.0), height - 1))
+            for x, y in annotation.polygon
+            if math.isfinite(x) and math.isfinite(y)
+        ]
+        if len(points) >= 2:
+            draw.line(points, fill=1, width=3, joint="curve")
+        elif points:
+            x, y = points[0]
+            draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=1)
+    return np.asarray(mask, dtype=bool)
 
 
 def visualize_samples(
@@ -490,42 +758,48 @@ def visualize_samples(
     metadata: DatasetMetadata,
     *,
     split: str | None,
-    n: int,
-    seed: int,
-    columns: int,
-    label_fn: Callable[[Path], str | None] | None = None,
-    line_width: float | None = None,
-    outline_width: float | None = None,
-    save_to: Path | None = None,
-    show: bool = True,
+    options: VisualizationOptions,
 ):
     candidates = [s for s in samples if split is None or s.split == split]
-    rng = random.Random(seed)
-    chosen = rng.sample(candidates, min(n, len(candidates))) if candidates else []
-    rows = max(1, math.ceil(max(1, len(chosen)) / columns))
-    fig, axes = plt.subplots(rows, columns, figsize=(6 * columns, 5 * rows), squeeze=False)
-    flat = axes.flatten()
-    for ax, sample in zip(flat, chosen):
-        _draw_sample(
-            ax,
+    title_split = split or "all splits"
+
+    def prepare(sample: Sample) -> VisualizationItem:
+        rendered = render_annotated_sample(
             sample,
             task,
             metadata,
-            label_fn=label_fn,
-            line_width=line_width,
-            outline_width=outline_width,
+            line_width=options.line_width,
+            outline_width=options.outline_width,
         )
-    for ax in flat[len(chosen) :]:
-        ax.axis("off")
-    title_split = split or "all splits"
-    fig.suptitle(f"Annotation check — {title_split} ({len(chosen)} images)", fontsize=13)
-    fig.tight_layout()
-    if save_to:
-        save_to.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(save_to, bbox_inches="tight", dpi=140)
-    if show:
-        _display_or_print(fig, save_to)
-    return fig
+        image = np.asarray(rendered)
+        if options.outline_alpha < 1:
+            with Image.open(sample.image_path) as opened:
+                source = np.asarray(ImageOps.exif_transpose(opened).convert("RGB"))
+            image = np.uint8(
+                source * (1 - options.outline_alpha) + image * options.outline_alpha
+            )
+        return VisualizationItem(
+            image_path=sample.image_path,
+            label=_sample_title(
+                sample,
+                None,
+                default=(
+                    f"{sample.relative_path}\n{sample.width}×{sample.height} | "
+                    f"{len(sample.annotations)} annotations | {sample.split}"
+                ),
+            )
+            or "",
+            panels=(VisualizationPanel(title="Annotation", image=image),),
+            foreground=_sample_foreground_mask(sample, task),
+        )
+
+    figure = visualize_records(
+        candidates,
+        options=options,
+        prepare=prepare,
+        title=lambda count: f"Annotation check — {title_split} ({count} images)",
+    )
+    return finish_visualization(figure, options)
 
 
 def visualize_semantic_masks(
@@ -533,88 +807,71 @@ def visualize_semantic_masks(
     mask_paths: dict[Path, Path],
     *,
     split: str | None,
-    n: int,
-    seed: int,
-    columns: int,
-    label_fn: Callable[[Path], str | None] | None = None,
-    save_to: Path | None = None,
-    show: bool = True,
+    options: VisualizationOptions,
 ):
     """Render paired source images and binary-mask overlays."""
 
     candidates = [sample for sample in samples if split is None or sample.split == split]
-    rng = random.Random(seed)
-    chosen = rng.sample(candidates, min(n, len(candidates))) if candidates else []
-    rows = max(1, math.ceil(max(1, len(chosen)) / columns))
-    fig, axes = plt.subplots(rows, columns, figsize=(6 * columns, 5 * rows), squeeze=False)
-    flat = axes.flatten()
-    for ax, sample in zip(flat, chosen):
+
+    def prepare(sample: Sample) -> VisualizationItem:
         mask_path = mask_paths[sample.image_path.resolve()]
         with Image.open(sample.image_path) as opened_image, Image.open(mask_path) as opened_mask:
-            image = opened_image.convert("RGB")
+            image = np.asarray(opened_image.convert("RGB"))
             mask = opened_mask.convert("L")
-        overlay = Image.blend(
-            image,
-            Image.composite(Image.new("RGB", image.size, (255, 32, 32)), image, mask),
-            0.45,
-        )
+        mask_array = np.asarray(mask) > 0
         foreground = sum(mask.histogram()[1:])
         fraction = foreground / (mask.width * mask.height) if mask.width and mask.height else 0.0
-        ax.imshow(overlay)
-        title = _sample_title(
-            sample,
-            label_fn,
-            default=(
-                f"{sample.split} · {sample.relative_path}\n"
-                f"foreground: {fraction:.1%}"
+        return VisualizationItem(
+            image_path=sample.image_path,
+            label=_sample_title(
+                sample,
+                None,
+                default=(
+                    f"{sample.split} · {sample.relative_path}\n"
+                    f"foreground: {fraction:.1%}"
+                ),
+            )
+            or "",
+            panels=(
+                VisualizationPanel(
+                    title="Annotation",
+                    image=image,
+                    mask=mask_array,
+                    color="#ff2020",
+                ),
             ),
+            foreground=mask_array,
         )
-        if title is not None:
-            ax.set_title(title, fontsize=8)
-        ax.axis("off")
-    for ax in flat[len(chosen) :]:
-        ax.axis("off")
+
     title_split = split or "all splits"
-    fig.suptitle(f"Semantic-mask check — {title_split} ({len(chosen)} images)", fontsize=13)
-    fig.tight_layout()
-    if save_to:
-        save_to.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(save_to, bbox_inches="tight", dpi=140)
-    if show:
-        _display_or_print(fig, save_to)
-    return fig
+    figure = visualize_records(
+        candidates,
+        options=options,
+        prepare=prepare,
+        title=lambda count: f"Semantic-mask check — {title_split} ({count} images)",
+    )
+    return finish_visualization(figure, options)
 
 
-def _draw_sample(
-    ax,
-    sample: Sample,
-    task: Task,
-    metadata: DatasetMetadata,
-    *,
-    label_fn: Callable[[Path], str | None] | None = None,
-    line_width: float | None = None,
-    outline_width: float | None = None,
-) -> None:
-    ax.imshow(
-        render_annotated_sample(
-            sample,
-            task,
-            metadata,
-            line_width=line_width,
-            outline_width=outline_width,
-        )
-    )
-    title = _sample_title(
-        sample,
-        label_fn,
-        default=(
-            f"{sample.relative_path}\n{sample.width}×{sample.height} | "
-            f"{len(sample.annotations)} annotations | {sample.split}"
-        ),
-    )
-    if title is not None:
-        ax.set_title(title, fontsize=8)
-    ax.axis("off")
+def _sample_foreground_mask(sample: Sample, task: Task) -> np.ndarray:
+    """Rasterize annotation geometry only for shared visualization cropping."""
+
+    canvas = Image.new("1", (sample.width, sample.height), 0)
+    draw = ImageDraw.Draw(canvas)
+    for annotation in sample.annotations:
+        if annotation.bbox is not None and task in {Task.DETECT, Task.POSE}:
+            draw.rectangle(annotation.bbox, fill=1)
+        if annotation.polygon:
+            draw.polygon(annotation.polygon, fill=1)
+        if annotation.point is not None:
+            x, y = annotation.point
+            radius = max(1.0, float(annotation.radius or 1.0))
+            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=1)
+        if annotation.keypoints:
+            for x, y, visibility in annotation.keypoints:
+                if visibility != 0:
+                    draw.ellipse((x - 1, y - 1, x + 1, y + 1), fill=1)
+    return np.asarray(canvas, dtype=bool)
 
 
 def _sample_title(
@@ -684,7 +941,12 @@ def render_annotated_sample(
                     (box[0], text_top, box[0] + text_width + 4, text_top + text_height + 4),
                     fill=color,
                 )
-                draw.text((box[0] + 2, text_top + 2), name, fill="white", font=font)
+                draw.text(
+                    (box[0] + 2, text_top + 2),
+                    name,
+                    fill="white",
+                    font=font,
+                )
         if annotation.polygon:
             points = [(x * scale_x, y * scale_y) for x, y in annotation.polygon]
             if len(points) >= 2:
@@ -695,7 +957,12 @@ def render_annotated_sample(
                     width=resolved_outline_width,
                     joint="curve",
                 )
-                draw.line(closed, fill=color, width=colour_width, joint="curve")
+                draw.line(
+                    closed,
+                    fill=color,
+                    width=colour_width,
+                    joint="curve",
+                )
         if annotation.keypoints:
             names = metadata.kpt_names.get(annotation.class_id, [])
             skeleton_value = metadata.extra.get("skeleton", [])
@@ -727,7 +994,12 @@ def render_annotated_sample(
                     width=1,
                 )
                 if show_names and idx < len(names):
-                    draw.text((px + marker_radius + 1, py + 1), names[idx], fill="white", font=font)
+                    draw.text(
+                        (px + marker_radius + 1, py + 1),
+                        names[idx],
+                        fill="white",
+                        font=font,
+                    )
         if annotation.point and annotation.radius is not None:
             x, y = annotation.point[0] * scale_x, annotation.point[1] * scale_y
             radius_x = annotation.radius * scale_x
@@ -782,52 +1054,74 @@ def save_split_preview(
             selected.extend(remaining[: 2 - len(selected)])
         chosen.extend((split, sample) for sample in selected)
 
-    columns = 2
-    rows = max(1, len(splits))
-    fig, axes = plt.subplots(rows, columns, figsize=(12, 5 * rows), squeeze=False)
-    flat = axes.flatten()
-    for ax, (target, sample) in zip(flat, chosen):
-        _draw_sample(ax, sample, task, metadata)
+    def prepare(value: tuple[str, Sample]) -> VisualizationItem:
+        target, sample = value
         group = group_lookup.get(str(sample.image_path), "ungrouped")
         if len(group) > 70:
             group = f"…{group[-69:]}"
-        ax.set_title(
-            f"{target.upper()} · group {group}\n"
-            f"{sample.relative_path} · {len(sample.annotations)} annotations",
-            color=SPLIT_COLORS[target],
-            fontsize=8,
+        return VisualizationItem(
+            image_path=sample.image_path,
+            label=(
+                f"{target.upper()} · group {group}\n"
+                f"{sample.relative_path} · {len(sample.annotations)} annotations"
+            ),
+            panels=(
+                VisualizationPanel(
+                    title="Annotation",
+                    image=np.asarray(render_annotated_sample(sample, task, metadata)),
+                ),
+            ),
+            foreground=np.ones((sample.height, sample.width), dtype=bool),
         )
-    for ax in flat[len(chosen) :]:
-        ax.axis("off")
+
     details = []
     for split in splits:
         paths = [path for path, target in assignments.items() if target == split]
         groups = {group_lookup.get(path, path) for path in paths}
         details.append(f"{split}: {len(paths)} images / {len(groups)} groups")
-    fig.suptitle("Split assignment audit — " + " · ".join(details), fontsize=13)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(output, bbox_inches="tight", dpi=140)
-    plt.close(fig)
+    options = VisualizationOptions(samples=None, columns=2, panel_size=4.0, show=False)
+    chart = visualize_records(
+        chosen,
+        options=options,
+        prepare=prepare,
+        title="Split assignment audit — " + " · ".join(details),
+    )
+    save_chart(chart, output)
     return output
 
 
 def save_split_summary(samples: list[Sample], assignments: dict[str, str], output: Path) -> Path:
+    import altair as alt
+
     splits = [s for s in ("train", "val", "test") if s in assignments.values()]
-    image_counts = [sum(v == split for v in assignments.values()) for split in splits]
-    annotation_counts = [
-        sum(len(sample.annotations) for sample in samples if assignments.get(str(sample.image_path)) == split)
+    rows = [
+        {
+            "split": split,
+            "images": sum(v == split for v in assignments.values()),
+            "annotations": sum(
+                len(sample.annotations)
+                for sample in samples
+                if assignments.get(str(sample.image_path)) == split
+            ),
+        }
         for split in splits
     ]
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    axes[0].bar(splits, image_counts, color=[SPLIT_COLORS[s] for s in splits])
-    axes[0].set_title("Images per split")
-    axes[1].bar(splits, annotation_counts, color=[SPLIT_COLORS[s] for s in splits])
-    axes[1].set_title("Annotations per split")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(output, bbox_inches="tight", dpi=140)
-    plt.close(fig)
+    colors = alt.Scale(domain=splits, range=[SPLIT_COLORS[split] for split in splits])
+
+    def panel(field: str, title: str) -> Any:
+        return (
+            alt.Chart(alt.Data(values=rows))
+            .mark_bar()
+            .encode(
+                x=alt.X("split:N", sort=splits, title="split"),
+                y=alt.Y(f"{field}:Q", title=field),
+                color=alt.Color("split:N", scale=colors, legend=None),
+                tooltip=["split:N", alt.Tooltip(f"{field}:Q", format=",")],
+            )
+            .properties(width=330, height=260, title=title)
+        )
+
+    save_chart(alt.hconcat(panel("images", "Images per split"), panel("annotations", "Annotations per split"), spacing=34), output)
     return output
 
 
@@ -838,31 +1132,27 @@ def save_class_count_summary(
     *,
     title: str = "Class counts before and after removal",
 ) -> Path:
+    import altair as alt
+
     labels = sorted((set(before) | set(after)) - {"background"}) + ["background"]
-    before_values = [before.get(label, 0) for label in labels]
-    after_values = [after.get(label, 0) for label in labels]
-    x = list(range(len(labels)))
-    fig, ax = plt.subplots(figsize=(max(7, len(labels) * 0.8), 4.5))
-    ax.bar([value - 0.2 for value in x], before_values, width=0.4, label="before")
-    ax.bar([value + 0.2 for value in x], after_values, width=0.4, label="after")
-    ax.set_xticks(x, labels, rotation=30, ha="right")
-    ax.set_ylabel("count")
-    ax.set_title(title)
-    ax.text(
-        0.99,
-        0.98,
-        "class bars = annotations\nbackground = empty images",
-        transform=ax.transAxes,
-        ha="right",
-        va="top",
-        fontsize=8,
-        color="#555555",
+    rows = [
+        {"class": label, "phase": phase, "count": values.get(label, 0)}
+        for label in labels
+        for phase, values in (("before", before), ("after", after))
+    ]
+    chart = (
+        alt.Chart(alt.Data(values=rows))
+        .mark_bar()
+        .encode(
+            x=alt.X("class:N", sort=labels, title="class / background"),
+            xOffset=alt.XOffset("phase:N", sort=["before", "after"]),
+            y=alt.Y("count:Q", title="count"),
+            color=alt.Color("phase:N", sort=["before", "after"]),
+            tooltip=["class:N", "phase:N", alt.Tooltip("count:Q", format=",")],
+        )
+        .properties(width=max(520, 72 * len(labels)), height=300, title=title)
     )
-    ax.legend()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(output, bbox_inches="tight", dpi=140)
-    plt.close(fig)
+    save_chart(chart, output)
     return output
 
 
@@ -874,53 +1164,45 @@ def save_tiling_count_summary(
 ) -> Path:
     """Plot annotation counts and image composition without mixing their units."""
 
+    import altair as alt
+
     labels = sorted(set(before_annotations) | set(after_annotations))
-    x = list(range(len(labels)))
-    fig, axes = plt.subplots(
-        1,
-        2,
-        figsize=(max(11, len(labels) * 0.8 + 6), 4.5),
-    )
-
-    axes[0].bar(
-        [value - 0.2 for value in x],
-        [before_annotations.get(label, 0) for label in labels],
-        width=0.4,
-        label="before",
-    )
-    axes[0].bar(
-        [value + 0.2 for value in x],
-        [after_annotations.get(label, 0) for label in labels],
-        width=0.4,
-        label="after",
-    )
-    axes[0].set_xticks(x, labels, rotation=30, ha="right")
-    axes[0].set_ylabel("annotation instances")
-    axes[0].set_title("Annotations by class")
-    axes[0].legend()
-
-    phases = ["before", "after"]
-    categories = ["annotated", "background"]
-    colors = {"annotated": "#4477AA", "background": "#CC6677"}
-    phase_x = list(range(len(phases)))
-    width = 0.36
-    for offset, category in zip((-width / 2, width / 2), categories):
-        axes[1].bar(
-            [value + offset for value in phase_x],
-            [image_composition[phase][category] for phase in phases],
-            width=width,
-            label=category,
-            color=colors[category],
+    annotation_rows = [
+        {"class": label, "phase": phase, "count": values.get(label, 0)}
+        for label in labels
+        for phase, values in (("before", before_annotations), ("after", after_annotations))
+    ]
+    composition_rows = [
+        {"phase": phase, "kind": kind, "images": image_composition[phase][kind]}
+        for phase in ("before", "after")
+        for kind in ("annotated", "background")
+    ]
+    annotations = (
+        alt.Chart(alt.Data(values=annotation_rows))
+        .mark_bar()
+        .encode(
+            x=alt.X("class:N", sort=labels),
+            xOffset=alt.XOffset("phase:N", sort=["before", "after"]),
+            y=alt.Y("count:Q", title="annotation instances"),
+            color=alt.Color("phase:N", sort=["before", "after"]),
         )
-    axes[1].set_xticks(phase_x, phases)
-    axes[1].set_ylabel("images")
-    axes[1].set_title("Image composition used for background ratio")
-    axes[1].legend()
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(output, bbox_inches="tight", dpi=140)
-    plt.close(fig)
+        .properties(width=max(420, 62 * len(labels)), height=280, title="Annotations by class")
+    )
+    composition = (
+        alt.Chart(alt.Data(values=composition_rows))
+        .mark_bar()
+        .encode(
+            x=alt.X("phase:N", sort=["before", "after"]),
+            xOffset=alt.XOffset("kind:N", sort=["annotated", "background"]),
+            y=alt.Y("images:Q", title="images"),
+            color=alt.Color(
+                "kind:N",
+                scale=alt.Scale(domain=["annotated", "background"], range=["#4477AA", "#CC6677"]),
+            ),
+        )
+        .properties(width=320, height=280, title="Image composition used for background ratio")
+    )
+    save_chart(alt.hconcat(annotations, composition, spacing=34), output)
     return output
 
 
@@ -930,90 +1212,83 @@ def save_source_pixel_coverage_summary(
 ) -> Path:
     """Plot exact source-area coverage aggregates and per-image distributions."""
 
+    import altair as alt
+
     exact = [row for row in rows if row.get("coverage_status") == "exact"]
     available = {str(row["split"]) for row in rows}
     splits = [split for split in ("train", "val", "test") if split in available]
     splits.extend(sorted(available - set(splits)))
-    fig, axes = plt.subplots(1, 2, figsize=(max(11, len(splits) * 2.6 + 6), 4.8))
-
-    weighted: list[float] = []
-    means: list[float] = []
-    medians: list[float] = []
-    distributions: list[list[float]] = []
-    unsupported_counts: list[int] = []
+    aggregate_rows: list[dict[str, Any]] = []
+    distribution_rows: list[dict[str, Any]] = []
+    unsupported: list[str] = []
     for split in splits:
         split_exact = [row for row in exact if row["split"] == split]
         values = sorted(float(row["source_pixel_coverage_percent"]) for row in split_exact)
         covered = sum(float(row["covered_source_area_px"]) for row in split_exact)
         total = sum(float(row["source_area_px"]) for row in split_exact)
-        weighted.append(100.0 * covered / total if total else 0.0)
-        means.append(sum(values) / len(values) if values else 0.0)
-        medians.append(
+        metrics = {
+            "pixel-weighted": 100.0 * covered / total if total else 0.0,
+            "mean per source": sum(values) / len(values) if values else 0.0,
+            "median per source": (
             values[len(values) // 2]
             if len(values) % 2 == 1
             else ((values[len(values) // 2 - 1] + values[len(values) // 2]) / 2 if values else 0.0)
-        )
-        distributions.append(values)
-        unsupported_counts.append(
-            sum(
-                row["split"] == split and row.get("coverage_status") != "exact"
-                for row in rows
-            )
-        )
-
-    x = list(range(len(splits)))
-    width = 0.24
-    for offset, values, label, color in (
-        (-width, weighted, "pixel-weighted", "#4477AA"),
-        (0.0, means, "mean per source", "#66CCEE"),
-        (width, medians, "median per source", "#228833"),
-    ):
-        bars = axes[0].bar(
-            [position + offset for position in x],
-            values,
-            width=width,
-            label=label,
-            color=color,
-        )
-        axes[0].bar_label(bars, fmt="%.1f%%", padding=2, fontsize=8)
-    axes[0].set_xticks(x, splits)
-    axes[0].set_ylim(0, 105)
-    axes[0].set_ylabel("union of original source area (%)")
-    axes[0].set_title("Spatial coverage by split")
-    axes[0].grid(axis="y", alpha=0.2)
-    axes[0].legend(frameon=False, fontsize=8)
-
-    nonempty = [(split, values) for split, values in zip(splits, distributions) if values]
-    if nonempty:
-        labels, values = zip(*nonempty)
-        axes[1].boxplot(values, tick_labels=labels, showfliers=True)
-        axes[1].set_ylim(0, 105)
-        axes[1].set_ylabel("source pixel coverage (%)")
-        axes[1].set_title("Per-source coverage distribution")
-        axes[1].grid(axis="y", alpha=0.2)
-    else:
-        axes[1].axis("off")
-        axes[1].text(0.5, 0.5, "No exact source footprints", ha="center", va="center")
-    if any(unsupported_counts):
-        axes[1].text(
-            0.02,
-            0.02,
-            "Unsupported source(s): "
-            + ", ".join(
-                f"{split}={count}"
-                for split, count in zip(splits, unsupported_counts)
-                if count
             ),
-            transform=axes[1].transAxes,
-            fontsize=8,
-            color="#AA2222",
+        }
+        aggregate_rows.extend(
+            {"split": split, "metric": metric, "percent": value}
+            for metric, value in metrics.items()
         )
+        distribution_rows.extend(
+            {"split": split, "percent": value}
+            for value in values
+        )
+        count = sum(
+            row["split"] == split and row.get("coverage_status") != "exact"
+            for row in rows
+        )
+        if count:
+            unsupported.append(f"{split}={count}")
 
-    fig.suptitle("Original source-pixel coverage from unioned tile footprints")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(output, bbox_inches="tight", dpi=160)
-    plt.close(fig)
+    bars = (
+        alt.Chart(alt.Data(values=aggregate_rows))
+        .mark_bar()
+        .encode(
+            x=alt.X("split:N", sort=splits),
+            xOffset=alt.XOffset("metric:N"),
+            y=alt.Y("percent:Q", scale=alt.Scale(domain=[0, 105]), title="source area (%)"),
+            color=alt.Color(
+                "metric:N",
+                scale=alt.Scale(
+                    domain=["pixel-weighted", "mean per source", "median per source"],
+                    range=["#4477AA", "#66CCEE", "#228833"],
+                ),
+            ),
+            tooltip=["split:N", "metric:N", alt.Tooltip("percent:Q", format=".1f")],
+        )
+        .properties(width=max(360, 105 * len(splits)), height=300, title="Spatial coverage by split")
+    )
+    distribution = (
+        alt.Chart(alt.Data(values=distribution_rows))
+        .mark_boxplot(size=42)
+        .encode(
+            x=alt.X("split:N", sort=splits),
+            y=alt.Y("percent:Q", scale=alt.Scale(domain=[0, 105]), title="source pixel coverage (%)"),
+            color=alt.Color("split:N", legend=None),
+        )
+        .properties(
+            width=max(320, 90 * len(splits)),
+            height=300,
+            title=alt.TitleParams(
+                text="Per-source coverage distribution",
+                subtitle=("Unsupported source(s): " + ", ".join(unsupported)) if unsupported else None,
+            ),
+        )
+    )
+    chart = alt.hconcat(bars, distribution, spacing=36).properties(
+        title="Original source-pixel coverage from unioned tile footprints"
+    )
+    save_chart(chart, output)
     return output
 
 
@@ -1023,99 +1298,97 @@ def save_label_coverage_summary(
 ) -> Path:
     """Plot label-hit and requested-appearance coverage by split."""
 
+    import altair as alt
+
     available = {str(row["split"]) for row in rows}
     splits = [split for split in ("train", "val", "test") if split in available]
     splits.extend(sorted(available - set(splits)))
-    label_hit: list[float] = []
-    requested_hit: list[float] = []
-    covered_counts: list[int] = []
-    missed_counts: list[int] = []
+    percent_rows: list[dict[str, Any]] = []
+    count_rows: list[dict[str, Any]] = []
     for split in splits:
         selected = [row for row in rows if row["split"] == split]
         total = sum(int(row["total_labels"]) for row in selected)
         covered = sum(int(row["labels_covered_at_least_once"]) for row in selected)
         requested = sum(int(row["requested_coverages"]) for row in selected)
         actual = sum(int(row["actual_coverages"]) for row in selected)
-        label_hit.append(100.0 * covered / total if total else 0.0)
-        requested_hit.append(100.0 * actual / requested if requested else 0.0)
-        covered_counts.append(covered)
-        missed_counts.append(total - covered)
-
-    fig, axes = plt.subplots(1, 2, figsize=(max(10, len(splits) * 2.5 + 5), 4.6))
-    x = list(range(len(splits)))
-    width = 0.36
-    for offset, values, label, color in (
-        (-width / 2, label_hit, "labels hit at least once", "#228833"),
-        (width / 2, requested_hit, "requested appearances produced", "#4477AA"),
-    ):
-        bars = axes[0].bar(
-            [position + offset for position in x],
-            values,
-            width=width,
-            label=label,
-            color=color,
+        percent_rows.extend(
+            (
+                {"split": split, "metric": "labels hit at least once", "percent": 100.0 * covered / total if total else 0.0},
+                {"split": split, "metric": "requested appearances produced", "percent": 100.0 * actual / requested if requested else 0.0},
+            )
         )
-        axes[0].bar_label(bars, fmt="%.1f%%", padding=2, fontsize=8)
-    axes[0].set_xticks(x, splits)
-    axes[0].set_ylim(0, 105)
-    axes[0].set_ylabel("coverage (%)")
-    axes[0].set_title("Annotation sampling coverage")
-    axes[0].grid(axis="y", alpha=0.2)
-    axes[0].legend(frameon=False, fontsize=8)
+        count_rows.extend(
+            (
+                {"split": split, "status": "covered", "count": covered},
+                {"split": split, "status": "never covered", "count": total - covered},
+            )
+        )
 
-    axes[1].bar(x, covered_counts, label="covered", color="#228833")
-    axes[1].bar(
-        x,
-        missed_counts,
-        bottom=covered_counts,
-        label="never covered",
-        color="#CC6677",
+    percentages = (
+        alt.Chart(alt.Data(values=percent_rows))
+        .mark_bar()
+        .encode(
+            x=alt.X("split:N", sort=splits),
+            xOffset="metric:N",
+            y=alt.Y("percent:Q", scale=alt.Scale(domain=[0, 105]), title="coverage (%)"),
+            color=alt.Color("metric:N", scale=alt.Scale(range=["#228833", "#4477AA"])),
+        )
+        .properties(width=max(340, 100 * len(splits)), height=290, title="Annotation sampling coverage")
     )
-    axes[1].set_xticks(x, splits)
-    axes[1].set_ylabel("source annotations")
-    axes[1].set_title("Labels represented at least once")
-    axes[1].grid(axis="y", alpha=0.2)
-    axes[1].legend(frameon=False, fontsize=8)
-
-    fig.suptitle("Coverage-tiling annotation audit")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(output, bbox_inches="tight", dpi=160)
-    plt.close(fig)
+    counts = (
+        alt.Chart(alt.Data(values=count_rows))
+        .mark_bar()
+        .encode(
+            x=alt.X("split:N", sort=splits),
+            y=alt.Y("count:Q", title="source annotations", stack="zero"),
+            color=alt.Color(
+                "status:N",
+                sort=["covered", "never covered"],
+                scale=alt.Scale(domain=["covered", "never covered"], range=["#228833", "#CC6677"]),
+            ),
+        )
+        .properties(width=max(300, 86 * len(splits)), height=290, title="Labels represented at least once")
+    )
+    save_chart(alt.hconcat(percentages, counts, spacing=36).properties(title="Coverage-tiling annotation audit"), output)
     return output
 
 
 def save_empty_image_balance_summary(summary: dict[str, dict[str, Any]], output: Path) -> Path:
     """Plot annotated/background image distributions before and after balancing."""
 
+    import altair as alt
+
     splits = list(summary)
-    categories = ["annotated", "background"]
-    colors = {"annotated": "#4477AA", "background": "#CC6677"}
-    fig, axes = plt.subplots(1, 2, figsize=(max(9, len(splits) * 2.4), 4.5), sharey=True)
-    for ax, phase in zip(axes, ("before", "after")):
-        x = list(range(len(splits)))
-        width = 0.36
-        for offset, category in zip((-width / 2, width / 2), categories):
-            values = [int(summary[split][phase][category]) for split in splits]
-            bars = ax.bar(
-                [value + offset for value in x],
-                values,
-                width=width,
-                label=category,
-                color=colors[category],
+    rows = [
+        {
+            "split": split,
+            "phase": phase,
+            "kind": kind,
+            "images": int(summary[split][phase][kind]),
+        }
+        for split in splits
+        for phase in ("before", "after")
+        for kind in ("annotated", "background")
+    ]
+
+    def panel(phase: str) -> Any:
+        return (
+            alt.Chart(alt.Data(values=[row for row in rows if row["phase"] == phase]))
+            .mark_bar()
+            .encode(
+                x=alt.X("split:N", sort=splits),
+                xOffset=alt.XOffset("kind:N"),
+                y=alt.Y("images:Q", title="images"),
+                color=alt.Color(
+                    "kind:N",
+                    scale=alt.Scale(domain=["annotated", "background"], range=["#4477AA", "#CC6677"]),
+                ),
+                tooltip=["split:N", "kind:N", alt.Tooltip("images:Q", format=",")],
             )
-            ax.bar_label(bars, padding=2, fontsize=8)
-        ax.set_xticks(x, splits)
-        ax.set_title(phase.capitalize())
-        ax.set_xlabel("split")
-        ax.grid(axis="y", alpha=0.2)
-    axes[0].set_ylabel("images")
-    axes[1].legend(frameon=False)
-    fig.suptitle("Annotated and background image distribution")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(output, bbox_inches="tight", dpi=160)
-    plt.close(fig)
+            .properties(width=max(300, 88 * len(splits)), height=280, title=phase.capitalize())
+        )
+
+    save_chart(alt.hconcat(panel("before"), panel("after"), spacing=36).properties(title="Annotated and background image distribution"), output)
     return output
 
 
@@ -1127,9 +1400,6 @@ def save_class_removal_preview(
     after_metadata: DatasetMetadata,
     output: Path,
 ) -> Path:
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    _draw_sample(axes[0], sample, task, before_metadata)
-    axes[0].set_title("Before")
     after = Sample(
         sample.image_path,
         sample.relative_path,
@@ -1142,12 +1412,31 @@ def save_class_removal_preview(
             if annotation.class_id in class_mapping
         ],
     )
-    _draw_sample(axes[1], after, task, after_metadata)
-    axes[1].set_title("After")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(output, bbox_inches="tight", dpi=140)
-    plt.close(fig)
+
+    def prepare(_: Sample) -> VisualizationItem:
+        return VisualizationItem(
+            image_path=sample.image_path,
+            label=str(sample.relative_path),
+            panels=(
+                VisualizationPanel(
+                    title="Before",
+                    image=np.asarray(render_annotated_sample(sample, task, before_metadata)),
+                ),
+                VisualizationPanel(
+                    title="After",
+                    image=np.asarray(render_annotated_sample(after, task, after_metadata)),
+                ),
+            ),
+            foreground=np.ones((sample.height, sample.width), dtype=bool),
+        )
+
+    chart = visualize_records(
+        [sample],
+        options=VisualizationOptions(samples=None, columns=1, panel_size=4.0, show=False),
+        prepare=prepare,
+        title="Class removal preview",
+    )
+    save_chart(chart, output)
     return output
 
 
@@ -1162,75 +1451,77 @@ def save_tiling_preview(
 ) -> Path:
     """Show one small pass-through source and up to three tiled sources."""
 
-    columns = 2
-    rows = max(1, math.ceil(len(items) / columns))
-    fig, axes = plt.subplots(rows, columns, figsize=(14, 6 * rows), squeeze=False)
-    flat = axes.flatten()
-    visualization_options = normalize_visualize_kwargs(visualize_kwargs)
-    for ax, (sample, boxes, status) in zip(flat, items):
-        _draw_sample(
-            ax,
+    render_options = normalize_visualize_kwargs(visualize_kwargs)
+
+    def prepare(value: tuple[Sample, list[tuple[int, int, int, int]], str]) -> VisualizationItem:
+        sample, boxes, status = value
+        rendered = render_annotated_sample(
             sample,
             task,
             metadata,
-            **visualization_options,
-        )
+            line_width=render_options.get("line_width"),
+            outline_width=render_options.get("outline_width"),
+        ).convert("RGBA")
+        draw = ImageDraw.Draw(rendered)
+        preview_scale = max(rendered.size) / 400
+        window_width = max(2, round(1.5 * preview_scale))
+        index_font = _font(max(13, round(11 * preview_scale)))
         for index, (left, top, right, bottom) in enumerate(boxes):
-            ax.add_patch(
-                patches.Rectangle(
-                    (left, top),
-                    right - left,
-                    bottom - top,
-                    fill=False,
-                    edgecolor="#00d4ff",
-                    linewidth=1.4,
-                )
+            draw.rectangle(
+                (left, top, right, bottom),
+                outline="#00d4ff",
+                width=window_width,
             )
             if len(boxes) <= 20:
-                ax.text(
-                    left + 3,
-                    top + 12,
+                _text_box(
+                    draw,
+                    (left + window_width * 2, top + window_width * 2),
                     str(index),
-                    color="white",
-                    fontsize=7,
-                    bbox={"facecolor": "black", "alpha": 0.65, "pad": 1},
+                    index_font,
+                    (255, 255, 255, 255),
+                    pad=max(3, window_width),
                 )
-        if not boxes:
-            ax.text(
-                0.02,
-                0.04,
-                "PASS-THROUGH · NO CROP",
-                transform=ax.transAxes,
-                color="white",
-                fontsize=9,
-                bbox={"facecolor": "#167c3a", "alpha": 0.9, "pad": 4},
-            )
-        title = _sample_title(
+        label = _sample_title(
             sample,
-            visualization_options.get("label_fn"),
+            render_options.get("label_fn"),
             default=(
                 f"{status} · {sample.split} · {sample.width}×{sample.height}\n"
                 f"{sample.relative_path} · {len(sample.annotations)} annotations"
             ),
         )
-        if title is None:
-            ax.set_title("")
-        else:
-            ax.set_title(title, fontsize=8)
-    for ax in flat[len(items) :]:
-        ax.axis("off")
+        return VisualizationItem(
+            image_path=sample.image_path,
+            label=label or "",
+            panels=(
+                VisualizationPanel(
+                    title="Crop windows",
+                    image=np.asarray(rendered),
+                    footer="PASS-THROUGH · NO CROP" if not boxes else None,
+                ),
+            ),
+            foreground=np.ones((sample.height, sample.width), dtype=bool),
+        )
+
     pass_through = sum(not boxes for _, boxes, _ in items)
     tiled = len(items) - pass_through
-    fig.suptitle(
-        f"{mode.capitalize()} tiling preview — "
-        f"{pass_through} small pass-through source(s), {tiled} tiled source(s)\n"
-        "cyan rectangles = output crop windows",
-        fontsize=13,
+    options = VisualizationOptions(
+        samples=None,
+        columns=2,
+        panel_size=4.2,
+        label_mode=render_options.get("label_mode", "middle"),
+        show=False,
     )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(output, bbox_inches="tight", dpi=140)
-    plt.close(fig)
+    chart = visualize_records(
+        items,
+        options=options,
+        prepare=prepare,
+        title=(
+            f"{mode.capitalize()} tiling preview — "
+            f"{pass_through} small pass-through source(s), {tiled} tiled source(s) — "
+            "cyan rectangles = output crop windows"
+        ),
+    )
+    save_chart(chart, output)
     return output
 
 
@@ -1584,39 +1875,7 @@ def save_coverage_annotated_original(
     return output
 
 
-def _display_or_print(fig, save_to: Path | None) -> None:
-    displayed = False
-    try:
-        from IPython import get_ipython
-        from IPython.display import display
-
-        if get_ipython() is not None:
-            display(fig)
-            displayed = True
-    except Exception:
-        pass
-    if save_to and not displayed:
-        print(f"Visualization: {save_to}")
-    plt.close(fig)
-
-
 def display_report(path: Path) -> None:
     """Display the canonical report PNG inline without redrawing its contents."""
 
-    try:
-        from IPython import get_ipython
-
-        if get_ipython() is None:
-            print(f"Visualization: {path}")
-            return
-    except Exception:
-        print(f"Visualization: {path}")
-        return
-    with Image.open(path) as opened:
-        report = opened.convert("RGB").copy()
-    aspect = report.height / max(1, report.width)
-    fig = plt.figure(figsize=(16, 16 * aspect), frameon=False)
-    ax = fig.add_axes((0, 0, 1, 1))
-    ax.imshow(report)
-    ax.axis("off")
-    _display_or_print(fig, path)
+    display_image(path)

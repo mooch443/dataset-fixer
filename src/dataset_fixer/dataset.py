@@ -54,6 +54,7 @@ from .validation_audit import ValidationFailureExample, build_load_validation_au
 from .visualization import (
     display_report,
     normalize_visualize_kwargs,
+    visualization_options,
     visualize_samples,
     visualize_semantic_masks,
 )
@@ -1952,34 +1953,46 @@ class Dataset:
         self,
         *,
         split: Literal["train", "val", "test"] | None = "train",
-        n: int = 12,
+        samples: int | None = 12,
         seed: int = 42,
         columns: int = 3,
+        panel_size: float = 3.0,
+        zoom: bool = False,
+        context_fraction: float = 0.35,
+        minimum_context: int = 100,
         label_fn: Callable[[Path], str | None] | None = None,
+        label_mode: Literal["middle", "wrap"] = "middle",
         line_width: float | None = None,
         outline_width: float | None = None,
-        save_to: str | Path | None = None,
+        outline_alpha: float = 1.0,
+        destination: str | Path | None = None,
         show: bool = True,
-    ) -> Any:
+    ) -> None:
         """Render a deterministic contact sheet with task-aware annotations.
 
         Parameters:
             split: One split to sample, or ``None`` for all splits.
-            n: Maximum number of images.
+            samples: Maximum number of images, or ``None`` for all images.
             seed: Deterministic image-sampling seed.
             columns: Contact-sheet column count.
+            panel_size: Approximate width and height of each image panel in inches.
+            zoom: Crop each image to its annotation extent. Empty images retain
+                the full source image.
+            context_fraction: Extra crop context on each side as a fraction of
+                the foreground-union width or height.
+            minimum_context: Minimum crop width and height in source pixels.
             label_fn: Optional callback receiving an image path and returning
                 the title shown above that image. Return ``None`` to show no
                 title. When omitted, a title retained by a producing operation
                 is reused before falling back to the standard filename title.
+            label_mode: Shorten long labels in the middle or wrap them.
             line_width: Annotation-colour line width in rendered preview pixels.
             outline_width: White annotation-outline width in preview pixels.
-            save_to: Optional PNG/JPEG/PDF output path.
+            outline_alpha: Annotation opacity in ``[0, 1]``.
+            destination: Optional PNG/JPEG/PDF/SVG output path.
             show: Display in an active notebook or interactive backend.
 
-        Returns:
-            The Matplotlib figure. Deferred pixel-generating pipelines must be
-            exported before visualization.
+        Deferred pixel-generating pipelines must be exported before visualization.
         """
 
         if self._plan and not self._projection_exact:
@@ -1987,46 +2000,38 @@ class Dataset:
                 "This pipeline contains deferred tiling, so exact output pixels do not exist yet; "
                 "call export() before visualizing tiled results"
             )
-        if n <= 0 or columns <= 0:
-            raise ValueError("n and columns must be positive")
-        visualization_options = normalize_visualize_kwargs(
-            {
-                key: value
-                for key, value in {
-                    "label_fn": label_fn,
-                    "line_width": line_width,
-                    "outline_width": outline_width,
-                }.items()
-                if value is not None
-            }
+        options = visualization_options(
+            samples=samples,
+            columns=columns,
+            seed=seed,
+            panel_size=panel_size,
+            zoom=zoom,
+            context_fraction=context_fraction,
+            minimum_context=minimum_context,
+            label_fn=label_fn,
+            label_mode=label_mode,
+            line_width=line_width,
+            outline_width=outline_width,
+            outline_alpha=outline_alpha,
+            destination=destination,
+            show=show,
         )
         normalized = normalize_split(split) if split is not None else None
         if normalized is not None and normalized not in self.splits:
             raise ValueError(f"Unknown split {split!r}; available splits are {self.splits}")
-        destination = Path(save_to).expanduser().resolve() if save_to else None
         if self.format == "semantic_masks":
             return visualize_semantic_masks(
                 self._samples,
                 self._mask_paths,
                 split=normalized,
-                n=n,
-                seed=seed,
-                columns=columns,
-                label_fn=visualization_options.get("label_fn"),
-                save_to=destination,
-                show=show,
+                options=options,
             )
         return visualize_samples(
             self._samples,
             self.task,
             self._metadata,
             split=normalized,
-            n=n,
-            seed=seed,
-            columns=columns,
-            **visualization_options,
-            save_to=destination,
-            show=show,
+            options=options,
         )
 
     def sample(

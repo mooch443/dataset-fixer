@@ -24,6 +24,7 @@ from dataset_fixer.comparison.object_sizes import (
     render_segmentation_metric_breakdown,
     select_large_examples,
 )
+import dataset_fixer.comparison.object_sizes as object_sizes_module
 
 
 def _component(
@@ -50,12 +51,30 @@ def _component(
     )
 
 
-def _model_type_badges(axis: object) -> dict[str, tuple[float, float, float, float]]:
-    return {
-        text.get_text(): text.get_bbox_patch().get_facecolor()
-        for text in axis.texts
-        if text.get_bbox_patch() is not None
-    }
+def _capture_chart(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    captured: dict[str, object] = {}
+    original = object_sizes_module.save_chart
+
+    def save(chart: object, path: Path, **kwargs: object) -> Path:
+        captured["spec"] = chart.to_dict()  # type: ignore[attr-defined]
+        return original(chart, path, **kwargs)
+
+    monkeypatch.setattr(object_sizes_module, "save_chart", save)
+    return captured
+
+
+def _inline_rows(value: object) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    if isinstance(value, dict):
+        data = value.get("data")
+        if isinstance(data, dict) and isinstance(data.get("values"), list):
+            rows.extend(data["values"])
+        for child in value.values():
+            rows.extend(_inline_rows(child))
+    elif isinstance(value, list):
+        for child in value:
+            rows.extend(_inline_rows(child))
+    return rows
 
 
 def test_semantic_components_use_eight_connectivity_and_foreground_area() -> None:
@@ -308,8 +327,6 @@ def test_metric_breakdown_includes_model_type_and_presence_columns(
     model_type: str,
     expected_slug: str,
 ) -> None:
-    import matplotlib.pyplot as plt
-
     ranking = [
         {
             "model": "model",
@@ -330,25 +347,19 @@ def test_metric_breakdown_includes_model_type_and_presence_columns(
             "positive_case_dice": 0.8,
         }
     ]
-    original_close = plt.close
-    monkeypatch.setattr(plt, "close", lambda _figure: None)
+    captured = _capture_chart(monkeypatch)
 
     path = render_segmentation_metric_breakdown(
         tmp_path,
         ranking,
         minimum_component_area=12,
     )
-    figure = plt.gcf()
-    axis = figure.axes[0]
-    column_labels = [label.get_text() for label in axis.get_xticklabels()]
-    row_labels = [label.get_text() for label in axis.get_yticklabels()]
-    badges = _model_type_badges(axis)
-    original_close(figure)
+    rows = _inline_rows(captured["spec"])
+    column_labels = list(dict.fromkeys(str(row["column"]) for row in rows if "column" in row))
+    row_labels = list(dict.fromkeys(str(row["model_label"]) for row in rows if "model_label" in row))
 
     assert path.is_file()
-    assert row_labels == ["model"]
-    assert set(badges) == {expected_slug, "4×", "512px"}
-    assert badges[expected_slug][3] == pytest.approx(1.0)
+    assert row_labels == [f"model · {expected_slug} · 4× · 512px"]
     assert column_labels == [
         "Mean Dice",
         "Pooled foreground\nDice",
@@ -367,9 +378,6 @@ def test_object_size_breakdown_includes_colored_model_type_badges(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import to_rgba
-
     components = {
         "image": (
             _component("small", np.ones((1, 1), dtype=bool)),
@@ -394,30 +402,23 @@ def test_object_size_breakdown_includes_colored_model_type_badges(
             "large_object_dice": 0.0,
         },
     ]
-    original_close = plt.close
-    monkeypatch.setattr(plt, "close", lambda _figure: None)
+    captured = _capture_chart(monkeypatch)
 
     path = render_object_size_breakdown(tmp_path, ranking, analysis)
-    figure = plt.gcf()
-    axis = figure.axes[0]
-    badges = _model_type_badges(axis)
-    original_close(figure)
+    rows = _inline_rows(captured["spec"])
+    labels = list(dict.fromkeys(str(row["model_label"]) for row in rows if "model_label" in row))
 
     assert path is not None and path.is_file()
-    assert [label.get_text() for label in axis.get_yticklabels()] == [
-        "semantic-model",
-        "instance-model",
+    assert labels == [
+        "semantic-model · yolo26m-sem",
+        "instance-model · yolo26m-seg",
     ]
-    assert badges["yolo26m-sem"] == pytest.approx(to_rgba("#0F766E"))
-    assert badges["yolo26m-seg"] == pytest.approx(to_rgba("#2563EB"))
 
 
 def test_grouped_metric_breakdown_sorts_by_macro_and_shows_defined_support(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import matplotlib.pyplot as plt
-
     ranking = [
         {"model": "lower", "model_type": "yolo26m-seg"},
         {"model": "higher", "model_type": "nnunet-m"},
@@ -442,8 +443,7 @@ def test_grouped_metric_breakdown_sorts_by_macro_and_shows_defined_support(
             ],
         },
     }
-    original_close = plt.close
-    monkeypatch.setattr(plt, "close", lambda _figure: None)
+    captured = _capture_chart(monkeypatch)
 
     path = render_grouped_metric_breakdown(
         tmp_path,
@@ -451,27 +451,18 @@ def test_grouped_metric_breakdown_sorts_by_macro_and_shows_defined_support(
         grouped_by_model,
         group_splits={"aoi-a": ("train",), "aoi-b": ("val",)},
     )
-    figure = plt.gcf()
-    axis = figure.axes[0]
-    row_labels = [label.get_text() for label in axis.get_yticklabels()]
-    column_labels = [label.get_text() for label in axis.get_xticklabels()]
-    column_colors = [label.get_color() for label in axis.get_xticklabels()]
-    badges = _model_type_badges(axis)
-    cell_labels = [
-        label.get_text() for label in axis.texts if label.get_bbox_patch() is None
-    ]
-    displayed_values = np.asarray(axis.images[0].get_array())
-    original_close(figure)
+    rows = _inline_rows(captured["spec"])
+    row_labels = list(dict.fromkeys(str(row["model_label"]) for row in rows if "model_label" in row))
+    column_labels = list(dict.fromkeys(str(row["column"]) for row in rows if "column" in row))
+    cell_labels = [str(row["label"]) for row in rows if "label" in row]
 
     assert path.is_file()
-    assert row_labels == ["higher", "lower"]
-    assert set(badges) == {"nnunet-m", "yolo26m-seg"}
-    assert column_labels == ["Macro", "aoi-a", "aoi-b"]
-    assert column_colors[1:] == ["#2563EB", "#D97706"]
+    assert row_labels == ["higher · nnunet-m", "lower · yolo26m-seg"]
+    assert column_labels == ["Macro", "aoi-a\n[train]", "aoi-b\n[val]"]
     assert cell_labels[0] == "0.750\n(2/2)"
     assert cell_labels[3] == "0.250\n(1/2)"
     assert cell_labels[5] == "TN"
-    assert displayed_values[1, 2] == 1.0
+    assert next(row["display_value"] for row in rows if row.get("model_label") == "lower · yolo26m-seg" and row.get("column") == "aoi-b\n[val]") == 1.0
 
 
 @pytest.mark.parametrize("metric", ["precision", "recall", "f1"])
@@ -480,8 +471,6 @@ def test_grouped_presence_breakdown_sorts_by_macro_f1_and_marks_edge_cases(
     monkeypatch: pytest.MonkeyPatch,
     metric: str,
 ) -> None:
-    import matplotlib.pyplot as plt
-
     ranking = [
         {"model": "lower", "model_type": "yolo26m-seg"},
         {"model": "higher", "model_type": "nnunet-m"},
@@ -547,8 +536,7 @@ def test_grouped_presence_breakdown_sorts_by_macro_f1_and_marks_edge_cases(
             ],
         },
     }
-    original_close = plt.close
-    monkeypatch.setattr(plt, "close", lambda _figure: None)
+    captured = _capture_chart(monkeypatch)
 
     path = render_grouped_presence_metric_breakdown(
         tmp_path,
@@ -561,28 +549,20 @@ def test_grouped_presence_breakdown_sorts_by_macro_f1_and_marks_edge_cases(
             "aoi-tn": ("train", "val"),
         },
     )
-    figure = plt.gcf()
-    axis = figure.axes[0]
-    row_labels = [label.get_text() for label in axis.get_yticklabels()]
-    column_labels = [label.get_text() for label in axis.get_xticklabels()]
-    column_colors = [label.get_color() for label in axis.get_xticklabels()]
-    badges = _model_type_badges(axis)
-    cell_labels = [
-        label.get_text() for label in axis.texts if label.get_bbox_patch() is None
-    ]
-    original_close(figure)
+    rows = _inline_rows(captured["spec"])
+    row_labels = list(dict.fromkeys(str(row["model_label"]) for row in rows if "model_label" in row))
+    column_labels = list(dict.fromkeys(str(row["column"]) for row in rows if "column" in row))
+    cell_labels = [str(row["label"]) for row in rows if "label" in row]
 
     assert path.name == f"grouped-presence-{metric}.png"
     assert path.is_file()
-    assert row_labels == ["higher", "lower"]
-    assert set(badges) == {"nnunet-m", "yolo26m-seg"}
+    assert row_labels == ["higher · nnunet-m", "lower · yolo26m-seg"]
     assert column_labels == [
         f"Macro {metric.upper()}",
-        "aoi-fp",
-        "aoi-miss",
-        "aoi-tn",
+        "aoi-fp\n[train]",
+        "aoi-miss\n[val]",
+        "aoi-tn\n[train/val]",
     ]
-    assert column_colors[1:] == ["#2563EB", "#D97706", "#7C3AED"]
     assert cell_labels[0].startswith("1.000")
     assert "TN" in cell_labels
     if metric == "precision":

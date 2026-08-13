@@ -129,7 +129,7 @@ def to_jsonable(value: Any) -> Any:
 def package_versions() -> dict[str, str]:
     result: dict[str, str] = {}
     for name in (
-        "dataset-fixer", "numpy", "Pillow", "PyYAML", "matplotlib", "shapely", "tqdm",
+        "dataset-fixer", "numpy", "Pillow", "PyYAML", "altair", "vl-convert-python", "shapely", "tqdm",
         "albumentations", "ultralytics", "sahi", "nnunetv2",
     ):
         try:

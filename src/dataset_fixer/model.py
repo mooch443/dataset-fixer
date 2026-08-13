@@ -22,6 +22,13 @@ from .errors import (
 from .geometry import Geometry, filter_inputs_by_size, normalize_errors
 from .prediction_cache import PredictionCache
 from .utils import IMAGE_SUFFIXES, sha256_file, slugify, to_jsonable
+from .visualization import (
+    finish_visualization,
+    VisualizationItem,
+    VisualizationPanel,
+    visualize_records,
+    visualization_options,
+)
 
 ModelKind = Literal["ultralytics", "nnunet"]
 PredictionTask = Literal["detect", "segment", "pose", "polo", "semantic_segment"]
@@ -508,10 +515,14 @@ class PredictionResult:
         zoom: bool = False,
         context_fraction: float = 0.35,
         minimum_context: int = 100,
+        label_fn: Callable[[Path], str | None] | None = None,
+        label_mode: Literal["middle", "wrap"] = "middle",
+        line_width: float | None = None,
         outline_width: float = 1.0,
         outline_alpha: float = 1.0,
         destination: str | Path | None = None,
-    ) -> Any:
+        show: bool = True,
+    ) -> None:
         """Render compact original/annotation/prediction rows.
 
         Parameters:
@@ -527,281 +538,84 @@ class PredictionResult:
                 fraction of the foreground-union width or height.
             minimum_context: Minimum total crop width and height in source
                 pixels when ``zoom`` is enabled.
-            outline_width: Annotation and prediction outline width. Overlays
-                are never filled, so source-image pixels remain visible.
+            label_fn: Optional callback receiving an image path and returning
+                its row title. Return ``None`` to suppress the title.
+            label_mode: Shorten long labels in the middle or wrap them.
+            line_width: Annotation and prediction colour-line width.
+            outline_width: White halo width around annotation and prediction
+                lines. Overlays are never filled, so source pixels remain visible.
             outline_alpha: Annotation and prediction outline opacity in
                 ``[0, 1]``. The default is fully opaque.
-            destination: Optional PNG output path.
+            destination: Optional PNG/JPEG/PDF/SVG output path.
+            show: Display in an active notebook or interactive backend.
 
-        Returns:
-            A Matplotlib figure.
         """
 
-        if samples is not None and (
-            isinstance(samples, bool) or not isinstance(samples, int) or samples <= 0
-        ):
-            raise ValueError("samples must be a positive integer or None")
-        if columns <= 0:
-            raise ValueError("columns must be positive")
-        if not math.isfinite(panel_size) or panel_size <= 0:
-            raise ValueError("panel_size must be a positive finite number")
-        if not isinstance(zoom, bool):
-            raise TypeError("zoom must be a boolean")
-        if not math.isfinite(context_fraction) or context_fraction < 0:
-            raise ValueError("context_fraction must be a finite non-negative number")
-        if (
-            isinstance(minimum_context, bool)
-            or not isinstance(minimum_context, int)
-            or minimum_context <= 0
-        ):
-            raise ValueError("minimum_context must be a positive integer")
-        if not math.isfinite(outline_width) or outline_width <= 0:
-            raise ValueError("outline_width must be a positive finite number")
-        if not math.isfinite(outline_alpha) or not 0 <= outline_alpha <= 1:
-            raise ValueError("outline_alpha must be finite and in [0, 1]")
+        options = visualization_options(
+            samples=samples,
+            columns=columns,
+            seed=seed,
+            panel_size=panel_size,
+            zoom=zoom,
+            context_fraction=context_fraction,
+            minimum_context=minimum_context,
+            label_fn=label_fn,
+            label_mode=label_mode,
+            line_width=line_width,
+            outline_width=outline_width,
+            outline_alpha=outline_alpha,
+            destination=destination,
+            show=show,
+        )
         if not self.records:
             raise ValueError("PredictionResult contains no images")
-        import matplotlib.pyplot as plt
-        from matplotlib import font_manager
 
-        available_fonts = {font.name for font in font_manager.fontManager.ttflist}
-        font_family = next(
-            (
-                candidate
-                for candidate in ("Arial", "Avenir Next", "Helvetica Neue")
-                if candidate in available_fonts
-            ),
-            "DejaVu Sans",
-        )
-
-        count = len(self.records) if samples is None else min(samples, len(self.records))
-        if count == len(self.records):
-            selected = list(self.records)
-        else:
-            rng = np.random.default_rng(seed)
-            indices = sorted(
-                rng.choice(len(self.records), size=count, replace=False).tolist()
-            )
-            selected = [self.records[index] for index in indices]
-
-        prepared: list[
-            tuple[ImagePrediction, tuple[int, int, int, int]]
-        ] = []
-        for record in selected:
+        def prepare(record: ImagePrediction) -> VisualizationItem:
             with Image.open(record.image_path) as opened:
-                source_size = opened.size
-            if source_size != (record.width, record.height):
+                image = np.asarray(opened.convert("RGB"))
+            if image.shape[:2] != (record.height, record.width):
                 raise DatasetValidationError(
                     f"Source image for {record.relative_path!r} has size "
-                    f"{source_size}; expected {(record.width, record.height)}"
+                    f"{(image.shape[1], image.shape[0])}; "
+                    f"expected {(record.width, record.height)}"
                 )
-            reference_mask = _reference_outline_mask(record)
-            prediction_mask = _prediction_outline_mask(record)
-            foreground = prediction_mask.copy()
-            if reference_mask is not None:
-                foreground |= reference_mask
-            bounds = (
-                _foreground_crop_bounds(
-                    foreground,
-                    context_fraction=context_fraction,
-                    minimum_context=minimum_context,
-                )
-                if zoom and np.any(foreground)
-                else (0, 0, record.width, record.height)
-            )
-            prepared.append((record, bounds))
-
-        rows = math.ceil(len(selected) / columns)
-        row_heights: list[float] = []
-        for row in range(rows):
-            row_values = prepared[row * columns : (row + 1) * columns]
-            aspect = max(
-                (bounds[3] - bounds[1]) / max(bounds[2] - bounds[0], 1)
-                for _, bounds in row_values
-            )
-            # Each cell contains three panels, so each panel is approximately
-            # ``panel_size`` inches wide. Allocate the matching image height
-            # instead of imposing a tall minimum: wide satellite strips would
-            # otherwise be vertically centered inside a mostly empty row.
-            row_heights.append(panel_size * min(1.55, max(0.08, aspect)))
-        title_heights = [0.50 if row == 0 else 0.30 for row in range(rows)]
-        model_header_height = 0.26
-        bottom_margin = 0.04
-        figure_height = (
-            sum(row_heights)
-            + sum(title_heights)
-            + model_header_height
-            + bottom_margin
-        )
-        figure = plt.figure(
-            figsize=(
-                panel_size * 3.0 * columns,
-                figure_height,
-            )
-        )
-        figure.subplots_adjust(
-            left=0.015,
-            right=0.995,
-            top=1.0 - model_header_height / figure_height,
-            bottom=bottom_margin / figure_height,
-        )
-        outer = figure.add_gridspec(
-            rows,
-            columns,
-            height_ratios=[
-                height + title_heights[row] for row, height in enumerate(row_heights)
-            ],
-            wspace=0.10,
-            hspace=0.045,
-        )
-        reference_color = "#D39A52"  # muted ochre
-        prediction_color = "#C86552"  # muted terracotta
-        key_labels: list[tuple[Any, Any]] = []
-        for index, (record, bounds) in enumerate(prepared):
-            row = index // columns
-            column = index % columns
-            x0, y0, x1, y1 = bounds
-            with Image.open(record.image_path) as opened:
-                image = np.asarray(opened.convert("RGB"))[y0:y1, x0:x1]
-            reference_mask = _reference_outline_mask(record)
-            prediction_mask = _prediction_outline_mask(record)
-            reference_crop = (
-                None if reference_mask is None else reference_mask[y0:y1, x0:x1]
-            )
-            prediction_crop = prediction_mask[y0:y1, x0:x1]
-            cell = outer[row, column].subgridspec(
-                2,
-                3,
-                height_ratios=(title_heights[row], row_heights[row]),
-                hspace=0.015,
-                wspace=0.045,
-            )
-            key = figure.add_subplot(cell[0, :])
-            key.set_axis_off()
-            key_label = key.text(
-                0.5,
-                0.70 if row == 0 else 0.5,
-                _prediction_key(record.relative_path),
-                ha="center",
-                va="center",
-                fontsize=8.2,
-                fontfamily=font_family,
-                color="#463D35",
-                linespacing=1.18,
-            )
-            key_labels.append((key, key_label))
-            if row == 0:
-                for x, heading in zip(
-                    (1 / 6, 1 / 2, 5 / 6),
-                    ("Original", "Annotation", "Prediction"),
-                    strict=True,
-                ):
-                    key.text(
-                        x,
-                        0.05,
-                        heading,
-                        ha="center",
-                        va="bottom",
-                        fontsize=9.2,
-                        fontweight="normal",
-                        fontfamily=font_family,
-                        color="#463D35",
-                    )
-            original = figure.add_subplot(cell[1, 0])
-            original.imshow(image)
-            reference = figure.add_subplot(cell[1, 1])
-            reference.imshow(image)
-            if reference_crop is not None:
-                _draw_mask_outline(
-                    reference,
-                    reference_crop,
-                    color=reference_color,
-                    linewidth=outline_width,
-                    alpha=outline_alpha,
-                )
-            prediction = figure.add_subplot(cell[1, 2])
-            prediction.imshow(image)
-            if record.mask is not None:
-                _draw_mask_outline(
-                    prediction,
-                    prediction_crop,
-                    color=prediction_color,
-                    linewidth=outline_width,
-                    alpha=outline_alpha,
-                )
-            else:
-                _draw_object_predictions(
-                    prediction,
-                    record.objects,
-                    color=prediction_color,
-                    linewidth=outline_width,
-                    alpha=outline_alpha,
-                    x_offset=x0,
-                    y_offset=y0,
-                )
-            crop_aspect = (y1 - y0) / max(x1 - x0, 1)
-            for axis in (original, reference, prediction):
-                axis.set_xlim(-0.5, x1 - x0 - 0.5)
-                axis.set_ylim(y1 - y0 - 0.5, -0.5)
-                axis.set_box_aspect(crop_aspect)
-                axis.set_xticks([])
-                axis.set_yticks([])
-                for spine in axis.spines.values():
-                    spine.set_visible(False)
-            if reference_mask is None or not np.any(reference_mask):
-                reference.text(
-                    0.98,
-                    0.03,
-                    "no annotation",
-                    transform=reference.transAxes,
-                    ha="right",
-                    va="bottom",
-                    fontsize=7.5,
-                    color="#6B625A",
-                )
-            if not np.any(prediction_mask):
-                prediction.text(
-                    0.98,
-                    0.03,
-                    "no prediction",
-                    transform=prediction.transAxes,
-                    ha="right",
-                    va="bottom",
-                    fontsize=7.5,
-                    color="#6B625A",
-                )
-        figure.suptitle(
-            _shorten_middle(self.model_name, 76),
-            fontsize=9.5,
-            fontweight="normal",
-            fontfamily=font_family,
-            color="#5C5147",
-            y=1.0 - 0.04 / figure_height,
-        )
-        # Layout first, then use the renderer's actual font metrics. Complete
-        # identifiers remain untouched until they exceed 90% of the available
-        # figure width (or their cell width in a multi-column layout).
-        figure.canvas.draw()
-        renderer = figure.canvas.get_renderer()
-        figure_limit = figure.bbox.width * 0.9
-        for key_axis, key_label in key_labels:
-            cell_limit = key_axis.get_window_extent(renderer).width * 0.9
-            _fit_text_to_width(
-                key_label,
-                renderer,
-                maximum_width=(
-                    figure_limit if columns == 1 else min(figure_limit, cell_limit)
+            reference = _reference_outline_mask(record)
+            prediction = _prediction_outline_mask(record)
+            foreground = prediction.copy()
+            if reference is not None:
+                foreground |= reference
+            return VisualizationItem(
+                image_path=record.image_path,
+                label=_prediction_key(record.relative_path),
+                panels=(
+                    VisualizationPanel(title="Original", image=image),
+                    VisualizationPanel(
+                        title="Annotation",
+                        image=image,
+                        mask=(
+                            np.zeros_like(prediction)
+                            if reference is None
+                            else reference
+                        ),
+                        color="#D39A52",
+                    ),
+                    VisualizationPanel(
+                        title="Prediction",
+                        image=image,
+                        mask=prediction,
+                        color="#C86552",
+                    ),
                 ),
+                foreground=foreground,
             )
-        if destination is not None:
-            path = Path(destination).expanduser().resolve()
-            if path.suffix.lower() != ".png":
-                raise ValueError("visualization destination must be a PNG file")
-            if path.exists():
-                raise FileExistsError(f"Visualization already exists: {path}")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
-        return figure
+
+        figure = visualize_records(
+            self.records,
+            options=options,
+            prepare=prepare,
+            title=_shorten_middle(self.model_name, 76),
+        )
+        finish_visualization(figure, options)
 
 
 @dataclass(frozen=True)
@@ -2153,13 +1967,17 @@ class Model:
         zoom: bool = False,
         context_fraction: float = 0.35,
         minimum_context: int = 100,
+        label_fn: Callable[[Path], str | None] | None = None,
+        label_mode: Literal["middle", "wrap"] = "middle",
+        line_width: float | None = None,
         outline_width: float = 1.0,
         outline_alpha: float = 1.0,
         destination: str | Path | None = None,
+        show: bool = True,
         errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
         prediction_options: Mapping[str, Any] | None = None,
-    ) -> Any:
+    ) -> None:
         """Predict a source and render sampled original/prediction pairs.
 
         Parameters:
@@ -2174,17 +1992,20 @@ class Model:
                 of the foreground-union width or height.
             minimum_context: Minimum total crop width and height in source
                 pixels when ``zoom`` is enabled.
-            outline_width: Annotation and prediction outline width.
+            label_fn: Optional callback receiving an image path and returning
+                its row title. Return ``None`` to suppress the title.
+            label_mode: Shorten long labels in the middle or wrap them.
+            line_width: Annotation and prediction colour-line width.
+            outline_width: White halo width around annotation and prediction lines.
             outline_alpha: Annotation and prediction outline opacity in
                 ``[0, 1]``. The default is fully opaque.
-            destination: Optional PNG output path.
+            destination: Optional PNG/JPEG/PDF/SVG output path.
+            show: Display in an active notebook or interactive backend.
             errors: Oversized-input policy forwarded to :meth:`predict`.
             progress: Show package-managed progress bars.
             prediction_options: Optional per-call overrides forwarded to
                 :meth:`predict`.
 
-        Returns:
-            The rendered Matplotlib figure.
         """
 
         options = dict(prediction_options or {})
@@ -2192,7 +2013,7 @@ class Model:
         options.setdefault("errors", errors)
         options.setdefault("progress", progress)
         result = self.predict(source, **options)
-        return result.visualize(
+        result.visualize(
             samples=samples,
             columns=columns,
             seed=seed,
@@ -2200,9 +2021,13 @@ class Model:
             zoom=zoom,
             context_fraction=context_fraction,
             minimum_context=minimum_context,
+            label_fn=label_fn,
+            label_mode=label_mode,
+            line_width=line_width,
             outline_width=outline_width,
             outline_alpha=outline_alpha,
             destination=destination,
+            show=show,
         )
 
     @classmethod
@@ -2861,34 +2686,52 @@ class ModelCollection:
         *,
         split: Literal["train", "val", "test"] = "val",
         samples: int = 8,
-        examples_per_row: int = 1,
-        include_empty: bool = False,
+        columns: int = 1,
         seed: int = 42,
         panel_size: float = 3.0,
+        zoom: bool = False,
+        context_fraction: float = 0.35,
+        minimum_context: int = 100,
+        label_fn: Callable[[Path], str | None] | None = None,
+        label_mode: Literal["middle", "wrap"] = "middle",
+        line_width: float | None = None,
+        outline_width: float = 1.0,
+        outline_alpha: float = 1.0,
+        destination: str | Path | None = None,
+        show: bool = True,
+        include_empty: bool = False,
         model_title_length: int = 30,
         image_title_length: int = 72,
         progress: bool = True,
-        destination: str | Path | None = None,
         errors: Literal["raise", "skip"] = "raise",
-    ) -> Any:
+    ) -> None:
         """Render a sampled semantic cohort with the shared comparison grid.
 
         Parameters:
             source: Semantic-mask :class:`Dataset` to visualize.
             split: Dataset split to sample.
             samples: Maximum number of source images to render.
-            examples_per_row: Source images placed in each grid row.
-            include_empty: Permit samples whose reference mask is empty.
+            columns: Source images placed in each grid row.
             seed: Deterministic sampling seed.
             panel_size: Width and height, in inches, of each grid panel.
+            zoom: Crop every panel to the annotation/prediction union.
+            context_fraction: Extra crop context on each side as a fraction
+                of the foreground-union width or height.
+            minimum_context: Minimum crop width and height in source pixels.
+            label_fn: Optional callback receiving an image path and returning
+                its row title. Return ``None`` to suppress the title.
+            label_mode: Shorten long labels in the middle or wrap them.
+            line_width: Annotation and prediction colour-line width.
+            outline_width: White halo width around annotation and prediction lines.
+            outline_alpha: Annotation and prediction opacity in ``[0, 1]``.
+            destination: Optional PNG/JPEG/PDF/SVG output path.
+            show: Display in an active notebook or interactive backend.
+            include_empty: Permit samples whose reference mask is empty.
             model_title_length: Maximum characters per displayed model-title line.
             image_title_length: Maximum displayed source-path length.
             progress: Show package-managed progress bars.
-            destination: Optional PNG output path or directory.
             errors: Oversized-image policy shared by the visualized models.
 
-        Returns:
-            The rendered Matplotlib figure.
         """
 
         active = source
@@ -2904,19 +2747,32 @@ class ModelCollection:
         active = validate_collection_geometry(active, self, split=split, errors=errors)
         from .semantic_comparison import visualize_nnunet_models
 
-        return visualize_nnunet_models(
+        options = visualization_options(
+            samples=samples,
+            columns=columns,
+            seed=seed,
+            panel_size=panel_size,
+            zoom=zoom,
+            context_fraction=context_fraction,
+            minimum_context=minimum_context,
+            label_fn=label_fn,
+            label_mode=label_mode,
+            line_width=line_width,
+            outline_width=outline_width,
+            outline_alpha=outline_alpha,
+            destination=destination,
+            show=show,
+        )
+
+        visualize_nnunet_models(
             active,
             self,
             split=split,
-            samples=samples,
-            examples_per_row=examples_per_row,
             include_empty=include_empty,
-            seed=seed,
-            panel_size=panel_size,
             model_title_length=model_title_length,
             image_title_length=image_title_length,
             progress=progress,
-            destination=destination,
+            options=options,
         )
 
     def __repr__(self) -> str:
@@ -3896,32 +3752,6 @@ def _prediction_key(relative_path: str) -> str:
     return key
 
 
-def _fit_text_to_width(
-    artist: Any,
-    renderer: Any,
-    *,
-    maximum_width: float,
-) -> None:
-    """Middle-shorten a text artist only when its rendered width overflows."""
-
-    value = artist.get_text()
-    if artist.get_window_extent(renderer).width <= maximum_width:
-        return
-    low = 2
-    high = len(value)
-    best = "…"
-    while low <= high:
-        middle = (low + high) // 2
-        candidate = _shorten_middle(value, middle)
-        artist.set_text(candidate)
-        if artist.get_window_extent(renderer).width <= maximum_width:
-            best = candidate
-            low = middle + 1
-        else:
-            high = middle - 1
-    artist.set_text(best)
-
-
 def _prediction_outline_mask(record: ImagePrediction) -> np.ndarray:
     """Rasterize any supported prediction task for outlines and crop bounds."""
 
@@ -3972,140 +3802,3 @@ def _reference_outline_mask(record: ImagePrediction) -> np.ndarray | None:
             f"{reference_mask.shape}; expected {(record.height, record.width)}"
         )
     return reference_mask
-
-
-def _foreground_crop_bounds(
-    foreground: np.ndarray,
-    *,
-    context_fraction: float,
-    minimum_context: int,
-) -> tuple[int, int, int, int]:
-    """Bound a foreground union with proportional padding and minimum extent."""
-
-    height, width = foreground.shape
-    ys, xs = np.nonzero(foreground)
-    if not len(xs):
-        return (0, 0, width, height)
-    object_x0 = int(xs.min())
-    object_x1 = int(xs.max()) + 1
-    object_y0 = int(ys.min())
-    object_y1 = int(ys.max()) + 1
-    object_width = object_x1 - object_x0
-    object_height = object_y1 - object_y0
-    target_width = min(
-        width,
-        max(
-            minimum_context,
-            object_width + 2 * int(math.ceil(object_width * context_fraction)),
-        ),
-    )
-    target_height = min(
-        height,
-        max(
-            minimum_context,
-            object_height + 2 * int(math.ceil(object_height * context_fraction)),
-        ),
-    )
-
-    def centered_bounds(start: int, end: int, target: int, maximum: int) -> tuple[int, int]:
-        center = (start + end) / 2.0
-        lower = int(math.floor(center - target / 2.0))
-        lower = min(max(lower, 0), maximum - target)
-        return lower, lower + target
-
-    x0, x1 = centered_bounds(object_x0, object_x1, target_width, width)
-    y0, y1 = centered_bounds(object_y0, object_y1, target_height, height)
-    return x0, y0, x1, y1
-
-
-def _draw_mask_outline(
-    axis: Any,
-    mask: np.ndarray,
-    *,
-    color: str,
-    linewidth: float,
-    alpha: float,
-) -> None:
-    """Draw only the boundary of a binary mask, leaving image pixels visible."""
-
-    if not np.any(mask):
-        return
-    padded = np.pad(np.asarray(mask, dtype=np.uint8), 1)
-    height, width = mask.shape
-    axis.contour(
-        np.arange(-1, width + 1),
-        np.arange(-1, height + 1),
-        padded,
-        levels=(0.5,),
-        colors=(color,),
-        linewidths=(linewidth,),
-        alpha=alpha,
-        antialiased=True,
-    )
-
-
-def _draw_object_predictions(
-    axis: Any,
-    values: tuple[Any, ...],
-    *,
-    color: str = "#9A4938",
-    linewidth: float = 1.0,
-    alpha: float = 1.0,
-    x_offset: int = 0,
-    y_offset: int = 0,
-) -> None:
-    import matplotlib.pyplot as plt
-
-    for value in values:
-        polygons = value.polygons or ([value.polygon] if value.polygon else [])
-        if value.bbox is not None and not polygons:
-            x1, y1, x2, y2 = value.bbox
-            axis.add_patch(
-                plt.Rectangle(
-                    (x1 - x_offset, y1 - y_offset),
-                    x2 - x1,
-                    y2 - y1,
-                    fill=False,
-                    color=color,
-                    linewidth=linewidth,
-                    alpha=alpha,
-                )
-            )
-        for raw_polygon in polygons:
-            polygon = np.asarray(raw_polygon, dtype=float)
-            axis.plot(
-                np.r_[polygon[:, 0], polygon[0, 0]] - x_offset,
-                np.r_[polygon[:, 1], polygon[0, 1]] - y_offset,
-                color=color,
-                linewidth=linewidth,
-                alpha=alpha,
-            )
-        if value.point is not None:
-            axis.scatter(
-                value.point[0] - x_offset,
-                value.point[1] - y_offset,
-                s=25,
-                facecolors="none",
-                edgecolors=color,
-                linewidth=linewidth,
-                alpha=alpha,
-            )
-        if value.keypoints:
-            keypoints = np.asarray(
-                [
-                    point[:2]
-                    for point in value.keypoints
-                    if len(point) < 3 or point[2] is None or point[2] > 0
-                ],
-                dtype=float,
-            )
-            if len(keypoints):
-                axis.scatter(
-                    keypoints[:, 0] - x_offset,
-                    keypoints[:, 1] - y_offset,
-                    s=14,
-                    facecolors="none",
-                    edgecolors=color,
-                    linewidth=linewidth,
-                    alpha=alpha,
-                )

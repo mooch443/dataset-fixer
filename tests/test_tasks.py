@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 import json
+import inspect
 from collections import Counter
 from pathlib import Path
 
+import numpy as np
 import pytest
 import yaml
-from PIL import Image
+from PIL import Image, ImageChops
 
-from dataset_fixer import Dataset, DatasetValidationError, Task
+from dataset_fixer import (
+    Dataset,
+    DatasetValidationError,
+    Model,
+    ModelCollection,
+    PredictionResult,
+    Task,
+)
 from dataset_fixer import tiling as tiling_module
 from dataset_fixer.models import Annotation, Sample
 from dataset_fixer.visualization import (
+    COMMON_VISUALIZE_PARAMETERS,
     _focus_invalid_annotation,
     _highlight_invalid_annotation,
     _polygon_invalidity_details,
@@ -118,9 +128,6 @@ def test_skip_audit_counts_all_failures_and_visualizes_at_most_four(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from matplotlib import pyplot as plt
-
-    open_figures = set(plt.get_fignums())
     invalid_row = "0 0.2 0.2 0.8 0.8 0.8 0.2 0.2 0.8"
     valid_row = "0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"
     source = make_yolo_dataset(
@@ -151,27 +158,27 @@ def test_skip_audit_counts_all_failures_and_visualizes_at_most_four(
     output = capsys.readouterr().out
     assert "Validation skip audit: 5 failed item(s)" in output
     assert "showing 4 example(s)" in output
-    assert set(plt.get_fignums()) == open_figures
 
 
-def test_notebook_display_closes_figure_after_immediate_render(
+def test_notebook_display_renders_static_png_without_global_renderer_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import altair as alt
     import IPython
     import IPython.display
-    from matplotlib import pyplot as plt
+    from dataset_fixer.static_rendering import display_chart
 
-    from dataset_fixer.visualization import _display_or_print
-
-    figure = plt.figure()
     displayed: list[object] = []
+    renderer = alt.renderers.active
     monkeypatch.setattr(IPython, "get_ipython", lambda: object())
     monkeypatch.setattr(IPython.display, "display", displayed.append)
+    chart = alt.Chart(alt.Data(values=[{"x": 1, "y": 2}])).mark_point().encode(x="x:Q", y="y:Q")
 
-    _display_or_print(figure, None)
+    display_chart(chart)
 
-    assert displayed == [figure]
-    assert figure.number not in plt.get_fignums()
+    assert len(displayed) == 1
+    assert isinstance(displayed[0], IPython.display.Image)
+    assert alt.renderers.active == renderer
 
 
 def test_invalid_polygon_visualization_identifies_exact_defects() -> None:
@@ -193,35 +200,19 @@ def test_invalid_polygon_visualization_identifies_exact_defects() -> None:
 
 
 def test_invalid_polygon_visualization_focuses_and_labels_vertices() -> None:
-    from matplotlib import pyplot as plt
-
     annotation = Annotation(
         class_id=0,
         polygon=[(90.0, 90.0), (130.0, 130.0), (130.0, 90.0), (90.0, 130.0)],
     )
-    figure, axis = plt.subplots()
-    _focus_invalid_annotation(axis, annotation, width=1000, height=800)
-    _highlight_invalid_annotation(axis, annotation, width=1000, height=800)
-
-    x_limits = sorted(axis.get_xlim())
-    y_limits = sorted(axis.get_ylim())
-    assert x_limits[1] - x_limits[0] < 300
-    assert y_limits[1] - y_limits[0] < 300
-    assert x_limits[0] <= 90 <= 130 <= x_limits[1]
-    assert y_limits[0] <= 90 <= 130 <= y_limits[1]
-    labels = {text.get_text() for text in axis.texts}
-    assert labels >= {
-        "0",
-        "1",
-        "2",
-        "3",
-        "self-intersection",
-    }
-    assert any(
-        label.startswith("Invalid polygon\n") and "self-intersection" in label
-        for label in labels
-    )
-    plt.close(figure)
+    bounds = _focus_invalid_annotation(annotation, width=1000, height=800)
+    assert bounds[2] - bounds[0] < 300
+    assert bounds[3] - bounds[1] < 300
+    assert bounds[0] <= 90 <= 130 <= bounds[2]
+    assert bounds[1] <= 90 <= 130 <= bounds[3]
+    source = Image.new("RGB", (1000, 800), "#334455")
+    rendered = _highlight_invalid_annotation(source, annotation, width=1000, height=800)
+    assert rendered.size == source.size
+    assert ImageChops.difference(source, rendered).getbbox() is not None
 
 
 def test_grid_tiling_transforms_segment_and_pose(tmp_path: Path) -> None:
@@ -448,7 +439,6 @@ def test_visualize_and_tiling_preview_labels_accept_path_callbacks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from matplotlib import pyplot as plt
     from dataset_fixer import dataset as dataset_module
 
     source = make_yolo_dataset(
@@ -466,24 +456,26 @@ def test_visualize_and_tiling_preview_labels_accept_path_callbacks(
         seen.append(path)
         return f"custom:{path.stem}"
 
-    figure = dataset.visualize(
+    direct_preview = tmp_path / "custom-label.png"
+    result = dataset.visualize(
         split="train",
-        n=1,
+        samples=1,
         label_fn=direct_label,
+        destination=direct_preview,
         show=False,
     )
-    assert figure.axes[0].get_title().startswith("custom:train_0")
+    assert result is None
+    assert direct_preview.is_file()
     assert seen and all(isinstance(path, Path) for path in seen)
-    plt.close(figure)
 
     untitled = dataset.visualize(
         split="train",
-        n=1,
+        samples=1,
         label_fn=lambda _path: None,
+        destination=tmp_path / "untitled.png",
         show=False,
     )
-    assert untitled.axes[0].get_title() == ""
-    plt.close(untitled)
+    assert untitled is None
 
     displayed_reports: list[Path] = []
     monkeypatch.setattr(dataset_module, "display_report", displayed_reports.append)
@@ -504,14 +496,14 @@ def test_visualize_and_tiling_preview_labels_accept_path_callbacks(
         str(record["display_label"]).startswith("tile:")
         for record in tiled.provenance.values()
     )
-    persisted = tiled.visualize(split="train", n=1, show=False)
-    assert persisted.axes[0].get_title().startswith("tile:")
-    plt.close(persisted)
+    persisted_preview = tmp_path / "persisted-label.png"
+    assert tiled.visualize(split="train", samples=1, destination=persisted_preview, show=False) is None
+    assert persisted_preview.is_file()
 
     with pytest.raises(TypeError, match="string or None"):
         dataset.visualize(
             split="train",
-            n=1,
+            samples=1,
             label_fn=lambda _path: 42,  # type: ignore[return-value]
             show=False,
         )
@@ -523,6 +515,62 @@ def test_visualize_and_tiling_preview_labels_accept_path_callbacks(
             visualize_kwargs={"line_width": 0},
             dry_run=True,
         )
+
+
+def test_public_visualize_methods_share_options_and_dataset_zoom(
+    tmp_path: Path,
+) -> None:
+    from dataset_fixer.visualization import foreground_crop_bounds
+
+    for method in (
+        Dataset.visualize,
+        PredictionResult.visualize,
+        Model.visualize,
+        ModelCollection.visualize,
+    ):
+        assert COMMON_VISUALIZE_PARAMETERS <= set(inspect.signature(method).parameters)
+
+    source = make_yolo_dataset(
+        tmp_path / "shared_visualization_source",
+        task="detect",
+        names=["school"],
+        train_rows=["0 0.5 0.5 0.1 0.2"],
+        val_rows=["0 0.5 0.5 0.1 0.2"],
+        size=(200, 100),
+    )
+    dataset = Dataset.open(source, task="detect", progress=False)
+    full_path = tmp_path / "full.png"
+    zoomed_path = tmp_path / "zoomed.png"
+    full = dataset.visualize(
+        split="train",
+        samples=1,
+        columns=1,
+        panel_size=2.0,
+        zoom=False,
+        destination=full_path,
+        show=False,
+    )
+    zoomed = dataset.visualize(
+        split="train",
+        samples=1,
+        columns=1,
+        panel_size=2.0,
+        zoom=True,
+        context_fraction=0.0,
+        minimum_context=10,
+        line_width=1.0,
+        outline_width=2.0,
+        outline_alpha=0.5,
+        label_fn=lambda path: path.stem,
+        destination=zoomed_path,
+        show=False,
+    )
+
+    assert full is None and zoomed is None
+    assert full_path.is_file() and zoomed_path.is_file()
+    mask = np.zeros((100, 200), dtype=bool)
+    mask[40:60, 90:110] = True
+    assert foreground_crop_bounds(mask, context_fraction=0.0, minimum_context=10) == (90, 40, 110, 60)
 
 
 def test_coverage_resamples_tiles_that_cut_annotations(tmp_path: Path) -> None:

@@ -6,14 +6,10 @@ import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import Any, Iterable
 
 from .models import Annotation, DatasetMetadata, Sample, Task
 from .utils import to_jsonable
-
-if TYPE_CHECKING:
-    from matplotlib.figure import Figure
-
 
 MAX_VISUALIZED_FAILURES = 4
 REPORT_NAME = "load_validation_audit.json"
@@ -97,7 +93,7 @@ def build_load_validation_audit(
     )
     from .visualization import visualize_validation_failures
 
-    figure: Figure = visualize_validation_failures(
+    visualize_validation_failures(
         examples,
         task,
         metadata,
@@ -106,9 +102,6 @@ def build_load_validation_audit(
         save_to=visualization,
         show=True,
     )
-    from matplotlib import pyplot as plt
-
-    plt.close(figure)
     return {
         "status": "passed_with_skips",
         "skipped_count": len(failure_warnings),

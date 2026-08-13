@@ -14,11 +14,9 @@ from .models import SemanticComparisonResult, Task
 from .prediction_cache import PredictionCache
 from .comparison.plot_labels import (
     ModelBadge,
-    add_model_badges,
     model_badges,
     model_full_label,
     model_label,
-    style_model_row_labels,
 )
 from .tracing import DatasetTrace, DatasetTraceNode, SampleTrace
 from .utils import bounded_slug
@@ -49,11 +47,9 @@ __all__ = [
     "SampleTrace",
     "Task",
     "ThresholdCalibrationResult",
-    "add_model_badges",
     "bounded_slug",
     "model_badges",
     "model_full_label",
     "model_label",
-    "style_model_row_labels",
     "__version__",
 ]

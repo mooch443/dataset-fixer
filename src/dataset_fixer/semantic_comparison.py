@@ -8,7 +8,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import textwrap
 import threading
 import time
 from collections import Counter
@@ -54,8 +53,8 @@ from .comparison.object_sizes import (
 )
 from .comparison.plot_labels import (
     model_badges,
+    model_full_label,
     model_label,
-    style_model_row_labels,
 )
 from .comparison.reporting import write_json
 from .errors import DatasetValidationError, ValidationIssue
@@ -63,6 +62,7 @@ from .model import ImagePrediction, Model, ModelCollection, ModelInput
 from .models import SemanticComparisonResult
 from .planning import callback_description
 from .sahi_support import resolve_sahi_settings
+from .static_rendering import finite_rows, save_chart
 from .utils import (
     IMAGE_SUFFIXES,
     environment_snapshot,
@@ -71,6 +71,14 @@ from .utils import (
     settings_fingerprint,
     sha256_file,
     to_jsonable,
+)
+from .visualization import (
+    VisualizationOptions,
+    finish_visualization,
+    VisualizationItem,
+    VisualizationPanel,
+    visualize_records,
+    visualization_options,
 )
 
 
@@ -2257,15 +2265,11 @@ def visualize_nnunet_models(
     cohort: ModelCollection,
     *,
     split: str,
-    samples: int,
-    examples_per_row: int,
     include_empty: bool,
-    seed: int,
-    panel_size: float,
     model_title_length: int,
     image_title_length: int,
     progress: bool,
-    destination: str | Path | None,
+    options: VisualizationOptions,
 ) -> Any:
     """Run sampled official nnU-Net inference and render model masks."""
 
@@ -2279,12 +2283,6 @@ def visualize_nnunet_models(
             f"Unknown semantic-mask split {split!r}; "
             f"available splits are {export.splits}"
         )
-    if samples <= 0:
-        raise ValueError("samples must be positive")
-    if examples_per_row <= 0:
-        raise ValueError("examples_per_row must be positive")
-    if not math.isfinite(panel_size) or panel_size <= 0:
-        raise ValueError("panel_size must be a positive finite number")
     if model_title_length < 5:
         raise ValueError("model_title_length must be at least 5")
     if image_title_length < 5:
@@ -2295,9 +2293,9 @@ def visualize_nnunet_models(
     cases, _ = _freeze_cohort(export, split, progress=progress)
     selected = _select_visual_cases(
         cases,
-        samples=samples,
+        samples=len(cases) if options.samples is None else options.samples,
         include_empty=include_empty,
-        seed=seed,
+        seed=options.seed,
     )
 
     with tempfile.TemporaryDirectory(prefix="dataset-fixer-semantic-visualize-") as temporary:
@@ -2342,21 +2340,13 @@ def visualize_nnunet_models(
                 }
                 for spec in cohort.models
             },
-            examples_per_row=examples_per_row,
-            panel_size=panel_size,
+            examples_per_row=options.columns,
+            panel_size=options.panel_size,
             model_title_length=model_title_length,
             image_title_length=image_title_length,
+            options=options,
         )
-        if destination is not None:
-            output = _visualization_destination(destination)
-            output.parent.mkdir(parents=True, exist_ok=True)
-            figure.savefig(
-                output,
-                dpi=180,
-                bbox_inches="tight",
-                facecolor="white",
-            )
-        return figure
+        return finish_visualization(figure, options)
 
 
 def _parse_models(models: Any) -> list[Model]:
@@ -3333,29 +3323,32 @@ def _render_ranking(
     ),
     title: str = "nnU-Net semantic-mask comparison",
 ) -> list[str]:
-    import matplotlib.pyplot as plt
+    import altair as alt
 
-    ordered = list(reversed(ranking))
-    figure, axis = plt.subplots(
-        figsize=(11.5, max(4.0, 1.05 * len(ordered) + 1.5))
-    )
-    scores = [
-        float(row["dice"]) if math.isfinite(float(row["dice"])) else 0.0
+    ordered = list(ranking)
+    data = [
+        {
+            **row,
+            "model_label": model_full_label(row),
+            "display_score": float(row["dice"]) if math.isfinite(float(row["dice"])) else 0.0,
+            "score_label": f"{float(row['dice']):.3f}" if math.isfinite(float(row["dice"])) else "n/a",
+        }
         for row in ordered
     ]
-    positions = np.arange(len(ordered))
-    axis.barh(positions, scores, color="#0072B2")
-    style_model_row_labels(axis, ordered)
-    axis.set_xlim(0, 1)
-    axis.set_xlabel(xlabel)
-    axis.set_title(title)
-    for index, (score, row) in enumerate(zip(scores, ordered)):
-        label = f"{float(row['dice']):.3f}" if math.isfinite(float(row["dice"])) else "n/a"
-        axis.text(min(score + 0.01, 0.98), index, label, va="center")
-    figure.tight_layout()
+    order = [row["model_label"] for row in data]
+    base = alt.Chart(alt.Data(values=finite_rows(data))).encode(
+        y=alt.Y("model_label:N", sort=order, title=None, axis=alt.Axis(labelLimit=340)),
+        x=alt.X("display_score:Q", scale=alt.Scale(domain=[0, 1]), title=xlabel),
+    )
+    bars = base.mark_bar(color="#0072B2")
+    labels = base.mark_text(align="left", dx=6).encode(text="score_label:N")
+    chart = (bars + labels).properties(
+        width=720,
+        height=max(190, 44 * len(ordered)),
+        title=title,
+    )
     path = root / "plots.png"
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
-    plt.close(figure)
+    save_chart(chart, path)
     return [str(path.relative_to(root))]
 
 
@@ -3613,15 +3606,13 @@ def _render_qualitative(
     *,
     seed: int,
 ) -> list[str]:
-    import matplotlib.pyplot as plt
-
     selected = _select_visual_cases(
         cases,
         samples=8,
         include_empty=False,
         seed=seed,
     )
-    figure = _render_semantic_grid(
+    chart = _render_semantic_grid(
         selected,
         prediction_dirs,
         rows_by_model,
@@ -3632,8 +3623,7 @@ def _render_qualitative(
         image_title_length=72,
     )
     output = root / "comparison.png"
-    figure.savefig(output, dpi=160, bbox_inches="tight", facecolor="white")
-    plt.close(figure)
+    save_chart(chart, output)
     return [str(output.relative_to(root))]
 
 
@@ -3654,8 +3644,6 @@ def _render_semantic_prediction_grids(
     nothing else is drawn.
     """
 
-    import matplotlib.pyplot as plt
-
     model_names = list(prediction_dirs)
     model_metadata = {
         str(row["model"]): row for row in (ranking or [])
@@ -3664,13 +3652,10 @@ def _render_semantic_prediction_grids(
         name: model_metadata.get(name, {"model": name})
         for name in model_names
     }
-    row_lookup = {
-        name: {str(row["case_id"]): row for row in rows}
-        for name, rows in rows_by_model.items()
-    }
     if case_ids is not None:
         selected = set(case_ids)
         cases = [case for case in cases if case.case_id in selected]
+    options = visualization_options(show=False)
     output_root = root / "predictions"
     rendered: list[str] = []
     for case in cases:
@@ -3684,42 +3669,20 @@ def _render_semantic_prediction_grids(
         # every panel, so there is nothing in it to look at.
         if not truth.any() and not any(value.any() for value in predictions.values()):
             continue
-        columns = min(2, len(model_names))
-        rows = math.ceil(len(model_names) / columns)
-        figure, axes = plt.subplots(
-            rows,
-            columns,
-            figsize=(5 * columns, 5 * rows),
-            squeeze=False,
+        chart = _render_semantic_grid(
+            [case],
+            prediction_dirs,
+            rows_by_model,
+            model_metadata=model_metadata,
+            examples_per_row=1,
+            panel_size=3.0,
+            model_title_length=30,
+            image_title_length=72,
+            options=options,
         )
-        with Image.open(case.image_path) as opened:
-            image = np.asarray(opened.convert("RGB"), dtype=np.float32)
-        for index, name in enumerate(model_names):
-            row, column = divmod(index, columns)
-            prediction = predictions[name]
-            overlay = image.copy()
-            overlay[truth] = 0.55 * overlay[truth] + 0.45 * np.asarray([0, 200, 90])
-            overlay[prediction] = 0.55 * overlay[prediction] + 0.45 * np.asarray([215, 50, 160])
-            metric = row_lookup[name][case.case_id]
-            axes[row, column].imshow(overlay.astype(np.uint8))
-            axes[row, column].set_title(
-                f"{model_label(model_metadata[name])}\n"
-                f"Dice={_format_metric(metric['dice'])} · "
-                f"IoU={_format_metric(metric['iou'])}",
-                pad=30,
-            )
-            _draw_panel_model_badges(axes[row, column], model_metadata[name])
-            axes[row, column].axis("off")
-        for index in range(len(model_names), rows * columns):
-            row, column = divmod(index, columns)
-            axes[row, column].axis("off")
-        figure.suptitle(f"{case.relative_path} · green=truth, magenta=prediction")
-        figure.tight_layout()
         relative = case.relative_path.with_suffix(".png")
         output = output_root / relative
-        output.parent.mkdir(parents=True, exist_ok=True)
-        figure.savefig(output, dpi=220, bbox_inches="tight", facecolor="white")
-        plt.close(figure)
+        save_chart(chart, output)
         rendered.append(str(output.relative_to(root)))
     return rendered
 
@@ -4209,77 +4172,6 @@ def _binary_metric_breakdown(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return binary_metric_breakdown(rows)
 
 
-def _draw_grid_model_badges(
-    axis: Any,
-    metadata: Mapping[str, Any],
-    *,
-    panel_index: int,
-    panel_count: int,
-) -> None:
-    """Center compact colored model badges beneath one grid heading."""
-
-    badges = model_badges(metadata)
-    if not badges:
-        return
-    panel_left = panel_index / panel_count
-    panel_width = 1.0 / panel_count
-    weights = np.asarray([len(badge.text) + 2.5 for badge in badges], dtype=float)
-    gaps = 0.035 * panel_width * max(0, len(badges) - 1)
-    usable_width = 0.88 * panel_width - gaps
-    widths = usable_width * weights / float(np.sum(weights))
-    cursor = panel_left + (panel_width - usable_width - gaps) / 2
-    for badge, width in zip(badges, widths, strict=True):
-        axis.text(
-            cursor + width / 2,
-            0.18,
-            badge.text,
-            transform=axis.transAxes,
-            ha="center",
-            va="center",
-            fontsize=6.7,
-            fontfamily="monospace",
-            color="white",
-            bbox={
-                "boxstyle": "round,pad=0.22",
-                "facecolor": badge.color,
-                "edgecolor": "none",
-            },
-        )
-        cursor += width + 0.035 * panel_width
-
-
-def _draw_panel_model_badges(axis: Any, metadata: Mapping[str, Any]) -> None:
-    """Center the model-identity badges above one prediction panel."""
-
-    badges = model_badges(metadata)
-    if not badges:
-        return
-    weights = np.asarray([len(badge.text) + 2.5 for badge in badges], dtype=float)
-    gap = 0.025
-    usable_width = 0.82 - gap * max(0, len(badges) - 1)
-    widths = usable_width * weights / float(np.sum(weights))
-    cursor = (1.0 - usable_width - gap * max(0, len(badges) - 1)) / 2
-    for badge, width in zip(badges, widths, strict=True):
-        axis.text(
-            cursor + width / 2,
-            1.025,
-            badge.text,
-            transform=axis.transAxes,
-            ha="center",
-            va="bottom",
-            fontsize=7,
-            fontfamily="monospace",
-            color="white",
-            bbox={
-                "boxstyle": "round,pad=0.22",
-                "facecolor": badge.color,
-                "edgecolor": "none",
-            },
-            clip_on=False,
-        )
-        cursor += width + gap
-
-
 def _render_semantic_grid(
     cases: list[_SemanticCase],
     prediction_dirs: dict[str, Path],
@@ -4290,105 +4182,42 @@ def _render_semantic_grid(
     panel_size: float,
     model_title_length: int,
     image_title_length: int,
+    options: VisualizationOptions | None = None,
 ) -> Any:
-    import matplotlib.pyplot as plt
-
     if not cases:
         raise ValueError("At least one semantic-mask case is required for visualization")
     model_names = list(prediction_dirs)
     if not model_names:
         raise ValueError("At least one model prediction is required for visualization")
+    active_options = options or visualization_options(
+        columns=examples_per_row,
+        panel_size=panel_size,
+        show=False,
+    )
     row_lookup = {
-        name: {row["case_id"]: row for row in rows}
+        name: {str(row["case_id"]): row for row in rows}
         for name, rows in rows_by_model.items()
     }
     metadata = {
         name: dict((model_metadata or {}).get(name) or {"model": name})
         for name in model_names
     }
-    column_titles = [
-        "Original",
-        "GT",
-        *[
-            _shorten_middle(model_label(metadata[name]), model_title_length)
-            for name in model_names
-        ],
-    ]
-    heading_lines = max(title.count("\n") + 1 for title in column_titles)
-    panel_count = 2 + len(model_names)
-    grid_rows = math.ceil(len(cases) / examples_per_row)
-    group_width = panel_size * panel_count
-    image_title_height = 0.28
-    heading_height = max(0.5, 0.18 * heading_lines)
-    group_height = panel_size + image_title_height + heading_height
-    figure = plt.figure(
-        figsize=(
-            group_width * examples_per_row,
-            group_height * grid_rows,
-        ),
-    )
-    figure.subplots_adjust(
-        left=0.015,
-        right=0.985,
-        top=0.985,
-        bottom=0.015,
-    )
-    outer = figure.add_gridspec(
-        grid_rows,
-        examples_per_row,
-        wspace=0.08,
-        hspace=0.18,
-    )
-    for index, case in enumerate(cases):
-        grid_row = index // examples_per_row
-        grid_column = index % examples_per_row
-        cell = outer[grid_row, grid_column].subgridspec(
-            3,
-            panel_count,
-            height_ratios=(image_title_height, heading_height, panel_size),
-            hspace=0.01,
-            wspace=0.07,
-        )
-        title_slot = cell[0, :] if grid_row == 0 else cell[0:2, :]
-        title_axis = figure.add_subplot(title_slot)
-        title_axis.set_axis_off()
-        title_axis.text(
-            0.5,
-            0.5,
-            _shorten_middle(case.relative_path.name, image_title_length),
-            ha="center",
-            va="center",
-            fontsize=9,
-            fontweight="semibold",
-        )
-        if grid_row == 0:
-            heading_axis = figure.add_subplot(cell[1, :])
-            heading_axis.set_axis_off()
-            for panel_index, heading in enumerate(column_titles):
-                heading_y = 0.5 if panel_index < 2 else 0.72
-                heading_axis.text(
-                    (panel_index + 0.5) / panel_count,
-                    heading_y,
-                    heading,
-                    ha="center",
-                    va="center",
-                    fontsize=8,
-                    linespacing=1.15,
-                )
-                if panel_index >= 2:
-                    _draw_grid_model_badges(
-                        heading_axis,
-                        metadata[model_names[panel_index - 2]],
-                        panel_index=panel_index,
-                        panel_count=panel_count,
-                    )
 
+    def prepare(case: _SemanticCase) -> VisualizationItem:
         with Image.open(case.image_path) as opened_image:
             image = np.asarray(opened_image.convert("RGB"))
         with Image.open(case.mask_path) as opened_mask:
             truth = np.asarray(opened_mask.convert("L")) > 0
-        panels: list[np.ndarray] = [image, truth]
-        metrics: list[dict[str, Any] | None] = [None, None]
+        masks = [truth]
+        panels = [
+            VisualizationPanel(title="Original", image=image),
+            VisualizationPanel(
+                title="GT",
+                image=image,
+                mask=truth,
+                color="#D39A52",
+            ),
+        ]
         for name in model_names:
             prediction_path = prediction_dirs[name] / f"{case.case_id}.png"
             with Image.open(prediction_path) as opened_prediction:
@@ -4398,39 +4227,45 @@ def _render_semantic_grid(
                     f"Prediction dimensions {prediction.shape} do not match "
                     f"ground truth {truth.shape}: {prediction_path}"
                 )
-            panels.append(prediction)
             try:
-                metrics.append(row_lookup[name][case.case_id])
+                metric = row_lookup[name][case.case_id]
             except KeyError as exc:
                 raise DatasetValidationError(
                     f"Missing visualization metrics for {name}/{case.case_id}"
                 ) from exc
+            masks.append(prediction)
+            badges = " · ".join(
+                badge.text for badge in model_badges(metadata[name])
+            )
+            panel_title = _shorten_middle(
+                model_label(metadata[name]),
+                model_title_length,
+            )
+            if badges:
+                panel_title = f"{panel_title}\n{badges}"
+            panels.append(
+                VisualizationPanel(
+                    title=panel_title,
+                    image=image,
+                    mask=prediction,
+                    footer=(
+                        f"Dice={_format_metric(metric['dice'])} · "
+                        f"IoU={_format_metric(metric['iou'])}"
+                    ),
+                )
+            )
+        return VisualizationItem(
+            image_path=case.image_path,
+            label=_shorten_middle(case.relative_path.name, image_title_length),
+            panels=tuple(panels),
+            foreground=np.logical_or.reduce(masks),
+        )
 
-        for panel_index, panel in enumerate(panels):
-            axis = figure.add_subplot(cell[2, panel_index])
-            if panel_index == 0:
-                axis.imshow(panel)
-            else:
-                axis.imshow(
-                    panel,
-                    cmap="gray",
-                    vmin=0,
-                    vmax=1,
-                    interpolation="nearest",
-                )
-            axis.set_xticks([])
-            axis.set_yticks([])
-            for spine in axis.spines.values():
-                spine.set_visible(False)
-            metric = metrics[panel_index]
-            if metric is not None:
-                axis.set_xlabel(
-                    f"Dice={_format_metric(metric['dice'])} · "
-                    f"IoU={_format_metric(metric['iou'])}",
-                    fontsize=7.5,
-                    labelpad=2,
-                )
-    return figure
+    return visualize_records(
+        cases,
+        options=active_options,
+        prepare=prepare,
+    )
 
 
 def _shorten_middle(value: str, maximum: int) -> str:
@@ -4439,32 +4274,6 @@ def _shorten_middle(value: str, maximum: int) -> str:
     left = (maximum - 1) // 2
     right = maximum - 1 - left
     return f"{value[:left]}…{value[-right:]}"
-
-
-def _multiline_model_title(value: str, line_width: int) -> str:
-    """Format canonical model identities as readable narrow-column titles."""
-
-    parts = value.split("__")
-    if len(parts) >= 4:
-        lines = textwrap.wrap(
-            parts[0],
-            width=line_width,
-            break_long_words=True,
-            break_on_hyphens=True,
-        )
-        lines.append(parts[1])
-        lines.append(" · ".join(parts[2:]))
-    else:
-        lines = textwrap.wrap(
-            value,
-            width=line_width,
-            break_long_words=True,
-            break_on_hyphens=True,
-        )
-    if len(lines) > 5:
-        remainder = "".join(lines[4:])
-        lines = [*lines[:4], _shorten_middle(remainder, line_width)]
-    return "\n".join(lines)
 
 
 def _format_metric(value: Any) -> str:
@@ -4493,12 +4302,3 @@ def _format_batch_sizes(values: Iterable[int]) -> str:
     return ", ".join(
         f"{size}×{counts[size]}" for size in sorted(counts, reverse=True)
     )
-
-
-def _visualization_destination(destination: str | Path) -> Path:
-    path = Path(destination).expanduser().resolve()
-    if path.suffix:
-        if path.suffix.lower() != ".png":
-            raise ValueError("visualization destination must be a PNG file or directory")
-        return path
-    return path / "comparison.png"

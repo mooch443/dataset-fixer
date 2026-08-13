@@ -45,10 +45,13 @@ dataset = Dataset.open("/datasets/orchard/data.yaml", task="pose", deep=True)
 dataset.assert_trainable()  # also checks Ultralytics when it is installed
 dataset.visualize(
     split="train",
-    n=12,
+    samples=12,
     seed=42,
     columns=3,
+    panel_size=3,
+    zoom=True,
     label_fn=lambda path: path.stem,  # return None to suppress an image title
+    label_mode="middle",              # or "wrap" for two bounded lines
 )
 ```
 
@@ -214,6 +217,12 @@ exported = coverage.export(
 With `visualize=True`, `export()` and `export_formats()` display the exact
 saved `reports/plots.png` inline in a notebook. The same visualization options
 are accepted by direct `dataset.visualize()` calls as named arguments.
+All public `visualize()` entry points share `samples`, `columns`, `seed`,
+`panel_size`, `zoom`, `context_fraction`, `minimum_context`, `label_fn`,
+`label_mode`, `line_width`, `outline_width`, `outline_alpha`, `destination`,
+and `show`. Visualizations use aligned, fixed-size letterboxed cards and return
+`None`. `show=True` renders a static PNG in notebooks; `destination` accepts
+PNG, JPEG, PDF, or SVG without enabling an interactive renderer.
 
 Coverage crops can also sample a fresh Albumentations virtual camera view for
 each output. The complete source image and synchronized annotations are
@@ -405,12 +414,12 @@ models = Model.load_many(
     }
 )
 
-# Predict only eight sampled validation images and return a Matplotlib figure.
-figure = models.visualize(
+# Predict only eight sampled validation images and write a static comparison.
+models.visualize(
     masks,
     split="val",
     samples=8,
-    examples_per_row=1,
+    columns=1,
     destination="quick-comparison.png",
 )
 
@@ -468,7 +477,7 @@ or the primary ranking.
 The sampled figure and the full comparison use the same renderer: each example
 has one filename title and columns for Original, GT, and each shortened model
 name. Model panels show masks only, with Dice and IoU beneath them. The
-`examples_per_row` and `panel_size` arguments control the grid. Datasets do
+`columns` and `panel_size` control the grid. Datasets do
 not expose model-loading or model-comparison methods; load models with
 `Model.load_many(...)` and call `models.compare(masks, ...)`.
 

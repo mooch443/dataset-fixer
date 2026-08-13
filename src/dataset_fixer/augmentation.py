@@ -846,8 +846,14 @@ def _save_preview(
     dataset: "Dataset",
     output: Path,
 ) -> Path:
-    from .visualization import _draw_sample
-    import matplotlib.pyplot as plt
+    from .static_rendering import save_chart
+    from .visualization import (
+        VisualizationItem,
+        VisualizationOptions,
+        VisualizationPanel,
+        render_annotated_sample,
+        visualize_records,
+    )
 
     temporary = output.with_name(".augmentation-preview-image.png")
     Image.fromarray(augmented_image).save(temporary)
@@ -860,15 +866,45 @@ def _save_preview(
         annotations,
     )
     try:
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        _draw_sample(axes[0], source, dataset.task, dataset._metadata)
-        axes[0].set_title("Before")
-        _draw_sample(axes[1], augmented, dataset.task, dataset._metadata)
-        axes[1].set_title("Albumentations preview")
-        output.parent.mkdir(parents=True, exist_ok=True)
-        fig.tight_layout()
-        fig.savefig(output, bbox_inches="tight", dpi=160)
-        plt.close(fig)
+        size = (augmented.width, augmented.height)
+
+        def prepare(_: Sample) -> VisualizationItem:
+            return VisualizationItem(
+                image_path=source.image_path,
+                label=str(source.relative_path),
+                panels=(
+                    VisualizationPanel(
+                        title="Before",
+                        image=np.asarray(
+                            render_annotated_sample(
+                                source,
+                                dataset.task,
+                                dataset._metadata,
+                                resize_to=size,
+                            )
+                        ),
+                    ),
+                    VisualizationPanel(
+                        title="Albumentations preview",
+                        image=np.asarray(
+                            render_annotated_sample(
+                                augmented,
+                                dataset.task,
+                                dataset._metadata,
+                            )
+                        ),
+                    ),
+                ),
+                foreground=np.ones((augmented.height, augmented.width), dtype=bool),
+            )
+
+        chart = visualize_records(
+            [source],
+            options=VisualizationOptions(samples=None, columns=1, panel_size=4.0, show=False),
+            prepare=prepare,
+            title="Augmentation preview",
+        )
+        save_chart(chart, output)
     finally:
         temporary.unlink(missing_ok=True)
     return output

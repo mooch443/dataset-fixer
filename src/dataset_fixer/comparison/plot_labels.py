@@ -8,9 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
-
 _MODEL_TYPE_COLORS = {
     "semantic": "#0F766E",
     "instance": "#2563EB",
@@ -42,7 +39,7 @@ class ModelBadge:
     text:
         Visible badge text.
     color:
-        Background color accepted by Matplotlib.
+        CSS-compatible presentation color.
     """
 
     text: str
@@ -159,104 +156,6 @@ def model_full_label(model: Any) -> str:
     return " · ".join(value for value in values if value)
 
 
-def add_model_badges(
-    axis: Any,
-    model: Any,
-    *,
-    anchor: tuple[float, float] = (1.0, 1.0),
-    offset: tuple[float, float] = (-4.0, -4.0),
-    fontsize: float = 7.0,
-) -> None:
-    """Add architecture, upscale, and input-resolution badges to a panel.
-
-    axis:
-        Matplotlib axis receiving the badge annotations.
-    model:
-        Model or model metadata mapping.
-    anchor:
-        Badge anchor in axis-fraction coordinates.
-    offset:
-        Initial text offset in display points.
-    fontsize:
-        Badge font size.
-    """
-
-    horizontal_offset, vertical_offset = offset
-    for badge in reversed(model_badges(model)):
-        axis.annotate(
-            badge.text,
-            xy=anchor,
-            xycoords="axes fraction",
-            xytext=(horizontal_offset, vertical_offset),
-            textcoords="offset points",
-            horizontalalignment="right",
-            verticalalignment="top",
-            fontsize=fontsize,
-            fontfamily="monospace",
-            color="white",
-            bbox={
-                "boxstyle": "round,pad=0.24",
-                "facecolor": badge.color,
-                "edgecolor": "none",
-            },
-            annotation_clip=False,
-        )
-        horizontal_offset -= 7.0 + 4.5 * len(badge.text)
-
-
-def style_model_row_labels(
-    axis: Any,
-    ranking: list[Any],
-    labels: Mapping[str, str] | None = None,
-) -> None:
-    """Render normalized names with architecture, scale, and resolution badges.
-
-    axis:
-        Matplotlib axis whose y labels should be styled.
-    ranking:
-        Ordered models or model metadata rows.
-    labels:
-        Optional explicit label overrides keyed by model name.
-    """
-
-    metadata = [_model_metadata(model) for model in ranking]
-    row_labels = [
-        labels.get(_metadata_name(row), model_label(row))
-        if labels is not None
-        else model_label(row)
-        for row in metadata
-    ]
-    axis.set_yticks(np.arange(len(metadata)), row_labels, fontsize=8.5)
-    for row_index, (tick, row) in enumerate(
-        zip(axis.get_yticklabels(), metadata, strict=True)
-    ):
-        badges = model_badges(row)
-        if not badges:
-            continue
-        tick.set_verticalalignment("bottom")
-        offset = -6.0
-        for badge in reversed(badges):
-            axis.annotate(
-                badge.text,
-                xy=(0, row_index),
-                xycoords=("axes fraction", "data"),
-                xytext=(offset, -5),
-                textcoords="offset points",
-                horizontalalignment="right",
-                verticalalignment="top",
-                fontsize=7,
-                fontfamily="monospace",
-                color="white",
-                bbox={
-                    "boxstyle": "round,pad=0.24",
-                    "facecolor": badge.color,
-                    "edgecolor": "none",
-                },
-                annotation_clip=False,
-            )
-            offset -= 7.0 + 4.5 * len(badge.text)
-
-
 def _model_metadata(model: Any) -> Mapping[str, Any]:
     if isinstance(model, Mapping):
         return model
@@ -267,10 +166,6 @@ def _model_metadata(model: Any) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise TypeError("model.describe() must return a metadata mapping")
     return value
-
-
-def _metadata_name(row: Mapping[str, Any]) -> str:
-    return str(row.get("model") or row.get("name") or "model")
 
 
 def _resolution_label(row: Mapping[str, Any]) -> str | None:

@@ -12,19 +12,19 @@ from PIL import Image, ImageDraw
 from scipy import ndimage
 from scipy.optimize import linear_sum_assignment
 
+from ..static_rendering import finite_rows, save_chart
 from ..utils import bounded_slug
-from .plot_labels import style_model_row_labels as _style_model_row_labels
+from ..visualization import (
+    VisualizationItem,
+    VisualizationOptions,
+    VisualizationPanel,
+    draw_mask_outline,
+    visualize_records,
+)
+from .plot_labels import model_full_label
 
 
 SIZE_GROUPS = ("small", "medium", "large")
-
-_GROUP_SPLIT_COLORS = {
-    "train": "#2563EB",
-    "val": "#D97706",
-    "test": "#059669",
-    "mixed": "#7C3AED",
-    "other": "#4B5563",
-}
 
 def _group_split_values(
     group: str,
@@ -47,18 +47,45 @@ def _group_split_values(
     )
 
 
-def _style_group_split_ticks(
-    axis: Any,
-    groups: list[str],
-    group_splits: Mapping[str, Iterable[str]] | None,
-) -> None:
-    for tick, group in zip(axis.get_xticklabels()[1:], groups, strict=True):
-        splits = _group_split_values(group, group_splits)
-        if not splits:
-            continue
-        color_key = "mixed" if len(splits) > 1 else splits[0]
-        tick.set_color(_GROUP_SPLIT_COLORS.get(color_key, _GROUP_SPLIT_COLORS["other"]))
-        tick.set_fontweight("semibold")
+def _model_display(row: Mapping[str, Any], labels: Mapping[str, str] | None) -> str:
+    name = str(row["model"])
+    return labels.get(name, model_full_label(row)) if labels is not None else model_full_label(row)
+
+
+def _heatmap_chart(
+    rows: list[dict[str, Any]],
+    *,
+    x_order: list[str],
+    y_order: list[str],
+    title: str,
+    legend_title: str,
+) -> Any:
+    """Render every report matrix through one declarative heatmap builder."""
+
+    import altair as alt
+
+    data = alt.Data(values=finite_rows(rows))
+    base = alt.Chart(data).encode(
+        x=alt.X("column:N", sort=x_order, title=None, axis=alt.Axis(labelAngle=-38, labelLimit=220)),
+        y=alt.Y("model_label:N", sort=y_order, title=None, axis=alt.Axis(labelLimit=320)),
+    )
+    rectangles = base.mark_rect().encode(
+        color=alt.condition(
+            "datum.display_value == null",
+            alt.value("#D9D9D9"),
+            alt.Color("display_value:Q", scale=alt.Scale(domain=[0, 1], scheme="viridis"), title=legend_title),
+        ),
+        tooltip=["model_label:N", "column:N", "label:N"],
+    )
+    labels = base.mark_text(fontSize=11).encode(
+        text="label:N",
+        color=alt.condition("datum.display_value < 0.65", alt.value("white"), alt.value("black")),
+    )
+    return (rectangles + labels).properties(
+        width=max(420, 94 * len(x_order)),
+        height=max(180, 42 * len(y_order)),
+        title=alt.TitleParams(text=title.splitlines()[0], subtitle=title.splitlines()[1:]),
+    )
 
 
 def object_size_report_artifacts_exist(root: Path, manifest: Mapping[str, Any]) -> bool:
@@ -624,54 +651,36 @@ def render_object_size_breakdown(
 ) -> Path | None:
     if analysis.status != "complete":
         return None
-    import matplotlib.pyplot as plt
-
-    values = np.asarray(
-        [
-            [float(row.get(f"{group}_object_dice", math.nan)) for group in SIZE_GROUPS]
-            for row in ranking
-        ],
-        dtype=float,
-    )
-    masked = np.ma.masked_invalid(values)
-    figure, axis = plt.subplots(
-        figsize=(9.2, max(3.8, 1.05 * len(ranking) + 2.2))
-    )
-    colormap = plt.get_cmap("viridis").with_extremes(bad="#D9D9D9")
-    image = axis.imshow(masked, vmin=0, vmax=1, cmap=colormap, aspect="auto")
     support = analysis.metadata()["reference_support"]
     column_labels = [
         f"{group.title()}-object Dice\nreference n={support[group]}"
         for group in SIZE_GROUPS
     ]
-    axis.set_xticks(np.arange(len(SIZE_GROUPS)), column_labels, fontsize=9)
-    _style_model_row_labels(axis, ranking, labels)
-    axis.tick_params(axis="x", bottom=False, top=True, labelbottom=False, labeltop=True)
-    for row_index in range(values.shape[0]):
-        for column_index in range(values.shape[1]):
-            value = values[row_index, column_index]
-            label = f"{value:.3f}" if math.isfinite(value) else "n/a"
-            axis.text(
-                column_index,
-                row_index,
-                label,
-                ha="center",
-                va="center",
-                color="white" if math.isfinite(value) and value < 0.65 else "black",
-                fontsize=8.5,
-            )
-    axis.set_title(
+    y_order = [_model_display(row, labels) for row in ranking]
+    cells = [
+        {
+            "model_label": _model_display(row, labels),
+            "column": column_labels[index],
+            "display_value": value if math.isfinite(value) else None,
+            "label": f"{value:.3f}" if math.isfinite(value) else "n/a",
+        }
+        for row in ranking
+        for index, group in enumerate(SIZE_GROUPS)
+        for value in [float(row.get(f"{group}_object_dice", math.nan))]
+    ]
+    chart = _heatmap_chart(
+        cells,
+        x_order=column_labels,
+        y_order=y_order,
+        title=(
         "Object Dice by reference foreground area\n"
         f"small ≤ p10 ({analysis.p10_area:.1f} px²), "
-        f"medium p10–p90, large ≥ p90 ({analysis.p90_area:.1f} px²)",
-        pad=48,
+        f"medium p10–p90, large ≥ p90 ({analysis.p90_area:.1f} px²)"
+        ),
+        legend_title="Macro object Dice",
     )
-    colorbar = figure.colorbar(image, ax=axis, fraction=0.035, pad=0.025)
-    colorbar.set_label("Macro object Dice (unmatched objects = 0)")
-    figure.tight_layout()
     path = reports / "object-size-breakdown.png"
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
-    plt.close(figure)
+    save_chart(chart, path)
     return path
 
 
@@ -684,8 +693,6 @@ def render_segmentation_metric_breakdown(
     minimum_component_area: float | None = None,
 ) -> Path:
     """Render pixel metrics and raw/area-filtered image-presence metrics."""
-
-    import matplotlib.pyplot as plt
 
     columns = (
         ("dice", "Mean Dice"),
@@ -708,52 +715,34 @@ def render_segmentation_metric_breakdown(
             "Empty specificity\narea-filtered",
         ),
     )
-    values = np.asarray(
-        [
-            [float(row.get(key, math.nan)) for key, _ in columns]
-            for row in ranking
-        ],
-        dtype=float,
-    )
-    masked = np.ma.masked_invalid(values)
-    figure, axis = plt.subplots(
-        figsize=(20.5, max(4.2, 1.05 * len(ranking) + 2.3))
-    )
-    colormap = plt.get_cmap("viridis").with_extremes(bad="#D9D9D9")
-    image = axis.imshow(masked, vmin=0, vmax=1, cmap=colormap, aspect="auto")
-    axis.set_xticks(
-        np.arange(len(columns)),
-        [label for _, label in columns],
-        fontsize=9,
-    )
-    _style_model_row_labels(axis, ranking, labels)
-    axis.tick_params(axis="x", bottom=False, top=True, labelbottom=False, labeltop=True)
-    for row_index in range(values.shape[0]):
-        for column_index in range(values.shape[1]):
-            value = values[row_index, column_index]
-            label = f"{value:.3f}" if math.isfinite(value) else "n/a"
-            axis.text(
-                column_index,
-                row_index,
-                label,
-                ha="center",
-                va="center",
-                color="white" if math.isfinite(value) and value < 0.65 else "black",
-                fontsize=8.5,
-            )
+    column_labels = [label for _, label in columns]
+    y_order = [_model_display(row, labels) for row in ranking]
+    cells = [
+        {
+            "model_label": _model_display(row, labels),
+            "column": label,
+            "display_value": value if math.isfinite(value) else None,
+            "label": f"{value:.3f}" if math.isfinite(value) else "n/a",
+        }
+        for row in ranking
+        for key, label in columns
+        for value in [float(row.get(key, math.nan))]
+    ]
     threshold_note = (
         f"\nArea-filtered presence requires an 8-connected component ≥ "
         f"{minimum_component_area:.1f} px²; raw presence requires any foreground pixel"
         if minimum_component_area is not None
         else "\nArea-filtered presence threshold unavailable; raw presence requires any foreground pixel"
     )
-    axis.set_title(title + threshold_note, pad=58)
-    colorbar = figure.colorbar(image, ax=axis, fraction=0.03, pad=0.025)
-    colorbar.set_label("Higher is better")
-    figure.tight_layout()
+    chart = _heatmap_chart(
+        cells,
+        x_order=column_labels,
+        y_order=y_order,
+        title=title + threshold_note,
+        legend_title="Higher is better",
+    )
     path = reports / "metric-breakdown.png"
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
-    plt.close(figure)
+    save_chart(chart, path)
     return path
 
 
@@ -767,8 +756,6 @@ def render_grouped_metric_breakdown(
 ) -> Path:
     """Render per-group pooled Dice, ordered by equal-weight group macro Dice."""
 
-    import matplotlib.pyplot as plt
-
     groups = sorted(
         {
             str(group["group"])
@@ -776,7 +763,13 @@ def render_grouped_metric_breakdown(
             for group in result.get("per_group", [])
         }
     )
-    columns = ["Macro", *groups]
+    group_labels = [
+        f"{group}\n[{'/'.join(_group_split_values(group, group_splits))}]"
+        if _group_split_values(group, group_splits)
+        else group
+        for group in groups
+    ]
+    columns = ["Macro", *group_labels]
 
     def macro_sort_key(row: Mapping[str, Any]) -> tuple[bool, float, str]:
         value = float(
@@ -804,25 +797,7 @@ def render_grouped_metric_breakdown(
             + [lookup.get(group, math.nan) for group in groups]
         )
     array = np.asarray(values, dtype=float)
-    display_array = array.copy()
-    display_array[:, 1:] = np.where(
-        np.isfinite(display_array[:, 1:]),
-        display_array[:, 1:],
-        1.0,
-    )
-    masked = np.ma.masked_invalid(display_array)
-    figure, axis = plt.subplots(
-        figsize=(
-            max(10.5, 4.5 + 0.58 * len(columns)),
-            max(4.2, 1.05 * len(ordered_ranking) + 2.6),
-        )
-    )
-    colormap = plt.get_cmap("viridis").with_extremes(bad="#D9D9D9")
-    image = axis.imshow(masked, vmin=0, vmax=1, cmap=colormap, aspect="auto")
-    axis.set_xticks(np.arange(len(columns)), columns, fontsize=8.5, rotation=60, ha="left")
-    _style_model_row_labels(axis, ordered_ranking, labels)
-    axis.tick_params(axis="x", bottom=False, top=True, labelbottom=False, labeltop=True)
-    _style_group_split_ticks(axis, groups, group_splits)
+    cells: list[dict[str, Any]] = []
     for row_index in range(array.shape[0]):
         for column_index in range(array.shape[1]):
             value = array[row_index, column_index]
@@ -835,34 +810,34 @@ def render_grouped_metric_breakdown(
                 label = f"{value:.3f}\n({defined}/{total})"
             elif column_index > 0 and not math.isfinite(value):
                 label = "TN"
+                display_value: float | None = 1.0
             else:
                 label = f"{value:.3f}" if math.isfinite(value) else "n/a"
-            axis.text(
-                column_index,
-                row_index,
-                label,
-                ha="center",
-                va="center",
-                color=(
-                    "white"
-                    if math.isfinite(display_array[row_index, column_index])
-                    and display_array[row_index, column_index] < 0.65
-                    else "black"
-                ),
-                fontsize=7.5,
+                display_value = value if math.isfinite(value) else None
+            if column_index == 0:
+                display_value = value if math.isfinite(value) else None
+            cells.append(
+                {
+                    "model_label": _model_display(ordered_ranking[row_index], labels),
+                    "column": columns[column_index],
+                    "display_value": display_value,
+                    "label": label,
+                }
             )
-    axis.set_title(
+    y_order = [_model_display(row, labels) for row in ordered_ranking]
+    chart = _heatmap_chart(
+        cells,
+        x_order=columns,
+        y_order=y_order,
+        title=(
         "Grouped foreground Dice — TP/FP/FN pooled within each group\n"
         "Rows are sorted by macro Dice; support is defined groups / all groups\n"
-        "0 = no overlap; green TN = empty reference and prediction (excluded from macro)",
-        pad=72,
+        "0 = no overlap; green TN = empty reference and prediction (excluded from macro)"
+        ),
+        legend_title="Foreground Dice (TN = 1)",
     )
-    colorbar = figure.colorbar(image, ax=axis, fraction=0.025, pad=0.02)
-    colorbar.set_label("Display score (foreground Dice; TN = 1)")
-    figure.tight_layout()
     path = reports / "grouped-metric-breakdown.png"
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
-    plt.close(figure)
+    save_chart(chart, path)
     return path
 
 
@@ -876,8 +851,6 @@ def render_grouped_presence_metric_breakdown(
     group_splits: Mapping[str, Iterable[str]] | None = None,
 ) -> Path:
     """Render an AOI-level area-filtered presence precision, recall, or F1 grid."""
-
-    import matplotlib.pyplot as plt
 
     if metric not in {"precision", "recall", "f1"}:
         raise ValueError("metric must be one of: precision, recall, f1")
@@ -905,7 +878,13 @@ def render_grouped_presence_metric_breakdown(
         )
 
     ordered_ranking = sorted(ranking, key=macro_f1_sort_key)
-    columns = [f"Macro {metric.upper()}", *groups]
+    group_labels = [
+        f"{group}\n[{'/'.join(_group_split_values(group, group_splits))}]"
+        if _group_split_values(group, group_splits)
+        else group
+        for group in groups
+    ]
+    columns = [f"Macro {metric.upper()}", *group_labels]
     values: list[list[float]] = []
     group_rows: list[dict[str, Mapping[str, Any]]] = []
     for row in ordered_ranking:
@@ -955,47 +934,32 @@ def render_grouped_presence_metric_breakdown(
             labels_for_row.append(label)
         display_labels.append(labels_for_row)
 
-    masked = np.ma.masked_invalid(display_array)
-    figure, axis = plt.subplots(
-        figsize=(
-            max(10.5, 4.5 + 0.58 * len(columns)),
-            max(4.2, 1.05 * len(ordered_ranking) + 2.6),
-        )
-    )
-    colormap = plt.get_cmap("viridis").with_extremes(bad="#D9D9D9")
-    image = axis.imshow(masked, vmin=0, vmax=1, cmap=colormap, aspect="auto")
-    axis.set_xticks(np.arange(len(columns)), columns, fontsize=8.5, rotation=60, ha="left")
-    _style_model_row_labels(axis, ordered_ranking, labels)
-    axis.tick_params(axis="x", bottom=False, top=True, labelbottom=False, labeltop=True)
-    _style_group_split_ticks(axis, groups, group_splits)
+    cells: list[dict[str, Any]] = []
     for row_index in range(array.shape[0]):
         for column_index in range(array.shape[1]):
             display_value = display_array[row_index, column_index]
-            axis.text(
-                column_index,
-                row_index,
-                display_labels[row_index][column_index],
-                ha="center",
-                va="center",
-                color=(
-                    "white"
-                    if math.isfinite(display_value) and display_value < 0.65
-                    else "black"
-                ),
-                fontsize=7.5,
+            cells.append(
+                {
+                    "model_label": _model_display(ordered_ranking[row_index], labels),
+                    "column": columns[column_index],
+                    "display_value": display_value if math.isfinite(display_value) else None,
+                    "label": display_labels[row_index][column_index],
+                }
             )
-    axis.set_title(
+    y_order = [_model_display(row, labels) for row in ordered_ranking]
+    chart = _heatmap_chart(
+        cells,
+        x_order=columns,
+        y_order=y_order,
+        title=(
         f"Area-filtered case-presence {metric} pooled within each AOI\n"
         "Rows are sorted by macro presence F1; macro support is defined AOIs / all AOIs\n"
-        "Green TN = empty reference and prediction; MISS/FP = zero display score",
-        pad=72,
+        "Green TN = empty reference and prediction; MISS/FP = zero display score"
+        ),
+        legend_title=f"Presence {metric} (TN = 1)",
     )
-    colorbar = figure.colorbar(image, ax=axis, fraction=0.025, pad=0.02)
-    colorbar.set_label(f"Display score (presence {metric}; TN = 1)")
-    figure.tight_layout()
     path = reports / f"grouped-presence-{metric}.png"
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
-    plt.close(figure)
+    save_chart(chart, path)
     return path
 
 
@@ -1008,7 +972,6 @@ def render_large_object_examples(
 ) -> list[dict[str, Any]]:
     if not selections:
         return []
-    import matplotlib.pyplot as plt
 
     output_root = reports / "large-object-examples"
     output_root.mkdir(parents=True, exist_ok=True)
@@ -1028,47 +991,50 @@ def render_large_object_examples(
                 min(image.height, bottom + padding),
             )
             crop = np.asarray(image.crop(crop_box))
-        rows = 1 + math.ceil(len(model_names) / 2)
-        figure, axes = plt.subplots(
-            rows,
-            2,
-            figsize=(10, 4.6 * rows),
-            squeeze=False,
-        )
-        _show_component_panel(axes[0, 0], crop, (), crop_box, "Source crop")
-        _show_component_panel(
-            axes[0, 1], crop, (component,), crop_box, "Selected ground truth"
-        )
-        for model_index, model_name in enumerate(model_names):
-            row = 1 + model_index // 2
-            column = model_index % 2
+        panels: list[tuple[str, np.ndarray]] = [
+            ("Source crop", _show_component_panel(crop, (), crop_box)),
+            ("Selected ground truth", _show_component_panel(crop, (component,), crop_box)),
+        ]
+        for model_name in model_names:
             score = results[model_name].reference_scores.get(
                 component.component_id, 0.0
             )
             values = predictions[model_name].get(component.image_id, ())
             display_name = textwrap.fill(str(model_name), width=48)
-            _show_component_panel(
-                axes[row, column],
-                crop,
-                values,
-                crop_box,
-                f"{display_name}\n"
-                f"{backends.get(model_name, 'unknown')} · matched Dice {score:.3f}",
+            panels.append(
+                (
+                    f"{display_name}\n{backends.get(model_name, 'unknown')} · matched Dice {score:.3f}",
+                    _show_component_panel(crop, values, crop_box),
+                )
             )
-        for model_index in range(len(model_names), (rows - 1) * 2):
-            row = 1 + model_index // 2
-            column = model_index % 2
-            axes[row, column].axis("off")
-        figure.suptitle(
-            f"Large reference object · {component.area:,} px² · "
-            f"{selection['selection_reason']}",
-            fontsize=13,
+
+        def prepare(value: tuple[str, np.ndarray]) -> VisualizationItem:
+            heading, panel_image = value
+            return VisualizationItem(
+                image_path=component.image_path,
+                label="",
+                panels=(VisualizationPanel(title=heading, image=panel_image),),
+                foreground=np.ones(panel_image.shape[:2], dtype=bool),
+            )
+
+        chart = visualize_records(
+            panels,
+            options=VisualizationOptions(
+                samples=None,
+                columns=2,
+                panel_size=4.2,
+                label_mode="wrap",
+                show=False,
+            ),
+            prepare=prepare,
+            title=(
+                f"Large reference object · {component.area:,} px² · "
+                f"{selection['selection_reason']}"
+            ),
         )
-        figure.tight_layout()
         stem = bounded_slug(Path(component.relative_path).stem, max_length=96)
         path = output_root / f"{selection_index:02d}-{stem}.png"
-        figure.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
-        plt.close(figure)
+        save_chart(chart, path)
         rendered.append(
             {
                 "path": str(path.relative_to(reports.parent)),
@@ -1085,12 +1051,10 @@ def render_large_object_examples(
 
 
 def _show_component_panel(
-    axis: Any,
     image: np.ndarray,
     components: Any,
     crop_box: tuple[int, int, int, int],
-    title: str,
-) -> None:
+) -> np.ndarray:
     mask = np.zeros(image.shape[:2], dtype=bool)
     crop_left, crop_top, crop_right, crop_bottom = crop_box
     for component in components:
@@ -1108,11 +1072,16 @@ def _show_component_panel(
             x1 - crop_left : x2 - crop_left,
         ]
         destination |= source
-    axis.imshow(image)
-    if np.any(mask):
-        overlay = np.zeros((*mask.shape, 4), dtype=float)
-        overlay[mask] = (1.0, 0.25, 0.1, 0.42)
-        axis.imshow(overlay)
-        axis.contour(mask.astype(float), levels=[0.5], colors=["white"], linewidths=1)
-    axis.set_title(title, fontsize=9)
-    axis.axis("off")
+    rendered = np.asarray(image, dtype=np.uint8).copy()
+    if not np.any(mask):
+        return rendered
+    tint = np.asarray((255, 64, 26), dtype=float)
+    rendered[mask] = np.uint8(np.round(rendered[mask] * 0.58 + tint * 0.42))
+    return draw_mask_outline(
+        rendered,
+        mask,
+        color="#FF401A",
+        line_width=2,
+        outline_width=4,
+        alpha=1.0,
+    )

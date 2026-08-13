@@ -3865,10 +3865,10 @@ def _save_staging_contact_sheet(
     output = builder.staging / relative_output
     staged.visualize(
         split=None,
-        n=12,
+        samples=12,
         seed=42,
         columns=3,
-        save_to=output,
+        destination=output,
         show=False,
         **dict(visualize_kwargs or {}),
     )

@@ -29,7 +29,6 @@ from dataset_fixer.semantic_comparison import (
     _binary_metric_breakdown,
     _canonicalize_predictions,
     _freeze_cohort,
-    _multiline_model_title,
     _project_semantic_predictions,
     _run_command,
     _select_visual_cases,
@@ -210,23 +209,6 @@ def test_model_label_normalizes_named_wandb_run_and_adds_hash() -> None:
     )
 
     assert label == "2026-08-10 11:48:19 · a1b2c3d4"
-
-
-def test_semantic_grid_model_title_wraps_canonical_identity() -> None:
-    title = _multiline_model_title(
-        (
-            "islands-128-08.08.2026-merged-1class_masks"
-            "__gnsuhtfc__yolo26x-sem__512px"
-        ),
-        30,
-    )
-
-    assert title == (
-        "islands-128-08.08.2026-merged-\n"
-        "1class_masks\n"
-        "gnsuhtfc\n"
-        "yolo26x-sem · 512px"
-    )
 
 
 def test_nnunet_command_progress_suppresses_per_case_chatter(
@@ -1161,8 +1143,6 @@ def test_loaded_semantic_models_visualize_only_sampled_cases_with_shared_mask_gr
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import matplotlib.pyplot as plt
-
     exported = _semantic_export(tmp_path)
     perfect = _nnunet_model(tmp_path / "perfect-model")
     weak = _nnunet_model(tmp_path / "weak-model")
@@ -1202,10 +1182,10 @@ def test_loaded_semantic_models_visualize_only_sampled_cases_with_shared_mask_gr
         "resenc-m-very-long-model-name-alpha",
         "resenc-m-very-long-model-name-beta",
     )
-    figure = loaded.visualize(
+    result = loaded.visualize(
         source=exported,
         samples=2,
-        examples_per_row=1,
+        columns=1,
         panel_size=2.0,
         model_title_length=18,
         progress=False,
@@ -1213,19 +1193,13 @@ def test_loaded_semantic_models_visualize_only_sampled_cases_with_shared_mask_gr
     )
 
     assert (tmp_path / "quick-comparison.png").is_file()
+    assert result is None
     assert len(commands) == 2
     assert all(command[0] == "nnUNetv2_predict_from_modelfolder" for command in commands)
     assert all(command[command.index("-device") + 1] == "mps" for command in commands)
-    assert len(figure.axes) == 11  # filenames, one shared heading row, and panels
-    headings = [text.get_text() for text in figure.axes[1].texts]
-    assert headings[:2] == ["Original", "GT"]
-    assert "2×" in headings
-    assert "1×" in headings
-    assert "unknown" not in headings
-    assert figure.axes[4].get_xlabel().startswith("Dice=")
-    assert np.asarray(figure.axes[4].images[0].get_array()).ndim == 2
-    assert figure.axes[6].texts[0].get_text().endswith(".jpg")
-    plt.close(figure)
+    with Image.open(tmp_path / "quick-comparison.png") as rendered:
+        assert rendered.width > rendered.height
+        assert rendered.getbbox() is not None
 
 
 def test_generic_model_predicts_semantic_export_and_saves_masks(
@@ -1276,8 +1250,6 @@ def test_sampled_semantic_dataset_reuses_full_instance_cache_and_visualizes_refe
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import matplotlib.pyplot as plt
-
     exported = _semantic_export(tmp_path)
     checkpoint = tmp_path / "sampled-instance.pt"
     checkpoint.write_bytes(b"sampled-instance")
@@ -1315,32 +1287,21 @@ def test_sampled_semantic_dataset_reuses_full_instance_cache_and_visualizes_refe
     assert reused.records[0].reference_mask_path is not None
     assert reused.records[0].objects[0].polygon is not None
 
-    figure = reused.visualize(
+    destination = tmp_path / "sampled-reference.png"
+    rendered = reused.visualize(
         columns=1,
         panel_size=2.0,
         zoom=True,
         context_fraction=0.0,
         minimum_context=10,
         outline_width=0.8,
+        destination=destination,
+        show=False,
     )
-    heading_text = [text.get_text() for text in figure.axes[0].texts]
-    assert "Original" in heading_text
-    assert "Annotation" in heading_text
-    assert "Prediction" in heading_text
-    assert len(figure.axes) == 4  # wrapped image key plus three image panels
-    assert reused.records[0].relative_path.split("/")[-1].split("_")[0] in (
-        figure.axes[0].texts[0].get_text().replace("\n", "")
-    )
-    assert all(
-        np.asarray(axis.images[0].get_array()).ndim == 3
-        for axis in figure.axes[1:]
-    )
-    assert abs(figure.axes[1].get_xlim()[1] - figure.axes[1].get_xlim()[0]) < 40
-    assert any(axis.patches or axis.lines for axis in figure.axes)
-    assert figure.axes[0].get_position().y0 >= figure.axes[1].get_position().y1
-    assert all(line.get_alpha() == 1.0 for line in figure.axes[3].lines)
-    assert all(line.get_linewidth() == 0.8 for line in figure.axes[3].lines)
-    plt.close(figure)
+    assert rendered is None
+    with Image.open(destination) as preview:
+        assert preview.width > preview.height
+        assert preview.getbbox() is not None
 
 
 def test_semantic_filter_and_add_retain_mask_metadata(tmp_path: Path) -> None:
@@ -1383,11 +1344,9 @@ def test_semantic_filter_and_add_retain_mask_metadata(tmp_path: Path) -> None:
     assert cases[0].image_path == validation[0].image_path.resolve()
 
 
-def test_prediction_visualization_does_not_pad_wide_images_vertically(
+def test_prediction_visualization_letterboxes_wide_images_in_fixed_cards(
     tmp_path: Path,
 ) -> None:
-    import matplotlib.pyplot as plt
-
     image = tmp_path / "wide-island.png"
     Image.new("RGB", (800, 80), (25, 45, 65)).save(image)
     mask = np.zeros((80, 800), dtype=bool)
@@ -1410,20 +1369,16 @@ def test_prediction_visualization_does_not_pad_wide_images_vertically(
         inference_seconds=0.0,
     )
 
-    figure = result.visualize(columns=1, panel_size=3.0)
-    key = figure.axes[0].get_position()
-    panels = [axis.get_position() for axis in figure.axes[1:]]
-
-    assert figure.get_size_inches()[1] < 1.5
-    assert key.y0 - max(panel.y1 for panel in panels) < 0.12
-    plt.close(figure)
+    destination = tmp_path / "wide-letterboxed.png"
+    assert result.visualize(columns=1, panel_size=3.0, destination=destination, show=False) is None
+    with Image.open(destination) as rendered:
+        assert rendered.width > rendered.height
+        assert rendered.getbbox() is not None
 
 
-def test_prediction_visualization_uses_fixed_header_space_for_many_rows(
+def test_prediction_visualization_renders_many_rows_with_dedicated_headers(
     tmp_path: Path,
 ) -> None:
-    import matplotlib.pyplot as plt
-
     image = tmp_path / "many-rows.png"
     Image.new("RGB", (320, 240), (25, 45, 65)).save(image)
     mask = np.zeros((240, 320), dtype=bool)
@@ -1447,19 +1402,17 @@ def test_prediction_visualization_uses_fixed_header_space_for_many_rows(
         inference_seconds=0.0,
     )
 
-    figure = result.visualize(columns=1, panel_size=3.0)
-    header_space_inches = (
-        1.0 - max(axis.get_position().y1 for axis in figure.axes)
-    ) * figure.get_size_inches()[1]
-
-    assert header_space_inches < 0.35
-    plt.close(figure)
+    destination = tmp_path / "many-rows-rendered.png"
+    assert result.visualize(columns=1, panel_size=2.0, destination=destination, show=False) is None
+    with Image.open(destination) as rendered:
+        assert rendered.height > rendered.width
+        assert rendered.getbbox() is not None
 
 
-def test_prediction_visualization_shortens_keys_by_rendered_width(
+def test_prediction_visualization_shortens_keys_in_the_middle(
     tmp_path: Path,
 ) -> None:
-    import matplotlib.pyplot as plt
+    from dataset_fixer.static_rendering import format_label
 
     image = tmp_path / "key-width.png"
     Image.new("RGB", (320, 240), (25, 45, 65)).save(image)
@@ -1485,18 +1438,14 @@ def test_prediction_visualization_shortens_keys_by_rendered_width(
         inference_seconds=0.0,
     )
 
-    figure = result.visualize(columns=1, panel_size=3.0)
-    renderer = figure.canvas.get_renderer()
-    first_label = figure.axes[0].texts[0]
-    second_label = figure.axes[4].texts[0]
-
-    expected_first = Path(formerly_truncated)
-    assert first_label.get_text() == (
-        f"{expected_first.parent.as_posix()} / {expected_first.stem}"
-    )
-    assert "…" in second_label.get_text()
-    assert second_label.get_window_extent(renderer).width <= figure.bbox.width * 0.9
-    plt.close(figure)
+    destination = tmp_path / "shortened-keys.png"
+    assert result.visualize(columns=1, panel_size=3.0, destination=destination, show=False) is None
+    first = format_label(formerly_truncated, mode="middle", maximum=125)
+    second = format_label(too_wide, mode="middle", maximum=125)
+    assert "…" not in first[0]
+    assert "…" in second[0]
+    assert len(second[0]) == 125
+    assert destination.is_file()
 
 
 def test_semantic_predict_and_compare_share_raw_prediction_cache(
