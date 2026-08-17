@@ -5,11 +5,17 @@ import json
 import shutil
 from pathlib import Path
 
+import pandas as pd
 import pytest
 import yaml
 from PIL import Image, ImageDraw
 
-from dataset_fixer import Dataset, DatasetTrace, DatasetValidationError
+from dataset_fixer import (
+    Dataset,
+    DatasetComparisonResult,
+    DatasetTrace,
+    DatasetValidationError,
+)
 from dataset_fixer.artifacts import (
     CANONICAL_REPORT_FILES,
     DATASET_INFO_SCHEMA,
@@ -18,7 +24,6 @@ from dataset_fixer.artifacts import (
     split_image_summary,
     write_lineage,
 )
-from dataset_fixer.dataset_report import render_dataset_report
 from dataset_fixer.visualization import draw_label_position_heatmap
 from dataset_fixer.validation_audit import stage_load_validation_audit
 from conftest import make_yolo_dataset
@@ -193,37 +198,81 @@ def test_dataset_report_shows_split_composition_and_deterministic_examples(
     assert (185, 194, 205) in colors
 
     rerendered = tmp_path / "again.png"
-    render_dataset_report(
-        exported.location,
-        _lineage_records(exported.location),
-        name=exported.name,
-        task="detect",
-        format_name="yolo",
-        classes=exported.classes,
-        output=rerendered,
-    )
+    assert exported.report(destination=rerendered, show=False) == rerendered
     assert rerendered.read_bytes() == output.read_bytes()
 
 
-def test_report_captions_are_trimmed_to_fit_their_column() -> None:
-    from dataset_fixer.dataset_report import _fit, _fit_middle, _font, _text_width
-
-    font = _font(22)
-    caption = (
-        "val/images/0549e88a-741eaa7d-0cee-4225-87f1-58e5df816aa3"
-        "_20220223_044202_89_2428_3B_Analyt_1vtlT3h.png  ·  annotated"
+def test_public_dataset_comparison_reuses_transaction_report_and_visual_options(
+    tmp_path: Path,
+) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "comparison-source",
+        task="detect",
+        names=["fruit"],
+        train_rows=["0 0.5 0.5 0.25 0.25", ""],
+        val_rows=["0 0.5 0.5 0.25 0.25"],
     )
-    fitted = _fit_middle(caption, font, 540, keep_suffix=len("annotated") + 5)
+    baseline = Dataset.open(source, task="detect", progress=False)
+    candidate = baseline.export(
+        destination=tmp_path / "train-only",
+        splits=("train",),
+        visualize=False,
+        progress=False,
+    )
+    seen: list[Path] = []
 
-    assert _text_width(fitted, font) <= 540
-    # The distinguishing tail survives; the long shared prefix gives way.
-    assert fitted.endswith("·  annotated")
-    assert fitted.startswith("val/images/0549e88a")
-    assert "…" in fitted
+    def label(path: Path) -> str:
+        seen.append(path)
+        return path.stem
 
-    short = "val/images/a.png  ·  annotated"
-    assert _fit_middle(short, font, 540, keep_suffix=14) == short
-    assert _text_width(_fit("x" * 400, font, 300), font) <= 300
+    result = baseline.compare(
+        candidate,
+        destination=tmp_path / "comparison",
+        visualize_kwargs={"label_fn": label, "line_width": 1, "outline_width": 3},
+        show=False,
+    )
+
+    assert isinstance(result, DatasetComparisonResult)
+    assert all(
+        isinstance(table.index, pd.RangeIndex)
+        for table in (result.overview, result.splits, result.classes, result.images)
+    )
+    assert result.plot == tmp_path / "comparison" / "plots.png"
+    assert result.plot.is_file()
+    assert result.images["status"].value_counts().to_dict() == {
+        "unchanged": 2,
+        "removed": 1,
+    }
+    assert result.overview.set_index("metric").loc["images", "delta"] == -1
+    val = result.splits.set_index("split").loc["val"]
+    assert (val["images_before"], val["images_after"]) == (1, 0)
+    assert any(baseline.location in path.parents for path in seen)
+    assert any(candidate.location in path.parents for path in seen)
+
+
+def test_comparison_profile_keeps_pixel_split_and_annotation_statistics() -> None:
+    from dataset_fixer.dataset_comparison import DatasetReportState, _profile_chart
+
+    state = DatasetReportState(
+        Path("/dataset"), "baseline", "detect", "yolo", {0: "object"},
+        ({
+            "output_image": "train/images/a.png", "output_split": "train",
+            "pixels": 12_000, "output_annotation_count": 2,
+            "output_has_labels": True, "class_counts": {0: 2},
+        },),
+    )
+    chart = _profile_chart((state,)).to_dict()
+    specification = json.dumps(chart)
+
+    assert "Image-pixel distribution" in specification
+    assert "Images per split" in specification
+    assert "Annotated objects per split" in specification
+    assert "Annotated/background images per split" in specification
+    assert "Annotated objects per class" in specification
+    assert len(chart["vconcat"]) == 2
+    assert len(chart["vconcat"][1]["hconcat"]) == 2
+    assert '"labelAngle": 0' in specification
+    assert "split(datum.label, '\\\\n')" in specification
 
 
 def test_label_position_heatmaps_preserve_coordinate_frame_aspect_ratio() -> None:
@@ -251,19 +300,12 @@ def test_label_position_heatmaps_preserve_coordinate_frame_aspect_ratio() -> Non
     assert output_width / output_height == pytest.approx(1.0)
 
 
-def test_coverage_panel_includes_source_image_representation_bar(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from dataset_fixer import dataset_report
+def test_comparison_coverage_includes_source_image_representation() -> None:
+    from dataset_fixer.dataset_comparison import DatasetReportState, _coverage_chart
 
-    bars: list[dict[str, object]] = []
-
-    def capture_bar(_draw, _box, **kwargs) -> None:
-        bars.append(kwargs)
-
-    monkeypatch.setattr(dataset_report, "_draw_ratio_bar", capture_bar)
-    dataset_report._render_coverage(
-        {
+    state = DatasetReportState(
+        Path("/dataset"), "candidate", "detect", "yolo", {}, (),
+        coverage={
             "source_labels": 10,
             "source_labels_covered_at_least_once": 10,
             "source_label_coverage_percent": 100.0,
@@ -273,15 +315,49 @@ def test_coverage_panel_includes_source_image_representation_bar(
             "source_image_representation_percent": 75.0,
             "splits": {},
         },
-        width=2400,
+    )
+    specification = json.dumps(_coverage_chart((state,)).to_dict())
+
+    assert "source images represented" in specification
+    assert "75.0" in specification
+
+
+def test_comparison_coverage_centers_square_cells_and_orders_source_before_output() -> None:
+    from dataset_fixer.dataset_comparison import DatasetReportState, _coverage_chart
+
+    state = DatasetReportState(
+        Path("/dataset"), "candidate", "detect", "yolo", {}, (),
+        coverage={
+            "source_label_coverage_percent": 100.0,
+            "source_image_space_coverage_percent": 50.0,
+            "source_image_representation_percent": 75.0,
+            "label_positions": {
+                "labels": [[1, 2], [3, 4]],
+                "uncovered": [[0, 0], [0, 1]],
+            },
+            "output_label_positions": {
+                "labels": [[1, 2, 3]],
+                "uncovered": [[0, 0, 0]],
+            },
+        },
     )
 
-    represented = next(
-        bar for bar in bars if str(bar["filled_label"]).startswith("images represented")
+    chart = _coverage_chart((state,)).to_dict()
+    panels = chart["vconcat"][1]["vconcat"][0]["hconcat"]
+
+    assert [panel["title"] for panel in panels] == ["Source", "Output"]
+    assert [(panel["width"], panel["height"]) for panel in panels] == [
+        (84, 84),
+        (126, 42),
+    ]
+    assert all(
+        panel["encoding"][axis]["scale"] == {
+            "paddingInner": 0,
+            "paddingOuter": 0,
+        }
+        for panel in panels
+        for axis in ("x", "y")
     )
-    assert represented["fraction"] == pytest.approx(0.75)
-    assert represented["filled_label"] == "images represented 75.0%"
-    assert represented["empty_label"] == "not represented 25.0%"
 
 
 def test_semantic_dataset_report_overlays_masks_in_red(tmp_path: Path) -> None:

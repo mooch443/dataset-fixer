@@ -433,6 +433,16 @@ def normalize_wandb_run(value: str) -> str:
     return "/".join(parts)
 
 
+def _wandb_option(run: Any, source: str) -> dict[str, str]:
+    """Return the canonical run URL while replacing aliases with ``run.id``."""
+
+    if run is None:
+        return {}
+    entity, project, supplied = normalize_wandb_run(source).split("/")
+    run_id = str(getattr(run, "id", "") or supplied).strip()
+    return {"wandb": f"https://wandb.ai/{entity}/{project}/runs/{run_id}"}
+
+
 def _wandb_file(run: Any, requested: str | None) -> Any:
     files = {str(value.name): value for value in run.files()}
 
@@ -820,6 +830,7 @@ def resolve_model_source(
         options = dict(resolved.options)
         if created_at := _creation_time(resolved.manifest, run=run):
             options["source_created_at"] = created_at
+        options.update(_wandb_option(run, source_key))
         return replace(resolved, source=source_key, options=options)
     if path.suffix.lower() == ".pt":
         resolved = _resolve_checkpoint(
@@ -828,7 +839,11 @@ def resolve_model_source(
             run=run,
             progress=progress,
         )
-        return replace(resolved, source=source_key)
+        return replace(
+            resolved,
+            source=source_key,
+            options={**resolved.options, **_wandb_option(run, source_key)},
+        )
     raise DatasetValidationError(
         ValidationIssue(
             "Unsupported model source",

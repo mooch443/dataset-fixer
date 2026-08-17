@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import textwrap
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,8 +10,10 @@ import numpy as np
 from PIL import Image, ImageDraw
 from scipy import ndimage
 from scipy.optimize import linear_sum_assignment
+from tqdm import tqdm
 
-from ..static_rendering import finite_rows, save_chart
+from ..static_rendering import save_chart
+from ..tabular import chart_data
 from ..utils import bounded_slug
 from ..visualization import (
     VisualizationItem,
@@ -21,7 +22,8 @@ from ..visualization import (
     draw_mask_outline,
     visualize_records,
 )
-from .plot_labels import model_full_label
+from .plot_labels import model_identity_card, model_identity_chart, model_identity_row_height
+from .metrics import component_filtered_presence_breakdown, component_filtered_presence_decisions
 
 
 SIZE_GROUPS = ("small", "medium", "large")
@@ -47,16 +49,11 @@ def _group_split_values(
     )
 
 
-def _model_display(row: Mapping[str, Any], labels: Mapping[str, str] | None) -> str:
-    name = str(row["model"])
-    return labels.get(name, model_full_label(row)) if labels is not None else model_full_label(row)
-
-
 def _heatmap_chart(
     rows: list[dict[str, Any]],
     *,
     x_order: list[str],
-    y_order: list[str],
+    models: list[dict[str, Any]],
     title: str,
     legend_title: str,
 ) -> Any:
@@ -64,10 +61,12 @@ def _heatmap_chart(
 
     import altair as alt
 
-    data = alt.Data(values=finite_rows(rows))
+    data = chart_data(rows)
+    row_height = model_identity_row_height(models)
+    y_order = [str(index) for index in range(len(models))]
     base = alt.Chart(data).encode(
         x=alt.X("column:N", sort=x_order, title=None, axis=alt.Axis(labelAngle=-38, labelLimit=220)),
-        y=alt.Y("model_label:N", sort=y_order, title=None, axis=alt.Axis(labelLimit=320)),
+        y=alt.Y("model_key:N", sort=y_order, title=None, axis=None),
     )
     rectangles = base.mark_rect().encode(
         color=alt.condition(
@@ -75,16 +74,21 @@ def _heatmap_chart(
             alt.value("#D9D9D9"),
             alt.Color("display_value:Q", scale=alt.Scale(domain=[0, 1], scheme="viridis"), title=legend_title),
         ),
-        tooltip=["model_label:N", "column:N", "label:N"],
+        tooltip=["model:N", "column:N", "label:N"],
     )
     labels = base.mark_text(fontSize=11).encode(
         text="label:N",
         color=alt.condition("datum.display_value < 0.65", alt.value("white"), alt.value("black")),
     )
-    return (rectangles + labels).properties(
+    heatmap = (rectangles + labels).properties(
         width=max(420, 94 * len(x_order)),
-        height=max(180, 42 * len(y_order)),
+        height=alt.Step(row_height),
         title=alt.TitleParams(text=title.splitlines()[0], subtitle=title.splitlines()[1:]),
+    )
+    return alt.hconcat(
+        model_identity_chart(models, row_height=row_height),
+        heatmap,
+        spacing=14,
     )
 
 
@@ -286,6 +290,88 @@ def unavailable_object_size_summary() -> dict[str, Any]:
     return summary
 
 
+def apply_component_presence(
+    reference: ObjectSizeReference,
+    ranking: list[dict[str, Any]],
+    rows_by_model: Mapping[str, list[dict[str, Any]]],
+    component_areas: Mapping[str, Mapping[str, list[float]]],
+    requested_area: float | None,
+) -> dict[str, Any]:
+    """Attach one canonical connected-component presence analysis."""
+
+    resolved = requested_area if requested_area is not None else reference.p10_area
+    analysis: dict[str, Any] = {
+        "raw_definition": "any predicted foreground pixel",
+        "component_filtered_definition": (
+            "at least one predicted 8-connected foreground component with "
+            "area greater than or equal to the resolved threshold"
+        ),
+        "connectivity": 8,
+        "requested_min_connected_component_area_px": requested_area,
+        "resolved_min_connected_component_area_px": resolved,
+        "threshold_source": "explicit" if requested_area is not None else "held-out-reference-object-p10",
+    }
+    if resolved is None:
+        analysis.update(
+            status="skipped",
+            reason=(
+                "minimum connected-component area is unavailable because the "
+                "held-out cohort has no reference foreground objects"
+            ),
+        )
+        return analysis
+    analysis["status"] = "complete"
+    for row in ranking:
+        name = str(row["model"])
+        rows, areas = rows_by_model[name], component_areas[name]
+        row.update(component_filtered_presence_breakdown(rows, areas, resolved))
+        decisions = component_filtered_presence_decisions(rows, areas, resolved)
+        for metric in rows:
+            case_id = str(metric.get("case_id", metric.get("image_id")))
+            metric["component_filtered_predicted_presence"] = decisions[case_id]
+    return analysis
+
+
+def complete_object_size_analysis(
+    reference: ObjectSizeReference,
+    predictions: Mapping[str, Mapping[str, tuple[ObjectComponent, ...]]],
+    ranking: list[dict[str, Any]],
+    reports: Path,
+    *,
+    backends: Mapping[str, str],
+    progress: bool = False,
+) -> tuple[dict[str, Any], str | None, list[dict[str, Any]]]:
+    """Evaluate and render one canonical object-size report."""
+
+    if reference.status != "complete":
+        for row in ranking:
+            row.update(unavailable_object_size_summary())
+        return reference.metadata(), None, []
+    results = {
+        name: evaluate_object_size_model(reference, values)
+        for name, values in tqdm(
+            predictions.items(),
+            total=len(predictions),
+            desc="Scoring object sizes",
+            unit="model",
+            disable=not progress,
+            dynamic_ncols=True,
+        )
+    }
+    for row in ranking:
+        row.update(results[str(row["model"])].summary)
+    path = render_object_size_breakdown(reports, ranking, reference)
+    examples = render_large_object_examples(
+        reports,
+        select_large_examples(reference, results),
+        predictions,
+        results,
+        backends,
+        {str(row["model"]): row for row in ranking},
+    )
+    return reference.metadata(), str(path.relative_to(reports.parent)) if path else None, examples
+
+
 def prepare_object_size_reference(
     components: dict[str, tuple[ObjectComponent, ...]],
     *,
@@ -449,11 +535,19 @@ def semantic_components_for_cases(
     *,
     prediction_directory: Path | None = None,
     prefix: str,
+    progress: bool = False,
+    progress_description: str = "Extracting object components",
 ) -> dict[str, tuple[ObjectComponent, ...]]:
     """Extract binary 8-connected objects from final full-image masks."""
 
     components: dict[str, tuple[ObjectComponent, ...]] = {}
-    for case in cases:
+    for case in tqdm(
+        cases,
+        desc=progress_description,
+        unit="mask",
+        disable=not progress,
+        dynamic_ncols=True,
+    ):
         mask_path = (
             Path(case.mask_path)
             if prediction_directory is None
@@ -646,36 +740,32 @@ def render_object_size_breakdown(
     reports: Path,
     ranking: list[dict[str, Any]],
     analysis: ObjectSizeReference,
-    *,
-    labels: Mapping[str, str] | None = None,
 ) -> Path | None:
     if analysis.status != "complete":
         return None
     support = analysis.metadata()["reference_support"]
-    column_labels = [
-        f"{group.title()}-object Dice\nreference n={support[group]}"
-        for group in SIZE_GROUPS
-    ]
-    y_order = [_model_display(row, labels) for row in ranking]
+    column_labels = [group.title() for group in SIZE_GROUPS]
     cells = [
         {
-            "model_label": _model_display(row, labels),
+            "model": str(row["model"]),
+            "model_key": str(row_index),
             "column": column_labels[index],
             "display_value": value if math.isfinite(value) else None,
             "label": f"{value:.3f}" if math.isfinite(value) else "n/a",
         }
-        for row in ranking
+        for row_index, row in enumerate(ranking)
         for index, group in enumerate(SIZE_GROUPS)
         for value in [float(row.get(f"{group}_object_dice", math.nan))]
     ]
     chart = _heatmap_chart(
         cells,
         x_order=column_labels,
-        y_order=y_order,
+        models=ranking,
         title=(
-        "Object Dice by reference foreground area\n"
-        f"small ≤ p10 ({analysis.p10_area:.1f} px²), "
-        f"medium p10–p90, large ≥ p90 ({analysis.p90_area:.1f} px²)"
+        "Object Dice by foreground area "
+        f"(small {support['small']}, medium {support['medium']}, large {support['large']})\n"
+        f"small ≤ p10 ({analysis.p10_area:.1f} px²), medium p10–p90, "
+        f"large ≥ p90 ({analysis.p90_area:.1f} px²)"
         ),
         legend_title="Macro object Dice",
     )
@@ -689,7 +779,6 @@ def render_segmentation_metric_breakdown(
     ranking: list[dict[str, Any]],
     *,
     title: str = "Segmentation metric breakdown — final reconstructed source images",
-    labels: Mapping[str, str] | None = None,
     minimum_component_area: float | None = None,
 ) -> Path:
     """Render pixel metrics and raw/area-filtered image-presence metrics."""
@@ -716,15 +805,15 @@ def render_segmentation_metric_breakdown(
         ),
     )
     column_labels = [label for _, label in columns]
-    y_order = [_model_display(row, labels) for row in ranking]
     cells = [
         {
-            "model_label": _model_display(row, labels),
+            "model": str(row["model"]),
+            "model_key": str(row_index),
             "column": label,
             "display_value": value if math.isfinite(value) else None,
             "label": f"{value:.3f}" if math.isfinite(value) else "n/a",
         }
-        for row in ranking
+        for row_index, row in enumerate(ranking)
         for key, label in columns
         for value in [float(row.get(key, math.nan))]
     ]
@@ -737,7 +826,7 @@ def render_segmentation_metric_breakdown(
     chart = _heatmap_chart(
         cells,
         x_order=column_labels,
-        y_order=y_order,
+        models=ranking,
         title=title + threshold_note,
         legend_title="Higher is better",
     )
@@ -751,7 +840,6 @@ def render_grouped_metric_breakdown(
     ranking: list[dict[str, Any]],
     grouped_by_model: Mapping[str, Mapping[str, Any]],
     *,
-    labels: Mapping[str, str] | None = None,
     group_splits: Mapping[str, Iterable[str]] | None = None,
 ) -> Path:
     """Render per-group pooled Dice, ordered by equal-weight group macro Dice."""
@@ -818,17 +906,17 @@ def render_grouped_metric_breakdown(
                 display_value = value if math.isfinite(value) else None
             cells.append(
                 {
-                    "model_label": _model_display(ordered_ranking[row_index], labels),
+                    "model": str(ordered_ranking[row_index]["model"]),
+                    "model_key": str(row_index),
                     "column": columns[column_index],
                     "display_value": display_value,
                     "label": label,
                 }
             )
-    y_order = [_model_display(row, labels) for row in ordered_ranking]
     chart = _heatmap_chart(
         cells,
         x_order=columns,
-        y_order=y_order,
+        models=ordered_ranking,
         title=(
         "Grouped foreground Dice — TP/FP/FN pooled within each group\n"
         "Rows are sorted by macro Dice; support is defined groups / all groups\n"
@@ -847,7 +935,6 @@ def render_grouped_presence_metric_breakdown(
     grouped_by_model: Mapping[str, Mapping[str, Any]],
     *,
     metric: str,
-    labels: Mapping[str, str] | None = None,
     group_splits: Mapping[str, Iterable[str]] | None = None,
 ) -> Path:
     """Render an AOI-level area-filtered presence precision, recall, or F1 grid."""
@@ -940,17 +1027,17 @@ def render_grouped_presence_metric_breakdown(
             display_value = display_array[row_index, column_index]
             cells.append(
                 {
-                    "model_label": _model_display(ordered_ranking[row_index], labels),
+                    "model": str(ordered_ranking[row_index]["model"]),
+                    "model_key": str(row_index),
                     "column": columns[column_index],
                     "display_value": display_value if math.isfinite(display_value) else None,
                     "label": display_labels[row_index][column_index],
                 }
             )
-    y_order = [_model_display(row, labels) for row in ordered_ranking]
     chart = _heatmap_chart(
         cells,
         x_order=columns,
-        y_order=y_order,
+        models=ordered_ranking,
         title=(
         f"Area-filtered case-presence {metric} pooled within each AOI\n"
         "Rows are sorted by macro presence F1; macro support is defined AOIs / all AOIs\n"
@@ -969,6 +1056,7 @@ def render_large_object_examples(
     predictions: Mapping[str, dict[str, tuple[ObjectComponent, ...]]],
     results: Mapping[str, ObjectSizeModelResult],
     backends: Mapping[str, str],
+    model_metadata: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     if not selections:
         return []
@@ -991,29 +1079,41 @@ def render_large_object_examples(
                 min(image.height, bottom + padding),
             )
             crop = np.asarray(image.crop(crop_box))
-        panels: list[tuple[str, np.ndarray]] = [
-            ("Source crop", _show_component_panel(crop, (), crop_box)),
-            ("Selected ground truth", _show_component_panel(crop, (component,), crop_box)),
+        panels: list[tuple[str, np.ndarray, str | None, Mapping[str, Any] | None]] = [
+            ("Source crop", _show_component_panel(crop, (), crop_box), None, None),
+            ("Selected ground truth", _show_component_panel(crop, (component,), crop_box), None, None),
         ]
         for model_name in model_names:
             score = results[model_name].reference_scores.get(
                 component.component_id, 0.0
             )
             values = predictions[model_name].get(component.image_id, ())
-            display_name = textwrap.fill(str(model_name), width=48)
             panels.append(
                 (
-                    f"{display_name}\n{backends.get(model_name, 'unknown')} · matched Dice {score:.3f}",
+                    str(model_name),
                     _show_component_panel(crop, values, crop_box),
+                    f"{backends.get(model_name, 'unknown')} · matched Dice {score:.3f}",
+                    (model_metadata or {}).get(model_name),
                 )
             )
 
-        def prepare(value: tuple[str, np.ndarray]) -> VisualizationItem:
-            heading, panel_image = value
+        def prepare(
+            value: tuple[str, np.ndarray, str | None, Mapping[str, Any] | None]
+        ) -> VisualizationItem:
+            heading, panel_image, footer, metadata = value
             return VisualizationItem(
                 image_path=component.image_path,
                 label="",
-                panels=(VisualizationPanel(title=heading, image=panel_image),),
+                panels=(VisualizationPanel(
+                    title=heading,
+                    image=panel_image,
+                    footer=footer,
+                    heading=(
+                        model_identity_card(metadata, width=403, maximum=48)
+                        if metadata is not None
+                        else None
+                    ),
+                ),),
                 foreground=np.ones(panel_image.shape[:2], dtype=bool),
             )
 

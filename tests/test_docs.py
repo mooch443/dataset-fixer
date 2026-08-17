@@ -11,6 +11,7 @@ import dataset_fixer.wandb as wandb_api
 from dataset_fixer import (
     ComparisonResult,
     Dataset,
+    DatasetComparisonResult,
     DatasetValidationError,
     Model,
     ModelCollection,
@@ -51,6 +52,8 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
         "augment",
         "export",
         "export_formats",
+        "report",
+        "compare",
         "visualize",
         "sample",
         "filter",
@@ -103,6 +106,7 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
     ):
         assert removed not in comparison_signature
     assert inspect.getdoc(ComparisonResult)
+    assert inspect.getdoc(DatasetComparisonResult)
     assert inspect.getdoc(SemanticComparisonResult)
     assert "folds" not in comparison_signature
     assert "upscale_factor" not in comparison_signature
@@ -118,6 +122,10 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
     assert inspect.getdoc(Model.load_many)
     assert tuple(inspect.signature(Model.load_many).parameters) == ("models",)
     assert not hasattr(Model, "model_sha256")
+    assert hasattr(Model, "hash")
+    assert hasattr(Model, "wandb")
+    assert not hasattr(ModelCollection, "hashes")
+    assert not hasattr(ModelCollection, "hash_for")
     assert inspect.getdoc(ModelCollection)
 
 

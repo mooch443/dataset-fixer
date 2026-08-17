@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence, TypeVar
 
 import cv2
 import numpy as np
+import pandas as pd
 from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps
 from shapely.geometry import Polygon
 from shapely.validation import explain_validity
@@ -25,6 +26,7 @@ from .static_rendering import (
     save_chart,
     text_region,
 )
+from .tabular import chart_data, frame
 
 if TYPE_CHECKING:
     from .validation_audit import ValidationFailureExample
@@ -71,6 +73,7 @@ class VisualizationPanel:
     mask: np.ndarray | None = None
     color: str = "#C86552"
     footer: str | None = None
+    heading: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,33 @@ class VisualizationItem:
 
 
 _VisualRecord = TypeVar("_VisualRecord")
+
+
+def _fixed_chart_height(chart: Any) -> int:
+    """Return the rendered height of a fixed-size custom panel heading."""
+
+    def resolve(specification: Mapping[str, Any]) -> float | None:
+        height = specification.get("height")
+        if isinstance(height, (int, float)) and not isinstance(height, bool):
+            return float(height)
+        if isinstance(children := specification.get("vconcat"), list):
+            heights = [resolve(child) for child in children]
+            if all(value is not None for value in heights):
+                spacing = specification.get("spacing", 10)
+                return sum(value for value in heights if value is not None) + float(
+                    spacing
+                ) * max(0, len(heights) - 1)
+        for key in ("hconcat", "layer"):
+            if isinstance(children := specification.get(key), list):
+                heights = [resolve(child) for child in children]
+                if heights and all(value is not None for value in heights):
+                    return max(value for value in heights if value is not None)
+        return None
+
+    height = resolve(chart.to_dict())
+    if height is None or not math.isfinite(height) or height <= 0:
+        raise ValueError("custom panel headings must have a fixed positive height")
+    return round(height)
 
 
 def visualize_records(
@@ -121,6 +151,36 @@ def visualize_records(
     import altair as alt
 
     viewport = max(144, round(options.panel_size * 96))
+    maximum = max(18, viewport // 7)
+    heading_specs: dict[int, tuple[Any | None, int]] = {}
+    for item in items:
+        for panel in item.panels:
+            if panel.heading is not None:
+                heading_specs[id(panel)] = (
+                    panel.heading,
+                    _fixed_chart_height(panel.heading),
+                )
+                continue
+            lines = format_label(
+                panel.title,
+                mode=options.label_mode,
+                maximum=maximum,
+            )
+            heading_specs[id(panel)] = (
+                text_region(
+                    lines,
+                    width=viewport,
+                    font_size=12,
+                    font_weight="bold",
+                )
+                if lines
+                else None,
+                len(lines) * 18,
+            )
+    shared_heading_height = max(
+        (height for _, height in heading_specs.values()),
+        default=0,
+    )
     item_charts: list[Any] = []
     for item, bounds in prepared:
         x0, y0, x1, y1 = bounds
@@ -148,22 +208,41 @@ def visualize_records(
                     outline_width=options.outline_width,
                     alpha=options.outline_alpha,
                 )
-            panel_charts.append(
-                card(
-                    image,
-                    width=viewport,
-                    height=viewport,
-                    heading=format_label(
-                        panel.title,
-                        mode=options.label_mode,
-                        maximum=max(18, viewport // 7),
-                    ),
-                    footer=format_label(
-                        panel.footer or "",
-                        mode=options.label_mode,
-                        maximum=max(18, viewport // 7),
-                    ),
+            panel_card = card(
+                image,
+                width=viewport,
+                height=viewport,
+                heading=(),
+                footer=format_label(
+                    panel.footer or "",
+                    mode=options.label_mode,
+                    maximum=maximum,
+                ),
+            )
+            heading, heading_height = heading_specs[id(panel)]
+            heading_regions: list[Any] = []
+            padding = shared_heading_height - heading_height
+            if padding:
+                heading_regions.append(
+                    text_region(("",), width=viewport, height_per_line=padding)
                 )
+            if heading is not None:
+                heading_regions.append(heading)
+            heading_chart = (
+                None
+                if not heading_regions
+                else heading_regions[0]
+                if len(heading_regions) == 1
+                else alt.vconcat(*heading_regions, spacing=0)
+            )
+            panel_charts.append(
+                alt.vconcat(
+                    heading_chart,
+                    panel_card,
+                    spacing=4,
+                )
+                if heading_regions
+                else panel_card
             )
         panel_row = alt.hconcat(*panel_charts, spacing=8)
         label_lines = format_label(
@@ -1094,23 +1173,23 @@ def save_split_summary(samples: list[Sample], assignments: dict[str, str], outpu
     import altair as alt
 
     splits = [s for s in ("train", "val", "test") if s in assignments.values()]
-    rows = [
-        {
-            "split": split,
-            "images": sum(v == split for v in assignments.values()),
-            "annotations": sum(
-                len(sample.annotations)
-                for sample in samples
-                if assignments.get(str(sample.image_path)) == split
-            ),
-        }
-        for split in splits
-    ]
+    assigned = pd.DataFrame(assignments.items(), columns=["image_path", "split"])
+    annotations = pd.DataFrame(
+        ((str(sample.image_path), len(sample.annotations)) for sample in samples),
+        columns=["image_path", "annotations"],
+    )
+    rows = (
+        assigned.merge(annotations, on="image_path", how="left")
+        .assign(annotations=lambda value: value["annotations"].fillna(0))
+        .groupby("split", sort=False, as_index=False)
+        .agg(images=("image_path", "size"), annotations=("annotations", "sum"))
+        .set_index("split").reindex(splits, fill_value=0).reset_index()
+    )
     colors = alt.Scale(domain=splits, range=[SPLIT_COLORS[split] for split in splits])
 
     def panel(field: str, title: str) -> Any:
         return (
-            alt.Chart(alt.Data(values=rows))
+            alt.Chart(chart_data(rows))
             .mark_bar()
             .encode(
                 x=alt.X("split:N", sort=splits, title="split"),
@@ -1135,13 +1214,16 @@ def save_class_count_summary(
     import altair as alt
 
     labels = sorted((set(before) | set(after)) - {"background"}) + ["background"]
-    rows = [
-        {"class": label, "phase": phase, "count": values.get(label, 0)}
-        for label in labels
-        for phase, values in (("before", before), ("after", after))
-    ]
+    rows = (
+        pd.DataFrame({"before": before, "after": after})
+        .reindex(labels, fill_value=0)
+        .rename_axis("class")
+        .stack(future_stack=True)
+        .rename_axis(index=["class", "phase"])
+        .rename("count").reset_index()
+    )
     chart = (
-        alt.Chart(alt.Data(values=rows))
+        alt.Chart(chart_data(rows))
         .mark_bar()
         .encode(
             x=alt.X("class:N", sort=labels, title="class / background"),
@@ -1167,18 +1249,20 @@ def save_tiling_count_summary(
     import altair as alt
 
     labels = sorted(set(before_annotations) | set(after_annotations))
-    annotation_rows = [
-        {"class": label, "phase": phase, "count": values.get(label, 0)}
-        for label in labels
-        for phase, values in (("before", before_annotations), ("after", after_annotations))
-    ]
-    composition_rows = [
-        {"phase": phase, "kind": kind, "images": image_composition[phase][kind]}
-        for phase in ("before", "after")
-        for kind in ("annotated", "background")
-    ]
+    annotation_rows = (
+        pd.DataFrame({"before": before_annotations, "after": after_annotations})
+        .reindex(labels, fill_value=0).rename_axis("class")
+        .stack(future_stack=True).rename_axis(index=["class", "phase"])
+        .rename("count").reset_index()
+    )
+    composition_rows = (
+        pd.DataFrame.from_dict(image_composition, orient="index")
+        .reindex(index=["before", "after"], columns=["annotated", "background"])
+        .rename_axis("phase").stack(future_stack=True)
+        .rename_axis(index=["phase", "kind"]).rename("images").reset_index()
+    )
     annotations = (
-        alt.Chart(alt.Data(values=annotation_rows))
+        alt.Chart(chart_data(annotation_rows))
         .mark_bar()
         .encode(
             x=alt.X("class:N", sort=labels),
@@ -1189,7 +1273,7 @@ def save_tiling_count_summary(
         .properties(width=max(420, 62 * len(labels)), height=280, title="Annotations by class")
     )
     composition = (
-        alt.Chart(alt.Data(values=composition_rows))
+        alt.Chart(chart_data(composition_rows))
         .mark_bar()
         .encode(
             x=alt.X("phase:N", sort=["before", "after"]),
@@ -1214,44 +1298,32 @@ def save_source_pixel_coverage_summary(
 
     import altair as alt
 
-    exact = [row for row in rows if row.get("coverage_status") == "exact"]
-    available = {str(row["split"]) for row in rows}
+    data = frame(rows)
+    exact = data[data["coverage_status"].eq("exact")].copy()
+    available = set(data["split"].astype(str))
     splits = [split for split in ("train", "val", "test") if split in available]
     splits.extend(sorted(available - set(splits)))
-    aggregate_rows: list[dict[str, Any]] = []
-    distribution_rows: list[dict[str, Any]] = []
-    unsupported: list[str] = []
-    for split in splits:
-        split_exact = [row for row in exact if row["split"] == split]
-        values = sorted(float(row["source_pixel_coverage_percent"]) for row in split_exact)
-        covered = sum(float(row["covered_source_area_px"]) for row in split_exact)
-        total = sum(float(row["source_area_px"]) for row in split_exact)
-        metrics = {
-            "pixel-weighted": 100.0 * covered / total if total else 0.0,
-            "mean per source": sum(values) / len(values) if values else 0.0,
-            "median per source": (
-            values[len(values) // 2]
-            if len(values) % 2 == 1
-            else ((values[len(values) // 2 - 1] + values[len(values) // 2]) / 2 if values else 0.0)
-            ),
-        }
-        aggregate_rows.extend(
-            {"split": split, "metric": metric, "percent": value}
-            for metric, value in metrics.items()
-        )
-        distribution_rows.extend(
-            {"split": split, "percent": value}
-            for value in values
-        )
-        count = sum(
-            row["split"] == split and row.get("coverage_status") != "exact"
-            for row in rows
-        )
-        if count:
-            unsupported.append(f"{split}={count}")
+    summary = exact.groupby("split").agg(
+        covered=("covered_source_area_px", "sum"), total=("source_area_px", "sum"),
+        mean=("source_pixel_coverage_percent", "mean"), median=("source_pixel_coverage_percent", "median"),
+    ).reindex(splits, fill_value=0)
+    summary["pixel-weighted"] = (100 * summary["covered"].div(summary["total"].where(summary["total"].ne(0)))).fillna(0)
+    aggregate_rows = (
+        summary[["pixel-weighted", "mean", "median"]]
+        .rename(columns={"mean": "mean per source", "median": "median per source"})
+        .rename_axis("split").stack(future_stack=True)
+        .rename_axis(index=["split", "metric"]).rename("percent").reset_index()
+    )
+    distribution_rows = (
+        exact[["split", "source_pixel_coverage_percent"]]
+        .rename(columns={"source_pixel_coverage_percent": "percent"})
+        .sort_values(["split", "percent"], key=lambda column: column.map({name: index for index, name in enumerate(splits)}) if column.name == "split" else column, kind="stable")
+    )
+    unsupported_counts = data[~data["coverage_status"].eq("exact")]["split"].value_counts()
+    unsupported = [f"{split}={int(unsupported_counts[split])}" for split in splits if split in unsupported_counts]
 
     bars = (
-        alt.Chart(alt.Data(values=aggregate_rows))
+        alt.Chart(chart_data(aggregate_rows))
         .mark_bar()
         .encode(
             x=alt.X("split:N", sort=splits),
@@ -1269,7 +1341,7 @@ def save_source_pixel_coverage_summary(
         .properties(width=max(360, 105 * len(splits)), height=300, title="Spatial coverage by split")
     )
     distribution = (
-        alt.Chart(alt.Data(values=distribution_rows))
+        alt.Chart(chart_data(distribution_rows))
         .mark_boxplot(size=42)
         .encode(
             x=alt.X("split:N", sort=splits),
@@ -1300,32 +1372,23 @@ def save_label_coverage_summary(
 
     import altair as alt
 
-    available = {str(row["split"]) for row in rows}
+    data = frame(rows)
+    available = set(data["split"].astype(str))
     splits = [split for split in ("train", "val", "test") if split in available]
     splits.extend(sorted(available - set(splits)))
-    percent_rows: list[dict[str, Any]] = []
-    count_rows: list[dict[str, Any]] = []
-    for split in splits:
-        selected = [row for row in rows if row["split"] == split]
-        total = sum(int(row["total_labels"]) for row in selected)
-        covered = sum(int(row["labels_covered_at_least_once"]) for row in selected)
-        requested = sum(int(row["requested_coverages"]) for row in selected)
-        actual = sum(int(row["actual_coverages"]) for row in selected)
-        percent_rows.extend(
-            (
-                {"split": split, "metric": "labels hit at least once", "percent": 100.0 * covered / total if total else 0.0},
-                {"split": split, "metric": "requested appearances produced", "percent": 100.0 * actual / requested if requested else 0.0},
-            )
-        )
-        count_rows.extend(
-            (
-                {"split": split, "status": "covered", "count": covered},
-                {"split": split, "status": "never covered", "count": total - covered},
-            )
-        )
+    summary = data.groupby("split")[["total_labels", "labels_covered_at_least_once", "requested_coverages", "actual_coverages"]].sum().reindex(splits, fill_value=0)
+    percent = pd.DataFrame(index=summary.index)
+    percent["labels hit at least once"] = (100 * summary["labels_covered_at_least_once"].div(summary["total_labels"].where(summary["total_labels"].ne(0)))).fillna(0)
+    percent["requested appearances produced"] = (100 * summary["actual_coverages"].div(summary["requested_coverages"].where(summary["requested_coverages"].ne(0)))).fillna(0)
+    percent_rows = percent.rename_axis("split").stack(future_stack=True).rename_axis(index=["split", "metric"]).rename("percent").reset_index()
+    counts = pd.DataFrame({
+        "covered": summary["labels_covered_at_least_once"],
+        "never covered": summary["total_labels"] - summary["labels_covered_at_least_once"],
+    })
+    count_rows = counts.rename_axis("split").stack(future_stack=True).rename_axis(index=["split", "status"]).rename("count").reset_index()
 
     percentages = (
-        alt.Chart(alt.Data(values=percent_rows))
+        alt.Chart(chart_data(percent_rows))
         .mark_bar()
         .encode(
             x=alt.X("split:N", sort=splits),
@@ -1336,7 +1399,7 @@ def save_label_coverage_summary(
         .properties(width=max(340, 100 * len(splits)), height=290, title="Annotation sampling coverage")
     )
     counts = (
-        alt.Chart(alt.Data(values=count_rows))
+        alt.Chart(chart_data(count_rows))
         .mark_bar()
         .encode(
             x=alt.X("split:N", sort=splits),
@@ -1359,21 +1422,15 @@ def save_empty_image_balance_summary(summary: dict[str, dict[str, Any]], output:
     import altair as alt
 
     splits = list(summary)
-    rows = [
-        {
-            "split": split,
-            "phase": phase,
-            "kind": kind,
-            "images": int(summary[split][phase][kind]),
-        }
-        for split in splits
-        for phase in ("before", "after")
-        for kind in ("annotated", "background")
-    ]
+    rows = pd.json_normalize(
+        [{"split": split, **summary[split]} for split in splits], sep="."
+    ).set_index("split")
+    rows.columns = pd.MultiIndex.from_tuples(column.split(".", 1) for column in rows.columns)
+    rows = rows.stack([0, 1], future_stack=True).rename_axis(index=["split", "phase", "kind"]).rename("images").reset_index()
 
     def panel(phase: str) -> Any:
         return (
-            alt.Chart(alt.Data(values=[row for row in rows if row["phase"] == phase]))
+            alt.Chart(chart_data(rows[rows["phase"].eq(phase)]))
             .mark_bar()
             .encode(
                 x=alt.X("split:N", sort=splits),

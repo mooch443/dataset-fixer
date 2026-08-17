@@ -15,6 +15,7 @@ CANONICAL_DEFINITIONS = {
     "model_badges": PACKAGE_ROOT / "comparison" / "plot_labels.py",
     "model_badge_text": PACKAGE_ROOT / "comparison" / "plot_labels.py",
     "model_full_label": PACKAGE_ROOT / "comparison" / "plot_labels.py",
+    "model_presentation": PACKAGE_ROOT / "comparison" / "plot_labels.py",
 }
 FORBIDDEN_ALIASES = re.compile(
     r"^_?(?:safe_stem|short_model_name|model_plot_label|model_plot_badges|"

@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+import pandas as pd
 
 from .models import Annotation, DatasetMetadata, Sample, Task
 from .utils import to_jsonable
@@ -61,7 +62,13 @@ def build_load_validation_audit(
             "visualization": None,
         }, None
 
-    categories = Counter(_failure_category(warning) for warning in failure_warnings)
+    category_counts = (
+        pd.Series(failure_warnings, dtype="string")
+        .map(_failure_category)
+        .value_counts()
+        .sort_index()
+    )
+    categories = {str(name): int(count) for name, count in category_counts.items()}
     examples = list(structured_examples[:MAX_VISUALIZED_FAILURES])
     remaining = list(failure_warnings)
     for example in examples:
@@ -105,7 +112,7 @@ def build_load_validation_audit(
     return {
         "status": "passed_with_skips",
         "skipped_count": len(failure_warnings),
-        "counts_by_category": dict(sorted(categories.items())),
+        "counts_by_category": categories,
         "visualized_count": len(examples),
         "max_visualized_examples": MAX_VISUALIZED_FAILURES,
         "report": None,

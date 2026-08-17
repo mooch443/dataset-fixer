@@ -20,7 +20,9 @@ from .dataset import Dataset
 from .errors import PredictionCacheMissError, PredictionScoreUnavailableError
 from .model import ImagePrediction, Model, ModelCollection, PredictionResult
 from .prediction_cache import PredictionCache
-from .static_rendering import finite_rows, save_chart
+from .comparison.plot_labels import with_model_identities
+from .static_rendering import save_chart
+from .tabular import chart_data, frame
 from .utils import to_jsonable
 
 
@@ -40,10 +42,10 @@ class ThresholdCalibrationResult:
 
     location: Path
     recommendations: dict[str, float]
-    cache_audit: tuple[dict[str, Any], ...]
-    threshold_scores: tuple[dict[str, Any], ...]
-    fold_scores: tuple[dict[str, Any], ...]
-    improvements: tuple[dict[str, Any], ...]
+    cache_audit: pd.DataFrame
+    threshold_scores: pd.DataFrame
+    fold_scores: pd.DataFrame
+    improvements: pd.DataFrame
 
 
 def calibrate_prediction_thresholds(
@@ -485,14 +487,15 @@ def calibrate_prediction_thresholds(
         split=split,
         seed=seed,
         minimum_component_area=resolved_component_area,
+        model_metadata=[model.describe() for model in collection],
     )
     return ThresholdCalibrationResult(
         location=root,
         recommendations=recommendations,
-        cache_audit=tuple(cache_audit),
-        threshold_scores=tuple(threshold_scores),
-        fold_scores=tuple(fold_scores),
-        improvements=tuple(improvements),
+        cache_audit=frame(cache_audit),
+        threshold_scores=frame(threshold_scores),
+        fold_scores=frame(fold_scores),
+        improvements=frame(improvements),
     )
 
 
@@ -842,6 +845,7 @@ def _publish_instance_threshold_alias(
             records=result.records,
             inference_seconds=result.inference_seconds,
             settings={**result.settings, "confidence": float(threshold)},
+            model_metadata=result.model_metadata,
         ),
         namespace="semantic",
         identity=identity,
@@ -1047,85 +1051,44 @@ def _summarize_rows(
     *,
     minimum_component_area: float,
 ) -> dict[str, float | int]:
-    selected = list(rows) if indices is None else [rows[index] for index in indices]
-    finite = [float(row["dice"]) for row in selected if math.isfinite(float(row["dice"]))]
-    tp = sum(int(row["tp"]) for row in selected)
-    fp = sum(int(row["fp"]) for row in selected)
-    fn = sum(int(row["fn"]) for row in selected)
-    positives = [row for row in selected if int(row["n_ref"]) > 0]
-    empties = [row for row in selected if int(row["n_ref"]) == 0]
-    detected = sum(int(row["n_pred"]) > 0 for row in positives)
-    empty_fp = sum(int(row["n_pred"]) > 0 for row in empties)
-    precision_denominator = detected + empty_fp
-    presence_precision = detected / precision_denominator if precision_denominator else math.nan
-    presence_recall = detected / len(positives) if positives else math.nan
-    presence_f1 = (
-        2 * presence_precision * presence_recall / (presence_precision + presence_recall)
-        if math.isfinite(presence_precision)
-        and math.isfinite(presence_recall)
-        and presence_precision + presence_recall
-        else math.nan
-    )
-    filtered_positives = [
-        row for row in selected if int(row["component_reference_count"]) > 0
-    ]
-    filtered_empties = [
-        row for row in selected if int(row["component_reference_count"]) == 0
-    ]
-    filtered_image_detected = sum(
-        int(row["component_prediction_count"]) > 0
-        for row in filtered_positives
-    )
-    filtered_image_fp = sum(
-        int(row["component_prediction_count"]) > 0
-        for row in filtered_empties
-    )
-    filtered_image_precision_denominator = (
-        filtered_image_detected + filtered_image_fp
-    )
-    filtered_image_precision = (
-        filtered_image_detected / filtered_image_precision_denominator
-        if filtered_image_precision_denominator
-        else math.nan
-    )
-    filtered_image_recall = (
-        filtered_image_detected / len(filtered_positives)
-        if filtered_positives
-        else math.nan
-    )
-    filtered_image_f1 = _f1(filtered_image_precision, filtered_image_recall)
+    data = frame(rows)
+    if indices is not None:
+        data = data.iloc[list(indices)]
+    totals = data[["tp", "fp", "fn"]].sum()
+    tp, fp, fn = (int(totals[key]) for key in ("tp", "fp", "fn"))
+    positive = data["n_ref"].astype(int).gt(0)
+    predicted = data["n_pred"].astype(int).gt(0)
+    detected, empty_fp = int((positive & predicted).sum()), int((~positive & predicted).sum())
+    presence_precision = _ratio(detected, detected + empty_fp)
+    presence_recall = _ratio(detected, int(positive.sum()))
+    presence_f1 = _f1(presence_precision, presence_recall)
 
-    component_references = sum(
-        int(row["component_reference_count"]) for row in selected
+    filtered_positive = data["component_reference_count"].astype(int).gt(0)
+    filtered_predicted = data["component_prediction_count"].astype(int).gt(0)
+    filtered_detected = int((filtered_positive & filtered_predicted).sum())
+    filtered_fp = int((~filtered_positive & filtered_predicted).sum())
+    filtered_precision = _ratio(filtered_detected, filtered_detected + filtered_fp)
+    filtered_recall = _ratio(filtered_detected, int(filtered_positive.sum()))
+    component_references, component_predictions, component_matches = (
+        int(data[column].sum())
+        for column in ("component_reference_count", "component_prediction_count", "component_match_count")
     )
-    component_predictions = sum(
-        int(row["component_prediction_count"]) for row in selected
-    )
-    component_matches = sum(int(row["component_match_count"]) for row in selected)
-    component_precision = (
-        component_matches / component_predictions
-        if component_predictions
-        else math.nan
-    )
-    component_recall = (
-        component_matches / component_references
-        if component_references
-        else math.nan
-    )
+    component_precision = _ratio(component_matches, component_predictions)
+    component_recall = _ratio(component_matches, component_references)
     component_f1 = _f1(component_precision, component_recall)
     return {
-        "macro_dice": float(np.mean(finite)) if finite else math.nan,
-        "micro_dice": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else math.nan,
-        "foreground_precision": tp / (tp + fp) if tp + fp else math.nan,
-        "foreground_recall": tp / (tp + fn) if tp + fn else math.nan,
+        "macro_dice": _finite_series_mean(data["dice"]),
+        "micro_dice": _ratio(2 * tp, 2 * tp + fp + fn),
+        "foreground_precision": _ratio(tp, tp + fp),
+        "foreground_recall": _ratio(tp, tp + fn),
         "presence_precision": presence_precision,
         "presence_recall": presence_recall,
         "presence_f1": presence_f1,
         # Image-level presence remains location-insensitive: any retained
         # prediction makes an image positive. Keep it as a separate diagnostic.
-        "area_filtered_image_presence_precision": filtered_image_precision,
-        "area_filtered_image_presence_recall": filtered_image_recall,
-        "area_filtered_image_presence_f1": filtered_image_f1,
+        "area_filtered_image_presence_precision": filtered_precision,
+        "area_filtered_image_presence_recall": filtered_recall,
+        "area_filtered_image_presence_f1": _f1(filtered_precision, filtered_recall),
         # Component detection is localization-aware. A match requires at least
         # one shared pixel and is assigned one-to-one, so duplicate predictions
         # remain false positives.
@@ -1136,22 +1099,23 @@ def _summarize_rows(
         "area_filtered_component_predictions": component_predictions,
         "area_filtered_component_references": component_references,
         "area_filtered_empty_specificity": (
-            (len(filtered_empties) - filtered_image_fp) / len(filtered_empties)
-            if filtered_empties
-            else math.nan
+            _ratio(int((~filtered_positive).sum()) - filtered_fp, int((~filtered_positive).sum()))
         ),
         "area_filtered_tiny_reference_only_excluded_cases": (
-            sum(
-                int(row["n_ref"]) > 0
-                and int(row["component_reference_count"]) == 0
-                for row in selected
-            )
+            int((positive & ~filtered_positive).sum())
         ),
-        "empty_specificity": (
-            (len(empties) - empty_fp) / len(empties) if empties else math.nan
-        ),
-        "cases": len(selected),
+        "empty_specificity": _ratio(int((~positive).sum()) - empty_fp, int((~positive).sum())),
+        "cases": len(data),
     }
+
+
+def _ratio(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else math.nan
+
+
+def _finite_series_mean(values: pd.Series) -> float:
+    finite = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return float(finite.mean()) if finite.notna().any() else math.nan
 
 
 def _f1(precision: float, recall: float) -> float:
@@ -1344,12 +1308,13 @@ def _write_calibration_artifacts(
     split: str,
     seed: int,
     minimum_component_area: float,
+    model_metadata: list[dict[str, Any]],
 ) -> None:
-    pd.DataFrame(cache_audit).to_csv(root / "cache-audit.csv", index=False)
-    scores = pd.DataFrame(threshold_scores)
+    frame(cache_audit).to_csv(root / "cache-audit.csv", index=False)
+    scores = frame(threshold_scores)
     scores.to_csv(root / "threshold-scores.csv", index=False)
-    pd.DataFrame(fold_scores).to_csv(root / "grouped-cv-folds.csv", index=False)
-    pd.DataFrame(improvements).to_csv(
+    frame(fold_scores).to_csv(root / "grouped-cv-folds.csv", index=False)
+    frame(improvements).to_csv(
         root / "calibration-improvements.csv",
         index=False,
     )
@@ -1396,18 +1361,15 @@ def _write_calibration_artifacts(
         "area_filtered_component_f1": "area-filtered component F1",
         "area_filtered_component_precision": "area-filtered component precision",
     }
-    long_rows = [
-        {
-            "model": row["model"],
-            "prediction_threshold": row["prediction_threshold"],
-            "metric": label,
-            "value": row[field],
-            "selected": recommendations[row["model"]],
-        }
-        for row in threshold_scores
-        for field, label in metric_fields.items()
-    ]
-    data = alt.Data(values=finite_rows(long_rows))
+    data = scores.melt(
+        id_vars=["model", "prediction_threshold"],
+        value_vars=list(metric_fields),
+        var_name="metric",
+        value_name="value",
+    )
+    data["metric"] = data["metric"].map(metric_fields)
+    data["selected"] = data["model"].map(recommendations)
+    data = chart_data(data)
     lines = (
         alt.Chart()
         .mark_line(point=True)
@@ -1430,4 +1392,7 @@ def _write_calibration_artifacts(
         .properties(title="Full-image threshold calibration (grouped CV cohort)")
         .resolve_scale(x="shared", y="shared")
     )
-    save_chart(chart, root / "threshold-curves.png")
+    save_chart(
+        with_model_identities(chart, model_metadata),
+        root / "threshold-curves.png",
+    )

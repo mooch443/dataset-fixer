@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Hashable, Iterable, Literal, Mapping, Sequence
 
 import numpy as np
+import pandas as pd
 from PIL import Image
 from tqdm.auto import tqdm
 
@@ -46,6 +47,7 @@ from .planning import (
     select_empty_images,
 )
 from .semantic_export import export_semantic_masks
+from .tabular import frame
 from .tiling import tile_dataset
 from .tracing import DatasetTrace, trace_dataset
 from .utils import IMAGE_SUFFIXES, ensure_safe_destination, normalize_split, settings_fingerprint, slugify
@@ -60,6 +62,7 @@ from .visualization import (
 )
 
 if TYPE_CHECKING:
+    from .dataset_comparison import DatasetComparisonResult
     from .model import Model, PredictionResult
 
 
@@ -1949,6 +1952,81 @@ class Dataset:
             results["semantic_masks"] = semantic
         return results
 
+    def report(
+        self,
+        *,
+        destination: str | Path | None = None,
+        visualize_kwargs: Mapping[str, Any] | None = None,
+        show: bool = True,
+        width: int = 2400,
+    ) -> Path | None:
+        """Display or save the canonical dataset overview image.
+
+        An existing ``reports/plots.png`` is reused when possible. Styling
+        overrides render the current physical samples with the same renderer
+        used by publication and :meth:`compare`.
+
+        Parameters:
+            destination: Optional output PNG. When omitted, a temporary render
+                is displayed unless the canonical saved report already exists.
+            visualize_kwargs: Report options: ``label_fn``, ``label_mode``,
+                ``line_width``, and ``outline_width``.
+            show: Display the resulting PNG inline when possible.
+            width: Report width in pixels.
+
+        Returns:
+            The persistent report path, or ``None`` for a temporary display.
+        """
+
+        from .dataset_comparison import render_dataset_overview
+
+        return render_dataset_overview(
+            self,
+            destination=destination,
+            visualize_kwargs=visualize_kwargs,
+            show=show,
+            width=width,
+        )
+
+    def compare(
+        self,
+        candidate: "Dataset",
+        *,
+        destination: str | Path | None = None,
+        visualize_kwargs: Mapping[str, Any] | None = None,
+        show: bool = True,
+        width: int = 2400,
+    ) -> "DatasetComparisonResult":
+        """Compare this baseline with another dataset and render one overview.
+
+        Images are aligned by ultimate-original lineage identity when present,
+        including duplicate occurrences, and otherwise by relative path. The
+        returned result exposes independent pandas tables for overview, split,
+        class, and image-level changes.
+
+        Parameters:
+            candidate: Dataset state to compare against this baseline.
+            destination: Optional PNG path or report directory. A directory
+                receives ``plots.png``; comparison tables remain on the result.
+            visualize_kwargs: Report options: ``label_fn``, ``label_mode``,
+                ``line_width``, and ``outline_width``.
+            show: Display the comparison PNG inline when possible.
+            width: Report width in pixels.
+        """
+
+        if not isinstance(candidate, Dataset):
+            raise TypeError("candidate must be a Dataset")
+        from .dataset_comparison import compare_datasets
+
+        return compare_datasets(
+            self,
+            candidate,
+            destination=destination,
+            visualize_kwargs=visualize_kwargs,
+            show=show,
+            width=width,
+        )
+
     def visualize(
         self,
         *,
@@ -2710,9 +2788,21 @@ class Dataset:
         return "\n".join(lines)
 
     def _summary_counts(self) -> dict[str, Any]:
+        samples = frame(
+            (
+                {
+                    "sample_id": index,
+                    "split": sample.split,
+                    "width": sample.width,
+                    "height": sample.height,
+                    "annotations": len(sample.annotations),
+                }
+                for index, sample in enumerate(self._samples)
+            ),
+            columns=["sample_id", "split", "width", "height", "annotations"],
+        )
         split_counts = {
-            split: sum(sample.split == split for sample in self._samples)
-            for split in self.splits
+            split: int(samples["split"].eq(split).sum()) for split in self.splits
         }
         if self._plan and not self._projection_exact:
             return {
@@ -2728,32 +2818,44 @@ class Dataset:
                 "mask_statistics": None,
             }
         if self.format == "semantic_masks":
+            mask_rows = frame(
+                (
+                    {
+                        "split": sample.split,
+                        **statistics,
+                    }
+                    for sample in self._samples
+                    if (
+                        statistics := self._mask_statistics.get(
+                            sample.image_path.resolve()
+                        )
+                    )
+                    is not None
+                ),
+                columns=["split", "foreground_pixels", "total_pixels"],
+            )
+            masks = len(mask_rows)
+            images = len(self._samples)
+            grouped = mask_rows.assign(
+                nonempty=mask_rows["foreground_pixels"].astype(int).gt(0)
+            ).groupby("split", sort=False).agg(
+                images=("split", "size"),
+                nonempty=("nonempty", "sum"),
+                foreground_pixels=("foreground_pixels", "sum"),
+                total_pixels=("total_pixels", "sum"),
+            ).reindex(self.splits, fill_value=0)
+            grouped["empty"] = grouped["images"] - grouped["nonempty"]
             mask_statistics = {
                 split: {
-                    "images": 0,
-                    "nonempty": 0,
-                    "empty": 0,
-                    "foreground_pixels": 0,
-                    "total_pixels": 0,
+                    "images": int(row["images"]),
+                    "nonempty": int(row["nonempty"]),
+                    "empty": int(row["empty"]),
+                    "foreground_pixels": int(row["foreground_pixels"]),
+                    "total_pixels": int(row["total_pixels"]),
                     "foreground_fraction": 0.0,
                 }
-                for split in self.splits
+                for split, row in grouped.iterrows()
             }
-            masks = 0
-            for sample in self._samples:
-                statistics = self._mask_statistics.get(sample.image_path.resolve())
-                if statistics is None:
-                    continue
-                masks += 1
-                split = mask_statistics[sample.split]
-                split["images"] += 1
-                split["foreground_pixels"] += statistics["foreground_pixels"]
-                split["total_pixels"] += statistics["total_pixels"]
-                if statistics["foreground_pixels"]:
-                    split["nonempty"] += 1
-                else:
-                    split["empty"] += 1
-            images = len(self._samples)
             if masks == images:
                 for statistics in mask_statistics.values():
                     total_pixels = statistics["total_pixels"]
@@ -2762,9 +2864,7 @@ class Dataset:
                         if total_pixels
                         else 0.0
                     )
-                empty = sum(
-                    statistics["empty"] for statistics in mask_statistics.values()
-                )
+                empty = sum(statistics["empty"] for statistics in mask_statistics.values())
             else:
                 summary = self._manifest.get("split_summary")
                 summary_is_complete = _semantic_summary_is_complete(
@@ -2780,9 +2880,7 @@ class Dataset:
                         "annotated": None,
                         "empty": None,
                         "empty_fraction": 0.0,
-                        "image_sizes": sorted(
-                            {(sample.width, sample.height) for sample in self._samples}
-                        ),
+                        "image_sizes": _image_sizes(samples),
                         "split_statistics": None,
                         "class_statistics": None,
                         "mask_statistics": None,
@@ -2800,9 +2898,7 @@ class Dataset:
                         }
                     )
                 masks = len(self._mask_paths)
-                empty = sum(
-                    statistics["empty"] for statistics in mask_statistics.values()
-                )
+                empty = sum(statistics["empty"] for statistics in mask_statistics.values())
             return {
                 "splits": split_counts,
                 "images": images,
@@ -2811,48 +2907,48 @@ class Dataset:
                 "annotated": images - empty,
                 "empty": empty,
                 "empty_fraction": empty / images if images else 0.0,
-                "image_sizes": sorted({(sample.width, sample.height) for sample in self._samples}),
+                "image_sizes": _image_sizes(samples),
                 "split_statistics": None,
                 "class_statistics": None,
                 "mask_statistics": mask_statistics,
             }
-        images = len(self._samples)
-        empty = sum(not sample.annotations for sample in self._samples)
-        annotations = sum(len(sample.annotations) for sample in self._samples)
+        images = len(samples)
+        annotations = int(samples["annotations"].sum())
+        annotated = samples["annotations"].astype(int).gt(0)
+        empty = int((~annotated).sum())
+        grouped = samples.assign(annotated=annotated).groupby("split", sort=False).agg(
+            images=("sample_id", "size"),
+            annotated=("annotated", "sum"),
+            annotations=("annotations", "sum"),
+        ).reindex(self.splits, fill_value=0)
+        grouped["empty"] = grouped["images"] - grouped["annotated"]
         split_statistics = {
-            split: {
-                "images": 0,
-                "annotated": 0,
-                "empty": 0,
-                "annotations": 0,
-            }
-            for split in self.splits
+            split: {key: int(row[key]) for key in ("images", "annotated", "empty", "annotations")}
+            for split, row in grouped.iterrows()
         }
+        class_rows = frame(
+            (
+                {"sample_id": sample_id, "class_id": annotation.class_id}
+                for sample_id, sample in enumerate(self._samples)
+                for annotation in sample.annotations
+            ),
+            columns=["sample_id", "class_id"],
+        )
+        class_counts = class_rows.groupby("class_id").agg(
+            annotations=("class_id", "size"), images=("sample_id", "nunique")
+        )
         class_statistics = {
             class_id: {
                 "name": name,
-                "annotations": 0,
-                "images": 0,
-                "image_fraction": 0.0,
+                "annotations": int(class_counts["annotations"].get(class_id, 0)),
+                "images": int(class_counts["images"].get(class_id, 0)),
+                "image_fraction": (
+                    int(class_counts["images"].get(class_id, 0)) / images
+                    if images else 0.0
+                ),
             }
             for class_id, name in self.classes.items()
         }
-        for sample in self._samples:
-            split = split_statistics[sample.split]
-            split["images"] += 1
-            split["annotations"] += len(sample.annotations)
-            if sample.annotations:
-                split["annotated"] += 1
-            else:
-                split["empty"] += 1
-            present_class_ids: set[int] = set()
-            for annotation in sample.annotations:
-                class_statistics[annotation.class_id]["annotations"] += 1
-                present_class_ids.add(annotation.class_id)
-            for class_id in present_class_ids:
-                class_statistics[class_id]["images"] += 1
-        for statistics in class_statistics.values():
-            statistics["image_fraction"] = statistics["images"] / images if images else 0.0
         return {
             "splits": split_counts,
             "images": images,
@@ -2860,7 +2956,7 @@ class Dataset:
             "annotated": images - empty,
             "empty": empty,
             "empty_fraction": empty / images if images else 0.0,
-            "image_sizes": sorted({(sample.width, sample.height) for sample in self._samples}),
+            "image_sizes": _image_sizes(samples),
             "split_statistics": split_statistics,
             "class_statistics": class_statistics,
             "mask_statistics": None,
@@ -2992,6 +3088,13 @@ class Dataset:
                 progress=progress,
                 dry_run=False,
             )
+
+
+def _image_sizes(samples: pd.DataFrame) -> list[tuple[int, int]]:
+    return sorted(
+        (int(row.width), int(row.height))
+        for row in samples[["width", "height"]].drop_duplicates().itertuples(index=False)
+    )
 
 
 def _resolve_data_yaml(requested: Path, root: Path) -> Path | None:

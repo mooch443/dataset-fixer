@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import json
 import math
 import shutil
@@ -9,9 +8,11 @@ from typing import Any, Iterable
 
 import altair as alt
 import numpy as np
+import pandas as pd
 from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageFont
 
-from ..static_rendering import finite_rows, save_chart
+from ..static_rendering import save_chart
+from ..tabular import TableLike, chart_data, frame
 from ..utils import to_jsonable
 from ..visualization import (
     VisualizationItem,
@@ -19,23 +20,20 @@ from ..visualization import (
     VisualizationPanel,
     visualize_records,
 )
+from .plot_labels import (
+    model_identity_card,
+    model_identity_chart,
+    model_identity_row_height,
+    with_model_identities,
+)
 from .types import Cohort, Prediction
 
 COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#000000"]
 
 
-def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+def write_csv(path: Path, rows: TableLike) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields: list[str] = []
-    for row in rows:
-        for key in row:
-            if key not in fields:
-                fields.append(key)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: _cell(row.get(key)) for key in fields})
+    _csv_frame(rows).to_csv(path, index=False, lineterminator="\r\n")
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -43,18 +41,32 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(to_jsonable(value), indent=2, sort_keys=True), encoding="utf-8")
 
 
-def write_tables(root: Path, ranking: list[dict[str, Any]]) -> None:
-    write_csv(root / "tables" / "model_comparison.csv", ranking)
-    columns = [key for key in ("rank", "model", "backend", "score", "confidence", "postprocess", "support_images", "support_annotations", "support_clusters") if ranking and key in ranking[0]]
-    lines = ["\\begin{tabular}{" + "l" * len(columns) + "}", " & ".join(columns) + " \\\\ \\hline"]
-    for row in ranking:
-        lines.append(" & ".join(_latex(row.get(key)) for key in columns) + " \\\\")
-    lines.append("\\end{tabular}")
-    (root / "tables" / "model_comparison.tex").write_text("\n".join(lines) + "\n", encoding="utf-8")
+def write_tables(root: Path, ranking: TableLike) -> None:
+    data = frame(ranking)
+    serialized = _csv_frame(ranking)
+    write_csv(root / "tables" / "model_comparison.csv", serialized)
+    columns = [
+        key
+        for key in (
+            "rank", "model", "backend", "score", "confidence", "postprocess",
+            "support_images", "support_annotations", "support_clusters",
+        )
+        if key in data
+    ]
+    lines = [
+        "\\begin{tabular}{" + "l" * len(columns) + "}",
+        " & ".join(columns) + " \\\\ \\hline",
+        *(
+            " & ".join(_latex(value) for value in row) + " \\\\"
+        for row in serialized[columns].itertuples(index=False, name=None)
+        ),
+        "\\end{tabular}",
+    ]
+    (root / "tables" / "model_comparison.tex").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
     try:
-        import pandas as pd
-
-        pd.DataFrame(ranking).to_excel(root / "tables" / "model_comparison.xlsx", index=False)
+        data.to_excel(root / "tables" / "model_comparison.xlsx", index=False)
     except ImportError:
         pass
 
@@ -73,6 +85,7 @@ def render_figures(
     leakage_audit: dict[str, Any],
     metadata: dict[str, Any],
 ) -> list[str]:
+    metadata = {**metadata, "_model_presentations": ranking}
     paths: list[str] = []
     model_order = [row["model"] for row in ranking]
     paths += _ranking_figure(root, ranking, metadata)
@@ -97,7 +110,7 @@ def render_qualitative(
     cohort: Cohort,
     predictions: dict[str, dict[str, list[Prediction]]],
     confidences: dict[str, float],
-    model_order: list[str],
+    ranking: list[dict[str, Any]],
     *,
     n: int = 6,
     seed: int = 42,
@@ -125,7 +138,8 @@ def render_qualitative(
                 image=np.asarray(_draw_panel(image, list(record.annotations), truth=True)),
             )
         ]
-        for name in model_order:
+        for model in ranking:
+            name = str(model["model"])
             selected = [p for p in predictions[name][record.image_id] if p.score >= confidences[name]]
             rendered, heading = _draw_matched_panel(
                 image,
@@ -133,9 +147,13 @@ def render_qualitative(
                 selected,
                 cohort.task,
                 cohort.metadata,
-                name,
             )
-            panels.append(VisualizationPanel(title=heading, image=np.asarray(rendered)))
+            panels.append(VisualizationPanel(
+                title=name,
+                image=np.asarray(rendered),
+                footer=heading,
+                heading=model_identity_card(model, width=346, maximum=48),
+            ))
 
         def prepare(_: Any) -> VisualizationItem:
             return VisualizationItem(
@@ -164,18 +182,19 @@ def render_prediction_grids(
     cohort: Cohort,
     predictions: dict[str, dict[str, list[Prediction]]],
     confidences: dict[str, float],
-    model_order: list[str],
+    ranking: list[dict[str, Any]],
 ) -> list[str]:
     """Render one annotated grid per image, with at most two models per row."""
 
     output_root = root / "predictions"
     rendered: list[str] = []
     for record in cohort.records:
-        columns = min(2, len(model_order))
+        columns = min(2, len(ranking))
         with Image.open(record.image_path) as opened:
             image = opened.convert("RGB")
 
-        def prepare(name: str) -> VisualizationItem:
+        def prepare(model: dict[str, Any]) -> VisualizationItem:
+            name = str(model["model"])
             selected = [
                 prediction
                 for prediction in predictions[name][record.image_id]
@@ -187,17 +206,21 @@ def render_prediction_grids(
                 selected,
                 cohort.task,
                 cohort.metadata,
-                name,
             )
             return VisualizationItem(
                 image_path=record.image_path,
-                label=heading,
-                panels=(VisualizationPanel(title="Prediction", image=np.asarray(panel)),),
+                label="",
+                panels=(VisualizationPanel(
+                    title=name,
+                    image=np.asarray(panel),
+                    footer=heading,
+                    heading=model_identity_card(model, width=403, maximum=48),
+                ),),
                 foreground=np.ones((image.height, image.width), dtype=bool),
             )
 
         chart = visualize_records(
-            model_order,
+            ranking,
             options=VisualizationOptions(samples=None, columns=columns, panel_size=4.2, show=False),
             prepare=prepare,
             title=str(record.relative_path),
@@ -209,13 +232,40 @@ def render_prediction_grids(
     return rendered
 
 
-def _save_figure(root: Path, name: str, chart: Any, rows: list[dict[str, Any]], metadata: dict[str, Any]) -> list[str]:
+def _save_figure(root: Path, name: str, chart: Any, rows: TableLike, metadata: dict[str, Any]) -> list[str]:
     figure_dir = root / "figures"
     data_path = figure_dir / "data" / f"{name}.csv"
     meta_path = figure_dir / "metadata" / f"{name}.json"
     write_csv(data_path, rows)
     _assert_csv_roundtrip(data_path, rows)
-    write_json(meta_path, {**metadata, "figure": name, "rows": len(rows)})
+    public_metadata = {
+        key: value for key, value in metadata.items() if not key.startswith("_")
+    }
+    write_json(meta_path, {**public_metadata, "figure": name, "rows": len(rows)})
+    columns = set(frame(rows).columns)
+    model_presentations = metadata.get("_model_presentations")
+    if (
+        name != "ranking_forest"
+        and isinstance(model_presentations, list)
+        and {"model", "model_a", "model_b"} & columns
+    ):
+        chart = with_model_identities(
+            chart,
+            model_presentations,
+            series_colors=(
+                COLORS
+                if name in {
+                    "precision_recall",
+                    "f1_confidence",
+                    "calibration_reliability",
+                    "throughput_performance_pareto",
+                    "polo_count_agreement",
+                    "polo_bland_altman",
+                    "polo_count_residuals",
+                }
+                else None
+            ),
+        )
     outputs = []
     for suffix in ("pdf", "svg", "png"):
         path = figure_dir / f"{name}.{suffix}"
@@ -225,29 +275,31 @@ def _save_figure(root: Path, name: str, chart: Any, rows: list[dict[str, Any]], 
 
 
 def _ranking_figure(root: Path, rows: list[dict[str, Any]], meta: dict[str, Any]) -> list[str]:
-    order = [str(row["model"]) for row in rows]
-    data = [
-        {
-            **row,
-            "value": row.get("uncertainty_score", row["score"]),
-            "low": row.get("ci_low", row.get("uncertainty_score", row["score"])),
-            "high": row.get("ci_high", row.get("uncertainty_score", row["score"])),
-        }
-        for row in rows
-    ]
-    base = alt.Chart(alt.Data(values=finite_rows(data))).encode(
-        y=alt.Y("model:N", sort=order, title=None),
+    row_height = model_identity_row_height(rows)
+    data = frame(rows)
+    data["model_key"] = data.index.astype(str)
+    data["value"] = (
+        data["uncertainty_score"].fillna(data["score"])
+        if "uncertainty_score" in data else data["score"]
+    )
+    data["low"] = data["ci_low"].fillna(data["value"]) if "ci_low" in data else data["value"]
+    data["high"] = data["ci_high"].fillna(data["value"]) if "ci_high" in data else data["value"]
+    base = alt.Chart(chart_data(data)).encode(
+        y=alt.Y("model_key:N", sort=list(data["model_key"]), axis=None),
     )
     intervals = base.mark_rule(color=COLORS[0], strokeWidth=2).encode(x="low:Q", x2="high:Q")
     points = base.mark_point(color=COLORS[0], filled=True, size=75).encode(
         x=alt.X("value:Q", title=rows[0].get("uncertainty_metric", "score") if rows else "score"),
-        tooltip=["model:N", alt.Tooltip("value:Q", format=".3f"), alt.Tooltip("low:Q", format=".3f"), alt.Tooltip("high:Q", format=".3f")],
+        tooltip=["model:N", "model_hash:N", alt.Tooltip("value:Q", format=".3f"), alt.Tooltip("low:Q", format=".3f"), alt.Tooltip("high:Q", format=".3f")],
     )
-    chart = (intervals + points).properties(
+    metrics = (intervals + points).properties(
         width=560,
-        height=max(180, 42 * len(rows)),
+        height=alt.Step(row_height),
         title="Ultimate-original cluster performance with 95% bootstrap intervals",
     )
+    chart = alt.hconcat(
+        model_identity_chart(rows, row_height=row_height), metrics, spacing=18
+    ).resolve_scale(y="shared")
     return _save_figure(root, "ranking_forest", chart, rows, meta)
 
 
@@ -264,12 +316,12 @@ def _pr_figure(root: Path, data: dict[str, Any], order: list[str], meta: dict[st
         mean = np.mean(vals, axis=0)
         rows.extend({"model": name, "recall": float(x), "precision": float(y)} for x, y in zip(grid, mean))
     chart = (
-        alt.Chart(alt.Data(values=rows))
+        alt.Chart(chart_data(rows))
         .mark_line(strokeWidth=2)
         .encode(
             x=alt.X("recall:Q", scale=alt.Scale(domain=[0, 1]), title="Recall"),
             y=alt.Y("precision:Q", scale=alt.Scale(domain=[0, 1]), title="Precision"),
-            color=alt.Color("model:N", sort=order, scale=alt.Scale(range=COLORS)),
+            color=alt.Color("model:N", sort=order, scale=alt.Scale(range=COLORS), legend=None),
             tooltip=["model:N", alt.Tooltip("recall:Q", format=".2f"), alt.Tooltip("precision:Q", format=".3f")],
         )
         .properties(width=500, height=420, title="Precision–recall curves")
@@ -278,21 +330,18 @@ def _pr_figure(root: Path, data: dict[str, Any], order: list[str], meta: dict[st
 
 
 def _f1_figure(root: Path, grid: list[dict[str, Any]], order: list[str], meta: dict[str, Any]) -> list[str]:
-    rows: list[dict[str, Any]] = []
-    for name in order:
-        selected = [row for row in grid if row["model"] == name]
-        by_confidence: dict[float, list[float]] = {}
-        for row in selected:
-            by_confidence.setdefault(float(row["confidence"]), []).append(float(row["f1"]))
-        x = sorted(by_confidence); y = [max(by_confidence[value]) for value in x]
-        rows.extend({"model": name, "confidence": a, "f1": b} for a, b in zip(x, y))
+    rows = (
+        frame(grid).groupby(["model", "confidence"], sort=True, as_index=False)["f1"].max()
+        .assign(model=lambda data: pd.Categorical(data["model"], order, ordered=True))
+        .sort_values(["model", "confidence"], kind="stable").reset_index(drop=True)
+    )
     chart = (
-        alt.Chart(alt.Data(values=rows))
+        alt.Chart(chart_data(rows))
         .mark_line(point=True)
         .encode(
             x=alt.X("confidence:Q", title="Confidence threshold"),
             y=alt.Y("f1:Q", scale=alt.Scale(domain=[0, 1]), title="F1"),
-            color=alt.Color("model:N", sort=order, scale=alt.Scale(range=COLORS)),
+            color=alt.Color("model:N", sort=order, scale=alt.Scale(range=COLORS), legend=None),
         )
         .properties(width=500, height=360, title="F1–confidence curves")
     )
@@ -302,7 +351,7 @@ def _f1_figure(root: Path, grid: list[dict[str, Any]], order: list[str], meta: d
 def _class_heatmap(root: Path, rows: list[dict[str, Any]], order: list[str], meta: dict[str, Any]) -> list[str]:
     classes = sorted({str(row["class_name"]) for row in rows})
     chart = (
-        alt.Chart(alt.Data(values=finite_rows(rows)))
+        alt.Chart(chart_data(rows))
         .mark_rect()
         .encode(
             x=alt.X("class_name:N", sort=classes, title="class"),
@@ -318,11 +367,11 @@ def _class_heatmap(root: Path, rows: list[dict[str, Any]], order: list[str], met
 def _paired_figure(root: Path, rows: list[dict[str, Any]], meta: dict[str, Any]) -> list[str]:
     data = [{**row, "pair": f"{row['model_b']} − {row['model_a']}"} for row in rows]
     order = [row["pair"] for row in data]
-    base = alt.Chart(alt.Data(values=finite_rows(data))).encode(y=alt.Y("pair:N", sort=order, title=None))
+    base = alt.Chart(chart_data(data)).encode(y=alt.Y("pair:N", sort=order, title=None))
     axis_title = "Model B − model A in ultimate-original macro F1"
     intervals = base.mark_rule(color=COLORS[1], strokeWidth=2).encode(x=alt.X("ci_low:Q", title=axis_title), x2="ci_high:Q")
     points = base.mark_point(color=COLORS[1], filled=True, size=70).encode(x=alt.X("difference:Q", title=axis_title))
-    zero = alt.Chart(alt.Data(values=[{"zero": 0}])).mark_rule(color="black").encode(x="zero:Q")
+    zero = alt.Chart(chart_data([{"zero": 0}])).mark_rule(color="black").encode(x="zero:Q")
     chart = (intervals + points + zero).properties(
         width=520,
         height=max(180, 40 * len(rows)),
@@ -333,7 +382,7 @@ def _paired_figure(root: Path, rows: list[dict[str, Any]], meta: dict[str, Any])
 
 def _grid_heatmap(root: Path, rows: list[dict[str, Any]], order: list[str], meta: dict[str, Any]) -> list[str]:
     chart = (
-        alt.Chart(alt.Data(values=finite_rows(rows)))
+        alt.Chart(chart_data(rows))
         .mark_rect()
         .encode(
             x=alt.X("confidence:O", title="Confidence"),
@@ -349,30 +398,30 @@ def _grid_heatmap(root: Path, rows: list[dict[str, Any]], order: list[str], meta
 
 
 def _calibration_figure(root: Path, rows: list[dict[str, Any]], order: list[str], meta: dict[str, Any]) -> list[str]:
-    data=[]
-    for name in order:
-        values=sorted((r for r in rows if r["model"]==name), key=lambda r:r["confidence"])
-        x=[r["confidence"] for r in values]; y=[r.get("precision",0) for r in values]
-        data += [{"model":name,"confidence":a,"precision":b} for a,b in zip(x,y)]
-    lines = alt.Chart(alt.Data(values=finite_rows(data))).mark_line(point=True).encode(
+    data = frame(rows)[["model", "confidence", "precision"]]
+    data["model"] = pd.Categorical(data["model"], order, ordered=True)
+    data = data.sort_values(["model", "confidence"], kind="stable").reset_index(drop=True)
+    lines = alt.Chart(chart_data(data)).mark_line(point=True).encode(
         x=alt.X("confidence:Q", scale=alt.Scale(domain=[0, 1]), title="Confidence threshold"),
         y=alt.Y("precision:Q", scale=alt.Scale(domain=[0, 1]), title="Observed precision"),
-        color=alt.Color("model:N", sort=order, scale=alt.Scale(range=COLORS)),
+        color=alt.Color("model:N", sort=order, scale=alt.Scale(range=COLORS), legend=None),
     )
-    identity = alt.Chart(alt.Data(values=[{"x": 0, "y": 0, "x2": 1, "y2": 1}])).mark_rule(color="gray", strokeDash=[6, 4]).encode(x="x:Q", y="y:Q", x2="x2:Q", y2="y2:Q")
+    identity = alt.Chart(chart_data([{"x": 0, "y": 0, "x2": 1, "y2": 1}])).mark_rule(color="gray", strokeDash=[6, 4]).encode(x="x:Q", y="y:Q", x2="x2:Q", y2="y2:Q")
     chart = (lines + identity).properties(width=500, height=360, title="Confidence reliability")
     return _save_figure(root,"calibration_reliability",chart,data,meta)
 
 
 def _error_figure(root: Path, rows: list[dict[str, Any]], meta: dict[str, Any]) -> list[str]:
     order = [str(row["model"]) for row in rows]
-    data = [
-        {"model": row["model"], "error": error, "count": row.get(key, 0)}
-        for row in rows
-        for error, key in (("FP", "fp"), ("FN", "fn"))
-    ]
+    data = frame(rows).reindex(columns=["model", "fp", "fn"], fill_value=0).melt(
+        id_vars="model", value_vars=["fp", "fn"], var_name="error", value_name="count"
+    )
+    data["error"] = data["error"].str.upper()
+    data["model"] = pd.Categorical(data["model"], order, ordered=True)
+    data["error"] = pd.Categorical(data["error"], ["FP", "FN"], ordered=True)
+    data = data.sort_values(["model", "error"], kind="stable").reset_index(drop=True)
     chart = (
-        alt.Chart(alt.Data(values=data))
+        alt.Chart(chart_data(data))
         .mark_bar()
         .encode(
             x=alt.X("model:N", sort=order),
@@ -386,14 +435,16 @@ def _error_figure(root: Path, rows: list[dict[str, Any]], meta: dict[str, Any]) 
 
 
 def _pareto_figure(root: Path, rows: list[dict[str, Any]], meta: dict[str, Any]) -> list[str]:
-    data = [{**row, "throughput": row.get("throughput_images_per_second") or 0} for row in rows]
-    points = alt.Chart(alt.Data(values=finite_rows(data))).mark_point(filled=True, size=95).encode(
+    data = frame(rows).assign(
+        throughput=lambda value: value["throughput_images_per_second"].fillna(0)
+    )
+    points = alt.Chart(chart_data(data)).mark_point(filled=True, size=95).encode(
         x=alt.X("throughput:Q", title="Throughput (images/s)"),
         y=alt.Y("score:Q", title="Ranking metric"),
         color=alt.Color("model:N", scale=alt.Scale(range=COLORS), legend=None),
         tooltip=["model:N", alt.Tooltip("throughput:Q", format=".2f"), alt.Tooltip("score:Q", format=".3f")],
     )
-    labels = alt.Chart(alt.Data(values=finite_rows(data))).mark_text(align="left", dx=7, dy=-6).encode(
+    labels = alt.Chart(chart_data(data)).mark_text(align="left", dx=7, dy=-6).encode(
         x="throughput:Q", y="score:Q", text="model:N"
     )
     return _save_figure(root,"throughput_performance_pareto",(points+labels).properties(width=500,height=340,title="Performance–throughput trade-off"),rows,meta)
@@ -410,7 +461,7 @@ def _cohort_figure(root: Path, cohort: Cohort, meta: dict[str, Any]) -> list[str
         "unit": "empty images",
     })
     chart = (
-        alt.Chart(alt.Data(values=rows))
+        alt.Chart(chart_data(rows))
         .mark_bar()
         .encode(
             x=alt.X("class_name:N", sort=[row["class_name"] for row in rows], title="class / background"),
@@ -424,9 +475,10 @@ def _cohort_figure(root: Path, cohort: Cohort, meta: dict[str, Any]) -> list[str
 
 
 def _cache_figure(root: Path, audit: dict[str, Any], order: list[str], meta: dict[str, Any]) -> list[str]:
-    rows=[{"model":name,**audit.get(name,{})} for name in order]
-    data=[{**row,"source":str(row.get("source","fresh")),"value":1} for row in rows]
-    chart=(alt.Chart(alt.Data(values=finite_rows(data))).mark_bar().encode(
+    rows = frame({"model": name, **audit.get(name, {})} for name in order)
+    source = rows["source"] if "source" in rows else pd.Series("fresh", index=rows.index)
+    data = rows.assign(source=source.fillna("fresh").astype(str), value=1)
+    chart=(alt.Chart(chart_data(data)).mark_bar().encode(
         y=alt.Y("model:N",sort=order,title=None),x=alt.X("value:Q",axis=None,title=None),
         color=alt.Color("source:N",scale=alt.Scale(range=COLORS)),tooltip=["model:N","source:N"]
     ).properties(width=440,height=max(180,38*len(rows)),title="Prediction cache source audit"))
@@ -434,12 +486,18 @@ def _cache_figure(root: Path, audit: dict[str, Any], order: list[str], meta: dic
 
 
 def _leakage_figure(root: Path, audit: dict[str, Any], order: list[str], meta: dict[str, Any]) -> list[str]:
-    rows = [
+    rows = frame(
         {"model": name, "status": audit.get(name, {}).get("status", "unknown"), "overlap_count": int(audit.get(name, {}).get("overlap_count", 0))}
         for name in order
-    ]
-    data=[{**row,"state":"overlap" if row["overlap_count"] else "verified" if row["status"]=="verified" else "unknown"} for row in rows]
-    chart=(alt.Chart(alt.Data(values=data)).mark_bar().encode(
+    )
+    data = rows.assign(
+        state=np.select(
+            [rows["overlap_count"].ne(0), rows["status"].eq("verified")],
+            ["overlap", "verified"],
+            default="unknown",
+        )
+    )
+    chart=(alt.Chart(chart_data(data)).mark_bar().encode(
         y=alt.Y("model:N",sort=order,title=None),
         x=alt.X("overlap_count:Q",title="Overlapping ultimate originals"),
         color=alt.Color("state:N",scale=alt.Scale(domain=["overlap","verified","unknown"],range=["#D55E00","#009E73","#999999"]),legend=None),
@@ -451,22 +509,25 @@ def _leakage_figure(root: Path, audit: dict[str, Any], order: list[str], meta: d
 def _count_figures(root: Path, rows: list[dict[str, Any]], order: list[str], meta: dict[str, Any]) -> list[str]:
     paths=[]
     maximum=max([float(row["gt"]) for row in rows]+[float(row["pred"]) for row in rows]+[1.0])
-    points=alt.Chart(alt.Data(values=finite_rows(rows))).mark_point(filled=True,opacity=.65).encode(
+    points=alt.Chart(chart_data(rows)).mark_point(filled=True,opacity=.65).encode(
         x=alt.X("gt:Q",title="Ground-truth count"),y=alt.Y("pred:Q",title="Predicted count"),
-        color=alt.Color("model:N",sort=order,scale=alt.Scale(range=COLORS))
+        color=alt.Color("model:N",sort=order,scale=alt.Scale(range=COLORS),legend=None)
     )
-    identity=alt.Chart(alt.Data(values=[{"x":0,"y":0,"x2":maximum,"y2":maximum}])).mark_rule(color="gray",strokeDash=[6,4]).encode(x="x:Q",y="y:Q",x2="x2:Q",y2="y2:Q")
+    identity=alt.Chart(chart_data([{"x":0,"y":0,"x2":maximum,"y2":maximum}])).mark_rule(color="gray",strokeDash=[6,4]).encode(x="x:Q",y="y:Q",x2="x2:Q",y2="y2:Q")
     paths += _save_figure(root,"polo_count_agreement",(points+identity).properties(width=420,height=420,title="POLO count agreement"),rows,meta)
-    derived=[{**row,"mean_count":(row["gt"]+row["pred"])/2,"residual":row["pred"]-row["gt"]} for row in rows]
-    bland=alt.Chart(alt.Data(values=finite_rows(derived))).mark_point(filled=True,opacity=.65).encode(
-        x=alt.X("mean_count:Q",title="Mean count"),y=alt.Y("residual:Q",title="Prediction − truth"),
-        color=alt.Color("model:N",sort=order,scale=alt.Scale(range=COLORS))
+    derived = frame(rows).assign(
+        mean_count=lambda value: (value["gt"] + value["pred"]) / 2,
+        residual=lambda value: value["pred"] - value["gt"],
     )
-    zero=alt.Chart(alt.Data(values=[{"zero":0}])).mark_rule(color="gray",strokeDash=[6,4]).encode(y="zero:Q")
+    bland=alt.Chart(chart_data(derived)).mark_point(filled=True,opacity=.65).encode(
+        x=alt.X("mean_count:Q",title="Mean count"),y=alt.Y("residual:Q",title="Prediction − truth"),
+        color=alt.Color("model:N",sort=order,scale=alt.Scale(range=COLORS),legend=None)
+    )
+    zero=alt.Chart(chart_data([{"zero":0}])).mark_rule(color="gray",strokeDash=[6,4]).encode(y="zero:Q")
     paths += _save_figure(root,"polo_bland_altman",(bland+zero).properties(width=500,height=340,title="POLO Bland–Altman view"),rows,meta)
-    histogram=alt.Chart(alt.Data(values=finite_rows(derived))).mark_bar(opacity=.5).encode(
+    histogram=alt.Chart(chart_data(derived)).mark_bar(opacity=.5).encode(
         x=alt.X("residual:Q",bin=alt.Bin(maxbins=24),title="Count residual"),y=alt.Y("count():Q",title="Images"),
-        color=alt.Color("model:N",sort=order,scale=alt.Scale(range=COLORS))
+        color=alt.Color("model:N",sort=order,scale=alt.Scale(range=COLORS),legend=None)
     ).properties(width=500,height=340,title="POLO count-residual distribution")
     paths += _save_figure(root,"polo_count_residuals",histogram,rows,meta)
     return paths
@@ -488,7 +549,6 @@ def _draw_matched_panel(
     predictions: list[Prediction],
     task: str,
     metadata: dict[str, Any],
-    title: str,
 ) -> tuple[Image.Image, str]:
     from .metrics import optimal_match
 
@@ -497,7 +557,8 @@ def _draw_matched_panel(
     overlay = Image.new("RGBA", rendered.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     heading = (
-        f"{title}\nTP {len(matched['matches'])}  FP {len(matched['unmatched_pred'])}  FN {len(matched['unmatched_gt'])}"
+        f"TP {len(matched['matches'])}  FP {len(matched['unmatched_pred'])}  "
+        f"FN {len(matched['unmatched_gt'])}"
     )
     for truth_index, prediction_index, _ in matched["matches"]:
         _draw_value(draw, truth[truth_index], truth=True, color="#FFFFFF", alpha=.75, linewidth=3)
@@ -553,25 +614,38 @@ def _center(value: Any) -> tuple[float, float] | None:
 
 
 def _cell(value: Any) -> Any:
-    if isinstance(value, (dict, list, tuple)): return json.dumps(to_jsonable(value), sort_keys=True)
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(to_jsonable(value), sort_keys=True)
     return value
 
 
-def _assert_csv_roundtrip(path: Path, rows: list[dict[str, Any]]) -> None:
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        restored = list(csv.DictReader(handle))
-    if len(restored) != len(rows):
+def _csv_cell(value: Any) -> str:
+    cell = _cell(value)
+    return "" if cell is None or cell is pd.NA else str(cell)
+
+
+def _csv_frame(rows: TableLike) -> pd.DataFrame:
+    if isinstance(rows, pd.DataFrame):
+        return rows.astype(object).map(_csv_cell)
+    return pd.DataFrame.from_records(
+        ({key: _csv_cell(value) for key, value in row.items()} for row in rows)
+    )
+
+
+def _assert_csv_roundtrip(path: Path, rows: TableLike) -> None:
+    source = _csv_frame(rows).astype(str)
+    if not len(source.columns):
+        return
+    restored = pd.read_csv(path, dtype=str, keep_default_na=False)
+    if len(restored) != len(source):
         raise AssertionError(f"Figure data row count changed while writing {path}")
-    for source, target in zip(rows, restored):
-        for key, value in source.items():
-            cell = _cell(value)
-            expected = "" if cell is None else str(cell)
-            if expected != target.get(key, ""):
-                raise AssertionError(f"Figure value {key!r} changed while writing {path}")
+    if not restored.equals(source):
+        raise AssertionError(f"Figure values changed while writing {path}")
 
 
 def _latex(value: Any) -> str:
-    text=str(_cell(value)); return text.replace("_","\\_").replace("%","\\%")
+    text = str(_cell(value))
+    return text.replace("_", "\\_").replace("%", "\\%")
 
 
 def combine_report_plots(
@@ -579,6 +653,7 @@ def combine_report_plots(
     output: Path,
     *,
     limit: int = 16,
+    width: int = 1600,
 ) -> Path | None:
     """Collapse comparison figures into one readable, vertically stacked sheet.
 
@@ -602,7 +677,7 @@ def combine_report_plots(
     if not candidates:
         return None
     chosen = candidates[:limit]
-    canvas_width = 1600
+    canvas_width = width
     outer_padding = 32
     panel_padding = 24
     label_height = 52

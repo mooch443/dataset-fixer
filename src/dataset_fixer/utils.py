@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import pandas as pd
+
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 STANDARD_SPLITS = ("train", "val", "test")
 SPLIT_ALIASES = {"validation": "val", "valid": "val"}
@@ -109,6 +111,14 @@ def _iter_canonical_json(value: Any):
 
 
 def to_jsonable(value: Any) -> Any:
+    if isinstance(value, pd.DataFrame):
+        from .tabular import records
+
+        return [to_jsonable(row) for row in records(value)]
+    if isinstance(value, pd.Series):
+        return {str(key): to_jsonable(item) for key, item in value.items()}
+    if value is pd.NA:
+        return None
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, dict):
@@ -137,6 +147,15 @@ def package_versions() -> dict[str, str]:
         except importlib.metadata.PackageNotFoundError:
             continue
     return result
+
+
+def shorten_middle(value: str, maximum: int) -> str:
+    """Elide a label's center while preserving both identifying ends."""
+
+    if len(value) <= maximum:
+        return value
+    left = (maximum - 1) // 2
+    return f"{value[:left]}…{value[-(maximum - 1 - left):]}"
 
 
 def git_state(path: Path) -> dict[str, Any]:

@@ -628,7 +628,9 @@ def test_wandb_model_name_uses_dataset_run_model_and_resolution(
         "wandb:max-planck-institute-for-animal-behavior/"
         "schools-segmentation/gnsuhtfc"
     )
-    run = SimpleNamespace(display_name="an extremely long W&B display name")
+    run = SimpleNamespace(
+        id="i9xve33c", display_name="an extremely long W&B display name"
+    )
     monkeypatch.setattr(
         "dataset_fixer.model_sources._download_wandb",
         lambda *_args, **_kwargs: (bundle.path, run),
@@ -646,6 +648,11 @@ def test_wandb_model_name_uses_dataset_run_model_and_resolution(
     )
     assert model.model_type == "yolo26x-sem"
     assert model.effective_resolution == (512, 512)
+    assert model.hash() == "i9xve33c"
+    assert model.wandb == (
+        "https://wandb.ai/max-planck-institute-for-animal-behavior/"
+        "schools-segmentation/runs/i9xve33c"
+    )
     assert model.digest not in model.name
     assert "max-planck-institute" not in model.name
 

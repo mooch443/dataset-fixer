@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
 import math
 import random
 import re
-import statistics
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 
 import numpy as np
+import pandas as pd
 from PIL import Image, ImageOps
 from shapely.errors import ShapelyError
 from shapely.geometry import Point, Polygon, box as shapely_box
@@ -23,6 +22,7 @@ from .augmentation import apply_virtual_view
 from .errors import DatasetValidationError, ValidationIssue
 from .models import Annotation, Sample, Task
 from .operations import _builder, _print_start, _publish
+from .tabular import TableLike, frame
 from .utils import normalize_split
 from .writer import PUBLISHES_OPERATION_VISUALS
 from .visualization import (
@@ -2949,15 +2949,13 @@ def _append_coverage_rows(
     )
 
 
-def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+def _write_csv(path: Path, rows: TableLike) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
+    data = frame(rows)
+    if data.empty:
         path.write_text("", encoding="utf-8")
         return
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
+    data.to_csv(path, index=False)
 
 
 _MATRIX_NUMBER = re.compile(r"[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?")
@@ -3230,28 +3228,32 @@ def _source_pixel_coverage_payload(
         ),
         "splits": {},
     }
+    data = frame(rows)
     for split in [*sorted(splits), "all"]:
-        selected = rows if split == "all" else [row for row in rows if row["split"] == split]
-        exact = [row for row in selected if row["coverage_status"] == "exact"]
-        values = [float(row["source_pixel_coverage_percent"]) for row in exact]
-        covered = sum(float(row["covered_source_area_px"]) for row in exact)
-        total = sum(float(row["source_area_px"]) for row in exact)
-        payload["splits"][split] = {
-            "source_images": len(selected),
-            "represented_source_images": sum(int(row["output_tiles"]) > 0 for row in selected),
-            "exact_source_images": len(exact),
-            "unsupported_source_images": len(selected) - len(exact),
-            "output_tiles": sum(int(row["output_tiles"]) for row in selected),
-            "covered_source_area_px": covered,
-            "source_area_px": total,
-            "pixel_weighted_coverage_percent": 100.0 * covered / total if total else 0.0,
-            "mean_per_source_coverage_percent": statistics.mean(values) if values else 0.0,
-            "median_per_source_coverage_percent": statistics.median(values) if values else 0.0,
-            "minimum_per_source_coverage_percent": min(values) if values else 0.0,
-            "maximum_per_source_coverage_percent": max(values) if values else 0.0,
-            "fully_covered_source_images": sum(value >= 99.999 for value in values),
-        }
+        selected = data if split == "all" else data[data["split"].eq(split)]
+        payload["splits"][split] = _source_pixel_stats(selected)
     return payload
+
+
+def _source_pixel_stats(data: pd.DataFrame) -> dict[str, Any]:
+    exact = data[data["coverage_status"].eq("exact")]
+    values = exact["source_pixel_coverage_percent"].astype(float)
+    covered, total = (float(exact[column].sum()) for column in ("covered_source_area_px", "source_area_px"))
+    return {
+        "source_images": len(data),
+        "represented_source_images": int(data["output_tiles"].astype(int).gt(0).sum()),
+        "exact_source_images": len(exact),
+        "unsupported_source_images": len(data) - len(exact),
+        "output_tiles": int(data["output_tiles"].sum()),
+        "covered_source_area_px": covered,
+        "source_area_px": total,
+        "pixel_weighted_coverage_percent": 100.0 * covered / total if total else 0.0,
+        "mean_per_source_coverage_percent": float(values.mean()) if len(values) else 0.0,
+        "median_per_source_coverage_percent": float(values.median()) if len(values) else 0.0,
+        "minimum_per_source_coverage_percent": float(values.min()) if len(values) else 0.0,
+        "maximum_per_source_coverage_percent": float(values.max()) if len(values) else 0.0,
+        "fully_covered_source_images": int(values.ge(99.999).sum()),
+    }
 
 
 def _source_coverage_summary(
@@ -3268,33 +3270,7 @@ def _source_coverage_summary(
     accepted tiles actually cover.
     """
 
-    def block(rows: list[dict[str, Any]], pixels: list[dict[str, Any]]) -> dict[str, Any]:
-        total_labels = len(rows)
-        covered = sum(1 for row in rows if row["covered_at_least_once"])
-        exact = [row for row in pixels if row["coverage_status"] == "exact"]
-        covered_area = sum(float(row["covered_source_area_px"]) for row in exact)
-        total_area = sum(float(row["source_area_px"]) for row in exact)
-        total_images = len(pixels)
-        represented = sum(1 for row in pixels if int(row["output_tiles"]) > 0)
-        return {
-            "source_labels": total_labels,
-            "source_labels_covered_at_least_once": covered,
-            "source_labels_never_covered": total_labels - covered,
-            "source_label_coverage_percent": (
-                100.0 * covered / total_labels if total_labels else 100.0
-            ),
-            "source_images": total_images,
-            "source_images_represented": represented,
-            "source_image_representation_percent": (
-                100.0 * represented / total_images if total_images else 100.0
-            ),
-            "covered_source_area_px": covered_area,
-            "source_area_px": total_area,
-            "source_image_space_coverage_percent": (
-                100.0 * covered_area / total_area if total_area else 0.0
-            ),
-            "source_images_without_exact_area": len(pixels) - len(exact),
-        }
+    labels, pixels = frame(coverage_rows), frame(source_pixel_rows)
 
     payload: dict[str, Any] = {
         "definition": (
@@ -3305,14 +3281,33 @@ def _source_coverage_summary(
         "splits": {},
         "label_positions": _label_position_histogram(coverage_rows),
         "output_label_positions": _output_label_position_histogram(output_samples),
-        **block(coverage_rows, source_pixel_rows),
+        **_coverage_block(labels, pixels),
     }
     for split in sorted(splits):
-        payload["splits"][split] = block(
-            [row for row in coverage_rows if row["split"] == split],
-            [row for row in source_pixel_rows if row["split"] == split],
+        payload["splits"][split] = _coverage_block(
+            labels[labels["split"].eq(split)], pixels[pixels["split"].eq(split)]
         )
     return payload
+
+
+def _coverage_block(labels: pd.DataFrame, pixels: pd.DataFrame) -> dict[str, Any]:
+    total_labels = len(labels)
+    covered = int(labels["covered_at_least_once"].astype(bool).sum()) if total_labels else 0
+    pixel_stats = _source_pixel_stats(pixels)
+    total_images, represented = pixel_stats["source_images"], pixel_stats["represented_source_images"]
+    return {
+        "source_labels": total_labels,
+        "source_labels_covered_at_least_once": covered,
+        "source_labels_never_covered": total_labels - covered,
+        "source_label_coverage_percent": 100.0 * covered / total_labels if total_labels else 100.0,
+        "source_images": total_images,
+        "source_images_represented": represented,
+        "source_image_representation_percent": 100.0 * represented / total_images if total_images else 100.0,
+        "covered_source_area_px": pixel_stats["covered_source_area_px"],
+        "source_area_px": pixel_stats["source_area_px"],
+        "source_image_space_coverage_percent": pixel_stats["pixel_weighted_coverage_percent"],
+        "source_images_without_exact_area": pixel_stats["unsupported_source_images"],
+    }
 
 
 def _label_position_histogram(
@@ -3327,16 +3322,11 @@ def _label_position_histogram(
     and where the ones that never reached the output were located.
     """
 
-    total = [[0] * columns for _ in range(rows)]
-    uncovered = [[0] * columns for _ in range(rows)]
-    for row in coverage_rows:
-        x = min(max(float(row["x_norm"]), 0.0), 0.999999)
-        y = min(max(float(row["y_norm"]), 0.0), 0.999999)
-        column_index = int(x * columns)
-        row_index = int(y * rows)
-        total[row_index][column_index] += 1
-        if not row["covered_at_least_once"]:
-            uncovered[row_index][column_index] += 1
+    data = frame(coverage_rows)
+    total = _position_grid(data, columns=columns, rows=rows)
+    uncovered = _position_grid(
+        data[~data["covered_at_least_once"].astype(bool)], columns=columns, rows=rows
+    )
     return {
         "definition": (
             "Counts of source labels binned by their normalized position in the "
@@ -3357,18 +3347,14 @@ def _output_label_position_histogram(
 ) -> dict[str, Any]:
     """Bin final annotation anchors in normalized output-image coordinates."""
 
-    total = [[0] * columns for _ in range(rows)]
-    output_annotations = 0
-    annotated_images = 0
-    for sample in samples:
-        if sample.annotations:
-            annotated_images += 1
-        for annotation in sample.annotations:
-            x, y = _annotation_anchor(annotation)
-            x_norm = min(max(float(x) / sample.width, 0.0), 0.999999)
-            y_norm = min(max(float(y) / sample.height, 0.0), 0.999999)
-            total[int(y_norm * rows)][int(x_norm * columns)] += 1
-            output_annotations += 1
+    sample_values = list(samples)
+    positions = [
+        (float(x) / sample.width, float(y) / sample.height)
+        for sample in sample_values
+        for annotation in sample.annotations
+        for x, y in [_annotation_anchor(annotation)]
+    ]
+    data = pd.DataFrame(positions, columns=["x_norm", "y_norm"])
     return {
         "definition": (
             "Counts of exported annotation anchors binned by their normalized "
@@ -3377,10 +3363,19 @@ def _output_label_position_histogram(
         "coordinate_space": "normalized output image",
         "columns": columns,
         "rows": rows,
-        "labels": total,
-        "output_annotations": output_annotations,
-        "annotated_output_images": annotated_images,
+        "labels": _position_grid(data, columns=columns, rows=rows),
+        "output_annotations": len(data),
+        "annotated_output_images": sum(bool(sample.annotations) for sample in sample_values),
     }
+
+
+def _position_grid(data: pd.DataFrame, *, columns: int, rows: int) -> list[list[int]]:
+    if data.empty:
+        return np.zeros((rows, columns), dtype=int).tolist()
+    x = data["x_norm"].astype(float).clip(0, 0.999999)
+    y = data["y_norm"].astype(float).clip(0, 0.999999)
+    histogram, _, _ = np.histogram2d(y, x, bins=(rows, columns), range=((0, 1), (0, 1)))
+    return histogram.astype(int).tolist()
 
 
 def _write_coverage_reports(
@@ -3399,85 +3394,39 @@ def _write_coverage_reports(
 ) -> list[Path]:
     visuals: list[Path] = []
     _write_csv(root / "label_coverage.csv", coverage_rows)
-    aggregate_image_rows = list(image_rows)
-    for split in [*sorted(splits), "all"]:
-        selected_rows = image_rows if split == "all" else [row for row in image_rows if row["split"] == split]
-        total_labels = sum(row["total_labels"] for row in selected_rows)
-        hit = sum(row["labels_covered_at_least_once"] for row in selected_rows)
-        actual = sum(row["actual_coverages"] for row in selected_rows)
-        requested = sum(row["requested_coverages"] for row in selected_rows)
-        aggregate_image_rows.append(
-            {
-                "split": split,
-                "image": "__TOTAL__",
-                "total_labels": total_labels,
-                "dense_labels": sum(row["dense_labels"] for row in selected_rows),
-                "sparse_labels": sum(row["sparse_labels"] for row in selected_rows),
-                "override_labels": sum(row["override_labels"] for row in selected_rows),
-                "labels_covered_at_least_once": hit,
-                "labels_never_covered": total_labels - hit,
-                "percent_labels_covered_at_least_once": 100 * hit / total_labels if total_labels else 0,
-                "actual_coverages": actual,
-                "requested_coverages": requested,
-                "percent_requested_coverages": 100 * actual / requested if requested else 0,
-                "is_large_image": "",
-            }
-        )
-    _write_csv(root / "label_hit_summary.csv", aggregate_image_rows)
-    class_rows = []
-    for (split, class_id), totals in sorted(class_totals.items()):
-        requested, actual = totals["requested_coverages"], totals["actual_coverages"]
-        original, hit = totals["original_labels"], totals["labels_covered_at_least_once"]
-        class_rows.append(
-            {
-                "split": split,
-                "class_id": class_id,
-                "original_labels": original,
-                "labels_covered_at_least_once": hit,
-                "percent_labels_covered_at_least_once": 100 * hit / original if original else 0,
-                "actual_coverages": actual,
-                "requested_coverages": requested,
-                "percent_of_requested": 100 * actual / requested if requested else 0,
-            }
-        )
-    for class_id in sorted({class_id for _, class_id in class_totals}):
-        totals = sum((class_totals[(split, class_id)] for split in splits), Counter())
-        requested, actual = totals["requested_coverages"], totals["actual_coverages"]
-        original, hit = totals["original_labels"], totals["labels_covered_at_least_once"]
-        class_rows.append(
-            {
-                "split": "all",
-                "class_id": class_id,
-                "original_labels": original,
-                "labels_covered_at_least_once": hit,
-                "percent_labels_covered_at_least_once": 100 * hit / original if original else 0,
-                "actual_coverages": actual,
-                "requested_coverages": requested,
-                "percent_of_requested": 100 * actual / requested if requested else 0,
-            }
-        )
-    _write_csv(root / "class_coverage_summary.csv", class_rows)
-    keys = sorted({key for summary in split_summary.values() for key in summary})
+    image_data = frame(image_rows)
+    additive = ["total_labels", "dense_labels", "sparse_labels", "override_labels", "labels_covered_at_least_once", "actual_coverages", "requested_coverages"]
+    totals = image_data.groupby("split")[additive].sum().reindex(sorted(splits), fill_value=0)
+    totals.loc["all"] = image_data[additive].sum()
+    totals["labels_never_covered"] = totals["total_labels"] - totals["labels_covered_at_least_once"]
+    totals["percent_labels_covered_at_least_once"] = 100 * totals["labels_covered_at_least_once"].div(totals["total_labels"].where(totals["total_labels"].ne(0))).fillna(0)
+    totals["percent_requested_coverages"] = 100 * totals["actual_coverages"].div(totals["requested_coverages"].where(totals["requested_coverages"].ne(0))).fillna(0)
+    totals = totals.assign(image="__TOTAL__", is_large_image="").reset_index().reindex(columns=image_data.columns)
+    _write_csv(root / "label_hit_summary.csv", pd.concat([image_data, totals], ignore_index=True))
 
-    def tile_row(split: str, summary: Counter) -> dict[str, Any]:
-        total = summary["total_output_images"]
-        policy = background_ratio_policy.get(split)
-        return {
-            "split": split,
-            **{key: summary[key] for key in keys},
-            "background_ratio_mode": policy["mode"] if policy else "aggregate",
-            "requested_background_fraction": policy["requested"] if policy else None,
-            "target_background_fraction": policy["target_fraction"] if policy else None,
-            "minimum_background_fraction": policy["minimum_fraction"] if policy else None,
-            "background_fraction": summary["empty_output_images"] / total if total else 0.0,
-        }
+    class_data = frame(
+        ({"split": split, "class_id": class_id, **totals} for (split, class_id), totals in sorted(class_totals.items()))
+    )
+    additive = ["original_labels", "labels_covered_at_least_once", "actual_coverages", "requested_coverages"]
+    all_classes = class_data.groupby("class_id", as_index=False)[additive].sum().assign(split="all")
+    class_data = pd.concat([class_data, all_classes], ignore_index=True)
+    class_data["percent_labels_covered_at_least_once"] = 100 * class_data["labels_covered_at_least_once"].div(class_data["original_labels"].where(class_data["original_labels"].ne(0))).fillna(0)
+    class_data["percent_of_requested"] = 100 * class_data["actual_coverages"].div(class_data["requested_coverages"].where(class_data["requested_coverages"].ne(0))).fillna(0)
+    _write_csv(root / "class_coverage_summary.csv", class_data[["split", "class_id", "original_labels", "labels_covered_at_least_once", "percent_labels_covered_at_least_once", "actual_coverages", "requested_coverages", "percent_of_requested"]])
 
-    tile_rows = [tile_row(split, split_summary[split]) for split in sorted(splits)]
-    combined = Counter()
-    for split in splits:
-        combined.update(split_summary[split])
-    tile_rows.append(tile_row("all", combined))
-    _write_csv(root / "tile_summary.csv", tile_rows)
+    split_order = [*sorted(splits), "all"]
+    tile_data = pd.DataFrame.from_dict({split: dict(split_summary[split]) for split in sorted(splits)}, orient="index").fillna(0)
+    tile_data.loc["all"] = tile_data.sum()
+    keys = sorted(tile_data.columns)
+    policies = [background_ratio_policy.get(split) for split in split_order]
+    tile_data = tile_data.reindex(split_order)
+    tile_data["background_ratio_mode"] = [policy["mode"] if policy else "aggregate" for policy in policies]
+    for column, key in (("requested_background_fraction", "requested"), ("target_background_fraction", "target_fraction"), ("minimum_background_fraction", "minimum_fraction")):
+        tile_data[column] = [policy[key] if policy else None for policy in policies]
+    empty_images = tile_data.get("empty_output_images", pd.Series(0, index=tile_data.index))
+    tile_data["background_fraction"] = empty_images.div(tile_data["total_output_images"].where(tile_data["total_output_images"].ne(0))).fillna(0)
+    _write_csv(root / "tile_summary.csv", tile_data.rename_axis("split").reset_index()[["split", *keys, "background_ratio_mode", "requested_background_fraction", "target_background_fraction", "minimum_background_fraction", "background_fraction"]])
+    combined = sum((split_summary[split] for split in splits), Counter())
     _write_csv(root / "source_pixel_coverage.csv", source_pixel_rows)
     source_coverage_payload = _source_coverage_summary(
         coverage_rows,

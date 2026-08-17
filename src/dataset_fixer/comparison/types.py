@@ -5,6 +5,8 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -98,7 +100,7 @@ class ComparisonResult:
     """
 
     location: Path
-    ranking: tuple[dict[str, Any], ...]
+    ranking: pd.DataFrame
     cohort_fingerprint: str
     cohort_verified: bool
     training_overlap_detected: bool

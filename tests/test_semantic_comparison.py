@@ -7,6 +7,7 @@ import types
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 from PIL import Image
 
@@ -671,15 +672,16 @@ def test_semantic_comparison_reports_finite_dice_support(
         group_by=lambda path: path.stem,
     )
 
-    assert result.ranking[0]["cohort_cases"] == 2
-    assert result.ranking[0]["support_cases"] == 1
-    assert result.ranking[0]["undefined_cases"] == 1
-    assert result.ranking[0]["positive_cases"] == 1
-    assert result.ranking[0]["empty_cases"] == 1
-    assert result.ranking[0]["positive_case_dice"] == pytest.approx(1.0)
-    assert result.ranking[0]["empty_image_specificity"] == pytest.approx(1.0)
-    assert result.ranking[0]["raw_presence_precision"] == pytest.approx(1.0)
-    assert result.ranking[0][
+    row = result.ranking.iloc[0]
+    assert row["cohort_cases"] == 2
+    assert row["support_cases"] == 1
+    assert row["undefined_cases"] == 1
+    assert row["positive_cases"] == 1
+    assert row["empty_cases"] == 1
+    assert row["positive_case_dice"] == pytest.approx(1.0)
+    assert row["empty_image_specificity"] == pytest.approx(1.0)
+    assert row["raw_presence_precision"] == pytest.approx(1.0)
+    assert row[
         "component_filtered_presence_precision"
     ] == pytest.approx(1.0)
     manifest = json.loads(
@@ -894,21 +896,23 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
     )
 
     assert isinstance(result, SemanticComparisonResult)
-    assert {row["model"] for row in result.ranking} == {
+    assert isinstance(result.ranking, pd.DataFrame)
+    assert isinstance(result.ranking.index, pd.RangeIndex)
+    assert set(result.ranking["model"]) == {
         "yolo-seg",
         "yolo-semantic",
         "nnunet",
     }
-    assert all(row["dice"] == pytest.approx(1.0) for row in result.ranking)
-    by_name = {row["model"]: row for row in result.ranking}
-    assert by_name["yolo-seg"]["native_task"] == "segment"
-    assert by_name["yolo-seg"]["projection"] == "polygon-foreground-union"
-    assert by_name["nnunet"]["native_task"] == "semantic_segment"
-    assert by_name["nnunet"]["projection"] == "native-semantic-mask"
-    assert by_name["yolo-semantic"]["native_task"] == "semantic_segment"
-    assert by_name["yolo-semantic"]["projection"] == "native-semantic-mask"
-    assert by_name["yolo-seg"]["micro_dice"] == pytest.approx(1.0)
-    assert by_name["yolo-seg"]["warning_count"] == 2
+    assert np.allclose(result.ranking["dice"].to_numpy(dtype=float), 1.0)
+    by_name = result.ranking.set_index("model")
+    assert by_name.loc["yolo-seg", "native_task"] == "segment"
+    assert by_name.loc["yolo-seg", "projection"] == "polygon-foreground-union"
+    assert by_name.loc["nnunet", "native_task"] == "semantic_segment"
+    assert by_name.loc["nnunet", "projection"] == "native-semantic-mask"
+    assert by_name.loc["yolo-semantic", "native_task"] == "semantic_segment"
+    assert by_name.loc["yolo-semantic", "projection"] == "native-semantic-mask"
+    assert by_name.loc["yolo-seg", "micro_dice"] == pytest.approx(1.0)
+    assert by_name.loc["yolo-seg", "warning_count"] == 2
     manifest = json.loads((destination / "reports" / "result.json").read_text())
     assert manifest["backend"] == "common-semantic-mask"
     assert manifest["negotiated_comparison_space"] == "semantic"
@@ -950,7 +954,7 @@ def test_mixed_yolo_seg_and_semantic_models_negotiate_binary_mask_space(
             "schema": 2,
             "space": "binary-semantic",
             "cohort": result.cohort_fingerprint,
-            "model_sha256": model.digest,
+            "model_hash": model.hash(),
             "kind": model.kind,
             "task": model.task,
             "folds": model.folds,
@@ -1376,6 +1380,65 @@ def test_prediction_visualization_letterboxes_wide_images_in_fixed_cards(
         assert rendered.getbbox() is not None
 
 
+def test_prediction_visualization_uses_shared_model_slugs_and_can_hide_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dataset_fixer.model as model_module
+
+    image = tmp_path / "slugged.png"
+    Image.new("RGB", (32, 32), "black").save(image)
+    result = PredictionResult(
+        model_name="long-local-model-filename.pt",
+        model_kind="ultralytics",
+        task="semantic_segment",
+        backend="native",
+        records=(ImagePrediction(
+            image_id="slugged",
+            image_path=image,
+            relative_path=image.name,
+            width=32,
+            height=32,
+            mask=np.zeros((32, 32), dtype=bool),
+        ),),
+        inference_seconds=0.0,
+        model_metadata={
+            "model": "long-local-model-filename.pt",
+            "canonical_name": "long-local-model-filename.pt",
+            "hash": "i9xve33c",
+            "model_identity": "both",
+            "model_type": "yolo26m-seg",
+            "upscale_factor": 2,
+            "resolution": 256,
+        },
+    )
+    specifications: list[str] = []
+    monkeypatch.setattr(
+        model_module,
+        "finish_visualization",
+        lambda chart, _options: specifications.append(str(chart.to_dict())),
+    )
+
+    result.visualize(show=False)
+    result.visualize(show=False, show_model_slugs=False)
+
+    assert all(
+        value in specifications[0]
+        for value in (
+            "long-local-model-filename.pt",
+            "i9xve33c",
+            "yolo26m-seg",
+            "2×",
+            "256px",
+            "#2563EB",
+            "#B45309",
+            "#475569",
+        )
+    )
+    assert "yolo26m-seg" not in specifications[1]
+    assert "i9xve33c" not in specifications[1]
+
+
 def test_prediction_visualization_renders_many_rows_with_dedicated_headers(
     tmp_path: Path,
 ) -> None:
@@ -1487,7 +1550,7 @@ def test_semantic_predict_and_compare_share_raw_prediction_cache(
         progress=False,
         destination=tmp_path / "shared-semantic-comparison",
     )
-    assert comparison.ranking[0]["dice"] == pytest.approx(1.0)
+    assert comparison.ranking.iloc[0]["dice"] == pytest.approx(1.0)
     assert calls == 1
     initial_entry = Path(direct.cache_info["location"])
     shutil.rmtree(initial_entry / "raw-result")
@@ -1562,11 +1625,11 @@ def test_completed_comparison_inference_is_durably_reused_across_thresholds(
     published = []
     for manifest_path in cache_root.glob("*/raw-result/manifest.json"):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if (manifest.get("identity") or {}).get("model_sha256") != Model(
+        if (manifest.get("identity") or {}).get("model_hash") != Model(
             checkpoint,
             task="semantic",
             resolution=64,
-        ).digest:
+        ).hash():
             continue
         published.append(manifest_path)
         assert len(manifest["records"]) == 2
@@ -1851,6 +1914,7 @@ def _install_fake_session(
 def test_semantic_export_compares_official_nnunet_model_folders(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     exported = _semantic_export(tmp_path)
     perfect = _nnunet_model(tmp_path / "perfect-model")
@@ -1889,15 +1953,22 @@ def test_semantic_export_compares_official_nnunet_model_folders(
         progress=True,
         destination=destination,
     )
+    progress_output = capsys.readouterr().err
 
     assert isinstance(result, SemanticComparisonResult)
+    assert "Finalizing comparison report" in progress_output
+    assert "bootstrapping 1 model pair" in progress_output
+    assert "Bootstrapping model pairs" in progress_output
+    assert "Extracting reference components" in progress_output
+    assert "Scoring object sizes" in progress_output
+    assert "writing and publishing report" in progress_output
     assert result.cohort_verified
-    assert result.ranking[0]["model"] == "perfect"
-    assert result.ranking[0]["score"] == pytest.approx(1.0)
-    assert result.ranking[1]["score"] == pytest.approx(0.0)
-    assert result.ranking[0]["upscale_factor"] == 2
-    assert result.ranking[1]["upscale_factor"] == 1
-    assert len(result.ranking[0]["model_sha256"]) == 64
+    assert result.ranking.iloc[0]["model"] == "perfect"
+    assert result.ranking.iloc[0]["score"] == pytest.approx(1.0)
+    assert result.ranking.iloc[1]["score"] == pytest.approx(0.0)
+    assert result.ranking.iloc[0]["upscale_factor"] == 2
+    assert result.ranking.iloc[1]["upscale_factor"] == 1
+    assert len(result.ranking.iloc[0]["model_hash"]) == 8
     assert len(commands) == 6
     assert all(options["capture_output"] is False for options in command_options)
     predict = commands[0]
@@ -1940,10 +2011,10 @@ def test_semantic_export_compares_official_nnunet_model_folders(
     assert "small_object_dice" in manifest["metric_definitions"]
     assert "upscale_factor" not in manifest["settings"]
     assert [model["upscale_factor"] for model in manifest["settings"]["models"]] == [2, 1]
-    assert result.ranking[0]["projection"] == "probability-area-pool-argmax"
-    assert result.ranking[0]["cohort_cases"] == 2
-    assert result.ranking[0]["support_cases"] == 2
-    assert result.ranking[0]["native_dice"] == pytest.approx(1.0)
+    assert result.ranking.iloc[0]["projection"] == "probability-area-pool-argmax"
+    assert result.ranking.iloc[0]["cohort_cases"] == 2
+    assert result.ranking.iloc[0]["support_cases"] == 2
+    assert result.ranking.iloc[0]["native_dice"] == pytest.approx(1.0)
     assert manifest["worst_cases"]
     command_count = len(commands)
     manifest["schema"] = 12
@@ -1956,7 +2027,7 @@ def test_semantic_export_compares_official_nnunet_model_folders(
         destination=destination,
     )
     assert len(commands) == command_count
-    assert all(row["cache"] == "hit" for row in regenerated.ranking)
+    assert regenerated.ranking["cache"].eq("hit").all()
     assert json.loads(
         (destination / "reports" / "result.json").read_text()
     )["schema"] == SEMANTIC_REPORT_SCHEMA
@@ -1967,7 +2038,7 @@ def test_semantic_export_compares_official_nnunet_model_folders(
         destination=tmp_path / "comparison-from-cache",
     )
     assert len(commands) == command_count
-    assert all(row["cache"] == "hit" for row in cached.ranking)
+    assert cached.ranking["cache"].eq("hit").all()
 
     equal = models.compare(
         exported,
@@ -2024,7 +2095,7 @@ def test_repeating_a_sahi_comparison_reuses_cached_predictions_and_metrics(
     )
 
     first = models.compare(exported, progress=False, destination=tmp_path / "sliced-a")
-    assert all(row["cache"] == "fresh" for row in first.ranking)
+    assert first.ranking["cache"].eq("fresh").all()
     inference_calls = len(session.batch_sizes)
     evaluations = len(commands)
     assert inference_calls > 0
@@ -2034,15 +2105,19 @@ def test_repeating_a_sahi_comparison_reuses_cached_predictions_and_metrics(
     # reuses the per-model prediction and metric cache under <dataset>/.cache.
     second = models.compare(exported, progress=False, destination=tmp_path / "sliced-b")
 
-    assert all(row["cache"] == "hit" for row in second.ranking)
+    assert second.ranking["cache"].eq("hit").all()
     assert len(session.batch_sizes) == inference_calls, "re-ran network inference"
     assert len(commands) == evaluations, "re-ran the official evaluator"
-    assert second.ranking[0]["score"] == pytest.approx(first.ranking[0]["score"])
+    assert second.ranking.iloc[0]["score"] == pytest.approx(
+        first.ranking.iloc[0]["score"]
+    )
 
     # Repeating into the same destination short-circuits before any per-model work.
     again = models.compare(exported, progress=False, destination=tmp_path / "sliced-b")
     assert len(session.batch_sizes) == inference_calls
-    assert again.ranking[0]["score"] == pytest.approx(first.ranking[0]["score"])
+    assert again.ranking.iloc[0]["score"] == pytest.approx(
+        first.ranking.iloc[0]["score"]
+    )
 
     # Device, worker count, and batching change execution only. They must not
     # create another prediction identity for the same model and cohort.
@@ -2054,7 +2129,7 @@ def test_repeating_a_sahi_comparison_reuses_cached_predictions_and_metrics(
         progress=False,
         destination=tmp_path / "sliced-execution-changed",
     )
-    assert all(row["cache"] == "hit" for row in execution_rerun.ranking)
+    assert execution_rerun.ranking["cache"].eq("hit").all()
     assert len(session.batch_sizes) == inference_calls, "re-ran network inference"
     assert len(commands) == evaluations, "re-ran the official evaluator"
 
@@ -2068,7 +2143,7 @@ def test_repeating_a_sahi_comparison_reuses_cached_predictions_and_metrics(
         # report's settings fingerprint before short-circuiting.
         destination=tmp_path / "sliced-b",
     )
-    assert all(row["cache"] == "fresh" for row in tta_result.ranking)
+    assert tta_result.ranking["cache"].eq("fresh").all()
     tta_inference_calls = len(session.batch_sizes)
     assert tta_inference_calls > inference_calls
 
@@ -2077,7 +2152,7 @@ def test_repeating_a_sahi_comparison_reuses_cached_predictions_and_metrics(
         progress=False,
         destination=tmp_path / "sliced-b",
     )
-    assert all(row["cache"] == "hit" for row in non_tta_again.ranking)
+    assert non_tta_again.ranking["cache"].eq("hit").all()
     assert len(session.batch_sizes) == tta_inference_calls
 
 
@@ -2121,7 +2196,7 @@ def test_changing_a_sahi_setting_invalidates_the_cached_prediction(
     calls = len(session.batch_sizes)
     result = compare(0.5, "overlap-b")
 
-    assert all(row["cache"] == "fresh" for row in result.ranking)
+    assert result.ranking["cache"].eq("fresh").all()
     assert len(session.batch_sizes) > calls
 
 

@@ -25,7 +25,7 @@ from .artifacts import (
     write_json,
     write_lineage,
 )
-from .dataset_report import render_dataset_report
+from .dataset_comparison import dataset_report_state, render_dataset_states
 from .errors import DatasetValidationError, ValidationIssue
 from .utils import environment_snapshot, ensure_safe_destination, sha256_file
 
@@ -155,16 +155,9 @@ def _update_root(
     prune_report_directory(staged_reports)
     if progress:
         print("Rendering dataset report from the physically present dataset...")
-    render_dataset_report(
-        root,
-        records,
-        name=dataset.name,
-        task=dataset.task.value,
-        format_name=dataset.format,
-        classes=dataset.classes,
+    render_dataset_states(
+        dataset_report_state(dataset),
         output=staged_reports / "plots.png",
-        metadata=dataset._metadata,
-        coverage=audits.get("coverage.source_coverage"),
     )
 
     environment = environment_snapshot()

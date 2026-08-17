@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping
+import textwrap
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import altair as alt
+
+from ..tabular import chart_data
+from ..utils import shorten_middle as _shorten_middle
 
 _MODEL_TYPE_COLORS = {
     "semantic": "#0F766E",
@@ -44,6 +50,29 @@ class ModelBadge:
 
     text: str
     color: str
+
+
+@dataclass(frozen=True)
+class ModelPresentation:
+    """Canonical display identity shared by every model-bearing figure.
+
+    key:
+        Stable model key used to associate plotted data with this identity.
+    label:
+        Length-limited model name/filename and optional second-line hash.
+    badges:
+        Coloured architecture, upscale, and resolution presentation slugs.
+    """
+
+    key: str
+    label: str
+    badges: tuple[ModelBadge, ...]
+
+    @property
+    def badge_pairs(self) -> tuple[tuple[str, str], ...]:
+        """Return renderer-neutral ``(text, colour)`` badge values."""
+
+        return tuple((badge.text, badge.color) for badge in self.badges)
 
 
 def model_type_color(model_type: str) -> str:
@@ -102,9 +131,13 @@ def model_label(model: Any) -> str:
         timestamp = _checkpoint_file_timestamp(row, source)
     candidate = timestamp or _shorten_middle(candidate or name, 58)
     digest = _checkpoint_digest(row)
-    if digest:
-        return f"{candidate} · {digest}"
-    return candidate
+    compact = f"{candidate} · {digest}" if digest else candidate
+    identity = row.get("model_identity")
+    if identity not in {"name", "both"}:
+        return compact
+    if identity == "name":
+        return candidate
+    return f"{candidate}\n{digest}" if digest else candidate
 
 
 def model_badges(model: Any) -> tuple[ModelBadge, ...]:
@@ -145,6 +178,23 @@ def model_badge_text(model: Any) -> str:
     return " · ".join(badge.text for badge in model_badges(model))
 
 
+def model_presentation(model: Any, *, key: str | None = None) -> ModelPresentation:
+    """Resolve one model once for axes, legends, and image-panel headings.
+
+    model:
+        Model or model metadata mapping.
+    key:
+        Optional plotted-data key; defaults to the model/name field.
+    """
+
+    row = _model_metadata(model)
+    return ModelPresentation(
+        key=str(key if key is not None else row.get("model") or row.get("name") or "model"),
+        label=model_label(row),
+        badges=model_badges(row),
+    )
+
+
 def model_full_label(model: Any) -> str:
     """Return the normalized name followed by its plain-text identity badges.
 
@@ -154,6 +204,179 @@ def model_full_label(model: Any) -> str:
 
     values = (model_label(model), model_badge_text(model))
     return " · ".join(value for value in values if value)
+
+
+def model_identity_chart(
+    models: Sequence[Mapping[str, Any]],
+    *,
+    width: int = 430,
+    row_height: int = 54,
+) -> alt.TopLevelMixin:
+    """Render comparison identities with their colored configuration badges."""
+
+    identities, badges = [], []
+    max_lines = 1
+    for index, model in enumerate(models):
+        presentation = model_presentation(model, key=str(index))
+        label = presentation.label
+        max_lines = max(max_lines, label.count("\n") + 1)
+        identities.append({"row": index, "label": label})
+        values = presentation.badges
+        widths = [max(45, len(value.text) * 8 + 14) for value in values]
+        cursor = width - sum(widths) - max(0, len(widths) - 1) * 6
+        for value, badge_width in zip(values, widths):
+            badges.append({
+                "row": index, "text": value.text, "color": value.color,
+                "x": cursor, "x2": cursor + badge_width,
+                "center": cursor + badge_width / 2,
+            })
+            cursor += badge_width + 6
+    row_height = max(row_height, 55 + 15 * max_lines)
+    label_center = 10 + 7.5 * max_lines
+    badge_top = 25 + 15 * max_lines
+    for value in identities:
+        value["y"] = value["row"] * row_height + label_center
+    for value in badges:
+        value["y"] = value["row"] * row_height + badge_top
+        value["y2"] = value["y"] + 20
+        value["middle"] = value["y"] + 10
+    y_scale = alt.Scale(domain=[row_height * len(models), 0])
+    labels = alt.Chart(chart_data(identities)).mark_text(
+        align="right", baseline="middle", lineBreak="\n", lineHeight=15
+    ).encode(
+        x=alt.value(width - 4),
+        y=alt.Y("y:Q", scale=y_scale, axis=None),
+        text="label:N",
+    )
+    badge_data = alt.Chart(chart_data(badges))
+    boxes = badge_data.mark_rect(cornerRadius=3).encode(
+        x=alt.X("x:Q", scale=alt.Scale(domain=[0, width]), axis=None),
+        x2="x2:Q",
+        y=alt.Y("y:Q", scale=y_scale, axis=None),
+        y2="y2:Q",
+        color=alt.Color("color:N", scale=None, legend=None),
+    )
+    text = badge_data.mark_text(color="white", baseline="middle").encode(
+        x=alt.X("center:Q", scale=alt.Scale(domain=[0, width]), axis=None),
+        y=alt.Y("middle:Q", scale=y_scale, axis=None),
+        text="text:N",
+    )
+    return (labels + boxes + text).properties(
+        width=width, height=row_height * len(models)
+    )
+
+
+def model_identity_card(
+    model: Any,
+    *,
+    width: int,
+    maximum: int = 44,
+    series_color: str | None = None,
+) -> alt.TopLevelMixin:
+    """Render a model identifier with its coloured slug row underneath."""
+
+    presentation = model_presentation(model)
+    lines = [
+        wrapped
+        for source_line in presentation.label.splitlines()
+        for wrapped in (
+            textwrap.wrap(
+                source_line,
+                width=max(8, maximum),
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+            or [source_line]
+        )
+    ] or [presentation.label]
+    text_rows = [
+        {"text": value, "y": 8 + 15 * index}
+        for index, value in enumerate(lines)
+    ]
+    label_height = max(18, 15 * len(lines) + 2)
+    label = alt.Chart(chart_data(text_rows)).mark_text(
+        align="center", baseline="middle", fontSize=11, fontWeight="bold"
+    ).encode(
+        x=alt.value(width / 2),
+        y=alt.Y("y:Q", scale=alt.Scale(domain=[label_height, 0]), axis=None),
+        text="text:N",
+    ).properties(width=width, height=label_height)
+    if not presentation.badges and series_color is None:
+        return label
+    values = (
+        ((ModelBadge("", series_color),) if series_color else ())
+        + presentation.badges
+    )
+    badge_widths = [
+        20 if not value.text else max(42, len(value.text) * 8 + 14)
+        for value in values
+    ]
+    cursor = (width - sum(badge_widths) - 6 * (len(values) - 1)) / 2
+    badge_rows = []
+    for value, badge_width in zip(values, badge_widths):
+        badge_rows.append({
+            "text": value.text,
+            "color": value.color,
+            "x": cursor,
+            "x2": cursor + badge_width,
+            "center": cursor + badge_width / 2,
+        })
+        cursor += badge_width + 6
+    data = alt.Chart(chart_data(badge_rows))
+    boxes = data.mark_rect(cornerRadius=3).encode(
+        x=alt.X("x:Q", scale=alt.Scale(domain=[0, width]), axis=None),
+        x2="x2:Q",
+        y=alt.value(1),
+        y2=alt.value(21),
+        color=alt.Color("color:N", scale=None, legend=None),
+    )
+    badge_text = data.mark_text(color="white", baseline="middle", fontSize=11).encode(
+        x=alt.X("center:Q", scale=alt.Scale(domain=[0, width]), axis=None),
+        y=alt.value(11),
+        text="text:N",
+    )
+    return alt.vconcat(label, (boxes + badge_text).properties(width=width, height=22), spacing=4)
+
+
+def with_model_identities(
+    chart: alt.TopLevelMixin,
+    models: Sequence[Mapping[str, Any]],
+    *,
+    columns: int = 2,
+    width: int = 360,
+    series_colors: Sequence[str] | None = None,
+) -> alt.TopLevelMixin:
+    """Place the canonical model identity cards above a model-bearing plot."""
+
+    if not models:
+        return chart
+    cards = [
+        model_identity_card(
+            model,
+            width=width,
+            series_color=(
+                series_colors[index % len(series_colors)]
+                if series_colors
+                else None
+            ),
+        )
+        for index, model in enumerate(models)
+    ]
+    rows = [
+        alt.hconcat(*cards[index : index + columns], spacing=16)
+        for index in range(0, len(cards), columns)
+    ]
+    identities = alt.vconcat(*rows, spacing=8).properties(
+        title=alt.TitleParams(text="Models", anchor="start", fontSize=13)
+    )
+    return alt.vconcat(identities, chart, spacing=14)
+
+
+def model_identity_row_height(models: Sequence[Mapping[str, Any]]) -> int:
+    """Return the shared plot-row height needed by identity and metric panels."""
+
+    lines = max((model_label(row).count("\n") + 1 for row in models), default=1)
+    return max(54, 55 + 15 * lines)
 
 
 def _model_metadata(model: Any) -> Mapping[str, Any]:
@@ -205,6 +428,9 @@ def _strip_dataset_prefix(value: str, row: Mapping[str, Any]) -> str:
 
 def _checkpoint_digest(row: Mapping[str, Any]) -> str | None:
     for key in (
+        "hash",
+        "model_hash_short",
+        "model_hash",
         "checkpoint_sha256_short",
         "model_sha256_short",
         "checkpoint_sha256",
@@ -212,9 +438,7 @@ def _checkpoint_digest(row: Mapping[str, Any]) -> str | None:
         "digest",
     ):
         value = str(row.get(key) or "").strip().lower()
-        if len(value) >= 7 and all(
-            character in "0123456789abcdef" for character in value
-        ):
+        if len(value) >= 7 and value.isalnum():
             return value[:8]
     return None
 
@@ -306,13 +530,19 @@ def _format_timestamp(value: Any) -> str | None:
         return None
     if isinstance(value, (int, float)):
         try:
-            parsed = datetime.fromtimestamp(float(value)).astimezone()
+            parsed = datetime.fromtimestamp(float(value), timezone.utc)
         except (OverflowError, OSError, ValueError):
             return None
         return parsed.strftime("%Y-%m-%d %H:%M:%S")
     text = str(value).strip()
     if not text:
         return None
+    try:
+        return datetime.fromtimestamp(float(text), timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    except (OverflowError, OSError, ValueError):
+        pass
     normalized = text.replace("Z", "+00:00")
     try:
         parsed = datetime.fromisoformat(normalized)
@@ -341,11 +571,3 @@ def _checkpoint_file_timestamp(
         return None
     created = float(getattr(stat, "st_birthtime", stat.st_mtime))
     return datetime.fromtimestamp(created).astimezone().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _shorten_middle(value: str, maximum: int) -> str:
-    if len(value) <= maximum:
-        return value
-    left = (maximum - 1) // 2
-    right = maximum - 1 - left
-    return f"{value[:left]}…{value[-right:]}"

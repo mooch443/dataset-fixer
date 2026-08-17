@@ -26,43 +26,42 @@ from .comparison.cache import (
     load_evaluation_cache,
     save_evaluation_cache,
 )
-from .comparison.grouping import (
-    annotate_group_splits,
-    resolve_evaluation_groups,
-    resolve_group_splits,
-)
+from .comparison.analysis import analyze_grouped_metrics
+from .comparison.grouping import resolve_evaluation_groups, resolve_group_splits
 from .comparison.metrics import (
-    binary_metric_breakdown,
-    component_filtered_presence_breakdown,
-    component_filtered_presence_decisions,
-    grouped_binary_metric_breakdown,
-    grouped_presence_metric_breakdown,
+    binary_metric_breakdown as _binary_metric_breakdown,
+    bootstrap_interval as _bootstrap_interval,
+    paired_score_statistics,
 )
 from .comparison.object_sizes import (
-    evaluate_object_size_model,
+    apply_component_presence,
+    complete_object_size_analysis,
     object_size_report_artifacts_exist,
     prepare_object_size_reference,
-    render_grouped_metric_breakdown,
-    render_grouped_presence_metric_breakdown,
-    render_large_object_examples,
-    render_object_size_breakdown,
     render_segmentation_metric_breakdown,
-    select_large_examples,
     semantic_components_for_cases,
-    unavailable_object_size_summary,
 )
 from .comparison.plot_labels import (
-    model_badges,
     model_full_label,
+    model_identity_card,
+    model_identity_chart,
+    model_identity_row_height,
     model_label,
 )
 from .comparison.reporting import write_json
 from .errors import DatasetValidationError, ValidationIssue
-from .model import ImagePrediction, Model, ModelCollection, ModelInput
+from .model import (
+    ImagePrediction,
+    Model,
+    ModelCollection,
+    ModelInput,
+    _compatible_hash_identities,
+)
 from .models import SemanticComparisonResult
 from .planning import callback_description
 from .sahi_support import resolve_sahi_settings
-from .static_rendering import finite_rows, save_chart
+from .static_rendering import save_chart
+from .tabular import chart_data, frame
 from .utils import (
     IMAGE_SUFFIXES,
     environment_snapshot,
@@ -70,6 +69,7 @@ from .utils import (
     package_versions,
     settings_fingerprint,
     sha256_file,
+    shorten_middle as _shorten_middle,
     to_jsonable,
 )
 from .visualization import (
@@ -85,9 +85,19 @@ from .visualization import (
 # Report presentation evolves independently from prediction/evaluation cache
 # identity. A report bump redraws output from completed caches without forcing
 # model inference to run again.
-SEMANTIC_REPORT_SCHEMA = 20
+SEMANTIC_REPORT_SCHEMA = 21
 SEMANTIC_PREDICTION_SCHEMA = 2
 SEMANTIC_EVALUATION_CACHE_SCHEMA = 2
+
+
+def _hash_cache_dirs(
+    root: Path, payload: Mapping[str, Any], model: Model
+) -> tuple[Path, ...]:
+    return tuple(
+        root / cache_key(identity)
+        for identity in _compatible_hash_identities(payload, model)
+    )
+
 
 # How much in-flight tile memory one SAHI work group may hold, and how much a
 # single grouped inference call may allocate for padded inputs and logits.
@@ -201,6 +211,77 @@ class _SemanticCase:
     mask_sha256: str
 
 
+@dataclass(frozen=True)
+class _SemanticReportContext:
+    export: "Dataset"
+    cases: list[_SemanticCase]
+    model_names: tuple[str, ...]
+    groups: Mapping[str, str] | None
+    group_settings: Mapping[str, Any] | None
+    requested_component_area: float | None
+    temporary: Path
+    target: Path
+    cohort_fingerprint: str
+    split: str
+    resolved_settings: Mapping[str, Any]
+    settings_fingerprint: str
+    limitations: list[str]
+    statistics_cache: Path
+    statistics_key: str
+    bootstrap_resamples: int
+    seed: int
+    save_prediction_plots: bool
+    progress: bool
+    started: float
+    manifest_fields: Mapping[str, Any]
+    ranking_render_options: Mapping[str, Any]
+    remove_cohort: bool = False
+    completion_suffix: str = ""
+    warnings: list[dict[str, Any]] | None = None
+
+
+class _ComparisonReportProgress:
+    """Keep a live, timed status line while the cached results become a report."""
+
+    def __init__(self, *, enabled: bool, total: int) -> None:
+        self.enabled = enabled
+        self._bar = tqdm(
+            total=total,
+            desc="Finalizing comparison report",
+            unit="stage",
+            disable=not enabled,
+            dynamic_ncols=True,
+        )
+        self._stop = threading.Event()
+        self._thread = (
+            threading.Thread(
+                target=self._refresh_elapsed,
+                name="dataset-fixer-comparison-report-progress",
+                daemon=True,
+            )
+            if enabled
+            else None
+        )
+        if self._thread is not None:
+            self._thread.start()
+
+    def _refresh_elapsed(self) -> None:
+        while not self._stop.wait(1.0):
+            self._bar.refresh()
+
+    def start(self, stage: str) -> None:
+        self._bar.set_postfix_str(stage, refresh=self.enabled)
+
+    def complete(self) -> None:
+        self._bar.update(1)
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._bar.close()
+
+
 if TYPE_CHECKING:
     from .dataset import Dataset
 
@@ -266,6 +347,7 @@ def compare_nnunet_models(
     errors: Literal["raise", "skip"] = "raise",
     min_connected_component_area: float | None = None,
     group_by: Callable[[Path], Hashable] | None = None,
+    model_identity: Literal["hash", "name", "both"] = "hash",
 ) -> SemanticComparisonResult:
     """Run official nnU-Net v2 prediction and evaluation for an export."""
 
@@ -340,6 +422,7 @@ def compare_nnunet_models(
         "presence_min_connected_component_area": requested_component_area,
         "presence_threshold_default": "held-out-reference-object-p10",
         "grouping": group_settings,
+        "model_identity": model_identity,
         "model_backends": model_backends,
         "comparison_unit": comparison_unit,
         "sahi_models": resolved_sahi_by_model,
@@ -351,7 +434,7 @@ def compare_nnunet_models(
                 "folds": spec.folds,
                 "checkpoint": spec.checkpoint,
                 "checkpoint_sha256": spec.checkpoint_sha256,
-                "model_sha256": spec.digest,
+                "model_hash": spec.hash(),
                 "upscale_factor": spec.upscale_factor,
                 "device": resolved_devices[spec.name],
                 "workers": spec.workers,
@@ -368,7 +451,7 @@ def compare_nnunet_models(
             "models": [
                 {
                     "name": spec.name,
-                    "model_sha256": spec.digest,
+                    "model_hash": spec.hash(),
                     "backend": model_backends[spec.name],
                     "folds": spec.folds,
                     "checkpoint": spec.checkpoint,
@@ -466,7 +549,7 @@ def compare_nnunet_models(
                 "schema": SEMANTIC_EVALUATION_CACHE_SCHEMA,
                 "space": "nnunet-semantic",
                 "cohort": cohort_fingerprint,
-                "model_sha256": spec.digest,
+                "model_hash": spec.hash(),
                 "backend": selected_backend,
                 "folds": spec.folds,
                 "checkpoint": spec.checkpoint,
@@ -478,6 +561,9 @@ def compare_nnunet_models(
             cache_identity = cache_key(cache_payload)
             semantic_cache_root = comparison_cache_root / "semantic"
             cache_dir = semantic_cache_root / cache_identity
+            hash_compatible_dirs = _hash_cache_dirs(
+                semantic_cache_root, cache_payload, spec
+            )
             legacy_cache_dir = semantic_cache_root / cache_key(
                 {
                     "schema": SEMANTIC_EVALUATION_CACHE_SCHEMA,
@@ -494,14 +580,18 @@ def compare_nnunet_models(
                     "versions": package_versions(),
                 }
             )
-            compatible_legacy_dirs: tuple[Path, ...] = ()
+            compatible_legacy_dirs: tuple[Path, ...] = hash_compatible_dirs
             if spec.nnunet_tta:
                 # nnU-Net TTA was always enabled before it became explicit.
                 # Those caches are valid only for an explicit TTA request.
                 prior_tta_payload = dict(cache_payload)
                 prior_tta_payload.pop("nnunet_tta")
                 compatible_legacy_dirs = (
+                    *hash_compatible_dirs,
                     semantic_cache_root / cache_key(prior_tta_payload),
+                    *_hash_cache_dirs(
+                        semantic_cache_root, prior_tta_payload, spec
+                    ),
                     legacy_cache_dir,
                 )
             cache_dir, cached = _load_compatible_semantic_cache(
@@ -634,7 +724,7 @@ def compare_nnunet_models(
             ranking.append(
                 {
                     "model": spec.name,
-                    **_model_report_fields(spec),
+                    **_model_report_fields(spec, model_identity),
                     "backend": selected_backend,
                     "adapter": "nnunetv2-official",
                     "metric": "canonical.foreground_mean.Dice",
@@ -654,7 +744,7 @@ def compare_nnunet_models(
                     "folds": ",".join(spec.folds),
                     "checkpoint": spec.checkpoint,
                     "checkpoint_sha256": spec.checkpoint_sha256,
-                    "model_sha256": spec.digest,
+                    "model_hash": spec.hash(),
                     "model_folder": str(spec.model_folder),
                     "upscale_factor": spec.upscale_factor,
                     "nnunet_tta": spec.nnunet_tta,
@@ -674,169 +764,46 @@ def compare_nnunet_models(
                     "execution": execution,
                 }
             )
-
-        ranking.sort(key=lambda row: (-_sortable_score(row["score"]), row["model"]))
-        for rank, row in enumerate(ranking, start=1):
-            row["rank"] = rank
-        if cached_statistics is not None and isinstance(cached_statistics.get("paired"), list):
-            paired = list(cached_statistics["paired"])
-        else:
-            paired = _all_pairwise_statistics(
-                model_rows,
-                resamples=bootstrap_resamples,
+        result = _complete_semantic_report(
+            _SemanticReportContext(
+                export=export,
+                cases=cases,
+                model_names=tuple(spec.name for spec in specs),
+                groups=groups,
+                group_settings=group_settings,
+                requested_component_area=requested_component_area,
+                temporary=temporary,
+                target=target,
+                cohort_fingerprint=cohort_fingerprint,
+                split=split,
+                resolved_settings=resolved_settings,
+                settings_fingerprint=fingerprint,
+                limitations=limitations,
+                statistics_cache=statistics_cache,
+                statistics_key=statistics_key,
+                bootstrap_resamples=bootstrap_resamples,
                 seed=seed,
-            )
-            save_evaluation_cache(
-                statistics_cache,
-                statistics_key,
-                {
-                    "intervals": {
-                        row["model"]: [row["ci_low"], row["ci_high"]]
-                        for row in ranking
-                    },
-                    "paired": paired,
+                save_prediction_plots=save_prediction_plots,
+                progress=progress,
+                started=started,
+                manifest_fields={
+                    "backend": resolved_settings["backend"],
+                    "adapter": "nnunetv2-official",
                 },
-            )
-        per_case = [row for name in [spec.name for spec in specs] for row in model_rows[name]]
-        reports = temporary / "reports"
-        reports.mkdir(parents=True, exist_ok=True)
-        (
-            object_size_analysis,
-            object_size_breakdown_path,
-            large_object_examples,
-            presence_analysis,
-        ) = _analyze_semantic_object_sizes(
-            cases,
-            prediction_dirs,
-            model_rows,
-            ranking,
-            reports,
-            requested_component_area=requested_component_area,
-        )
-        if object_size_analysis["status"] == "skipped":
-            skip_reason = str(object_size_analysis["reason"])
-            limitations.append(skip_reason)
-            print(f"Object-size analysis skipped: {skip_reason}")
-        object_size_analysis["examples"] = large_object_examples
-        large_object_example_paths = [
-            str(example["path"]) for example in large_object_examples
-        ]
-        grouped_analysis, grouped_metric_breakdown_path = _analyze_grouped_metrics(
-            model_rows,
-            groups,
-            ranking,
-            reports,
-            group_settings=group_settings,
-        )
-        _render_ranking(reports, ranking)
-        _render_metric_breakdown(
-            reports,
-            ranking,
-            minimum_component_area=presence_analysis.get(
-                "resolved_min_connected_component_area_px"
+                ranking_render_options={},
+                remove_cohort=True,
             ),
-        )
-        _render_qualitative(
-            reports,
-            cases,
-            prediction_dirs,
             model_rows,
+            prediction_dirs,
             ranking,
-            seed=seed,
+            cached_statistics,
         )
-        # Render only the cases the report keeps, so nothing is drawn that is
-        # not also referenced in the manifest.
-        worst_cases = _bounded_semantic_cases(per_case)
-        prediction_paths: list[str] = []
-        if save_prediction_plots:
-            prediction_paths = _render_semantic_prediction_grids(
-                temporary,
-                cases,
-                prediction_dirs,
-                model_rows,
-                ranking,
-                case_ids=[str(row["case_id"]) for row in worst_cases],
-            )
-        shutil.rmtree(temporary / "working", ignore_errors=True)
-        shutil.rmtree(temporary / "cohort", ignore_errors=True)
-
-        manifest = {
-            "schema": SEMANTIC_REPORT_SCHEMA,
-            "kind": "semantic-mask-model-comparison",
-            "backend": resolved_settings["backend"],
-            "adapter": "nnunetv2-official",
-            "dataset": {
-                "name": export.name,
-                "location": str(export.location),
-                "format": export.manifest.get("format"),
-                "class_handling": export.manifest.get("class_handling"),
-            },
-            "cohort_fingerprint": cohort_fingerprint,
-            "cohort_verified": True,
-            "split": split,
-            "cases": len(cases),
-            "case_composition": _case_composition(ranking),
-            "settings": resolved_settings,
-            "settings_fingerprint": fingerprint,
-            "ranking": ranking,
-            "metric_definitions": _METRIC_DEFINITIONS,
-            "object_size_analysis": object_size_analysis,
-            "presence_analysis": presence_analysis,
-            "grouped_analysis": grouped_analysis,
-            "paired_statistics": paired,
-            "limitations": limitations,
-            "worst_cases": worst_cases,
-            "reports": {
-                "plots": "reports/plots.png",
-                "metric_breakdown": "reports/metric-breakdown.png",
-                "grouped_metric_breakdown": grouped_metric_breakdown_path,
-                "grouped_presence_precision": grouped_analysis.get("reports", {}).get(
-                    "precision"
-                ),
-                "grouped_presence_recall": grouped_analysis.get("reports", {}).get(
-                    "recall"
-                ),
-                "grouped_presence_f1": grouped_analysis.get("reports", {}).get("f1"),
-                "object_size_breakdown": object_size_breakdown_path,
-                "large_object_examples": large_object_example_paths,
-                "comparison": "reports/comparison.png",
-                "prediction_plots": prediction_paths,
-            },
-            "environment": environment_snapshot(),
-            "started_at_unix": started,
-            "completed_at_unix": time.time(),
-        }
-        write_json(reports / "result.json", manifest)
-        if target.exists():
-            if not (target / "reports" / "result.json").is_file():
-                raise FileExistsError(f"Refusing to replace unrelated comparison destination: {target}")
-            shutil.rmtree(target)
-        temporary.replace(target)
     except BaseException:
         # BaseException, not Exception: a cancelled run (KeyboardInterrupt)
         # must not leave a partial evaluation behind either.
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-
-    pairing = "paired comparisons: all unordered pairs" if len(specs) > 1 else "single-model evaluation"
-    print(
-        f"Semantic model comparison complete: {target}\n"
-        f"Cohort verified: yes; cases: {len(cases)}; {pairing}"
-    )
-    if object_size_analysis["status"] == "complete":
-        print(
-            f"Object-size report: {target / 'reports' / 'object-size-breakdown.png'}\n"
-            f"Large-object examples: {len(large_object_example_paths)}"
-        )
-    return SemanticComparisonResult(
-        location=target,
-        ranking=tuple(ranking),
-        cohort_fingerprint=cohort_fingerprint,
-        cohort_verified=True,
-        split=split,
-        settings=resolved_settings,
-        limitations=tuple(limitations),
-    )
+    return result
 
 
 def compare_semantic_models(
@@ -850,15 +817,16 @@ def compare_semantic_models(
     prediction_cache: Any = None,
     trust_legacy_cache: bool = False,
     errors: Literal["raise", "skip"] = "raise",
+    seed: int = 42,
     min_connected_component_area: float | None = None,
     group_by: Callable[[Path], Hashable] | None = None,
+    model_identity: Literal["hash", "name", "both"] = "hash",
 ) -> SemanticComparisonResult:
     """Compare instance and semantic segmenters in one binary mask space."""
 
     requested_component_area = _normalize_minimum_component_area(
         min_connected_component_area
     )
-    seed = 42
     bootstrap_resamples = 10_000
     split = normalize_split(split)
     if split not in export.splits:
@@ -933,6 +901,7 @@ def compare_semantic_models(
         "presence_min_connected_component_area": requested_component_area,
         "presence_threshold_default": "held-out-reference-object-p10",
         "grouping": group_settings,
+        "model_identity": model_identity,
         "models": [
             {
                 **model.describe(),
@@ -954,7 +923,7 @@ def compare_semantic_models(
             "models": [
                 {
                     "name": model.name,
-                    "model_sha256": model.digest,
+                    "model_hash": model.hash(),
                     "kind": model.kind,
                     "task": model.task,
                     "folds": model.folds,
@@ -1075,7 +1044,7 @@ def compare_semantic_models(
                 "schema": SEMANTIC_EVALUATION_CACHE_SCHEMA,
                 "space": "binary-semantic",
                 "cohort": cohort_fingerprint,
-                "model_sha256": model.digest,
+                "model_hash": model.hash(),
                 "kind": model.kind,
                 "task": model.task,
                 "folds": model.folds,
@@ -1099,6 +1068,9 @@ def compare_semantic_models(
             cache_identity = cache_key(cache_payload)
             semantic_cache_root = comparison_cache_root / "semantic"
             cache_dir = semantic_cache_root / cache_identity
+            hash_compatible_dirs = _hash_cache_dirs(
+                semantic_cache_root, cache_payload, model
+            )
             legacy_cache_dir = semantic_cache_root / cache_key(
                 {
                     "schema": SEMANTIC_EVALUATION_CACHE_SCHEMA,
@@ -1123,7 +1095,10 @@ def compare_semantic_models(
             )
             compatible_legacy_dirs: tuple[Path, ...]
             if model.kind != "nnunet":
-                compatible_legacy_dirs = (legacy_cache_dir,)
+                compatible_legacy_dirs = (
+                    *hash_compatible_dirs,
+                    legacy_cache_dir,
+                )
             elif model.nnunet_tta:
                 # Prior releases always enabled nnU-Net TTA but did not record
                 # that fact in the identity. They are compatible only when the
@@ -1131,11 +1106,15 @@ def compare_semantic_models(
                 prior_tta_payload = dict(cache_payload)
                 prior_tta_payload.pop("nnunet_tta")
                 compatible_legacy_dirs = (
+                    *hash_compatible_dirs,
                     semantic_cache_root / cache_key(prior_tta_payload),
+                    *_hash_cache_dirs(
+                        semantic_cache_root, prior_tta_payload, model
+                    ),
                     legacy_cache_dir,
                 )
             else:
-                compatible_legacy_dirs = ()
+                compatible_legacy_dirs = hash_compatible_dirs
             cache_dir, cached = _load_compatible_semantic_cache(
                 cache_dir,
                 compatible_legacy_dirs,
@@ -1160,21 +1139,25 @@ def compare_semantic_models(
             else:
                 prediction_dir = temporary / "working" / "predictions" / model.slug
                 prediction_dir.mkdir(parents=True, exist_ok=True)
+                raw_identity = _raw_semantic_prediction_cache_identity(
+                    model,
+                    inputs=model_inputs,
+                    resolved_sahi=resolved_sahi_by_model.get(model.name),
+                )
+                cohort_identity = _cohort_semantic_prediction_cache_identity(
+                    model,
+                    cohort_fingerprint=cohort_fingerprint,
+                    resolved_sahi=resolved_sahi_by_model.get(model.name),
+                )
                 prediction_result = _predict_with_cache_context(
                     model,
                     model_inputs,
                     cache=(selected_prediction_cache or False),
-                    identity=_raw_semantic_prediction_cache_identity(
-                        model,
-                        inputs=model_inputs,
-                        resolved_sahi=resolved_sahi_by_model.get(model.name),
-                    ),
+                    identity=raw_identity,
                     compatible_identities=(
-                        _cohort_semantic_prediction_cache_identity(
-                            model,
-                            cohort_fingerprint=cohort_fingerprint,
-                            resolved_sahi=resolved_sahi_by_model.get(model.name),
-                        ),
+                        *_compatible_hash_identities(raw_identity, model),
+                        cohort_identity,
+                        *_compatible_hash_identities(cohort_identity, model),
                     ),
                     options=predict_options,
                 )
@@ -1237,7 +1220,7 @@ def compare_semantic_models(
             ranking.append(
                 {
                     "model": model.name,
-                    **_model_report_fields(model),
+                    **_model_report_fields(model, model_identity),
                     "model_kind": model.kind,
                     "native_task": native_task,
                     "backend": prediction_backend,
@@ -1254,7 +1237,7 @@ def compare_semantic_models(
                     "evaluation_resolution": "canonical-export",
                     "projection": projection,
                     "cohort_fingerprint": cohort_fingerprint,
-                    "model_sha256": model.digest,
+                    "model_hash": model.hash(),
                     "inference_seconds": inference_seconds,
                     "cache": cache_status,
                     "warning_count": len(model_warnings),
@@ -1266,185 +1249,288 @@ def compare_semantic_models(
                 }
             )
 
-        ranking.sort(key=lambda row: (-_sortable_score(row["score"]), row["model"]))
-        for rank, row in enumerate(ranking, start=1):
-            row["rank"] = rank
-        if cached_statistics is not None and isinstance(cached_statistics.get("paired"), list):
-            paired = list(cached_statistics["paired"])
-        else:
-            paired = _all_pairwise_statistics(
-                model_rows,
-                resamples=bootstrap_resamples,
+        result = _complete_semantic_report(
+            _SemanticReportContext(
+                export=export,
+                cases=cases,
+                model_names=tuple(model.name for model in models),
+                groups=groups,
+                group_settings=group_settings,
+                requested_component_area=requested_component_area,
+                temporary=temporary,
+                target=target,
+                cohort_fingerprint=cohort_fingerprint,
+                split=split,
+                resolved_settings=resolved_settings,
+                settings_fingerprint=fingerprint,
+                limitations=limitations,
+                statistics_cache=statistics_cache,
+                statistics_key=statistics_key,
+                bootstrap_resamples=bootstrap_resamples,
                 seed=seed,
-            )
-            save_evaluation_cache(
-                statistics_cache,
-                statistics_key,
-                {
-                    "intervals": {
-                        row["model"]: [row["ci_low"], row["ci_high"]]
-                        for row in ranking
-                    },
-                    "paired": paired,
+                save_prediction_plots=save_prediction_plots,
+                progress=progress,
+                started=started,
+                manifest_fields={
+                    "backend": "common-semantic-mask",
+                    "negotiated_comparison_space": "semantic",
                 },
-            )
-        per_case = [
-            row
-            for model in models
-            for row in model_rows[model.name]
-        ]
-        reports = temporary / "reports"
-        reports.mkdir(parents=True, exist_ok=True)
-        (
-            object_size_analysis,
-            object_size_breakdown_path,
-            large_object_examples,
-            presence_analysis,
-        ) = _analyze_semantic_object_sizes(
-            cases,
-            prediction_dirs,
-            model_rows,
-            ranking,
-            reports,
-            requested_component_area=requested_component_area,
-        )
-        if object_size_analysis["status"] == "skipped":
-            skip_reason = str(object_size_analysis["reason"])
-            limitations.append(skip_reason)
-            print(f"Object-size analysis skipped: {skip_reason}")
-        object_size_analysis["examples"] = large_object_examples
-        large_object_example_paths = [
-            str(example["path"]) for example in large_object_examples
-        ]
-        grouped_analysis, grouped_metric_breakdown_path = _analyze_grouped_metrics(
-            model_rows,
-            groups,
-            ranking,
-            reports,
-            group_settings=group_settings,
-        )
-        _render_ranking(
-            reports,
-            ranking,
-            xlabel=(
-                "Mean per-source-image foreground Dice "
-                "(empty false positives = 0; empty/empty excluded)"
+                ranking_render_options={
+                    "xlabel": (
+                        "Mean per-source-image foreground Dice "
+                        "(empty false positives = 0; empty/empty excluded)"
+                    ),
+                    "title": "Semantic-space model comparison",
+                },
+                completion_suffix="; comparison space: semantic",
+                warnings=projection_warnings,
             ),
-            title="Semantic-space model comparison",
-        )
-        _render_metric_breakdown(
-            reports,
-            ranking,
-            minimum_component_area=presence_analysis.get(
-                "resolved_min_connected_component_area_px"
-            ),
-        )
-        _render_qualitative(
-            reports,
-            cases,
-            prediction_dirs,
             model_rows,
+            prediction_dirs,
             ranking,
-            seed=seed,
+            cached_statistics,
         )
-        # Render only the cases the report keeps, so nothing is drawn that is
-        # not also referenced in the manifest.
-        worst_cases = _bounded_semantic_cases(per_case)
-        prediction_paths: list[str] = []
-        if save_prediction_plots:
-            prediction_paths = _render_semantic_prediction_grids(
-                temporary,
-                cases,
-                prediction_dirs,
-                model_rows,
-                ranking,
-                case_ids=[str(row["case_id"]) for row in worst_cases],
-            )
-        shutil.rmtree(temporary / "working", ignore_errors=True)
-
-        manifest = {
-            "schema": SEMANTIC_REPORT_SCHEMA,
-            "kind": "semantic-mask-model-comparison",
-            "backend": "common-semantic-mask",
-            "negotiated_comparison_space": "semantic",
-            "dataset": {
-                "name": export.name,
-                "location": str(export.location),
-                "format": export.manifest.get("format"),
-                "class_handling": export.manifest.get("class_handling"),
-            },
-            "cohort_fingerprint": cohort_fingerprint,
-            "cohort_verified": True,
-            "split": split,
-            "cases": len(cases),
-            "case_composition": _case_composition(ranking),
-            "settings": resolved_settings,
-            "settings_fingerprint": fingerprint,
-            "ranking": ranking,
-            "metric_definitions": _METRIC_DEFINITIONS,
-            "object_size_analysis": object_size_analysis,
-            "presence_analysis": presence_analysis,
-            "grouped_analysis": grouped_analysis,
-            "paired_statistics": paired,
-            "limitations": limitations,
-            "warnings": projection_warnings,
-            "worst_cases": worst_cases,
-            "reports": {
-                "plots": "reports/plots.png",
-                "metric_breakdown": "reports/metric-breakdown.png",
-                "grouped_metric_breakdown": grouped_metric_breakdown_path,
-                "grouped_presence_precision": grouped_analysis.get("reports", {}).get(
-                    "precision"
-                ),
-                "grouped_presence_recall": grouped_analysis.get("reports", {}).get(
-                    "recall"
-                ),
-                "grouped_presence_f1": grouped_analysis.get("reports", {}).get("f1"),
-                "object_size_breakdown": object_size_breakdown_path,
-                "large_object_examples": large_object_example_paths,
-                "comparison": "reports/comparison.png",
-                "prediction_plots": prediction_paths,
-            },
-            "environment": environment_snapshot(),
-            "started_at_unix": started,
-            "completed_at_unix": time.time(),
-        }
-        write_json(reports / "result.json", manifest)
-        if target.exists():
-            if not (target / "reports" / "result.json").is_file():
-                raise FileExistsError(f"Refusing to replace unrelated comparison destination: {target}")
-            shutil.rmtree(target)
-        temporary.replace(target)
     except BaseException:
         # BaseException, not Exception: a cancelled run (KeyboardInterrupt)
         # must not leave a partial evaluation behind either.
         shutil.rmtree(temporary, ignore_errors=True)
         raise
 
-    pairing = "paired comparisons: all unordered pairs" if len(models) > 1 else "single-model evaluation"
+    return result
+
+
+def _complete_semantic_report(
+    context: _SemanticReportContext,
+    model_rows: Mapping[str, list[dict[str, Any]]],
+    prediction_dirs: Mapping[str, Path],
+    ranking: list[dict[str, Any]],
+    cached_statistics: Mapping[str, Any] | None,
+) -> SemanticComparisonResult:
+    report_progress = _ComparisonReportProgress(
+        enabled=context.progress,
+        total=7 + int(context.save_prediction_plots),
+    )
+    try:
+        return _build_semantic_report(
+            context,
+            model_rows,
+            prediction_dirs,
+            ranking,
+            cached_statistics,
+            report_progress,
+        )
+    finally:
+        report_progress.close()
+
+
+def _build_semantic_report(
+    context: _SemanticReportContext,
+    model_rows: Mapping[str, list[dict[str, Any]]],
+    prediction_dirs: Mapping[str, Path],
+    ranking: list[dict[str, Any]],
+    cached_statistics: Mapping[str, Any] | None,
+    report_progress: _ComparisonReportProgress,
+) -> SemanticComparisonResult:
+    ranking.sort(key=lambda row: (-_sortable_score(row["score"]), row["model"]))
+    for rank, row in enumerate(ranking, start=1):
+        row["rank"] = rank
+    has_cached_pairs = cached_statistics is not None and isinstance(
+        cached_statistics.get("paired"), list
+    )
+    pair_count = len(context.model_names) * (len(context.model_names) - 1) // 2
+    pair_label = "model pair" if pair_count == 1 else "model pairs"
+    report_progress.start(
+        "loading cached paired statistics"
+        if has_cached_pairs
+        else f"bootstrapping {pair_count:,} {pair_label}"
+    )
+    if has_cached_pairs:
+        paired = list(cached_statistics["paired"])
+    else:
+        paired = _all_pairwise_statistics(
+            model_rows,
+            resamples=context.bootstrap_resamples,
+            seed=context.seed,
+            progress=context.progress,
+        )
+        save_evaluation_cache(
+            context.statistics_cache,
+            context.statistics_key,
+            {
+                "intervals": {
+                    row["model"]: [row["ci_low"], row["ci_high"]]
+                    for row in ranking
+                },
+                "paired": paired,
+            },
+        )
+    report_progress.complete()
+
+    per_case = [row for name in context.model_names for row in model_rows[name]]
+    reports = context.temporary / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    report_progress.start(
+        f"extracting and scoring object components for {len(ranking):,} models"
+    )
+    (
+        object_size_analysis,
+        object_size_breakdown_path,
+        large_object_examples,
+        presence_analysis,
+    ) = _analyze_semantic_object_sizes(
+        context.cases,
+        prediction_dirs,
+        model_rows,
+        ranking,
+        reports,
+        requested_component_area=context.requested_component_area,
+        progress=context.progress,
+    )
+    report_progress.complete()
+    if object_size_analysis["status"] == "skipped":
+        skip_reason = str(object_size_analysis["reason"])
+        context.limitations.append(skip_reason)
+        print(f"Object-size analysis skipped: {skip_reason}")
+    object_size_analysis["examples"] = large_object_examples
+    large_object_example_paths = [str(example["path"]) for example in large_object_examples]
+    report_progress.start(
+        "computing grouped metrics"
+        if context.groups is not None
+        else "checking grouped metrics"
+    )
+    grouped_analysis, grouped_metric_breakdown_path = _analyze_grouped_metrics(
+        model_rows,
+        context.groups,
+        ranking,
+        reports,
+        group_settings=context.group_settings,
+    )
+    report_progress.complete()
+    report_progress.start("rendering model ranking")
+    _render_ranking(reports, ranking, **context.ranking_render_options)
+    report_progress.complete()
+    report_progress.start("rendering metric breakdown")
+    _render_metric_breakdown(
+        reports,
+        ranking,
+        minimum_component_area=presence_analysis.get(
+            "resolved_min_connected_component_area_px"
+        ),
+    )
+    report_progress.complete()
+    report_progress.start("rendering qualitative comparison")
+    _render_qualitative(
+        reports,
+        context.cases,
+        prediction_dirs,
+        model_rows,
+        ranking,
+        seed=context.seed,
+    )
+    report_progress.complete()
+    worst_cases = _bounded_semantic_cases(per_case)
+    if context.save_prediction_plots:
+        report_progress.start(
+            f"rendering {len(worst_cases):,} worst-case prediction grids"
+        )
+        prediction_paths = _render_semantic_prediction_grids(
+            context.temporary,
+            context.cases,
+            prediction_dirs,
+            model_rows,
+            ranking,
+            case_ids=[str(row["case_id"]) for row in worst_cases],
+        )
+        report_progress.complete()
+    else:
+        prediction_paths = []
+    report_progress.start("writing and publishing report")
+    shutil.rmtree(context.temporary / "working", ignore_errors=True)
+    if context.remove_cohort:
+        shutil.rmtree(context.temporary / "cohort", ignore_errors=True)
+
+    manifest = {
+        "schema": SEMANTIC_REPORT_SCHEMA,
+        "kind": "semantic-mask-model-comparison",
+        **context.manifest_fields,
+        "dataset": {
+            "name": context.export.name,
+            "location": str(context.export.location),
+            "format": context.export.manifest.get("format"),
+            "class_handling": context.export.manifest.get("class_handling"),
+        },
+        "cohort_fingerprint": context.cohort_fingerprint,
+        "cohort_verified": True,
+        "split": context.split,
+        "cases": len(context.cases),
+        "case_composition": _case_composition(ranking),
+        "settings": context.resolved_settings,
+        "settings_fingerprint": context.settings_fingerprint,
+        "ranking": ranking,
+        "metric_definitions": _METRIC_DEFINITIONS,
+        "object_size_analysis": object_size_analysis,
+        "presence_analysis": presence_analysis,
+        "grouped_analysis": grouped_analysis,
+        "paired_statistics": paired,
+        "limitations": context.limitations,
+        **({"warnings": context.warnings} if context.warnings is not None else {}),
+        "worst_cases": worst_cases,
+        "reports": {
+            "plots": "reports/plots.png",
+            "metric_breakdown": "reports/metric-breakdown.png",
+            "grouped_metric_breakdown": grouped_metric_breakdown_path,
+            "grouped_presence_precision": grouped_analysis.get("reports", {}).get(
+                "precision"
+            ),
+            "grouped_presence_recall": grouped_analysis.get("reports", {}).get("recall"),
+            "grouped_presence_f1": grouped_analysis.get("reports", {}).get("f1"),
+            "object_size_breakdown": object_size_breakdown_path,
+            "large_object_examples": large_object_example_paths,
+            "comparison": "reports/comparison.png",
+            "prediction_plots": prediction_paths,
+        },
+        "environment": environment_snapshot(),
+        "started_at_unix": context.started,
+        "completed_at_unix": time.time(),
+    }
+    write_json(reports / "result.json", manifest)
+    if context.target.exists():
+        if not (context.target / "reports" / "result.json").is_file():
+            raise FileExistsError(
+                f"Refusing to replace unrelated comparison destination: {context.target}"
+            )
+        shutil.rmtree(context.target)
+    context.temporary.replace(context.target)
+    report_progress.complete()
+
+    pairing = (
+        "paired comparisons: all unordered pairs"
+        if len(context.model_names) > 1
+        else "single-model evaluation"
+    )
     print(
-        f"Semantic model comparison complete: {target}\n"
-        f"Cohort verified: yes; cases: {len(cases)}; {pairing}; "
-        "comparison space: semantic"
+        f"Semantic model comparison complete: {context.target}\n"
+        f"Cohort verified: yes; cases: {len(context.cases)}; {pairing}"
+        f"{context.completion_suffix}"
     )
     if object_size_analysis["status"] == "complete":
         print(
-            f"Object-size report: {target / 'reports' / 'object-size-breakdown.png'}\n"
+            f"Object-size report: {context.target / 'reports' / 'object-size-breakdown.png'}\n"
             f"Large-object examples: {len(large_object_example_paths)}"
         )
-    if projection_warnings:
+    if context.warnings:
         print(
-            f"Warnings: skipped {len(projection_warnings)} invalid segmentation "
-            f"object(s); details: {target / 'reports' / 'result.json'}"
+            f"Warnings: skipped {len(context.warnings)} invalid segmentation "
+            f"object(s); details: {context.target / 'reports' / 'result.json'}"
         )
     return SemanticComparisonResult(
-        location=target,
-        ranking=tuple(ranking),
-        cohort_fingerprint=cohort_fingerprint,
+        location=context.target,
+        ranking=frame(ranking),
+        cohort_fingerprint=context.cohort_fingerprint,
         cohort_verified=True,
-        split=split,
-        settings=resolved_settings,
-        limitations=tuple(limitations),
+        split=context.split,
+        settings=dict(context.resolved_settings),
+        limitations=tuple(context.limitations),
     )
 
 
@@ -2431,7 +2517,7 @@ def _cohort_semantic_prediction_cache_identity(
             "schema": 2,
             "space": "nnunet-semantic",
             "cohort": cohort_fingerprint,
-            "model_sha256": model.digest,
+            "model_hash": model.hash(),
             "backend": model.inference,
             "folds": model.folds,
             "checkpoint": model.checkpoint,
@@ -2450,7 +2536,7 @@ def _cohort_semantic_prediction_cache_identity(
         "schema": 2,
         "space": "binary-semantic",
         "cohort": cohort_fingerprint,
-        "model_sha256": model.digest,
+        "model_hash": model.hash(),
         "kind": model.kind,
         "task": model.task,
         "folds": model.folds,
@@ -3183,87 +3269,31 @@ def _metric(values: Mapping[str, Any], key: str) -> float:
         return math.nan
 
 
-def _bootstrap_interval(
-    values: list[float],
-    *,
-    resamples: int,
-    seed: int,
-) -> tuple[float, float]:
-    array = np.asarray([value for value in values if math.isfinite(value)], dtype=float)
-    if len(array) < 2:
-        return math.nan, math.nan
-    rng = np.random.default_rng(seed)
-    sampled = rng.choice(array, size=(resamples, len(array)), replace=True).mean(axis=1)
-    return float(np.quantile(sampled, 0.025)), float(np.quantile(sampled, 0.975))
-
-
 def _all_pairwise_statistics(
     rows_by_model: dict[str, list[dict[str, Any]]],
     *,
     resamples: int,
     seed: int,
+    progress: bool = False,
 ) -> list[dict[str, Any]]:
     """Compare every unordered model pair without designating a reference."""
 
-    scores_by_model = {
-        name: {
-            row["case_id"]: row["dice"]
-            for row in rows
-            if math.isfinite(row["dice"])
-        }
+    scores = {
+        name: frame(rows).set_index("case_id")["dice"]
         for name, rows in rows_by_model.items()
     }
-    names = list(rows_by_model)
-    rng = np.random.default_rng(seed)
-    output: list[dict[str, Any]] = []
-    raw_p: list[float] = []
-    for left_index, model_a in enumerate(names):
-        for model_b in names[left_index + 1 :]:
-            scores_a = scores_by_model[model_a]
-            scores_b = scores_by_model[model_b]
-            keys = sorted(set(scores_a) & set(scores_b))
-            differences = np.asarray(
-                [scores_b[key] - scores_a[key] for key in keys],
-                dtype=float,
-            )
-            if not len(differences):
-                continue
-            samples = rng.choice(
-                differences,
-                size=(resamples, len(differences)),
-                replace=True,
-            ).mean(axis=1)
-            signs = rng.choice((-1.0, 1.0), size=(resamples, len(differences)))
-            randomized = (differences * signs).mean(axis=1)
-            p_value = float(
-                (np.sum(np.abs(randomized) >= abs(differences.mean())) + 1)
-                / (resamples + 1)
-            )
-            raw_p.append(p_value)
-            output.append(
-                {
-                    "model_a": model_a,
-                    "model_b": model_b,
-                    "metric": "canonical.per_case.Dice",
-                    "difference_model_b_minus_model_a": float(differences.mean()),
-                    "ci_low": float(np.quantile(samples, 0.025)),
-                    "ci_high": float(np.quantile(samples, 0.975)),
-                    "p_value": p_value,
-                    "paired_cases": len(differences),
-                    "wins_model_b": int(np.sum(differences > 0)),
-                    "ties": int(np.sum(differences == 0)),
-                    "wins_model_a": int(np.sum(differences < 0)),
-                }
-            )
-    order = sorted(range(len(raw_p)), key=lambda index: raw_p[index])
-    adjusted = [0.0] * len(raw_p)
-    running = 0.0
-    for rank, index in enumerate(order):
-        running = max(running, min(1.0, raw_p[index] * (len(raw_p) - rank)))
-        adjusted[index] = running
-    for row, value in zip(output, adjusted):
-        row["p_value_holm"] = value
-    return output
+    return paired_score_statistics(
+        scores,
+        metric="canonical.per_case.Dice",
+        difference_name="difference_model_b_minus_model_a",
+        support_name="paired_cases",
+        resamples=resamples,
+        seed=seed,
+        include_wins=True,
+        include_difference_alias=False,
+        progress=progress,
+        progress_description="Bootstrapping model pairs",
+    )
 
 
 def _sortable_score(value: Any) -> float:
@@ -3274,7 +3304,10 @@ def _sortable_score(value: Any) -> float:
     return parsed if math.isfinite(parsed) else -math.inf
 
 
-def _model_report_fields(model: Model) -> dict[str, Any]:
+def _model_report_fields(
+    model: Model,
+    model_identity: Literal["hash", "name", "both"] | None = None,
+) -> dict[str, Any]:
     resolution = model.effective_resolution
     if resolution is None:
         resolution_label = "unknown"
@@ -3285,7 +3318,7 @@ def _model_report_fields(model: Model) -> dict[str, Any]:
     else:
         resolution_label = f"{resolution[1]}x{resolution[0]}px"
         resolution_size = list(resolution)
-    checkpoint_hash = model.checkpoint_sha256 or model.digest
+    checkpoint_hash = model.checkpoint_sha256 or None
     return {
         "model_source": model.source_key,
         "source_created_at": model.source_created_at,
@@ -3294,8 +3327,12 @@ def _model_report_fields(model: Model) -> dict[str, Any]:
         "effective_prediction_resolution": resolution_label,
         "effective_prediction_size": resolution_size,
         "checkpoint_sha256": checkpoint_hash,
-        "checkpoint_sha256_short": checkpoint_hash[:8],
-        "model_sha256_short": model.digest[:8],
+        "checkpoint_sha256_short": checkpoint_hash[:8] if checkpoint_hash else None,
+        "model_hash": model.hash(),
+        "model_hash_short": model.hash()[:8],
+        "wandb": model.wandb,
+        "canonical_name": model.canonical_name,
+        **({"model_identity": model_identity} if model_identity else {}),
         "upscale_factor": model.upscale_factor,
         "native_resolution": resolution_label,
         "prediction_threshold": model.prediction_threshold,
@@ -3326,6 +3363,7 @@ def _render_ranking(
     import altair as alt
 
     ordered = list(ranking)
+    row_height = model_identity_row_height(ordered)
     data = [
         {
             **row,
@@ -3335,18 +3373,23 @@ def _render_ranking(
         }
         for row in ordered
     ]
-    order = [row["model_label"] for row in data]
-    base = alt.Chart(alt.Data(values=finite_rows(data))).encode(
-        y=alt.Y("model_label:N", sort=order, title=None, axis=alt.Axis(labelLimit=340)),
+    for index, row in enumerate(data):
+        row["model_key"] = str(index)
+    order = [row["model_key"] for row in data]
+    base = alt.Chart(chart_data(data)).encode(
+        y=alt.Y("model_key:N", sort=order, axis=None),
         x=alt.X("display_score:Q", scale=alt.Scale(domain=[0, 1]), title=xlabel),
     )
     bars = base.mark_bar(color="#0072B2")
     labels = base.mark_text(align="left", dx=6).encode(text="score_label:N")
-    chart = (bars + labels).properties(
+    metrics = (bars + labels).properties(
         width=720,
-        height=max(190, 44 * len(ordered)),
+        height=alt.Step(row_height),
         title=title,
     )
+    chart = alt.hconcat(
+        model_identity_chart(ordered, row_height=row_height), metrics, spacing=18
+    ).resolve_scale(y="shared")
     path = root / "plots.png"
     save_chart(chart, path)
     return [str(path.relative_to(root))]
@@ -3360,6 +3403,7 @@ def _analyze_semantic_object_sizes(
     reports: Path,
     *,
     requested_component_area: float | None,
+    progress: bool = False,
 ) -> tuple[
     dict[str, Any],
     str | None,
@@ -3369,7 +3413,12 @@ def _analyze_semantic_object_sizes(
     """Score final full-image masks by reference-defined object area."""
 
     reference = prepare_object_size_reference(
-        semantic_components_for_cases(cases, prefix="reference")
+        semantic_components_for_cases(
+            cases,
+            prefix="reference",
+            progress=progress,
+            progress_description="Extracting reference components",
+        )
     )
     predictions: dict[str, dict[str, tuple[Any, ...]]] = {}
     for row in ranking:
@@ -3378,101 +3427,31 @@ def _analyze_semantic_object_sizes(
             cases,
             prediction_directory=prediction_dirs[model_name],
             prefix=f"prediction-{model_name}",
+            progress=progress,
+            progress_description=f"Extracting {model_name} components",
         )
         predictions[model_name] = model_predictions
 
-    resolved_component_area = (
-        requested_component_area
-        if requested_component_area is not None
-        else reference.p10_area
-    )
-    threshold_source = (
-        "explicit"
-        if requested_component_area is not None
-        else "held-out-reference-object-p10"
-    )
-    presence_analysis: dict[str, Any] = {
-        "raw_definition": "any predicted foreground pixel",
-        "component_filtered_definition": (
-            "at least one predicted 8-connected foreground component with "
-            "area greater than or equal to the resolved threshold"
-        ),
-        "connectivity": 8,
-        "requested_min_connected_component_area_px": requested_component_area,
-        "resolved_min_connected_component_area_px": resolved_component_area,
-        "threshold_source": threshold_source,
+    component_areas = {
+        name: {
+            case_id: [component.area for component in components]
+            for case_id, components in values.items()
+        }
+        for name, values in predictions.items()
     }
-    if resolved_component_area is None:
-        presence_analysis.update(
-            status="skipped",
-            reason=(
-                "minimum connected-component area is unavailable because the "
-                "held-out cohort has no reference foreground objects"
-            ),
-        )
-    else:
-        presence_analysis["status"] = "complete"
-        for row in ranking:
-            model_name = str(row["model"])
-            component_areas = {
-                case_id: [component.area for component in components]
-                for case_id, components in predictions[model_name].items()
-            }
-            row.update(
-                component_filtered_presence_breakdown(
-                    rows_by_model[model_name],
-                    component_areas,
-                    resolved_component_area,
-                )
-            )
-            decisions = component_filtered_presence_decisions(
-                rows_by_model[model_name],
-                component_areas,
-                resolved_component_area,
-            )
-            for metric_row in rows_by_model[model_name]:
-                case_id = str(metric_row.get("case_id", metric_row.get("image_id")))
-                metric_row["component_filtered_predicted_presence"] = decisions[
-                    case_id
-                ]
-
-    if reference.status != "complete":
-        for row in ranking:
-            row.update(unavailable_object_size_summary())
-        return reference.metadata(), None, [], presence_analysis
-
-    results = {}
-    for row in ranking:
-        model_name = str(row["model"])
-        model_predictions = predictions[model_name]
-        result = evaluate_object_size_model(reference, model_predictions)
-        results[model_name] = result
-        row.update(result.summary)
-
-    size_path = render_object_size_breakdown(
-        reports,
-        ranking,
+    presence_analysis = apply_component_presence(
+        reference, ranking, rows_by_model, component_areas, requested_component_area
+    )
+    backends = {str(row["model"]): str(row.get("backend") or "unknown") for row in ranking}
+    metadata, path, examples = complete_object_size_analysis(
         reference,
-        labels={
-            str(row["model"]): model_label(row)
-            for row in ranking
-        },
-    )
-    selections = select_large_examples(reference, results)
-    examples = render_large_object_examples(
-        reports,
-        selections,
         predictions,
-        results,
-        {
-            str(row["model"]): str(row.get("backend") or "unknown")
-            for row in ranking
-        },
+        ranking,
+        reports,
+        backends=backends,
+        progress=progress,
     )
-    relative_size_path = (
-        str(size_path.relative_to(reports.parent)) if size_path is not None else None
-    )
-    return reference.metadata(), relative_size_path, examples, presence_analysis
+    return metadata, path, examples, presence_analysis
 
 
 def _analyze_grouped_metrics(
@@ -3486,96 +3465,9 @@ def _analyze_grouped_metrics(
     if groups is None:
         return {"status": "not-requested"}, None
 
-    group_splits = dict((group_settings or {}).get("group_splits") or {})
-
-    by_model: dict[str, dict[str, Any]] = {}
-    for row in ranking:
-        model_name = str(row["model"])
-        result = grouped_binary_metric_breakdown(rows_by_model[model_name], groups)
-        annotate_group_splits(result, group_splits)
-        by_model[model_name] = result
-        row.update({key: value for key, value in result.items() if key != "per_group"})
-
-    presence_by_model: dict[str, dict[str, Any]] = {}
-    presence_available = all(
-        "component_filtered_predicted_presence" in metric_row
-        for model_rows in rows_by_model.values()
-        for metric_row in model_rows
-    )
-    presence_reports: dict[str, str | None] = {
-        "precision": None,
-        "recall": None,
-        "f1": None,
-    }
-    if presence_available:
-        for row in ranking:
-            model_name = str(row["model"])
-            decisions = {
-                str(metric_row.get("case_id", metric_row.get("image_id"))): bool(
-                    metric_row["component_filtered_predicted_presence"]
-                )
-                for metric_row in rows_by_model[model_name]
-            }
-            result = grouped_presence_metric_breakdown(
-                rows_by_model[model_name],
-                groups,
-                decisions,
-            )
-            annotate_group_splits(result, group_splits)
-            presence_by_model[model_name] = result
-            row.update(
-                {key: value for key, value in result.items() if key != "per_group"}
-            )
-
-    path = render_grouped_metric_breakdown(
-        reports,
-        ranking,
-        by_model,
-        labels={
-            str(row["model"]): model_label(row)
-            for row in ranking
-        },
-        group_splits=group_splits,
-    )
-    if presence_available:
-        plot_labels = {
-            str(row["model"]): model_label(row)
-            for row in ranking
-        }
-        for metric in presence_reports:
-            presence_path = render_grouped_presence_metric_breakdown(
-                reports,
-                ranking,
-                presence_by_model,
-                metric=metric,
-                labels=plot_labels,
-                group_splits=group_splits,
-            )
-            presence_reports[metric] = str(
-                presence_path.relative_to(reports.parent)
-            )
-    return (
-        {
-            "status": "complete",
-            "aggregation": "pool TP/FP/FN within group, then macro-average group scores",
-            "primary_ranking_unchanged": True,
-            "grouping": dict(group_settings or {}),
-            "models": by_model,
-            "presence": {
-                "status": "complete" if presence_available else "skipped",
-                "prediction_definition": (
-                    "at least one predicted 8-connected foreground component "
-                    "at or above the resolved area threshold"
-                ),
-                "aggregation": (
-                    "pool tile-level TP/FP/FN/TN within group, then "
-                    "macro-average defined group scores"
-                ),
-                "models": presence_by_model,
-            },
-            "reports": presence_reports,
-        },
-        str(path.relative_to(reports.parent)),
+    return analyze_grouped_metrics(
+        rows_by_model, groups, ranking, reports,
+        group_settings=group_settings, aggregation_unit="tile",
     )
 
 
@@ -3589,10 +3481,6 @@ def _render_metric_breakdown(
         root,
         ranking,
         title="Semantic metric breakdown — final reconstructed source images",
-        labels={
-            str(row["model"]): model_label(row)
-            for row in ranking
-        },
         minimum_component_area=minimum_component_area,
     )
 
@@ -3735,7 +3623,7 @@ def _semantic_result_from_manifest(
 ) -> SemanticComparisonResult:
     return SemanticComparisonResult(
         location=target,
-        ranking=tuple(manifest.get("ranking") or ()),
+        ranking=frame(manifest.get("ranking") or ()),
         cohort_fingerprint=str(manifest.get("cohort_fingerprint") or ""),
         cohort_verified=bool(manifest.get("cohort_verified")),
         split=str(manifest.get("split") or "val"),
@@ -4162,16 +4050,6 @@ def _binary_mask_metrics(
     }
 
 
-def _binary_metric_breakdown(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Summarize final source-image masks without letting background dominate.
-
-    Rows are emitted only after native or SAHI inference has produced one final
-    reconstructed mask per source image. SAHI tiles are therefore never metric
-    samples in this function.
-    """
-    return binary_metric_breakdown(rows)
-
-
 def _render_semantic_grid(
     cases: list[_SemanticCase],
     prediction_dirs: dict[str, Path],
@@ -4234,20 +4112,20 @@ def _render_semantic_grid(
                     f"Missing visualization metrics for {name}/{case.case_id}"
                 ) from exc
             masks.append(prediction)
-            badges = " · ".join(
-                badge.text for badge in model_badges(metadata[name])
-            )
             panel_title = _shorten_middle(
                 model_label(metadata[name]),
                 model_title_length,
             )
-            if badges:
-                panel_title = f"{panel_title}\n{badges}"
             panels.append(
                 VisualizationPanel(
                     title=panel_title,
                     image=image,
                     mask=prediction,
+                    heading=model_identity_card(
+                        metadata[name],
+                        width=max(144, round(panel_size * 96)),
+                        maximum=model_title_length,
+                    ),
                     footer=(
                         f"Dice={_format_metric(metric['dice'])} · "
                         f"IoU={_format_metric(metric['iou'])}"
@@ -4266,14 +4144,6 @@ def _render_semantic_grid(
         options=active_options,
         prepare=prepare,
     )
-
-
-def _shorten_middle(value: str, maximum: int) -> str:
-    if len(value) <= maximum:
-        return value
-    left = (maximum - 1) // 2
-    right = maximum - 1 - left
-    return f"{value[:left]}…{value[-right:]}"
 
 
 def _format_metric(value: Any) -> str:

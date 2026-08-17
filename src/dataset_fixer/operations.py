@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import json
 import random
 import tempfile
@@ -12,8 +11,10 @@ from typing import TYPE_CHECKING, Any, Callable, Hashable, Iterable, Mapping
 from tqdm.auto import tqdm
 
 from .errors import DatasetValidationError, ValidationIssue
+from .dataset_comparison import dataset_report_state
 from .models import Annotation, DatasetMetadata, Sample, Task
 from .planning import (
+    callback_description as _callback_description,
     normalize_split_ratios,
     project_move_images_with_classes,
     project_move_n_groups,
@@ -717,20 +718,6 @@ def _flat_polygon_area(flat: list[float]) -> float:
     return abs(sum(x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in zip(pts, pts[1:] + pts[:1]))) / 2
 
 
-def _callback_description(callback: Callable | None) -> dict[str, Any] | None:
-    if callback is None:
-        return None
-    try:
-        source = inspect.getsource(callback).strip()
-    except (OSError, TypeError):
-        source = None
-    return {
-        "module": getattr(callback, "__module__", None),
-        "qualname": getattr(callback, "__qualname__", None),
-        "source": source,
-    }
-
-
 def _builder(
     dataset: "Dataset",
     destination: str | Path | None,
@@ -757,6 +744,7 @@ def _builder(
         operation=operation,
         settings=settings,
         parent_manifest=dataset._manifest,
+        source_report_state=dataset_report_state(dataset),
     )
     load_validation, load_visualization = stage_load_validation_audit(
         dataset._validation_audit,

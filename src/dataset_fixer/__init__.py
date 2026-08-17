@@ -1,6 +1,7 @@
 """Safe, reproducible computer-vision dataset transformations."""
 
 from .dataset import Dataset
+from .dataset_comparison import DatasetComparisonResult
 from .calibration import ThresholdCalibrationResult, calibrate_prediction_thresholds
 from .comparison.types import ComparisonResult
 from .errors import (
@@ -14,9 +15,11 @@ from .models import SemanticComparisonResult, Task
 from .prediction_cache import PredictionCache
 from .comparison.plot_labels import (
     ModelBadge,
+    ModelPresentation,
     model_badges,
     model_full_label,
     model_label,
+    model_presentation,
 )
 from .tracing import DatasetTrace, DatasetTraceNode, SampleTrace
 from .utils import bounded_slug
@@ -28,6 +31,7 @@ except ImportError:  # source tree before setuptools-scm has generated the file
 
 __all__ = [
     "Dataset",
+    "DatasetComparisonResult",
     "calibrate_prediction_thresholds",
     "ComparisonResult",
     "DatasetValidationError",
@@ -37,6 +41,7 @@ __all__ = [
     "Geometry",
     "Model",
     "ModelBadge",
+    "ModelPresentation",
     "ModelCollection",
     "ModelInput",
     "PredictionResult",
@@ -51,5 +56,6 @@ __all__ = [
     "model_badges",
     "model_full_label",
     "model_label",
+    "model_presentation",
     "__version__",
 ]

@@ -11,7 +11,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from ..errors import DatasetValidationError, ValidationIssue
-from ..utils import sha256_file, to_jsonable
+from ..utils import to_jsonable
 from .types import Cohort, Prediction
 
 CACHE_SCHEMA = 5
@@ -26,10 +26,6 @@ def cache_key(payload: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(to_jsonable(payload), sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-
-
-def model_hash(path: Path) -> str:
-    return sha256_file(path)
 
 
 def default_cache_root(dataset_location: Path) -> Path:

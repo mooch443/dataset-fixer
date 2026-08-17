@@ -25,9 +25,13 @@ from .artifacts import (
     write_json,
     write_lineage,
 )
-from .dataset_report import render_dataset_report
+from .dataset_comparison import (
+    compare_dataset_states,
+    dataset_report_state,
+    report_state_from_samples,
+)
 from .errors import DatasetValidationError, ValidationIssue
-from .models import Task
+from .models import Sample, Task
 from .split_group_audit import (
     audit_split_groups,
     print_split_group_audit,
@@ -45,7 +49,6 @@ from .validation_audit import stage_load_validation_audit
 
 if TYPE_CHECKING:
     from .dataset import Dataset
-    from .models import Sample
 
 
 def export_semantic_masks(
@@ -134,6 +137,8 @@ def export_semantic_masks(
         )
     )
     records: list[dict[str, Any]] = []
+    output_samples: list[Sample] = []
+    output_masks: dict[Path, Path] = {}
     warnings = list(dataset.warnings)
     try:
         reports = staging / "reports"
@@ -176,6 +181,19 @@ def export_semantic_masks(
                     raise TypeError("label_fn must return a string or None")
                 record["display_label"] = display_label
             records.append(record)
+            output_samples.append(
+                Sample(
+                    image_path=image_output,
+                    relative_path=sample.relative_path,
+                    split=sample.split,
+                    width=sample.width,
+                    height=sample.height,
+                    annotations=list(sample.annotations),
+                    source_sha256=record["output_image_sha256"],
+                    provenance=record,
+                )
+            )
+            output_masks[image_output] = mask_output
 
         _validate_semantic_tree(staging, records)
         audits = dict(dataset._manifest.get("audits") or {})
@@ -184,20 +202,27 @@ def export_semantic_masks(
             audits.pop("split_group_audit", None)
         prune_report_directory(reports)
         report_visualize_kwargs = dict(visualize_kwargs)
-        report_visualize_kwargs.pop("label_fn", None)
-        plot = render_dataset_report(
-            staging,
-            records,
+        baseline_state = dataset_report_state(dataset)
+        candidate_state = report_state_from_samples(
+            root=staging,
             name=final_name,
             task=Task.SEGMENT.value,
             format_name="semantic_masks",
             classes=dataset.classes,
-            output=reports / "plots.png",
+            samples=output_samples,
+            mask_paths=output_masks,
+            details=records,
             # Source coverage is inherited from the operation that produced the
             # polygons, so a mask export reports it exactly like a YOLO export.
             coverage=audits.get("coverage.source_coverage"),
+        )
+        comparison = compare_dataset_states(
+            baseline_state,
+            candidate_state,
+            destination=reports / "plots.png",
             visualize_kwargs=report_visualize_kwargs,
         )
+        plot = comparison.plot
         visuals = ["reports/plots.png"] if plot is not None else []
         if load_validation.get("skipped_count", 0):
             load_validation["report"] = (

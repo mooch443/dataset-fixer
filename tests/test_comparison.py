@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import math
 import shutil
 import sys
 import types
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from dataset_fixer import (
@@ -23,6 +27,7 @@ from dataset_fixer import (
     PredictionResult,
     PredictionScoreUnavailableError,
 )
+from dataset_fixer.model import _compatible_hash_identities
 from dataset_fixer.geometry import validate_collection_geometry
 from dataset_fixer.comparison.cache import (
     load_package_cache,
@@ -31,6 +36,7 @@ from dataset_fixer.comparison.cache import (
 from dataset_fixer.comparison.cohort import freeze_cohort
 from dataset_fixer.comparison.grouping import resolve_group_splits
 from dataset_fixer.comparison.inference import _adaptive_batches, _run_native, resolve_backend
+from dataset_fixer.comparison.reporting import write_csv
 from dataset_fixer.comparison.metrics import (
     component_filtered_presence_breakdown,
     component_filtered_presence_decisions,
@@ -45,6 +51,25 @@ from dataset_fixer.comparison.types import Cohort, CohortRecord, ModelSpec, Pred
 from dataset_fixer.prediction_cache import prediction_cache_key
 from PIL import Image
 from conftest import make_yolo_dataset
+
+
+def test_pandas_csv_writer_preserves_legacy_cells_and_column_order(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        {"a": 1, "nested": {"x": "y"}},
+        {"a": None, "nested": [1, 2], "extra": math.nan},
+    ]
+    expected = io.StringIO(newline="")
+    writer = csv.DictWriter(expected, fieldnames=["a", "nested", "extra"])
+    writer.writeheader()
+    writer.writerow({"a": 1, "nested": json.dumps({"x": "y"}, sort_keys=True)})
+    writer.writerow({"a": None, "nested": json.dumps([1, 2]), "extra": math.nan})
+
+    output = tmp_path / "table.csv"
+    write_csv(output, rows)
+
+    assert output.read_bytes() == expected.getvalue().encode()
 
 
 def test_cohort_is_ordered_and_content_addressed(detect_dataset: Path) -> None:
@@ -657,7 +682,7 @@ def test_generic_model_auto_detects_and_predicts_supported_images(
     assert model.kind == "ultralytics"
     assert model.task == "detect"
     assert not model.loaded
-    assert model.describe()["digest"] == model.digest
+    assert model.describe()["hash"] == model.hash() == model.digest[:8]
     result = model.predict(image, confidence=0.2, progress=False)
 
     assert isinstance(result, PredictionResult)
@@ -699,18 +724,86 @@ def test_model_load_many_returns_reusable_unbound_collection(
     assert models["baseline"].device == "mps"
     assert models["baseline"].confidence == pytest.approx(0.5)
     assert models["baseline"].postprocess == pytest.approx(0.5)
-    assert models.hashes == {
-        "baseline": {
-            "source": str(checkpoint),
-            "path": str(checkpoint.resolve()),
-            "sha256": models["baseline"].digest,
-        }
-    }
-    assert models.hash_for("baseline") == models["baseline"].digest
-    assert models.hash_for(checkpoint) == models["baseline"].digest
-    assert models.hash_for(models["baseline"]) == models["baseline"].digest
-    with pytest.raises(KeyError, match="No loaded model matches"):
-        models.hash_for("missing-model")
+    assert models["baseline"].hash() == models["baseline"].digest[:8]
+    assert models["baseline"].wandb is None
+    assert not hasattr(models, "hashes")
+    assert not hasattr(models, "hash_for")
+
+
+def test_local_model_accepts_wandb_identity_and_canonical_epoch_name(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+
+    model = Model(
+        checkpoint,
+        model_type="yolo26m-sem",
+        resolution=1024,
+        native_tile_size=512,
+        upscale_factor=2,
+        source_created_at="1786380390",
+        wandb=(
+            "wandb:max-planck-institute-for-animal-behavior/"
+            "schools-segmentation/i9xve33c"
+        ),
+    )
+
+    assert model.hash() == "i9xve33c"
+    assert model.wandb == (
+        "https://wandb.ai/max-planck-institute-for-animal-behavior/"
+        "schools-segmentation/runs/i9xve33c"
+    )
+    assert model.canonical_name == "2026-08-10_16-46-30"
+    assert model.describe()["canonical_name"] == model.canonical_name
+
+
+def test_long_wandb_run_identifier_uses_short_content_hash(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    run_id = (
+        "isl-512-13.08.2026-m1c-0.75bg_yolo-yolo26m-seg-1024px-2x-"
+        "2026-08-13_15-41_20260813_154226"
+    )
+    model = Model(
+        checkpoint,
+        model_type="yolo26m-seg",
+        inference="sahi",
+        wandb=(
+            "wandb:max-planck-institute-for-animal-behavior/"
+            f"schools-segmentation/{run_id}"
+        ),
+    )
+
+    assert model.hash() == model.digest[:8]
+    assert run_id not in model.hash()
+    assert model.wandb and model.wandb.endswith(f"/runs/{run_id}")
+    assert "sahi" not in model.canonical_name
+
+    current = {"model_hash": model.hash(), "space": "prediction"}
+    compatible = _compatible_hash_identities(current, model)
+    former_identity = {"model_hash": run_id, "space": "prediction"}
+    assert compatible[0] == former_identity
+    assert prediction_cache_key(compatible[0]) == prediction_cache_key(
+        former_identity
+    )
+    assert compatible[1]["model_hash"] == model.digest
+    assert compatible[2]["model_sha256"] == model.digest
+    assert current == {"model_hash": model.hash(), "space": "prediction"}
+
+
+def test_local_model_uses_checkpoint_creation_time_as_provenance(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+
+    model = Model(checkpoint, model_type="yolo26m-seg")
+
+    assert model.source_created_at is not None
+    assert datetime.fromisoformat(model.source_created_at).tzinfo is not None
 
 
 def test_model_predict_opt_in_cache_round_trips_without_loading_runtime(
@@ -1627,8 +1720,10 @@ def test_model_collection_compare_atomic_result(
         destination=destination,
     )
     assert isinstance(result, ComparisonResult)
+    assert isinstance(result.ranking, pd.DataFrame)
+    assert isinstance(result.ranking.index, pd.RangeIndex)
     assert result.cohort_verified
-    assert result.ranking[0]["score"] == pytest.approx(1.0)
+    assert result.ranking.iloc[0]["score"] == pytest.approx(1.0)
     assert (destination / "reports" / "result.json").is_file()
     assert (destination / "reports" / "plots.png").is_file()
     assert (destination / "reports" / "comparison.png").is_file()
@@ -1650,7 +1745,7 @@ def test_model_collection_compare_atomic_result(
         destination=destination,
     )
     assert fake_inference.calls == 1
-    assert json.loads(old_manifest_path.read_text())["schema"] == 12
+    assert json.loads(old_manifest_path.read_text())["schema"] == 13
     assert regenerated.cache_statistics["prediction_hits"] == 1
 
     models.compare(
@@ -1687,7 +1782,7 @@ def test_model_collection_compare_atomic_result(
         progress=False,
         destination=tmp_path / "direct-comparison",
     )
-    assert direct_result.ranking[0]["model"] == "direct"
+    assert direct_result.ranking.iloc[0]["model"] == "direct"
     assert direct_result.settings["models"]["direct"]["backend"] == "native"
     assert fake_inference.calls == 1, "renaming identical model bytes invalidated the cache"
 
@@ -1777,7 +1872,7 @@ def test_segment_comparison_adds_postprocessed_binary_breakdown(
         group_by=lambda path: path.stem.split("_")[0],
     )
 
-    row = result.ranking[0]
+    row = result.ranking.iloc[0]
     assert row["heldout_projection"] == "instance-polygon-foreground-union"
     assert row["dice"] == pytest.approx(1.0)
     assert row["positive_case_dice"] == pytest.approx(1.0)
@@ -1785,7 +1880,7 @@ def test_segment_comparison_adds_postprocessed_binary_breakdown(
     assert row["empty_cases"] == 1
     assert row["empty_image_specificity"] == pytest.approx(1.0)
     manifest = json.loads((destination / "reports" / "result.json").read_text())
-    assert manifest["schema"] == 12
+    assert manifest["schema"] == 13
     assert manifest["ranking"][0]["model_type"] == models[0].model_type
     assert manifest["ranking"][0]["positive_micro_iou"] == pytest.approx(1.0)
     assert manifest["ranking"][0]["small_object_dice"] == pytest.approx(1.0)

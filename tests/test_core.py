@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 import yaml
 
@@ -17,12 +18,31 @@ from dataset_fixer import (
     PredictionResult,
     Task,
 )
+from dataset_fixer.tabular import frame, stable_sort
 from dataset_fixer.utils import settings_fingerprint, to_jsonable
 from conftest import make_yolo_dataset
 
 
 def _audit(dataset: Dataset, name: str):
     return dataset.manifest["audits"][name]
+
+
+def test_tabular_boundary_owns_nullable_range_indexed_data_and_stable_ties() -> None:
+    source = pd.DataFrame(
+        [
+            {"key": "duplicate", "score": 1.0, "value": None},
+            {"key": "duplicate", "score": 1.0, "value": 2},
+        ],
+        index=[8, 3],
+    )
+
+    result = stable_sort(frame(source), ["score"], ascending=False)
+    source.loc[8, "key"] = "changed"
+
+    assert isinstance(result.index, pd.RangeIndex)
+    assert result["key"].tolist() == ["duplicate", "duplicate"]
+    assert result["value"].dtype == pd.Int64Dtype()
+    assert pd.isna(result.loc[0, "value"])
 
 
 def test_open_identity_and_automatic_validation(detect_dataset: Path) -> None:

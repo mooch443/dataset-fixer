@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import gzip
 import json
 import re
@@ -9,6 +8,9 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any, Iterable
 
+import pandas as pd
+
+from .tabular import frame
 from .utils import settings_fingerprint, to_jsonable
 
 
@@ -104,23 +106,21 @@ def source_dataset_id(
 def split_image_summary(records: Iterable[dict[str, Any]]) -> dict[str, dict[str, int]]:
     """Count labeled and background output images for every dataset split."""
 
-    counts: dict[str, dict[str, int]] = {}
-    for record in records:
-        split = str(record.get("output_split") or "unknown")
-        details = counts.setdefault(
-            split,
-            {
-                "total_images": 0,
-                "labeled_images": 0,
-                "background_images": 0,
-            },
-        )
-        has_labels = record.get("output_has_labels")
-        if has_labels is None:
-            has_labels = int(record.get("output_annotation_count") or 0) > 0
-        details["total_images"] += 1
-        details["labeled_images" if bool(has_labels) else "background_images"] += 1
-    return {split: counts[split] for split in sorted(counts)}
+    data = frame(records)
+    if data.empty:
+        return {}
+    splits = data.get("output_split", pd.Series(index=data.index)).fillna("unknown").astype(str)
+    labels = data.get("output_has_labels", pd.Series(index=data.index, dtype="boolean"))
+    fallback = data.get("output_annotation_count", pd.Series(0, index=data.index)).fillna(0).astype(int).gt(0)
+    labeled = labels.fillna(fallback).astype(bool)
+    counts = pd.DataFrame({"split": splits, "labeled": labeled}).groupby("split", sort=True).agg(
+        total_images=("labeled", "size"), labeled_images=("labeled", "sum")
+    )
+    counts["background_images"] = counts["total_images"] - counts["labeled_images"]
+    return {
+        str(split): {key: int(row[key]) for key in counts.columns}
+        for split, row in counts.iterrows()
+    }
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -341,9 +341,8 @@ def collect_report_payloads(reports_dir: Path) -> dict[str, Any]:
     for path in sorted(reports_dir.rglob("*.csv")):
         key = path.relative_to(reports_dir).with_suffix("").as_posix().replace("/", ".")
         try:
-            with path.open(newline="", encoding="utf-8") as handle:
-                rows = list(csv.DictReader(handle))
-        except OSError:
+            rows = pd.read_csv(path, dtype=str, keep_default_na=False).to_dict("records")
+        except (OSError, pd.errors.EmptyDataError):
             rows = []
         if key in payloads:
             payloads[key] = {"summary": payloads[key], "rows": rows}

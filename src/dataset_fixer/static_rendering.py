@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import io
-import math
 import textwrap
 from pathlib import Path
 from typing import Any, Literal, Sequence
@@ -13,6 +12,7 @@ import altair as alt
 import numpy as np
 from PIL import Image, ImageColor, ImageOps
 
+from .tabular import chart_data
 
 LabelMode = Literal["middle", "wrap"]
 SUPPORTED_STATIC_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".pdf", ".svg"})
@@ -106,7 +106,7 @@ def text_region(
     if not values:
         values = [{"line": "", "y": 1}]
     return (
-        alt.Chart(alt.Data(values=values))
+        alt.Chart(chart_data(values))
         .mark_text(
             align="center",
             baseline="middle",
@@ -134,7 +134,7 @@ def image_region(
 
     boxed = letterbox_image(image, width=width, height=height, background=background)
     return (
-        alt.Chart(alt.Data(values=[{"url": image_data_url(boxed)}]))
+        alt.Chart(chart_data([{"url": image_data_url(boxed)}]))
         .mark_image(width=width, height=height)
         .encode(
             x=alt.value(width / 2),
@@ -265,21 +265,3 @@ def concat_grid(
             title=alt.TitleParams(text=title, anchor="middle", fontSize=16, offset=14)
         )
     return result.configure_view(stroke=None).configure_axis(labelFontSize=11, titleFontSize=12)
-
-
-def finite_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Replace non-finite floats because Vega-Lite JSON cannot represent them."""
-
-    cleaned: list[dict[str, Any]] = []
-    for row in rows:
-        cleaned.append(
-            {
-                key: (
-                    None
-                    if isinstance(value, float) and not math.isfinite(value)
-                    else value
-                )
-                for key, value in row.items()
-            }
-        )
-    return cleaned

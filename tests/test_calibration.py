@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 from PIL import Image
 
@@ -135,6 +136,14 @@ def test_grouped_threshold_calibration_uses_cached_probabilities_only(
     )
 
     assert result.recommendations[model.name] == pytest.approx(0.5)
+    for table in (
+        result.cache_audit,
+        result.threshold_scores,
+        result.fold_scores,
+        result.improvements,
+    ):
+        assert isinstance(table, pd.DataFrame)
+        assert isinstance(table.index, pd.RangeIndex)
     assert calls == [
         {
             "split": "val",
@@ -147,7 +156,7 @@ def test_grouped_threshold_calibration_uses_cached_probabilities_only(
     assert (result.location / "recommendations.json").is_file()
     assert (result.location / "threshold-curves.png").is_file()
     assert (result.location / "calibration-improvements.csv").is_file()
-    improvement = result.improvements[0]
+    improvement = result.improvements.iloc[0]
     assert improvement["baseline_threshold"] == pytest.approx(0.4)
     assert improvement["recommended_threshold"] == pytest.approx(0.5)
     assert improvement["cv_macro_dice_gain"] > 0
@@ -164,9 +173,9 @@ def test_grouped_threshold_calibration_uses_cached_probabilities_only(
         progress=False,
     )
     assert len(calls) == 1
-    assert repeated.cache_audit[0]["cache"] == "score-hit"
-    assert repeated.cache_audit[0]["cached_thresholds"] == 3
-    assert repeated.cache_audit[0]["scored_thresholds"] == 0
+    assert repeated.cache_audit.iloc[0]["cache"] == "score-hit"
+    assert repeated.cache_audit.iloc[0]["cached_thresholds"] == 3
+    assert repeated.cache_audit.iloc[0]["scored_thresholds"] == 0
 
     extended = calibrate_prediction_thresholds(
         (model,),
@@ -179,8 +188,8 @@ def test_grouped_threshold_calibration_uses_cached_probabilities_only(
         progress=False,
     )
     assert len(calls) == 2
-    assert extended.cache_audit[0]["cached_thresholds"] == 3
-    assert extended.cache_audit[0]["scored_thresholds"] == 1
+    assert extended.cache_audit.iloc[0]["cached_thresholds"] == 3
+    assert extended.cache_audit.iloc[0]["scored_thresholds"] == 1
 
 
 def test_probability_map_rerun_requires_explicit_switch(
@@ -273,4 +282,4 @@ def test_probability_map_rerun_requires_explicit_switch(
     )
     assert rerun.recommendations[model.name] == pytest.approx(0.5)
     assert calls == [True, False]
-    assert rerun.cache_audit[0]["cache"] == "rerun"
+    assert rerun.cache_audit.iloc[0]["cache"] == "rerun"

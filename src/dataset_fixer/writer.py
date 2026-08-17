@@ -26,7 +26,11 @@ from .artifacts import (
     write_json,
     write_lineage,
 )
-from .dataset_report import render_dataset_report
+from .dataset_comparison import (
+    DatasetReportState,
+    report_state_from_samples,
+)
+from .dataset_comparison import compare_dataset_states
 from .io import annotation_to_yolo
 from .models import Annotation, DatasetMetadata, Sample, Task
 from .utils import environment_snapshot, settings_fingerprint, sha256_file, slugify, to_jsonable
@@ -53,6 +57,7 @@ class OutputBuilder:
         operation: str,
         settings: dict[str, Any],
         parent_manifest: dict[str, Any],
+        source_report_state: DatasetReportState | None = None,
     ) -> None:
         self.source_root = source_root.resolve()
         self.source_name = source_name
@@ -64,6 +69,7 @@ class OutputBuilder:
         self.settings = to_jsonable(settings)
         self._settings_fingerprint = settings_fingerprint(self.settings)
         self.parent_manifest = parent_manifest
+        self.source_report_state = source_report_state
         self.started = time.time()
         self.staging = Path(tempfile.mkdtemp(prefix=f".{self.destination.name}.tmp-", dir=self.destination.parent))
         self.reports_dir = self.staging / "reports"
@@ -317,19 +323,24 @@ class OutputBuilder:
             )
         prune_report_directory(self.reports_dir, extra_roots=(coverage_dir,))
         report_visualize_kwargs = dict(self.visualize_kwargs)
-        report_visualize_kwargs.pop("label_fn", None)
-        plot = render_dataset_report(
-            self.staging,
-            self.records,
+        candidate_state = report_state_from_samples(
+            root=self.staging,
             name=self.name,
             task=self.task.value,
             format_name="yolo",
             classes=self.metadata.names,
-            output=self.reports_dir / "plots.png",
+            samples=self.output_samples,
             metadata=self.metadata,
             coverage=self.coverage_summary or audits.get("coverage.source_coverage"),
+            details=self.records,
+        )
+        comparison = compare_dataset_states(
+            self.source_report_state,
+            candidate_state,
+            destination=self.reports_dir / "plots.png",
             visualize_kwargs=report_visualize_kwargs,
         )
+        plot = comparison.plot
         self.visuals = ["reports/plots.png"] if plot is not None else []
         operation_record["visuals"] = list(self.visuals)
         load_validation = self.validation_details.get("load_validation")

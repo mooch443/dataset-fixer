@@ -3,11 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections import Counter
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
+import pandas as pd
 from PIL import Image, ImageOps
 from shapely.geometry import Polygon
 from tqdm.auto import tqdm
@@ -201,10 +201,12 @@ def validate_staged_yolo_output(
     if issues:
         raise DatasetValidationError(issues)
 
-    split_counts = Counter(sample.split for sample in samples)
+    split_counts = pd.Series(
+        (sample.split for sample in samples), dtype="string"
+    ).value_counts()
     return bool(
-        split_counts["train"]
-        and split_counts["val"]
+        split_counts.get("train", 0)
+        and split_counts.get("val", 0)
         and metadata.names
         and (task is not Task.POSE or metadata.kpt_shape)
         and (task is not Task.POLO or metadata.radii)

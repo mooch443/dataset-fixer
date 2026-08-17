@@ -6,6 +6,7 @@ import math
 import time
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -21,7 +22,7 @@ from .errors import (
 )
 from .geometry import Geometry, filter_inputs_by_size, normalize_errors
 from .prediction_cache import PredictionCache
-from .utils import IMAGE_SUFFIXES, sha256_file, slugify, to_jsonable
+from .utils import IMAGE_SUFFIXES, sha256_file, shorten_middle as _shorten_middle, slugify, to_jsonable
 from .visualization import (
     finish_visualization,
     VisualizationItem,
@@ -34,6 +35,50 @@ ModelKind = Literal["ultralytics", "nnunet"]
 PredictionTask = Literal["detect", "segment", "pose", "polo", "semantic_segment"]
 ModelTask = PredictionTask | Literal["auto", "locate", "semantic"]
 _MAX_INFERENCE_BATCH_SIZE = 128
+
+
+def _wandb_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    from .model_sources import normalize_wandb_run
+
+    entity, project, run_id = normalize_wandb_run(str(value)).split("/")
+    return f"https://wandb.ai/{entity}/{project}/runs/{run_id}"
+
+
+def _readable_timestamp(value: str | None) -> str:
+    if not value:
+        return "unknown-time"
+    text = str(value).strip()
+    try:
+        parsed = datetime.fromtimestamp(float(text), timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+            for pattern in ("%Y%m%d_%H%M%S", "%Y-%m-%d_%H-%M-%S"):
+                try:
+                    parsed = datetime.strptime(text, pattern).replace(tzinfo=timezone.utc)
+                    break
+                except ValueError:
+                    continue
+    return parsed.strftime("%Y-%m-%d_%H-%M-%S") if parsed else slugify(text)
+
+
+def _file_creation_timestamp(paths: Sequence[Path]) -> str | None:
+    """Return the newest selected model file's best available creation time."""
+
+    timestamps: list[float] = []
+    for path in paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        timestamps.append(float(getattr(stat, "st_birthtime", stat.st_mtime)))
+    if not timestamps:
+        return None
+    return datetime.fromtimestamp(max(timestamps)).astimezone().isoformat()
 
 
 def _default_nnunet_device() -> Literal["cpu", "cuda", "mps"]:
@@ -184,6 +229,7 @@ class PredictionResult:
         inference_seconds: Measured prediction wall time.
         settings: Effective device, batching, and inference configuration.
         cache_info: Verified prediction-cache status and location, when used.
+        model_metadata: Canonical model identity used by shared plot headings.
     """
 
     model_name: str
@@ -194,6 +240,7 @@ class PredictionResult:
     inference_seconds: float
     settings: dict[str, Any] = field(default_factory=dict)
     cache_info: dict[str, Any] = field(default_factory=dict)
+    model_metadata: dict[str, Any] = field(default_factory=dict)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -522,6 +569,7 @@ class PredictionResult:
         outline_alpha: float = 1.0,
         destination: str | Path | None = None,
         show: bool = True,
+        show_model_slugs: bool = True,
     ) -> None:
         """Render compact original/annotation/prediction rows.
 
@@ -548,6 +596,9 @@ class PredictionResult:
                 ``[0, 1]``. The default is fully opaque.
             destination: Optional PNG/JPEG/PDF/SVG output path.
             show: Display in an active notebook or interactive backend.
+            show_model_slugs: Show the canonical model identifier/hash with
+                coloured architecture, upscale, and resolution slugs above
+                every prediction panel.
 
         """
 
@@ -569,6 +620,25 @@ class PredictionResult:
         )
         if not self.records:
             raise ValueError("PredictionResult contains no images")
+        if not isinstance(show_model_slugs, bool):
+            raise TypeError("show_model_slugs must be a boolean")
+        from .comparison.plot_labels import model_identity_card
+
+        model_metadata = {
+            "model": self.model_name,
+            "name": self.model_name,
+            "model_type": self.model_kind,
+            **self.model_metadata,
+        }
+        model_heading = (
+            model_identity_card(
+                model_metadata,
+                width=max(144, round(panel_size * 96)),
+                maximum=max(18, round(panel_size * 96) // 7),
+            )
+            if show_model_slugs
+            else None
+        )
 
         def prepare(record: ImagePrediction) -> VisualizationItem:
             with Image.open(record.image_path) as opened:
@@ -604,6 +674,7 @@ class PredictionResult:
                         image=image,
                         mask=prediction,
                         color="#C86552",
+                        heading=model_heading,
                     ),
                 ),
                 foreground=foreground,
@@ -613,7 +684,11 @@ class PredictionResult:
             self.records,
             options=options,
             prepare=prepare,
-            title=_shorten_middle(self.model_name, 76),
+            title=(
+                "Prediction result"
+                if show_model_slugs
+                else _shorten_middle(self.model_name, 76)
+            ),
         )
         finish_visualization(figure, options)
 
@@ -655,6 +730,8 @@ class Model:
             automatically generated W&B model names.
         source_created_at: Checkpoint or run creation timestamp retained for
             stable, dataset-independent figure labels.
+        wandb: W&B run reference or URL. The normalized openable URL supplies
+            the preferred run-ID identity returned by :meth:`hash`.
         resolution: Default Ultralytics image size.
         training_dataset: Optional training-data provenance path.
         inference: Default Ultralytics inference mode.
@@ -703,6 +780,7 @@ class Model:
         model_type: str | None = None,
         source_dataset_zip: str | None = None,
         source_created_at: str | None = None,
+        wandb: str | None = None,
         resolution: int | None = None,
         training_dataset: str | Path | None = None,
         inference: Literal["native", "sahi"] = "native",
@@ -797,6 +875,9 @@ class Model:
         )
         self._source_created_at = (
             str(source_created_at).strip() if source_created_at else None
+        )
+        self._wandb = _wandb_url(
+            wandb or (self._source_key if self._source_key.startswith("wandb:") else None)
         )
         self._resolution = int(resolution) if resolution is not None else None
         self._inference = inference
@@ -917,6 +998,10 @@ class Model:
             self._digest = sha256_file(path)
             if self._resolved_task is None:
                 self._resolved_task = _task_from_args(path)
+        if self._source_created_at is None:
+            self._source_created_at = _file_creation_timestamp(
+                self._checkpoint_files or (path,)
+            )
 
         inferred_training = training_dataset or (
             _training_dataset_from_args(path) if resolved_kind == "ultralytics" else None
@@ -1021,6 +1106,12 @@ class Model:
         """Checkpoint/run creation timestamp retained from source provenance."""
 
         return self._source_created_at
+
+    @property
+    def wandb(self) -> str | None:
+        """Openable W&B run URL, when the model has run provenance."""
+
+        return self._wandb
 
     @property
     def path(self) -> Path:
@@ -1155,9 +1246,29 @@ class Model:
 
     @property
     def digest(self) -> str:
-        """Content digest used for cache and comparison identity."""
+        """Legacy content digest retained for read-only cache compatibility."""
 
         return self._digest
+
+    def hash(self) -> str:
+        """Return a compact W&B run ID or stable short content SHA-256.
+
+        User-defined W&B run IDs may be full human-readable run names. Those
+        remain available through :attr:`wandb`, but are not hashes and are
+        therefore never exposed by this method.
+        """
+
+        if self.wandb:
+            run_id = self.wandb.rsplit("/", 1)[-1]
+            if len(run_id) == 8 and run_id.isalnum():
+                return run_id
+        return self._digest[:8]
+
+    @property
+    def canonical_name(self) -> str:
+        """Human-readable checkpoint/run creation-time identity."""
+
+        return _readable_timestamp(self.source_created_at)
 
     @property
     def upscale_factor(self) -> int:
@@ -1242,10 +1353,12 @@ class Model:
             "model_type": self.model_type,
             "source_dataset_zip": self.source_dataset_zip,
             "source_created_at": self.source_created_at,
+            "wandb": self.wandb,
+            "hash": self.hash(),
+            "canonical_name": self.canonical_name,
             "kind": self.kind,
             "task": self.task,
             "path": str(self.path),
-            "digest": self.digest,
             "resolution": self.resolution,
             "training_dataset": (
                 str(self.training_dataset) if self.training_dataset else None
@@ -1301,6 +1414,7 @@ class Model:
             "model_type": self.model_type,
             "source_dataset_zip": self.source_dataset_zip,
             "source_created_at": self.source_created_at,
+            "wandb": self.wandb,
             "resolution": self.resolution,
             "training_dataset": self.training_dataset,
             "inference": self.inference,
@@ -1841,6 +1955,7 @@ class Model:
             records=tuple(records),
             inference_seconds=time.perf_counter() - started,
             settings=resolved_settings,
+            model_metadata=self.describe(),
         )
         if progress and cache_request is not None:
             print(
@@ -1904,6 +2019,7 @@ class Model:
         trust_legacy_cache: bool = False,
         min_connected_component_area: float | None = None,
         group_by: Callable[[Path], Hashable] | None = None,
+        model_identity: Literal["hash", "name", "both"] = "hash",
     ) -> Any:
         """Evaluate this model on one frozen dataset cohort.
 
@@ -1917,7 +2033,8 @@ class Model:
             errors: Oversized-image policy shared by all evaluated models.
                 Smaller images are always retained; ``"skip"`` omits images
                 exceeding the common native-size limit and audits them.
-            progress: Show package-managed progress bars.
+            progress: Show prediction loading, statistical analysis, object
+                scoring, and report-rendering progress with elapsed time.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.
             prediction_cache: Optional prediction-cache override. Omission or
@@ -1936,6 +2053,9 @@ class Model:
             group_by: Optional callback from each evaluation image path
                 to a stable, hashable group label. Adds group-pooled metrics
                 and a separate plot without changing inference or ranking.
+            model_identity: Label models by creation time plus compact hash,
+                creation time/name alone, or time/name with the hash on a
+                separate second line in report figures.
 
         Returns:
             A task-appropriate comparison result. Prediction and evaluation
@@ -1953,6 +2073,7 @@ class Model:
             trust_legacy_cache=trust_legacy_cache,
             min_connected_component_area=min_connected_component_area,
             group_by=group_by,
+            model_identity=model_identity,
         )
 
     def visualize(
@@ -2116,6 +2237,7 @@ class Model:
                     "model_type",
                     "source_dataset_zip",
                     "source_created_at",
+                    "wandb",
                     "resolution",
                     "training_dataset",
                     "inference",
@@ -2219,58 +2341,6 @@ class ModelCollection:
         """Model names in prediction order."""
 
         return tuple(model.name for model in self.models)
-
-    @property
-    def hashes(self) -> dict[str, dict[str, str]]:
-        """Map each unique model name to source, resolved path, and SHA-256.
-
-        Full digests are retained for provenance. Hash abbreviation is a
-        presentation concern handled by :func:`dataset_fixer.model_label`.
-        """
-
-        return {
-            model.name: {
-                "source": model.source_key,
-                "path": str(model.path),
-                "sha256": model.digest,
-            }
-            for model in self.models
-        }
-
-    def hash_for(self, identity: str | Path | Model) -> str:
-        """Return the full SHA-256 for a model name, source, or resolved path.
-
-        Parameters:
-            identity: Model object, collection name, source key, or resolved
-                checkpoint path.
-
-        Returns:
-            The unique model's full SHA-256 digest.
-        """
-
-        if isinstance(identity, Model):
-            matches = [model for model in self.models if model is identity]
-        else:
-            raw = str(identity)
-            expanded = (
-                raw
-                if raw.startswith("wandb:")
-                else str(Path(raw).expanduser().resolve())
-            )
-            matches = [
-                model
-                for model in self.models
-                if raw in {model.name, model.source_key, str(model.path)}
-                or expanded == str(model.path)
-            ]
-        if len(matches) == 1:
-            return matches[0].digest
-        if not matches:
-            raise KeyError(f"No loaded model matches {str(identity)!r}")
-        raise ValueError(
-            f"Model identity {str(identity)!r} is ambiguous across "
-            f"{len(matches)} loaded models; use the unique model name or resolved path"
-        )
 
     def __len__(self) -> int:
         return len(self.models)
@@ -2516,6 +2586,7 @@ class ModelCollection:
         trust_legacy_cache: bool = False,
         min_connected_component_area: float | None = None,
         group_by: Callable[[Path], Hashable] | None = None,
+        model_identity: Literal["hash", "name", "both"] = "hash",
     ) -> Any:
         """Compare the configured models on one frozen dataset cohort.
 
@@ -2540,7 +2611,8 @@ class ModelCollection:
                 ``native_tile_size`` as their slice geometry. ``"skip"`` omits
                 images exceeding any native-inference model's shared size limit
                 and records them in report settings.
-            progress: Show package-managed progress bars.
+            progress: Show prediction loading, statistical analysis, object
+                scoring, and report-rendering progress with elapsed time.
             destination: Optional report directory. By default the report is
                 content-addressed below ``<dataset>/evaluations/``.
             prediction_cache: Optional prediction-cache override. Omission or
@@ -2558,6 +2630,9 @@ class ModelCollection:
             group_by: Optional callback from each evaluation image path
                 to a stable, hashable group label. Adds group-pooled metrics
                 and a separate plot; it does not change inference or ranking.
+            model_identity: Label models by creation time plus compact hash,
+                creation time/name alone, or time/name with the hash on a
+                separate second line in report figures.
 
         Returns:
             A task-appropriate comparison result. Comparison space is inferred
@@ -2566,6 +2641,8 @@ class ModelCollection:
         """
 
         active = source
+        if model_identity not in {"hash", "name", "both"}:
+            raise ValueError("model_identity must be 'hash', 'name', or 'both'")
         from .dataset import Dataset
 
         if not isinstance(active, Dataset):
@@ -2617,6 +2694,7 @@ class ModelCollection:
                     errors=normalize_errors(errors),
                     min_connected_component_area=min_connected_component_area,
                     group_by=group_by,
+                    model_identity=model_identity,
                 )
             from .semantic_comparison import compare_nnunet_models
 
@@ -2632,6 +2710,7 @@ class ModelCollection:
                 errors=normalize_errors(errors),
                 min_connected_component_area=min_connected_component_area,
                 group_by=group_by,
+                model_identity=model_identity,
             )
         if any(model.kind != "ultralytics" for model in self.models):
             raise DatasetValidationError(
@@ -2678,6 +2757,7 @@ class ModelCollection:
             errors=normalize_errors(errors),
             min_connected_component_area=min_connected_component_area,
             group_by=group_by,
+            model_identity=model_identity,
         )
 
     def visualize(
@@ -2812,7 +2892,7 @@ def _semantic_image_prediction_cache_identity(
         "schema": 3,
         "space": "semantic-image-prediction",
         "input_fingerprint": prediction_input_fingerprint(inputs),
-        "model_sha256": model.digest,
+        "model_hash": model.hash(),
         "kind": model.kind,
         "task": (
             "semantic_segment"
@@ -2828,6 +2908,44 @@ def _semantic_image_prediction_cache_identity(
         "sahi": dict(resolved_sahi or {}) if inference == "sahi" else None,
         "settings": settings,
     }
+
+
+def _legacy_hash_identity(identity: Mapping[str, Any], model: Model) -> dict[str, Any]:
+    """Translate a canonical identity for read-only lookup of old caches."""
+
+    legacy = dict(identity)
+    if "model_hash" in legacy:
+        legacy["model_sha256"] = model.digest
+        legacy.pop("model_hash")
+    return legacy
+
+
+def _old_full_hash_identity(
+    identity: Mapping[str, Any], model: Model
+) -> dict[str, Any]:
+    """Preserve read-only access to caches written with full model hashes."""
+
+    legacy = dict(identity)
+    if "model_hash" in legacy:
+        legacy["model_hash"] = model.digest
+    return legacy
+
+
+def _compatible_hash_identities(
+    identity: Mapping[str, Any], model: Model
+) -> tuple[dict[str, Any], ...]:
+    compatible = [
+        _old_full_hash_identity(identity, model),
+        _legacy_hash_identity(identity, model),
+    ]
+    if model.wandb and "model_hash" in identity:
+        previous_wandb_hash = model.wandb.rsplit("/", 1)[-1]
+        if previous_wandb_hash != model.hash():
+            compatible.insert(
+                0,
+                {**identity, "model_hash": previous_wandb_hash},
+            )
+    return tuple(compatible)
 
 
 def _prepare_prediction_cache_request(
@@ -2912,6 +3030,7 @@ def _prepare_prediction_cache_request(
             namespace="semantic",
             postprocess=postprocess,
             keep_native=keep_native,
+            compatible_identities=_compatible_hash_identities(image_identity, model),
         )
 
     semantic_cohort = cache_context.get("semantic_cohort_fingerprint")
@@ -2931,7 +3050,7 @@ def _prepare_prediction_cache_request(
                 "schema": 2,
                 "space": "nnunet-semantic",
                 "cohort": str(semantic_cohort),
-                "model_sha256": model.digest,
+                "model_hash": model.hash(),
                 "backend": inference,
                 "folds": model.folds,
                 "checkpoint": model.checkpoint,
@@ -2947,7 +3066,11 @@ def _prepare_prediction_cache_request(
                 namespace="semantic",
                 postprocess=postprocess,
                 keep_native=keep_native,
-                compatible_identities=(cohort_identity,),
+                compatible_identities=(
+                    *_compatible_hash_identities(image_identity, model),
+                    cohort_identity,
+                    *_compatible_hash_identities(cohort_identity, model),
+                ),
             )
         identity_settings = dict(combined_settings)
         # Probability maps are the threshold-independent inference product.
@@ -2962,7 +3085,7 @@ def _prepare_prediction_cache_request(
             "schema": 2,
             "space": "binary-semantic",
             "cohort": str(semantic_cohort),
-            "model_sha256": model.digest,
+            "model_hash": model.hash(),
             "kind": model.kind,
             "task": model.task,
             "folds": model.folds,
@@ -2984,7 +3107,11 @@ def _prepare_prediction_cache_request(
             namespace="semantic",
             postprocess=postprocess,
             keep_native=keep_native,
-            compatible_identities=(cohort_identity,),
+            compatible_identities=(
+                *_compatible_hash_identities(image_identity, model),
+                cohort_identity,
+                *_compatible_hash_identities(cohort_identity, model),
+            ),
         )
 
     cohort = cache_context.get("cohort")
@@ -3006,7 +3133,7 @@ def _prepare_prediction_cache_request(
         adapter_settings.pop("confidence", None)
         adapter_settings.pop("postprocess", None)
         identity = {
-            "model_sha256": model.digest,
+            "model_hash": model.hash(),
             "cohort_fingerprint": cohort.fingerprint,
             "task": cohort.task,
             "classes": cohort.classes,
@@ -3028,6 +3155,7 @@ def _prepare_prediction_cache_request(
             package_payload=payload,
             postprocess=postprocess,
             keep_native=keep_native,
+            compatible_identities=_compatible_hash_identities(identity, model),
         )
 
     identity_settings = dict(combined_settings)
@@ -3043,7 +3171,7 @@ def _prepare_prediction_cache_request(
         "schema": 1,
         "space": "raw-prediction-result",
         "input_fingerprint": prediction_input_fingerprint(inputs),
-        "model_sha256": model.digest,
+        "model_hash": model.hash(),
         "kind": model.kind,
         "task": prediction_task,
         "source_task": source_task,
@@ -3065,6 +3193,7 @@ def _prepare_prediction_cache_request(
         or str(cache_context.get("namespace") or "predictions"),
         postprocess=postprocess,
         keep_native=keep_native,
+        compatible_identities=_compatible_hash_identities(identity, model),
     )
 
 
@@ -3091,15 +3220,21 @@ def _load_prediction_cache_request(
 
     if request.package_payload is not None:
         from .comparison.cache import load_package_cache
+        from .prediction_cache import prediction_cache_key
 
-        root = request.cache.entry(request.key, namespace="predictions")
-        loaded, shards, complete = load_package_cache(
-            root,
-            request.cohort,
-            (request.postprocess,),
-            progress=progress,
-        )
-        if complete:
+        cache_keys = [request.key, *(
+            prediction_cache_key(identity) for identity in request.compatible_identities
+        )]
+        for cache_key in cache_keys:
+            root = request.cache.entry(cache_key, namespace="predictions")
+            loaded, shards, complete = load_package_cache(
+                root,
+                request.cohort,
+                (request.postprocess,),
+                progress=progress,
+            )
+            if not complete:
+                continue
             by_image = loaded[float(request.postprocess)]
             records = tuple(
                 ImagePrediction(
@@ -3134,11 +3269,12 @@ def _load_prediction_cache_request(
                 cache_info={
                     "status": "hit",
                     "verified": True,
-                    "key": request.key,
+                    "key": cache_key,
                     "namespace": "predictions",
                     "location": str(root),
                     "shards": shards,
                 },
+                model_metadata=model.describe(),
             )
 
     cached = request.cache.load(
@@ -3272,7 +3408,11 @@ def _load_prediction_cache_request(
                 },
             )
     if cached is not None:
-        return replace(cached, model_name=model.name)
+        return replace(
+            cached,
+            model_name=model.name,
+            model_metadata=model.describe(),
+        )
 
     if (
         request.namespace == "semantic"
@@ -3474,6 +3614,7 @@ def _load_legacy_semantic_prediction(
         records=tuple(records),
         inference_seconds=float(metadata.get("inference_seconds", 0.0)),
         settings=dict(settings),
+        model_metadata=model.describe(),
     )
 
 
@@ -3499,24 +3640,13 @@ def normalize_model_inputs(
                 f"Unknown semantic-mask split {selected_split!r}; "
                 f"available splits are {source.splits}"
             )
-        from .semantic_comparison import _freeze_cohort
+        from .semantic_comparison import _freeze_cohort, _model_inputs_from_cases
 
         cases, cohort_fingerprint = _freeze_cohort(
             source, selected_split, progress=progress
         )
         return (
-            tuple(
-                ModelInput(
-                    image_id=case.case_id,
-                    image_path=case.image_path,
-                    width=case.width,
-                    height=case.height,
-                    relative_path=case.relative_path.as_posix(),
-                    mask_path=case.mask_path,
-                    image_sha256=case.image_sha256,
-                )
-                for case in cases
-            ),
+            _model_inputs_from_cases(cases),
             "semantic_segment",
             {
                 "semantic_cohort_fingerprint": cohort_fingerprint,
@@ -3732,14 +3862,6 @@ def _training_dataset_from_args(checkpoint: Path) -> str | None:
         except (OSError, TypeError, yaml.YAMLError):
             continue
     return None
-
-
-def _shorten_middle(value: str, maximum: int) -> str:
-    if len(value) <= maximum:
-        return value
-    left = (maximum - 1) // 2
-    right = maximum - 1 - left
-    return f"{value[:left]}…{value[-right:]}"
 
 
 def _prediction_key(relative_path: str) -> str:

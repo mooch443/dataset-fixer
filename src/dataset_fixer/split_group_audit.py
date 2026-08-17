@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import statistics
-from collections import Counter, defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
+import pandas as pd
+
 from .errors import DatasetValidationError, ValidationIssue
+from .tabular import frame
 from .utils import STANDARD_SPLITS, to_jsonable
 
 if TYPE_CHECKING:
@@ -33,40 +35,33 @@ def audit_split_groups(
     if not isinstance(settings, dict) or settings.get("group_by") is None:
         return _not_applicable("latest split operation did not use group_by", exported), None
 
-    missing = [
-        sample
+    samples = frame(
+        {
+            "split": sample.split,
+            "group": str((sample.provenance or {}).get("split_group")),
+            "has_group": "split_group" in (sample.provenance or {}),
+        }
         for sample in dataset._samples
-        if "split_group" not in (sample.provenance or {})
-    ]
-    if missing:
+    )
+    missing = samples[~samples["has_group"]]
+    if not missing.empty:
         raise DatasetValidationError(
             ValidationIssue(
                 "Physical split-group isolation is unverifiable because samples lack group identity",
                 value={
                     "missing_count": len(missing),
-                    "missing_by_split": dict(
-                        sorted(Counter(sample.split for sample in missing).items())
-                    ),
+                    "missing_by_split": missing["split"].value_counts().sort_index().to_dict(),
                 },
                 expected="split_group provenance for every current dataset image",
                 suggestion="recreate the dataset from the latest group-aware split before exporting",
             )
         )
 
-    group_split_counts: dict[str, Counter[str]] = defaultdict(Counter)
-    split_group_counts: dict[str, Counter[str]] = defaultdict(Counter)
-    for sample in dataset._samples:
-        group = str(sample.provenance["split_group"])
-        group_split_counts[group][sample.split] += 1
-        split_group_counts[sample.split][group] += 1
-
+    counts = samples.groupby(["group", "split"], sort=True).size().rename("images")
     overlaps = [
-        {
-            "group": group,
-            "splits": dict(sorted(counts.items())),
-        }
-        for group, counts in sorted(group_split_counts.items())
-        if len(counts) > 1
+        {"group": group, "splits": values.droplevel("group").to_dict()}
+        for group, values in counts.groupby(level="group", sort=True)
+        if len(values) > 1
     ]
     if overlaps:
         raise DatasetValidationError(
@@ -81,14 +76,15 @@ def audit_split_groups(
             )
         )
 
-    audited = _ordered_splits(split_group_counts)
+    audited = _ordered_splits(samples["split"])
     per_split = {
         split: {
-            "images": sum(split_group_counts[split].values()),
-            "distinct_groups": len(split_group_counts[split]),
-            "group_size": _size_distribution(split_group_counts[split].values()),
+            "images": int(len(rows)),
+            "distinct_groups": int(rows["group"].nunique()),
+            "group_size": _size_distribution(rows.groupby("group").size()),
         }
         for split in audited
+        for rows in [samples[samples["split"].eq(split)]]
     }
     report = {
         "schema_version": 1,
@@ -100,7 +96,7 @@ def audit_split_groups(
         "exported_splits": exported,
         "total": {
             "images": len(dataset._samples),
-            "distinct_groups": len(group_split_counts),
+            "distinct_groups": int(samples["group"].nunique()),
         },
         "splits": per_split,
         "overlap_count": 0,
@@ -178,12 +174,14 @@ def _ordered_splits(values: Iterable[str]) -> list[str]:
 
 
 def _size_distribution(values: Iterable[int]) -> dict[str, Any]:
-    sizes = sorted(int(value) for value in values)
-    histogram = Counter(sizes)
+    sizes = pd.Series(values, dtype="int64").sort_values()
     return {
-        "min": min(sizes),
-        "max": max(sizes),
-        "mean": statistics.mean(sizes),
-        "median": statistics.median(sizes),
-        "histogram": {str(size): histogram[size] for size in sorted(histogram)},
+        "min": int(sizes.min()),
+        "max": int(sizes.max()),
+        "mean": statistics.mean(sizes.tolist()),
+        "median": statistics.median(sizes.tolist()),
+        "histogram": {
+            str(size): int(count)
+            for size, count in sizes.value_counts().sort_index().items()
+        },
     }

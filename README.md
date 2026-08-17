@@ -217,6 +217,31 @@ exported = coverage.export(
 With `visualize=True`, `export()` and `export_formats()` display the exact
 saved `reports/plots.png` inline in a notebook. The same visualization options
 are accepted by direct `dataset.visualize()` calls as named arguments.
+The canonical report itself is also public:
+
+```python
+dataset.report()  # display the saved reports/plots.png
+dataset.report(destination="dataset-overview.png", show=False)
+
+comparison = baseline.compare(
+    candidate,
+    destination="dataset-comparison",
+    visualize_kwargs={"line_width": 2, "outline_width": 4},
+    show=False,
+)
+changed = comparison.images.loc[
+    comparison.images["status"].ne("unchanged")
+]
+```
+
+`Dataset.compare()` returns independent pandas tables in `overview`, `splits`,
+`classes`, and `images`. Its `plots.png` is the canonical report published by
+every dataset transaction: the transaction calls the same comparison function
+with its source as the baseline and its generated dataset as the candidate.
+The report includes per-dataset image-pixel distributions, image and annotated-
+object counts by split, annotated/background composition, class counts, source
+coverage and position distributions when available, and deterministic annotated
+examples. Visualization callbacks and line styling are forwarded unchanged.
 All public `visualize()` entry points share `samples`, `columns`, `seed`,
 `panel_size`, `zoom`, `context_fraction`, `minimum_context`, `label_fn`,
 `label_mode`, `line_width`, `outline_width`, `outline_alpha`, `destination`,
@@ -697,6 +722,9 @@ models = Model.load_many(
 comparison = models.compare(
     dataset,
     split="val",
+    # Put the canonical hash and wrapped human-readable model identity on
+    # separate lines. Use "hash" or "name" to show only one.
+    model_identity="both",
 )
 
 # Every comparison reports all unordered model pairs automatically.
@@ -722,6 +750,40 @@ exact model-name, case-ID, relative-path, metadata, and complete-mask match and
 refuses ambiguous matches. A successful migration records the trust decision
 under the current identity, so later calls should omit the option and reuse the
 cache normally.
+
+Model identity belongs to each `Model`, not the collection. `model.hash()`
+returns a compact eight-character W&B run ID when one exists and otherwise
+returns the first eight characters of the checkpoint/model-folder content
+SHA-256. Human-readable W&B run IDs remain in `model.wandb`, which is the
+normalized, openable run URL or `None`; `model.canonical_name` records the
+readable checkpoint/run creation timestamp. Architecture,
+prediction resolution, and training upscale remain separate model properties
+and are rendered as coloured slugs. Local checkpoints can attach the same
+provenance explicitly:
+
+```python
+model = Model(
+    "/models/islands.pt",
+    model_type="yolo26m-sem",
+    resolution=1024,
+    native_tile_size=512,
+    upscale_factor=2,
+    source_created_at="1786380390",  # Unix seconds are accepted
+    wandb=(
+        "wandb:max-planck-institute-for-animal-behavior/"
+        "schools-segmentation/i9xve33c"
+    ),
+)
+
+print(model.hash())           # i9xve33c
+print(model.wandb)            # openable https://wandb.ai/.../runs/i9xve33c
+print(model.canonical_name)   # 2026-08-10_16-46-30
+```
+
+The legacy `model.digest` content hash remains readable so existing caches can
+be discovered and promoted, but new cache keys and reports write only the
+canonical `model.hash()` identity. Collection-level `hashes` and `hash_for()`
+were removed; select the model and call `model.hash()` directly.
 
 `models.compare()` has no shared inference, resolution, threshold, protocol,
 comparison-space, comparison-unit, or model-reference options. Each model
@@ -840,6 +902,23 @@ random sample of non-empty ground-truth cases. Pass
 `predictions/<image>.png` grid per source image, with at most two model panels
 per row.
 
+Comparison and calibration result tables are pandas `DataFrame` objects with a
+stable `RangeIndex`. Use positional access with `.iloc`, keyed filtering with
+`.loc`, or select columns directly:
+
+```python
+best = comparison.ranking.iloc[0]
+scores = comparison.ranking[["model", "score", "ci_low", "ci_high"]]
+cache_hits = comparison.ranking.loc[
+    comparison.ranking["cache"].eq("hit"), ["model", "cache"]
+]
+
+calibrated = calibration.threshold_scores.loc[
+    calibration.threshold_scores["is_candidate"],
+    ["model", "prediction_threshold", "macro_dice"],
+]
+```
+
 ## Output and reproduction
 
 Derived datasets contain `{split}/images`, `{split}/labels`, `data.yaml`, and a
@@ -852,13 +931,13 @@ is the immediate-source snapshot;
 ultimate original; `reports/plots.png` summarizes the dataset as it is on disk.
 Publication remains atomic.
 
-`reports/plots.png` is regenerated from the physically present dataset rather
-than accumulated from previous operations. It shows the dataset name, task,
-format, and classes; one annotated/background composition bar per split with
-image counts and percentages; and one example row per split with four
-deterministically selected images, drawn with task-aware annotation overlays or
-red mask overlays for semantic datasets. Operation audits stay structured in
-`reports/dataset-info.json` instead of becoming report images.
+`reports/plots.png` is generated from the transaction's physical baseline and
+candidate through the same implementation as `Dataset.compare()`. It shows the
+dataset name, task, format, classes, annotated/background composition, and four
+deterministic examples for each available baseline and candidate split, using
+task-aware annotation overlays or red semantic-mask overlays. The comparison
+tables are available from public `Dataset.compare()` results; operation audits
+remain structured in `dataset-info.json` instead of becoming report images.
 
 Generated `data.yaml` files contain only relative split entries and metadata,
 with no `path` key, so a dataset resolves correctly wherever it is moved or

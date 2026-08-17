@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from ..errors import DatasetValidationError, ValidationIssue
 from ..planning import callback_description
 from ..sahi_support import reject_legacy_sahi_settings, resolve_sahi_settings
+from ..tabular import frame
 from ..utils import environment_snapshot, settings_fingerprint, to_jsonable
 from .cache import (
     build_staging_dir,
@@ -23,37 +24,26 @@ from .cache import (
     save_evaluation_cache,
 )
 from .cohort import check_training_provenance, freeze_cohort
-from .grouping import (
-    annotate_group_splits,
-    resolve_evaluation_groups,
-    resolve_group_splits,
-)
+from .analysis import analyze_grouped_metrics
+from .grouping import resolve_evaluation_groups, resolve_group_splits
 from .inference import resolve_backend, run_inference
 from .metrics import (
     binary_metric_breakdown,
     bootstrap_metric,
-    component_filtered_presence_breakdown,
-    component_filtered_presence_decisions,
     evaluate_configuration,
-    grouped_binary_metric_breakdown,
-    grouped_presence_metric_breakdown,
     paired_statistics,
     segmentation_binary_metric_rows,
 )
 from .object_sizes import (
-    evaluate_object_size_model,
+    apply_component_presence,
+    complete_object_size_analysis,
     object_size_report_artifacts_exist,
     polygon_components,
     prepare_object_size_reference,
-    render_grouped_metric_breakdown,
-    render_grouped_presence_metric_breakdown,
-    render_large_object_examples,
-    render_object_size_breakdown,
     render_segmentation_metric_breakdown,
-    select_large_examples,
     skipped_object_size_reference,
-    unavailable_object_size_summary,
 )
+from .plot_labels import model_full_label
 from .reporting import (
     combine_report_plots,
     render_figures,
@@ -68,7 +58,7 @@ if TYPE_CHECKING:
     from ..dataset import Dataset
 
 
-_MODEL_COMPARISON_REPORT_SCHEMA = 12
+_MODEL_COMPARISON_REPORT_SCHEMA = 13
 
 
 def _compare_models(
@@ -83,6 +73,7 @@ def _compare_models(
     errors: Literal["raise", "skip"] = "raise",
     min_connected_component_area: float | None = None,
     group_by: Callable[[Path], Hashable] | None = None,
+    model_identity: Literal["hash", "name", "both"] = "hash",
 ) -> ComparisonResult:
     """Evaluate multiple model configurations on one cryptographically frozen cohort."""
 
@@ -182,6 +173,7 @@ def _compare_models(
         "presence_min_connected_component_area": requested_component_area,
         "presence_threshold_default": "held-out-reference-object-p10",
         "grouping": group_settings,
+        "model_identity": model_identity,
         "models": model_systems,
         "source_size_policy": {
             "errors": errors,
@@ -191,7 +183,7 @@ def _compare_models(
             "skipped_inputs": geometry_skips,
         },
     }
-    model_hashes = {spec.name: spec.resolved_model.digest for spec in specs}
+    model_hashes = {spec.name: spec.resolved_model.hash() for spec in specs}
     fingerprint = settings_fingerprint(
         to_jsonable(
             {
@@ -200,7 +192,7 @@ def _compare_models(
                 "models": [
                     {
                         "name": spec.name,
-                        "sha256": model_hashes[spec.name],
+                        "hash": model_hashes[spec.name],
                         "resolution": spec.resolution,
                         "settings": spec.inference_overrides,
                     }
@@ -260,6 +252,8 @@ def _compare_models(
         cache_audit: dict[str, Any] = {}
         for spec in specs:
             sha = model_hashes[spec.name]
+            wandb = spec.resolved_model.wandb
+            previous_wandb_hash = wandb.rsplit("/", 1)[-1] if wandb else None
             spec_backend = model_backends[spec.name]
             model_outputs[spec.name] = _evaluate_model(
                 spec,
@@ -268,6 +262,12 @@ def _compare_models(
                 protocol=protocol,
                 cache_root=cache_root,
                 model_sha=sha,
+                legacy_sha=spec.resolved_model.digest,
+                legacy_wandb_hash=(
+                    previous_wandb_hash
+                    if previous_wandb_hash != sha
+                    else None
+                ),
                 device=spec.resolved_model.device,
                 progress=progress,
                 settings=dict(spec.inference_overrides),
@@ -333,7 +333,14 @@ def _compare_models(
             )
             rank_row = {
                 "model": spec.name,
+                "model_hash": spec.resolved_model.hash(),
+                "wandb": spec.resolved_model.wandb,
+                "canonical_name": spec.resolved_model.canonical_name,
+                "model_identity": model_identity,
                 "model_type": spec.resolved_model.model_type,
+                "source_created_at": spec.resolved_model.source_created_at,
+                "source_dataset_zip": spec.resolved_model.source_dataset_zip,
+                "upscale_factor": spec.resolved_model.upscale_factor,
                 "configuration": f"{spec.name}@{spec.resolution}/{output['backend']}",
                 "backend": output["backend"],
                 "metric": primary_metric,
@@ -356,6 +363,7 @@ def _compare_models(
                 "protocol_label": protocol,
                 **heldout_breakdown,
             }
+            rank_row["model_label"] = model_full_label(rank_row)
             if heldout_breakdown:
                 rank_row["heldout_projection"] = "instance-polygon-foreground-union"
                 segmentation_rows_by_model[spec.name] = heldout_rows
@@ -404,7 +412,7 @@ def _compare_models(
         )
         render_qualitative(
             temporary, cohort, best_predictions, best_confidences,
-            [row["model"] for row in ranking],
+            ranking,
             seed=seed,
         )
         reports_dir = temporary / "reports"
@@ -465,7 +473,7 @@ def _compare_models(
                 cohort,
                 best_predictions,
                 best_confidences,
-                [row["model"] for row in ranking],
+                ranking,
             )
 
         cache_verified = bool(cache_root) and all(bool(value.get("verified")) for value in cache_audit.values())
@@ -539,7 +547,7 @@ def _compare_models(
         )
     return ComparisonResult(
         location=target,
-        ranking=tuple(ranking),
+        ranking=frame(ranking),
         cohort_fingerprint=cohort.fingerprint,
         cohort_verified=True,
         training_overlap_detected=overlap,
@@ -601,68 +609,24 @@ def _analyze_native_object_sizes(
         connectivity=None,
         matching_class_policy="class-aware",
     )
-    resolved_component_area = (
-        requested_component_area
-        if requested_component_area is not None
-        else reference.p10_area
-    )
-    presence_analysis: dict[str, Any] = {
-        "raw_definition": "any predicted foreground pixel",
-        "component_filtered_definition": (
-            "at least one predicted 8-connected foreground component with "
-            "area greater than or equal to the resolved threshold"
-        ),
-        "connectivity": 8,
-        "requested_min_connected_component_area_px": requested_component_area,
-        "resolved_min_connected_component_area_px": resolved_component_area,
-        "threshold_source": (
-            "explicit"
-            if requested_component_area is not None
-            else "held-out-reference-object-p10"
-        ),
+    component_areas = {
+        name: {
+            str(row["case_id"]): list(row.get("prediction_component_areas", []))
+            for row in rows
+        }
+        for name, rows in segmentation_rows_by_model.items()
     }
-    if resolved_component_area is None:
-        presence_analysis.update(
-            status="skipped",
-            reason=(
-                "minimum connected-component area is unavailable because the "
-                "held-out cohort has no reference foreground objects"
-            ),
-        )
-    else:
-        presence_analysis["status"] = "complete"
-        for row in ranking:
-            model_name = str(row["model"])
-            component_areas = {
-                str(metric_row["case_id"]): list(
-                    metric_row.get("prediction_component_areas", [])
-                )
-                for metric_row in segmentation_rows_by_model[model_name]
-            }
-            row.update(
-                component_filtered_presence_breakdown(
-                    segmentation_rows_by_model[model_name],
-                    component_areas,
-                    resolved_component_area,
-                )
-            )
-            decisions = component_filtered_presence_decisions(
-                segmentation_rows_by_model[model_name],
-                component_areas,
-                resolved_component_area,
-            )
-            for metric_row in segmentation_rows_by_model[model_name]:
-                case_id = str(metric_row.get("case_id", metric_row.get("image_id")))
-                metric_row["component_filtered_predicted_presence"] = decisions[
-                    case_id
-                ]
+    presence_analysis = apply_component_presence(
+        reference, ranking, segmentation_rows_by_model, component_areas, requested_component_area
+    )
+    backends = {str(row["model"]): str(row.get("backend") or "unknown") for row in ranking}
     if reference.status != "complete":
-        for row in ranking:
-            row.update(unavailable_object_size_summary())
-        return reference.metadata(), None, [], presence_analysis
+        metadata, path, examples = complete_object_size_analysis(
+            reference, {}, ranking, reports, backends=backends
+        )
+        return metadata, path, examples, presence_analysis
 
     predictions: dict[str, dict[str, tuple[Any, ...]]] = {}
-    results = {}
     for row in ranking:
         model_name = str(row["model"])
         confidence = confidences_by_model[model_name]
@@ -686,25 +650,10 @@ def _analyze_native_object_sizes(
             for record in cohort.records
         }
         predictions[model_name] = by_image
-        result = evaluate_object_size_model(reference, by_image)
-        results[model_name] = result
-        row.update(result.summary)
-
-    size_path = render_object_size_breakdown(reports, ranking, reference)
-    examples = render_large_object_examples(
-        reports,
-        select_large_examples(reference, results),
-        predictions,
-        results,
-        {
-            str(row["model"]): str(row.get("backend") or "unknown")
-            for row in ranking
-        },
+    metadata, path, examples = complete_object_size_analysis(
+        reference, predictions, ranking, reports, backends=backends
     )
-    relative_size_path = (
-        str(size_path.relative_to(reports.parent)) if size_path is not None else None
-    )
-    return reference.metadata(), relative_size_path, examples, presence_analysis
+    return metadata, path, examples, presence_analysis
 
 
 def _analyze_native_groups(
@@ -723,86 +672,9 @@ def _analyze_native_groups(
             "reason": "grouped binary-mask metrics apply only to segmentation comparisons",
         }, None
 
-    group_splits = dict((group_settings or {}).get("group_splits") or {})
-
-    by_model: dict[str, dict[str, Any]] = {}
-    for row in ranking:
-        model_name = str(row["model"])
-        result = grouped_binary_metric_breakdown(rows_by_model[model_name], groups)
-        annotate_group_splits(result, group_splits)
-        by_model[model_name] = result
-        row.update({key: value for key, value in result.items() if key != "per_group"})
-
-    presence_by_model: dict[str, dict[str, Any]] = {}
-    presence_available = all(
-        "component_filtered_predicted_presence" in metric_row
-        for model_rows in rows_by_model.values()
-        for metric_row in model_rows
-    )
-    presence_reports: dict[str, str | None] = {
-        "precision": None,
-        "recall": None,
-        "f1": None,
-    }
-    if presence_available:
-        for row in ranking:
-            model_name = str(row["model"])
-            decisions = {
-                str(metric_row.get("case_id", metric_row.get("image_id"))): bool(
-                    metric_row["component_filtered_predicted_presence"]
-                )
-                for metric_row in rows_by_model[model_name]
-            }
-            result = grouped_presence_metric_breakdown(
-                rows_by_model[model_name],
-                groups,
-                decisions,
-            )
-            annotate_group_splits(result, group_splits)
-            presence_by_model[model_name] = result
-            row.update(
-                {key: value for key, value in result.items() if key != "per_group"}
-            )
-    path = render_grouped_metric_breakdown(
-        reports,
-        ranking,
-        by_model,
-        group_splits=group_splits,
-    )
-    if presence_available:
-        for metric in presence_reports:
-            presence_path = render_grouped_presence_metric_breakdown(
-                reports,
-                ranking,
-                presence_by_model,
-                metric=metric,
-                group_splits=group_splits,
-            )
-            presence_reports[metric] = str(
-                presence_path.relative_to(reports.parent)
-            )
-    return (
-        {
-            "status": "complete",
-            "aggregation": "pool TP/FP/FN within group, then macro-average group scores",
-            "primary_ranking_unchanged": True,
-            "grouping": dict(group_settings or {}),
-            "models": by_model,
-            "presence": {
-                "status": "complete" if presence_available else "skipped",
-                "prediction_definition": (
-                    "at least one predicted 8-connected foreground component "
-                    "at or above the resolved area threshold"
-                ),
-                "aggregation": (
-                    "pool image-level TP/FP/FN/TN within group, then "
-                    "macro-average defined group scores"
-                ),
-                "models": presence_by_model,
-            },
-            "reports": presence_reports,
-        },
-        str(path.relative_to(reports.parent)),
+    return analyze_grouped_metrics(
+        rows_by_model, groups, ranking, reports,
+        group_settings=group_settings, aggregation_unit="image",
     )
 
 
@@ -810,34 +682,47 @@ def _evaluate_model(
     spec: ModelSpec,
     cohort: Cohort,
     *, backend: str, protocol: str, cache_root: Path,
-    model_sha: str, device: str | None, progress: bool,
+    model_sha: str, legacy_sha: str, legacy_wandb_hash: str | None,
+    device: str | None, progress: bool,
     settings: dict[str, Any],
 ) -> dict[str, Any]:
     confidence = float(spec.confidence)
     postprocess = float(spec.postprocess)
     floor = confidence
-    evaluation_key = cache_key(
-        {
-            "schema": 1,
-            "model_sha256": model_sha,
-            "cohort_fingerprint": cohort.fingerprint,
-            "task": cohort.task,
-            "classes": cohort.classes,
-            "backend": backend,
-            "resolution": spec.resolution,
-            "confidence": confidence,
-            "postprocess": postprocess,
-            "protocol": protocol,
-            "settings": settings,
-        }
+    evaluation_payload = {
+        "schema": 1,
+        "model_hash": model_sha,
+        "cohort_fingerprint": cohort.fingerprint,
+        "task": cohort.task,
+        "classes": cohort.classes,
+        "backend": backend,
+        "resolution": spec.resolution,
+        "confidence": confidence,
+        "postprocess": postprocess,
+        "protocol": protocol,
+        "settings": settings,
+    }
+    evaluation_key = cache_key(evaluation_payload)
+    old_model_hashes = tuple(dict.fromkeys(
+        value
+        for value in (legacy_wandb_hash, legacy_sha)
+        if value and value != model_sha
+    ))
+    compatible_evaluation_keys = tuple(
+        cache_key({**evaluation_payload, "model_hash": value})
+        for value in old_model_hashes
     )
+    legacy_evaluation_payload = dict(evaluation_payload)
+    legacy_evaluation_payload["model_sha256"] = legacy_sha
+    legacy_evaluation_payload.pop("model_hash")
+    legacy_evaluation_key = cache_key(legacy_evaluation_payload)
 
     def get_predictions(active: Cohort, active_posts: tuple[float, ...]) -> tuple[dict[float, dict[str, list[Prediction]]], dict[str, Any], dict[str, float]]:
         # Execution choices such as device and batch size are deliberately not
         # part of this payload. They change how inference runs, not its logical
         # model/dataset/prediction identity.
         payload = {
-            "model_sha256": model_sha, "cohort_fingerprint": active.fingerprint, "task": active.task,
+            "model_hash": model_sha, "cohort_fingerprint": active.fingerprint, "task": active.task,
             "classes": active.classes, "backend": backend,
             "resolution": spec.resolution, "confidence_floor": floor, "postprocess_thresholds": active_posts,
             "settings": settings,
@@ -854,8 +739,40 @@ def _evaluate_model(
         loaded, shards, complete = load_package_cache(
             root, active, active_posts, progress=progress
         )
+        if not complete:
+            legacy_identity = dict(prediction_identity)
+            legacy_identity["model_sha256"] = legacy_sha
+            legacy_identity.pop("model_hash")
+            compatible_identities = (
+                *((
+                    "wandb-hash-package"
+                    if value == legacy_wandb_hash
+                    else "full-hash-package",
+                    {**prediction_identity, "model_hash": value},
+                ) for value in old_model_hashes),
+                ("legacy-package", legacy_identity),
+            )
+            for legacy_source, compatible_identity in compatible_identities:
+                compatible_root = model_cache_dir(
+                    cache_root, spec.name, cache_key(compatible_identity)
+                )
+                compatible_loaded, compatible_shards, compatible_complete = (
+                    load_package_cache(
+                        compatible_root,
+                        active,
+                        active_posts,
+                        progress=progress,
+                    )
+                )
+                if len(compatible_loaded) > len(loaded):
+                    loaded = compatible_loaded
+                    shards = compatible_shards
+                    complete = compatible_complete
+                    source = legacy_source
+                if complete:
+                    break
         if complete:
-            source = "package"
+            source = "package" if source == "fresh" else source
             if progress:
                 print(f"Cache hit: {spec.name} ({shards} prediction shards)")
         checkpointed = dict(loaded)
@@ -900,7 +817,18 @@ def _evaluate_model(
         return predictions, {"source": source, "verified": verified, "shards": shards, "root": str(root)}, {"inference_seconds": inference_seconds, **timings}
 
     grid: list[dict[str, Any]] = []
-    cached_evaluation = load_evaluation_cache(cache_root, evaluation_key)
+    cached_evaluation = next(
+        (
+            cached
+            for key in (
+                evaluation_key,
+                *compatible_evaluation_keys,
+                legacy_evaluation_key,
+            )
+            if (cached := load_evaluation_cache(cache_root, key)) is not None
+        ),
+        None,
+    )
     if cached_evaluation is not None:
         selected_post = float(cached_evaluation["best_postprocess"])
         evaluation_predictions, cache_info, timing = get_predictions(cohort, (selected_post,))
@@ -992,7 +920,7 @@ def _bounded_worst_cases(rows: list[dict[str, Any]], *, limit: int = 12) -> list
 def _result_from_manifest(target: Path, manifest: dict[str, Any]) -> ComparisonResult:
     return ComparisonResult(
         location=target,
-        ranking=tuple(manifest.get("ranking") or ()),
+        ranking=frame(manifest.get("ranking") or ()),
         cohort_fingerprint=str(manifest.get("cohort_fingerprint") or ""),
         cohort_verified=bool(manifest.get("cohort_verified")),
         training_overlap_detected=bool(manifest.get("training_overlap_detected")),

@@ -6,10 +6,13 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from PIL import Image, ImageDraw
 from scipy import ndimage
+from tqdm import tqdm
 
 from ..errors import DatasetValidationError
+from ..tabular import TableLike, frame
 from .types import Cohort, Prediction
 
 
@@ -117,84 +120,48 @@ def evaluate_configuration(
     return {"summary": summary, "per_image": rows, "per_class": per_class, "pr": ap["pr"]}
 
 
-def binary_metric_breakdown(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def binary_metric_breakdown(rows: TableLike) -> dict[str, Any]:
     """Summarize final binary source-image masks without background dominance."""
 
-    positive_rows = [row for row in rows if float(row["n_ref"]) > 0]
-    empty_rows = [row for row in rows if float(row["n_ref"]) == 0]
-
-    def totals(selected: list[dict[str, Any]]) -> tuple[int, int, int]:
-        return (
-            sum(int(row["tp"]) for row in selected),
-            sum(int(row["fp"]) for row in selected),
-            sum(int(row["fn"]) for row in selected),
-        )
-
-    def ratio(numerator: float, denominator: float) -> float:
-        return numerator / denominator if denominator else math.nan
-
-    tp, fp, fn = totals(rows)
-    positive_tp, positive_fp, positive_fn = totals(positive_rows)
-    empty_false_positive_rows = [
-        row for row in empty_rows if float(row["n_pred"]) > 0
-    ]
-    positive_missed_rows = [
-        row for row in positive_rows if float(row["n_pred"]) == 0
-    ]
-    empty_false_positive_pixels = sum(int(row["fp"]) for row in empty_rows)
-    positive_detected_cases = len(positive_rows) - len(positive_missed_rows)
-    empty_false_positive_cases = len(empty_false_positive_rows)
-    positive_image_recall = ratio(positive_detected_cases, len(positive_rows))
-    empty_image_specificity = ratio(
-        len(empty_rows) - empty_false_positive_cases,
-        len(empty_rows),
+    data = frame(rows)
+    positive = data[data["n_ref"].astype(float).gt(0)]
+    empty = data[data["n_ref"].astype(float).eq(0)]
+    tp, fp, fn = _confusion_totals(data)
+    positive_tp, positive_fp, positive_fn = _confusion_totals(positive)
+    positive_detected_cases = int(positive["n_pred"].astype(float).gt(0).sum())
+    empty_false_positive_cases = int(empty["n_pred"].astype(float).gt(0).sum())
+    empty_false_positive_pixels = int(empty["fp"].sum())
+    positive_image_recall = _ratio(positive_detected_cases, len(positive))
+    empty_image_specificity = _ratio(
+        len(empty) - empty_false_positive_cases, len(empty)
     )
-    empty_image_false_positive_rate = ratio(
-        empty_false_positive_cases,
-        len(empty_rows),
-    )
-    presence_precision = ratio(
-        positive_detected_cases,
-        positive_detected_cases + empty_false_positive_cases,
+    empty_image_false_positive_rate = _ratio(empty_false_positive_cases, len(empty))
+    presence_precision = _ratio(
+        positive_detected_cases, positive_detected_cases + empty_false_positive_cases
     )
 
     return {
-        "micro_dice": ratio(2 * tp, 2 * tp + fp + fn),
-        "micro_iou": ratio(tp, tp + fp + fn),
-        "foreground_precision": ratio(tp, tp + fp),
-        "foreground_recall": ratio(tp, tp + fn),
-        "positive_case_dice": _safe_mean([row["dice"] for row in positive_rows]),
-        "positive_case_iou": _safe_mean([row["iou"] for row in positive_rows]),
-        "positive_micro_dice": ratio(
-            2 * positive_tp,
-            2 * positive_tp + positive_fp + positive_fn,
-        ),
-        "positive_micro_iou": ratio(
-            positive_tp,
-            positive_tp + positive_fp + positive_fn,
-        ),
-        "positive_foreground_precision": ratio(
-            positive_tp,
-            positive_tp + positive_fp,
-        ),
-        "positive_foreground_recall": ratio(
-            positive_tp,
-            positive_tp + positive_fn,
-        ),
-        "positive_cases": len(positive_rows),
+        "micro_dice": _ratio(2 * tp, 2 * tp + fp + fn),
+        "micro_iou": _ratio(tp, tp + fp + fn),
+        "foreground_precision": _ratio(tp, tp + fp),
+        "foreground_recall": _ratio(tp, tp + fn),
+        "positive_case_dice": _series_mean(positive["dice"]),
+        "positive_case_iou": _series_mean(positive["iou"]),
+        "positive_micro_dice": _ratio(2 * positive_tp, 2 * positive_tp + positive_fp + positive_fn),
+        "positive_micro_iou": _ratio(positive_tp, positive_tp + positive_fp + positive_fn),
+        "positive_foreground_precision": _ratio(positive_tp, positive_tp + positive_fp),
+        "positive_foreground_recall": _ratio(positive_tp, positive_tp + positive_fn),
+        "positive_cases": len(positive),
         "positive_detected_cases": positive_detected_cases,
-        "positive_missed_cases": len(positive_missed_rows),
+        "positive_missed_cases": len(positive) - positive_detected_cases,
         "positive_image_recall": positive_image_recall,
-        "empty_cases": len(empty_rows),
-        "empty_correct_cases": len(empty_rows) - empty_false_positive_cases,
+        "empty_cases": len(empty),
+        "empty_correct_cases": len(empty) - empty_false_positive_cases,
         "empty_false_positive_cases": empty_false_positive_cases,
         "empty_image_specificity": empty_image_specificity,
         "empty_image_false_positive_rate": empty_image_false_positive_rate,
         "empty_false_positive_pixels": empty_false_positive_pixels,
-        "empty_mean_false_positive_pixels": ratio(
-            empty_false_positive_pixels,
-            len(empty_rows),
-        ),
+        "empty_mean_false_positive_pixels": _ratio(empty_false_positive_pixels, len(empty)),
         # The historical unsuffixed image-level fields remain the raw
         # any-foreground-pixel metrics. Explicit aliases make comparison with
         # the connected-component-filtered variants unambiguous in reports.
@@ -207,7 +174,7 @@ def binary_metric_breakdown(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def component_filtered_presence_breakdown(
-    rows: list[dict[str, Any]],
+    rows: TableLike,
     prediction_component_areas: Mapping[str, Sequence[float]],
     minimum_component_area: float,
 ) -> dict[str, Any]:
@@ -219,58 +186,31 @@ def component_filtered_presence_breakdown(
     greater than or equal to ``minimum_component_area``.
     """
 
-    positive_rows = [row for row in rows if float(row["n_ref"]) > 0]
-    empty_rows = [row for row in rows if float(row["n_ref"]) == 0]
-
-    decisions = component_filtered_presence_decisions(
-        rows,
-        prediction_component_areas,
-        minimum_component_area,
-    )
-
-    def row_id(row: Mapping[str, Any]) -> str:
-        return str(row.get("case_id", row.get("image_id")))
-
-    def predicted(row: Mapping[str, Any]) -> bool:
-        return decisions[row_id(row)]
-
-    positive_detected = sum(predicted(row) for row in positive_rows)
-    empty_false_positive = sum(predicted(row) for row in empty_rows)
-
-    def ratio(numerator: float, denominator: float) -> float:
-        return numerator / denominator if denominator else math.nan
+    data = frame(rows)
+    decisions = component_filtered_presence_decisions(data, prediction_component_areas, minimum_component_area)
+    identifiers = _case_ids(data, "Presence rows require a case_id or image_id for component filtering")
+    predicted = identifiers.map(decisions).astype(bool)
+    positive = data["n_ref"].astype(float).gt(0)
+    positive_detected = int((positive & predicted).sum())
+    empty_false_positive = int((~positive & predicted).sum())
+    positive_cases = int(positive.sum())
+    empty_cases = int((~positive).sum())
 
     return {
         "min_connected_component_area": float(minimum_component_area),
         "component_filtered_positive_detected_cases": positive_detected,
-        "component_filtered_positive_missed_cases": (
-            len(positive_rows) - positive_detected
-        ),
-        "component_filtered_positive_image_recall": ratio(
-            positive_detected,
-            len(positive_rows),
-        ),
-        "component_filtered_empty_correct_cases": (
-            len(empty_rows) - empty_false_positive
-        ),
+        "component_filtered_positive_missed_cases": positive_cases - positive_detected,
+        "component_filtered_positive_image_recall": _ratio(positive_detected, positive_cases),
+        "component_filtered_empty_correct_cases": empty_cases - empty_false_positive,
         "component_filtered_empty_false_positive_cases": empty_false_positive,
-        "component_filtered_empty_image_specificity": ratio(
-            len(empty_rows) - empty_false_positive,
-            len(empty_rows),
-        ),
-        "component_filtered_empty_image_false_positive_rate": ratio(
-            empty_false_positive,
-            len(empty_rows),
-        ),
-        "component_filtered_presence_precision": ratio(
-            positive_detected,
-            positive_detected + empty_false_positive,
-        ),
+        "component_filtered_empty_image_specificity": _ratio(empty_cases - empty_false_positive, empty_cases),
+        "component_filtered_empty_image_false_positive_rate": _ratio(empty_false_positive, empty_cases),
+        "component_filtered_presence_precision": _ratio(positive_detected, positive_detected + empty_false_positive),
     }
 
 
 def component_filtered_presence_decisions(
-    rows: Sequence[Mapping[str, Any]],
+    rows: TableLike,
     prediction_component_areas: Mapping[str, Sequence[float]],
     minimum_component_area: float,
 ) -> dict[str, bool]:
@@ -280,19 +220,11 @@ def component_filtered_presence_decisions(
     if not math.isfinite(threshold) or threshold <= 0:
         raise ValueError("minimum_component_area must be finite and greater than zero")
 
-    def row_id(row: Mapping[str, Any]) -> str:
-        value = row.get("case_id", row.get("image_id"))
-        if value is None:
-            raise ValueError(
-                "Presence rows require a case_id or image_id for component filtering"
-            )
-        return str(value)
-
-    missing = sorted(
-        row_id(row)
-        for row in rows
-        if row_id(row) not in prediction_component_areas
+    identifiers = _case_ids(
+        frame(rows),
+        "Presence rows require a case_id or image_id for component filtering",
     )
+    missing = sorted(set(identifiers) - set(prediction_component_areas))
     if missing:
         raise ValueError(
             "Prediction component areas are missing evaluation cases: "
@@ -300,154 +232,132 @@ def component_filtered_presence_decisions(
         )
 
     return {
-        row_id(row): any(
-            float(area) >= threshold
-            for area in prediction_component_areas[row_id(row)]
-        )
-        for row in rows
+        case_id: any(float(area) >= threshold for area in prediction_component_areas[case_id])
+        for case_id in identifiers
     }
 
 
 def grouped_presence_metric_breakdown(
-    rows: list[dict[str, Any]],
+    rows: TableLike,
     groups: Mapping[str, str],
     predicted_presence: Mapping[str, bool],
 ) -> dict[str, Any]:
     """Pool image-level presence confusion within groups and macro-average."""
 
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-
-    def row_id(row: Mapping[str, Any]) -> str:
-        value = row.get("case_id", row.get("image_id"))
-        if value is None:
-            raise ValueError("Grouped presence rows require a case_id or image_id")
-        return str(value)
-
-    for row in rows:
-        case_id = row_id(row)
-        if case_id not in groups:
-            raise ValueError(f"No group was resolved for evaluation case {case_id!r}")
-        if case_id not in predicted_presence:
-            raise ValueError(
-                f"No filtered presence decision was resolved for case {case_id!r}"
-            )
-        grouped[str(groups[case_id])].append(row)
-
-    def ratio(numerator: float, denominator: float) -> float:
-        return numerator / denominator if denominator else math.nan
-
-    per_group: list[dict[str, Any]] = []
-    for group in sorted(grouped):
-        selected = grouped[group]
-        tp = fp = fn = tn = 0
-        for row in selected:
-            reference = float(row["n_ref"]) > 0
-            prediction = bool(predicted_presence[row_id(row)])
-            if reference and prediction:
-                tp += 1
-            elif prediction:
-                fp += 1
-            elif reference:
-                fn += 1
-            else:
-                tn += 1
-        per_group.append(
-            {
-                "group": group,
-                "cases": len(selected),
-                "positive_cases": tp + fn,
-                "empty_cases": tn + fp,
-                "presence_tp": tp,
-                "presence_fp": fp,
-                "presence_fn": fn,
-                "presence_tn": tn,
-                "presence_precision": ratio(tp, tp + fp),
-                "presence_recall": ratio(tp, tp + fn),
-                "presence_f1": ratio(2 * tp, 2 * tp + fp + fn),
-            }
-        )
+    data = frame(rows)
+    identifiers = _case_ids(data, "Grouped presence rows require a case_id or image_id")
+    _require_case_mapping(identifiers, groups, "No group was resolved for evaluation case {case_id!r}")
+    _require_case_mapping(identifiers, predicted_presence, "No filtered presence decision was resolved for case {case_id!r}")
+    reference = data["n_ref"].astype(float).gt(0)
+    prediction = identifiers.map(predicted_presence).astype(bool)
+    data = data.assign(
+        group=identifiers.map(groups).astype(str),
+        positive_cases=reference.astype(int),
+        empty_cases=(~reference).astype(int),
+        presence_tp=(reference & prediction).astype(int),
+        presence_fp=(~reference & prediction).astype(int),
+        presence_fn=(reference & ~prediction).astype(int),
+        presence_tn=(~reference & ~prediction).astype(int),
+    )
+    per_group = data.groupby("group", sort=True, as_index=False).agg(
+        cases=("group", "size"),
+        positive_cases=("positive_cases", "sum"),
+        empty_cases=("empty_cases", "sum"),
+        presence_tp=("presence_tp", "sum"),
+        presence_fp=("presence_fp", "sum"),
+        presence_fn=("presence_fn", "sum"),
+        presence_tn=("presence_tn", "sum"),
+    )
+    per_group["presence_precision"] = _series_ratio(per_group["presence_tp"], per_group["presence_tp"] + per_group["presence_fp"])
+    per_group["presence_recall"] = _series_ratio(per_group["presence_tp"], per_group["presence_tp"] + per_group["presence_fn"])
+    per_group["presence_f1"] = _series_ratio(2 * per_group["presence_tp"], 2 * per_group["presence_tp"] + per_group["presence_fp"] + per_group["presence_fn"])
 
     return {
         "group_count": len(per_group),
-        "group_defined_presence_precision_count": sum(
-            math.isfinite(float(row["presence_precision"])) for row in per_group
-        ),
-        "group_defined_presence_recall_count": sum(
-            math.isfinite(float(row["presence_recall"])) for row in per_group
-        ),
-        "group_defined_presence_f1_count": sum(
-            math.isfinite(float(row["presence_f1"])) for row in per_group
-        ),
-        "group_macro_presence_precision": _safe_mean(
-            [row["presence_precision"] for row in per_group]
-        ),
-        "group_macro_presence_recall": _safe_mean(
-            [row["presence_recall"] for row in per_group]
-        ),
-        "group_macro_presence_f1": _safe_mean(
-            [row["presence_f1"] for row in per_group]
-        ),
-        "per_group": per_group,
+        "group_defined_presence_precision_count": int(np.isfinite(per_group["presence_precision"]).sum()),
+        "group_defined_presence_recall_count": int(np.isfinite(per_group["presence_recall"]).sum()),
+        "group_defined_presence_f1_count": int(np.isfinite(per_group["presence_f1"]).sum()),
+        "group_macro_presence_precision": _series_mean(per_group["presence_precision"]),
+        "group_macro_presence_recall": _series_mean(per_group["presence_recall"]),
+        "group_macro_presence_f1": _series_mean(per_group["presence_f1"]),
+        "per_group": per_group.to_dict(orient="records"),
     }
 
 
 def grouped_binary_metric_breakdown(
-    rows: list[dict[str, Any]],
+    rows: TableLike,
     groups: Mapping[str, str],
 ) -> dict[str, Any]:
     """Pool pixel confusion within groups, then macro-average across groups."""
 
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        value = row.get("case_id", row.get("image_id"))
-        if value is None:
-            raise ValueError("Grouped metric rows require a case_id or image_id")
-        case_id = str(value)
-        if case_id not in groups:
-            raise ValueError(f"No group was resolved for evaluation case {case_id!r}")
-        grouped[str(groups[case_id])].append(row)
-
-    per_group: list[dict[str, Any]] = []
-    for group in sorted(grouped):
-        selected = grouped[group]
-        tp = sum(int(row["tp"]) for row in selected)
-        fp = sum(int(row["fp"]) for row in selected)
-        fn = sum(int(row["fn"]) for row in selected)
-
-        def ratio(numerator: float, denominator: float) -> float:
-            return numerator / denominator if denominator else math.nan
-
-        per_group.append(
-            {
-                "group": group,
-                "cases": len(selected),
-                "positive_cases": sum(float(row["n_ref"]) > 0 for row in selected),
-                "empty_cases": sum(float(row["n_ref"]) == 0 for row in selected),
-                "tp": tp,
-                "fp": fp,
-                "fn": fn,
-                "dice": ratio(2 * tp, 2 * tp + fp + fn),
-                "iou": ratio(tp, tp + fp + fn),
-                "foreground_precision": ratio(tp, tp + fp),
-                "foreground_recall": ratio(tp, tp + fn),
-            }
-        )
+    data = frame(rows)
+    identifiers = _case_ids(data, "Grouped metric rows require a case_id or image_id")
+    _require_case_mapping(identifiers, groups, "No group was resolved for evaluation case {case_id!r}")
+    reference = data["n_ref"].astype(float)
+    data = data.assign(
+        group=identifiers.map(groups).astype(str),
+        positive_cases=reference.gt(0).astype(int),
+        empty_cases=reference.eq(0).astype(int),
+    )
+    per_group = data.groupby("group", sort=True, as_index=False).agg(
+        cases=("group", "size"),
+        positive_cases=("positive_cases", "sum"),
+        empty_cases=("empty_cases", "sum"),
+        tp=("tp", "sum"), fp=("fp", "sum"), fn=("fn", "sum"),
+    )
+    per_group["dice"] = _series_ratio(2 * per_group["tp"], 2 * per_group["tp"] + per_group["fp"] + per_group["fn"])
+    per_group["iou"] = _series_ratio(per_group["tp"], per_group["tp"] + per_group["fp"] + per_group["fn"])
+    per_group["foreground_precision"] = _series_ratio(per_group["tp"], per_group["tp"] + per_group["fp"])
+    per_group["foreground_recall"] = _series_ratio(per_group["tp"], per_group["tp"] + per_group["fn"])
 
     return {
         "group_count": len(per_group),
-        "group_defined_dice_count": sum(
-            math.isfinite(float(row["dice"])) for row in per_group
-        ),
-        "group_macro_dice": _safe_mean([row["dice"] for row in per_group]),
-        "group_macro_iou": _safe_mean([row["iou"] for row in per_group]),
-        "group_macro_foreground_precision": _safe_mean(
-            [row["foreground_precision"] for row in per_group]
-        ),
-        "group_macro_foreground_recall": _safe_mean(
-            [row["foreground_recall"] for row in per_group]
-        ),
-        "per_group": per_group,
+        "group_defined_dice_count": int(np.isfinite(per_group["dice"]).sum()),
+        "group_macro_dice": _series_mean(per_group["dice"]),
+        "group_macro_iou": _series_mean(per_group["iou"]),
+        "group_macro_foreground_precision": _series_mean(per_group["foreground_precision"]),
+        "group_macro_foreground_recall": _series_mean(per_group["foreground_recall"]),
+        "per_group": per_group.to_dict(orient="records"),
     }
+
+
+def _case_ids(data: pd.DataFrame, error: str) -> pd.Series:
+    identifiers = data.get("case_id")
+    if identifiers is None:
+        identifiers = data.get("image_id")
+    elif "image_id" in data:
+        identifiers = identifiers.fillna(data["image_id"])
+    if identifiers is None or identifiers.isna().any():
+        raise ValueError(error)
+    return identifiers.astype(str)
+
+
+def _require_case_mapping(
+    identifiers: pd.Series,
+    values: Mapping[str, Any],
+    error: str,
+) -> None:
+    missing = identifiers[~identifiers.isin(values)]
+    if not missing.empty:
+        raise ValueError(error.format(case_id=missing.iloc[0]))
+
+
+def _confusion_totals(data: pd.DataFrame) -> tuple[int, int, int]:
+    totals = data.reindex(columns=["tp", "fp", "fn"], fill_value=0).sum()
+    return int(totals["tp"]), int(totals["fp"]), int(totals["fn"])
+
+
+def _ratio(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else math.nan
+
+
+def _series_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    return numerator.astype(float).div(denominator.astype(float).where(denominator.ne(0)))
+
+
+def _series_mean(values: pd.Series) -> float:
+    finite = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return float(finite.mean()) if finite.notna().any() else math.nan
 
 
 def segmentation_binary_metric_breakdown(
@@ -672,50 +582,85 @@ def paired_statistics(
 ) -> list[dict[str, Any]]:
     """Compute every unordered model pair with no designated model reference."""
 
+    return paired_score_statistics(
+        {name: pd.Series(_cluster_scores(rows), dtype=float) for name, rows in rows_by_model.items()},
+        metric="ultimate_original_macro_f1",
+        difference_name="difference_b_minus_a",
+        support_name="independent_clusters",
+        resamples=resamples,
+        seed=seed,
+    )
+
+
+def paired_score_statistics(
+    scores_by_model: Mapping[str, pd.Series],
+    *,
+    metric: str,
+    difference_name: str,
+    support_name: str,
+    resamples: int,
+    seed: int,
+    include_wins: bool = False,
+    include_difference_alias: bool = True,
+    progress: bool = False,
+    progress_description: str = "Computing paired statistics",
+) -> list[dict[str, Any]]:
+    """Bootstrap paired score differences from aligned pandas Series."""
+
     rng = np.random.default_rng(seed)
     output: list[dict[str, Any]] = []
     raw_p: list[float] = []
-    scores_by_model = {
-        name: _cluster_scores(rows) for name, rows in rows_by_model.items()
-    }
-    names = list(rows_by_model)
-    for left_index, model_a in enumerate(names):
-        for model_b in names[left_index + 1 :]:
-            scores_a = scores_by_model[model_a]
-            scores_b = scores_by_model[model_b]
-            keys = sorted(set(scores_a) & set(scores_b))
-            differences = np.asarray(
-                [scores_b[key] - scores_a[key] for key in keys], dtype=float
+    names = list(scores_by_model)
+    pairs = [
+        (model_a, model_b)
+        for left_index, model_a in enumerate(names)
+        for model_b in names[left_index + 1 :]
+    ]
+    for model_a, model_b in tqdm(
+        pairs,
+        desc=progress_description,
+        unit="pair",
+        disable=not progress,
+        dynamic_ncols=True,
+    ):
+        paired = pd.concat(
+            [scores_by_model[model_a].rename("a"), scores_by_model[model_b].rename("b")],
+            axis=1,
+            join="inner",
+        ).sort_index()
+        paired = paired.replace([np.inf, -np.inf], np.nan).dropna()
+        differences = (paired["b"] - paired["a"]).to_numpy(dtype=float)
+        if not len(differences):
+            continue
+        samples = rng.choice(
+            differences, size=(resamples, len(differences)), replace=True
+        ).mean(axis=1)
+        signs = rng.choice((-1.0, 1.0), size=(resamples, len(differences)))
+        randomized = (differences * signs).mean(axis=1)
+        p = float(
+            (np.sum(np.abs(randomized) >= abs(differences.mean())) + 1)
+            / (resamples + 1)
+        )
+        raw_p.append(p)
+        difference = float(differences.mean())
+        row = {
+            "model_a": model_a, "model_b": model_b, "metric": metric,
+            difference_name: difference, "ci_low": float(np.quantile(samples, 0.025)),
+            "ci_high": float(np.quantile(samples, 0.975)), "p_value": p,
+            support_name: len(differences),
+        }
+        if include_difference_alias and difference_name != "difference":
+            row["difference"] = difference
+        if include_wins:
+            row.update(
+                wins_model_b=int(np.sum(differences > 0)),
+                ties=int(np.sum(differences == 0)),
+                wins_model_a=int(np.sum(differences < 0)),
             )
-            if not len(differences):
-                continue
-            samples = rng.choice(
-                differences, size=(resamples, len(differences)), replace=True
-            ).mean(axis=1)
-            signs = rng.choice((-1.0, 1.0), size=(resamples, len(differences)))
-            randomized = (differences * signs).mean(axis=1)
-            p = float(
-                (np.sum(np.abs(randomized) >= abs(differences.mean())) + 1)
-                / (resamples + 1)
-            )
-            raw_p.append(p)
-            output.append(
-                {
-                    "model_a": model_a,
-                    "model_b": model_b,
-                    "metric": "ultimate_original_macro_f1",
-                    "difference_b_minus_a": float(differences.mean()),
-                    "difference": float(differences.mean()),
-                    "ci_low": float(np.quantile(samples, 0.025)),
-                    "ci_high": float(np.quantile(samples, 0.975)),
-                    "p_value": p,
-                    "independent_clusters": len(keys),
-                }
-            )
-    order = sorted(range(len(raw_p)), key=lambda index: raw_p[index])
-    adjusted = [0.0] * len(raw_p)
+        output.append(row)
+    adjusted = [0.0] * len(output)
     running = 0.0
-    for rank, index in enumerate(order):
+    for rank, index in enumerate(np.argsort(raw_p, kind="stable")):
         running = max(running, min(1.0, raw_p[index] * (len(raw_p) - rank)))
         adjusted[index] = running
     for row, value in zip(output, adjusted):
@@ -724,11 +669,17 @@ def paired_statistics(
 
 
 def bootstrap_metric(rows: list[dict[str, Any]], *, resamples: int = 10_000, seed: int = 42) -> tuple[float, float]:
-    values = np.asarray(list(_cluster_scores(rows).values()), dtype=float)
-    if len(values) < 2:
+    return bootstrap_interval(_cluster_scores(rows).values(), resamples=resamples, seed=seed)
+
+
+def bootstrap_interval(
+    values: Sequence[float], *, resamples: int, seed: int
+) -> tuple[float, float]:
+    data = pd.Series(values, dtype=float).replace([np.inf, -np.inf], np.nan).dropna().to_numpy()
+    if len(data) < 2:
         return math.nan, math.nan
     rng = np.random.default_rng(seed)
-    sampled = rng.choice(values, size=(resamples, len(values)), replace=True).mean(axis=1)
+    sampled = rng.choice(data, size=(resamples, len(data)), replace=True).mean(axis=1)
     return float(np.quantile(sampled, 0.025)), float(np.quantile(sampled, 0.975))
 
 

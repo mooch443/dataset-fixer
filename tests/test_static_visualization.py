@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageChops
 
+from dataset_fixer.comparison.plot_labels import model_identity_card
 from dataset_fixer.static_rendering import (
     format_label,
     letterbox_image,
@@ -115,6 +116,53 @@ def test_visualization_grid_is_deterministic_and_keeps_incomplete_rows() -> None
     assert len(first_spec["vconcat"]) == 2
     assert len(first_spec["vconcat"][0]["hconcat"]) == 3
     assert len(first_spec["vconcat"][1]["hconcat"]) == 1
+
+
+def test_mixed_panel_headings_reserve_one_exact_shared_height() -> None:
+    image = np.zeros((32, 32, 3), dtype=np.uint8)
+    heading = model_identity_card(
+        {
+            "model": "yolo26m-seg-1024px-2x",
+            "hash": "abcdef12",
+            "source_created_at": "2026-08-13T15:42:28Z",
+            "model_identity": "both",
+            "model_type": "yolo26m-seg",
+            "upscale_factor": 2,
+            "resolution": 1024,
+        },
+        width=144,
+    )
+    item = VisualizationItem(
+        image_path=Path("/tmp/aligned.png"),
+        label="",
+        panels=(
+            VisualizationPanel(title="Original", image=image),
+            VisualizationPanel(title="GT", image=image),
+            VisualizationPanel(title="Prediction", image=image, heading=heading),
+        ),
+        foreground=np.zeros((32, 32), dtype=bool),
+    )
+    chart = visualize_records(
+        [item],
+        options=VisualizationOptions(
+            samples=None, columns=1, panel_size=1.5, show=False
+        ),
+        prepare=lambda value: value,
+    )
+    panels = chart.to_dict()["vconcat"][0]["hconcat"][0]["vconcat"][0][
+        "hconcat"
+    ]
+
+    def fixed_height(specification: dict) -> int:
+        if isinstance(specification.get("height"), int):
+            return specification["height"]
+        children = specification["vconcat"]
+        return sum(fixed_height(child) for child in children) + int(
+            specification.get("spacing", 10)
+        ) * (len(children) - 1)
+
+    assert [fixed_height(panel["vconcat"][0]) for panel in panels] == [58, 58, 58]
+    assert heading.to_dict()["spacing"] == 4
 
 
 def test_static_renderer_exports_png_jpeg_pdf_and_svg(tmp_path: Path) -> None:

@@ -301,6 +301,7 @@ class PredictionCache:
             inference_seconds=inference_seconds,
             settings=dict(result_value.get("settings") or {}),
             cache_info=info,
+            model_metadata=dict(result_value.get("model_metadata") or {}),
         )
 
     def find_image_compatible(
@@ -493,6 +494,7 @@ class PredictionCache:
                     "backend": result.backend,
                     "inference_seconds": result.inference_seconds,
                     "settings": to_jsonable(result.settings),
+                    "model_metadata": to_jsonable(result.model_metadata),
                 },
                 "records": records,
             }

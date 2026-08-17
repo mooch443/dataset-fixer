@@ -5,6 +5,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
+import pandas as pd
+
 
 class Task(str, Enum):
     """Supported annotation geometries.
@@ -117,7 +119,7 @@ class SemanticComparisonResult:
     """
 
     location: Path
-    ranking: tuple[dict[str, Any], ...]
+    ranking: pd.DataFrame
     cohort_fingerprint: str
     cohort_verified: bool
     split: str

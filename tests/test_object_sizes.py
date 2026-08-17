@@ -63,17 +63,25 @@ def _capture_chart(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     return captured
 
 
-def _inline_rows(value: object) -> list[dict[str, object]]:
+def _inline_rows(
+    value: object,
+    datasets: dict[str, list[dict[str, object]]] | None = None,
+) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     if isinstance(value, dict):
+        if datasets is None:
+            candidate = value.get("datasets")
+            datasets = candidate if isinstance(candidate, dict) else {}
         data = value.get("data")
         if isinstance(data, dict) and isinstance(data.get("values"), list):
             rows.extend(data["values"])
+        elif isinstance(data, dict) and isinstance(data.get("name"), str):
+            rows.extend(datasets.get(data["name"], []))
         for child in value.values():
-            rows.extend(_inline_rows(child))
+            rows.extend(_inline_rows(child, datasets))
     elif isinstance(value, list):
         for child in value:
-            rows.extend(_inline_rows(child))
+            rows.extend(_inline_rows(child, datasets))
     return rows
 
 
@@ -356,10 +364,18 @@ def test_metric_breakdown_includes_model_type_and_presence_columns(
     )
     rows = _inline_rows(captured["spec"])
     column_labels = list(dict.fromkeys(str(row["column"]) for row in rows if "column" in row))
-    row_labels = list(dict.fromkeys(str(row["model_label"]) for row in rows if "model_label" in row))
+    identity_labels = [
+        str(row["label"])
+        for row in rows
+        if "row" in row and "label" in row and "model" not in row
+    ]
+    badges = {str(row["text"]): str(row["color"]) for row in rows if "color" in row and "text" in row}
 
     assert path.is_file()
-    assert row_labels == [f"model · {expected_slug} · 4× · 512px"]
+    assert identity_labels == ["model"]
+    assert expected_slug in badges
+    assert badges["4×"] == "#B45309"
+    assert badges["512px"] == "#475569"
     assert column_labels == [
         "Mean Dice",
         "Pooled foreground\nDice",
@@ -406,13 +422,23 @@ def test_object_size_breakdown_includes_colored_model_type_badges(
 
     path = render_object_size_breakdown(tmp_path, ranking, analysis)
     rows = _inline_rows(captured["spec"])
-    labels = list(dict.fromkeys(str(row["model_label"]) for row in rows if "model_label" in row))
+    labels = [
+        str(row["label"])
+        for row in rows
+        if "row" in row and "label" in row and "model" not in row
+    ]
+    badges = {str(row["text"]): str(row["color"]) for row in rows if "color" in row and "text" in row}
 
     assert path is not None and path.is_file()
     assert labels == [
-        "semantic-model · yolo26m-sem",
-        "instance-model · yolo26m-seg",
+        "semantic-model",
+        "instance-model",
     ]
+    assert badges["yolo26m-sem"] == "#0F766E"
+    assert badges["yolo26m-seg"] == "#2563EB"
+    specification = str(captured["spec"])
+    assert "Object Dice by foreground area (small 1, medium 1, large 1)" in specification
+    assert "reference n=" not in specification
 
 
 def test_grouped_metric_breakdown_sorts_by_macro_and_shows_defined_support(
@@ -452,17 +478,23 @@ def test_grouped_metric_breakdown_sorts_by_macro_and_shows_defined_support(
         group_splits={"aoi-a": ("train",), "aoi-b": ("val",)},
     )
     rows = _inline_rows(captured["spec"])
-    row_labels = list(dict.fromkeys(str(row["model_label"]) for row in rows if "model_label" in row))
+    row_labels = [
+        str(row["label"])
+        for row in rows
+        if "row" in row and "label" in row and "model" not in row
+    ]
     column_labels = list(dict.fromkeys(str(row["column"]) for row in rows if "column" in row))
-    cell_labels = [str(row["label"]) for row in rows if "label" in row]
+    cell_labels = [
+        str(row["label"]) for row in rows if "label" in row and "model" in row
+    ]
 
     assert path.is_file()
-    assert row_labels == ["higher · nnunet-m", "lower · yolo26m-seg"]
+    assert row_labels == ["higher", "lower"]
     assert column_labels == ["Macro", "aoi-a\n[train]", "aoi-b\n[val]"]
     assert cell_labels[0] == "0.750\n(2/2)"
     assert cell_labels[3] == "0.250\n(1/2)"
     assert cell_labels[5] == "TN"
-    assert next(row["display_value"] for row in rows if row.get("model_label") == "lower · yolo26m-seg" and row.get("column") == "aoi-b\n[val]") == 1.0
+    assert next(row["display_value"] for row in rows if row.get("model") == "lower" and row.get("column") == "aoi-b\n[val]") == 1.0
 
 
 @pytest.mark.parametrize("metric", ["precision", "recall", "f1"])
@@ -550,13 +582,19 @@ def test_grouped_presence_breakdown_sorts_by_macro_f1_and_marks_edge_cases(
         },
     )
     rows = _inline_rows(captured["spec"])
-    row_labels = list(dict.fromkeys(str(row["model_label"]) for row in rows if "model_label" in row))
+    row_labels = [
+        str(row["label"])
+        for row in rows
+        if "row" in row and "label" in row and "model" not in row
+    ]
     column_labels = list(dict.fromkeys(str(row["column"]) for row in rows if "column" in row))
-    cell_labels = [str(row["label"]) for row in rows if "label" in row]
+    cell_labels = [
+        str(row["label"]) for row in rows if "label" in row and "model" in row
+    ]
 
     assert path.name == f"grouped-presence-{metric}.png"
     assert path.is_file()
-    assert row_labels == ["higher · nnunet-m", "lower · yolo26m-seg"]
+    assert row_labels == ["higher", "lower"]
     assert column_labels == [
         f"Macro {metric.upper()}",
         "aoi-fp\n[train]",
