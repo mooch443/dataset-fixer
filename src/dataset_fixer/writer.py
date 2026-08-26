@@ -344,7 +344,10 @@ class OutputBuilder:
         self.visuals = ["reports/plots.png"] if plot is not None else []
         operation_record["visuals"] = list(self.visuals)
         load_validation = self.validation_details.get("load_validation")
-        if isinstance(load_validation, dict) and load_validation.get("skipped_count", 0):
+        if isinstance(load_validation, dict) and (
+            load_validation.get("skipped_count", 0)
+            or load_validation.get("fixed_count", 0)
+        ):
             load_validation["report"] = (
                 "reports/dataset-info.json#audits.load_validation_audit"
             )

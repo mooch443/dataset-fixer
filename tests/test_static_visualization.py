@@ -63,6 +63,17 @@ def test_labels_support_middle_shortening_and_bounded_wrapping() -> None:
     assert 1 <= len(wrapped) <= 2
     assert all(len(line) <= 24 for line in wrapped)
 
+    roboflow_filename = "frame_178_27_jpg.rf.2b438b935f29be27747b435dd3e48253.jpg"
+    filename_lines = format_label(
+        roboflow_filename,
+        mode="wrap",
+        maximum=45,
+        wrap_width=42,
+        maximum_lines=2,
+    )
+    assert "".join(filename_lines) == roboflow_filename
+    assert all("…" not in line for line in filename_lines)
+
 
 def test_letterbox_preserves_aspect_and_mask_outline_handles_empty_masks() -> None:
     wide = Image.new("RGB", (240, 40), "#335577")
@@ -83,6 +94,19 @@ def test_letterbox_preserves_aspect_and_mask_outline_handles_empty_masks() -> No
         draw_mask_outline(source, mask, color="#ff0000", line_width=2, outline_width=4, alpha=1)
     )
     assert ImageChops.difference(wide, outlined).getbbox() is not None
+
+    mask_with_hole = np.zeros((40, 240), dtype=bool)
+    mask_with_hole[4:36, 70:170] = True
+    mask_with_hole[14:26, 105:135] = False
+    outlined_hole = draw_mask_outline(
+        source,
+        mask_with_hole,
+        color="#ff0000",
+        line_width=2,
+        outline_width=4,
+        alpha=1,
+    )
+    assert tuple(outlined_hole[14, 120]) == (255, 0, 0)
 
 
 def test_visualization_grid_is_deterministic_and_keeps_incomplete_rows() -> None:

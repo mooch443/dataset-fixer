@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import yaml
 import pandas as pd
@@ -16,6 +16,7 @@ from .artifacts import dataset_info_path, lineage_path, read_lineage
 from .errors import DatasetValidationError, ValidationIssue
 from .io import _label_path_for_image, _parse_yolo_line
 from .models import Annotation, DatasetMetadata, Sample, Task
+from .segmentation import PolygonRepairConfig, repair_polygon_annotation
 from .validation_audit import ValidationFailureExample, add_failure_example
 
 
@@ -340,6 +341,7 @@ def validate_dataset(
     deep: bool = False,
     progress: bool = False,
     errors: Literal["raise", "skip"] = "raise",
+    polygon_repair: PolygonRepairConfig | None = None,
     failure_examples: list[ValidationFailureExample] | None = None,
 ) -> list[str]:
     if errors not in {"raise", "skip"}:
@@ -460,30 +462,90 @@ def validate_dataset(
             annotation_source = (
                 f"{resolved} [annotation {annotation.source_id}]" if annotation.source_id is not None else str(resolved)
             )
-            annotation_issues = _validate_annotation(annotation, sample, metadata, task, annotation_source)
-            if annotation_issues and errors == "skip":
-                messages = "; ".join(dict.fromkeys(issue.message for issue in annotation_issues))
-                warning = f"Skipped invalid annotation {annotation_source}: {messages}"
+            candidates = [annotation]
+            if polygon_repair is not None and annotation.polygon is not None:
+                candidates, repair_issue = _repair_polygon(
+                    annotation,
+                    annotation_source,
+                    width=sample.width,
+                    height=sample.height,
+                    config=polygon_repair,
+                )
+                if repair_issue is not None:
+                    if errors == "skip":
+                        warning = (
+                            f"Skipped invalid annotation {annotation_source}: "
+                            f"{repair_issue.message}"
+                        )
+                        warnings.append(warning)
+                        add_failure_example(
+                            failure_examples,
+                            ValidationFailureExample(
+                                warning=warning,
+                                summary=repair_issue.message,
+                                image_path=sample.image_path,
+                                relative_path=sample.relative_path,
+                                split=sample.split,
+                                width=sample.width,
+                                height=sample.height,
+                                annotation=annotation.clone(),
+                            ),
+                        )
+                    else:
+                        issues.append(repair_issue)
+                    continue
+                warning = (
+                    f"Repaired polygon {annotation_source} into "
+                    f"{len(candidates)} valid component(s) in memory; source labels were not changed"
+                )
                 warnings.append(warning)
                 add_failure_example(
                     failure_examples,
                     ValidationFailureExample(
                         warning=warning,
-                        summary=messages,
+                        summary=(
+                            f"preserved {sum(len(value.polygon_holes or []) for value in candidates)} "
+                            "interior hole(s)"
+                        ),
                         image_path=sample.image_path,
                         relative_path=sample.relative_path,
                         split=sample.split,
                         width=sample.width,
                         height=sample.height,
                         annotation=annotation.clone(),
-                    ),
+                        repaired_annotations=tuple(candidate.clone() for candidate in candidates),
+                    )
                 )
-                continue
-            issues.extend(annotation_issues)
-            valid_annotations.append(annotation)
-            if annotation.rle is not None and not annotation_issues:
-                warnings.append(f"{resolved}: segmentation requires explicit allow_lossy=True for YOLO export")
-        if errors == "skip":
+            for candidate in candidates:
+                candidate_source = (
+                    f"{resolved} [annotation {candidate.source_id}]"
+                    if candidate.source_id is not None
+                    else str(resolved)
+                )
+                annotation_issues = _validate_annotation(candidate, sample, metadata, task, candidate_source)
+                if annotation_issues and errors == "skip":
+                    messages = "; ".join(dict.fromkeys(issue.message for issue in annotation_issues))
+                    warning = f"Skipped invalid annotation {candidate_source}: {messages}"
+                    warnings.append(warning)
+                    add_failure_example(
+                        failure_examples,
+                        ValidationFailureExample(
+                            warning=warning,
+                            summary=messages,
+                            image_path=sample.image_path,
+                            relative_path=sample.relative_path,
+                            split=sample.split,
+                            width=sample.width,
+                            height=sample.height,
+                            annotation=candidate.clone(),
+                        ),
+                    )
+                    continue
+                issues.extend(annotation_issues)
+                valid_annotations.append(candidate)
+                if candidate.rle is not None and not annotation_issues:
+                    warnings.append(f"{resolved}: segmentation requires explicit allow_lossy=True for YOLO export")
+        if errors == "skip" or polygon_repair is not None:
             sample.annotations = valid_annotations
         if valid_samples is not None:
             valid_samples.append(sample)
@@ -495,6 +557,52 @@ def validate_dataset(
     if issues:
         raise DatasetValidationError(issues)
     return warnings
+
+
+def _repair_polygon(
+    annotation: Annotation,
+    source: str,
+    *,
+    width: int,
+    height: int,
+    config: PolygonRepairConfig,
+) -> tuple[list[Annotation], ValidationIssue | None]:
+    """Recover a valid polygon hierarchy, or report why none is representable."""
+
+    assert annotation.polygon is not None
+    if len(annotation.polygon) < 3:
+        return [annotation], None
+    try:
+        repaired_annotations = repair_polygon_annotation(
+            annotation,
+            width=width,
+            height=height,
+            config=config,
+        )
+    except Exception as exc:
+        return [], ValidationIssue(
+            "Invalid or self-intersecting polygon; automatic repair failed",
+            source=source,
+            value=str(exc),
+            suggestion="correct the polygon vertices or use errors='skip'",
+        )
+
+    if not repaired_annotations:
+        return [], ValidationIssue(
+            "Invalid or self-intersecting polygon; automatic repair produced no polygonal area",
+            source=source,
+            suggestion="correct the polygon vertices or use errors='skip'",
+        )
+    for repaired in repaired_annotations:
+        assert repaired.polygon is not None
+        part = Polygon(repaired.polygon, repaired.polygon_holes or None)
+        if not part.is_valid or part.is_empty or part.area <= 0:
+            return [], ValidationIssue(
+                "Invalid or self-intersecting polygon; automatic repair remained invalid",
+                source=source,
+                suggestion="correct the polygon vertices or use errors='skip'",
+            )
+    return repaired_annotations, None
 
 
 def _validate_annotation(
@@ -540,7 +648,7 @@ def _validate_annotation(
             issues.append(ValidationIssue("Polygon needs at least three points", source=source))
         else:
             try:
-                polygon = Polygon(annotation.polygon)
+                polygon = Polygon(annotation.polygon, annotation.polygon_holes or None)
                 invalid_polygon = polygon.is_empty or polygon.area <= 0 or not polygon.is_valid
             except Exception:
                 invalid_polygon = True
@@ -554,6 +662,17 @@ def _validate_annotation(
                 for x, y in annotation.polygon
             ):
                 issues.append(ValidationIssue("Polygon lies outside normalized image bounds", source=source))
+            for ring in annotation.polygon_holes or []:
+                if len(ring) < 3:
+                    issues.append(ValidationIssue("Polygon hole needs at least three points", source=source))
+                if any(
+                    x < -0.01 * sample.width
+                    or y < -0.01 * sample.height
+                    or x > 1.01 * sample.width
+                    or y > 1.01 * sample.height
+                    for x, y in ring
+                ):
+                    issues.append(ValidationIssue("Polygon hole lies outside normalized image bounds", source=source))
     if annotation.keypoints is not None:
         if metadata.kpt_shape and len(annotation.keypoints) != metadata.kpt_shape[0]:
             issues.append(ValidationIssue("Keypoint count does not match kpt_shape", source=source))

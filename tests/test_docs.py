@@ -90,6 +90,7 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
     assert "background_filter" in tile_signature
     assert "**settings" not in tile_signature
     assert "Literal['raise', 'skip']" in open_signature
+    assert "polygon_repair" in open_signature
     assert "save_prediction_plots" in comparison_signature
     for removed in (
         "baseline",

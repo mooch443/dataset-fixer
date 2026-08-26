@@ -516,7 +516,10 @@ def _transform_annotation(
                 detail="The annotation is RLE or multipart data and cannot be written as one YOLO polygon.",
             )
         try:
-            source_polygon = Polygon(annotation.polygon)
+            source_polygon = Polygon(
+                annotation.polygon,
+                annotation.polygon_holes or None,
+            )
         except (ShapelyError, TypeError, ValueError) as exc:
             raise _segmentation_crop_error(
                 "Could not construct the source segmentation polygon",
@@ -604,7 +607,11 @@ def _transform_annotation(
         if len(polygon) < 3:
             return None
         xs, ys = zip(*polygon)
-        return annotation.clone(polygon=polygon, bbox=(min(xs), min(ys), max(xs), max(ys)))
+        return annotation.clone(
+            polygon=polygon,
+            polygon_holes=None,
+            bbox=(min(xs), min(ys), max(xs), max(ys)),
+        )
     return None
 
 
@@ -909,6 +916,11 @@ def _scale_annotation(annotation: Annotation, scale: float, task: Task, radius_m
         updates["bbox"] = tuple(value * scale for value in annotation.bbox)
     if annotation.polygon is not None:
         updates["polygon"] = [(x * scale, y * scale) for x, y in annotation.polygon]
+    if annotation.polygon_holes is not None:
+        updates["polygon_holes"] = [
+            [(x * scale, y * scale) for x, y in ring]
+            for ring in annotation.polygon_holes
+        ]
     if annotation.keypoints is not None:
         updates["keypoints"] = [(x * scale, y * scale, visibility) for x, y, visibility in annotation.keypoints]
     if annotation.point is not None:
@@ -2161,6 +2173,14 @@ def _scale_and_translate_annotation(
             (x * scale_x + offset_x, y * scale_y + offset_y)
             for x, y in annotation.polygon
         ]
+    if annotation.polygon_holes is not None:
+        updates["polygon_holes"] = [
+            [
+                (x * scale_x + offset_x, y * scale_y + offset_y)
+                for x, y in ring
+            ]
+            for ring in annotation.polygon_holes
+        ]
     if annotation.keypoints is not None:
         updates["keypoints"] = [
             (
@@ -2544,7 +2564,7 @@ def _annotation_is_cut_by_crop(
         circle = Point(x, y).buffer(radius)
         return circle.intersects(crop_shape) and not crop_shape.covers(circle)
     if task is Task.SEGMENT and annotation.polygon:
-        geometry = Polygon(annotation.polygon)
+        geometry = Polygon(annotation.polygon, annotation.polygon_holes or None)
         if not geometry.is_valid:
             geometry = geometry.buffer(0)
         intersection = geometry.intersection(crop_shape)

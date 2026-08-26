@@ -74,6 +74,33 @@ missing split entries, orphan labels, and incomplete provenance are omitted
 virtually and listed in `dataset.warnings`. An unusable class schema or a dataset
 with no valid images still raises. Loading never changes the source.
 
+For segmentation data, pass `polygon_repair=PolygonRepairConfig(...)` to
+explicitly rasterize every polygon with an even-odd fill, apply a classical
+closing to seal encoded bridge slits, and vectorize the result into connected
+exterior polygons with explicit hole hierarchy. With the default
+`polygon_repair=None`, no polygon geometry is changed. The cleaned mask is the
+repair source of truth; multipart repairs become multiple polygon annotations
+and semantic-mask export preserves their holes without another morphology pass.
+YOLO export raises on
+holes by default because its polygon rows have no hole hierarchy; pass
+`allow_lossy="bridge-holes"` to open every hole through a 0.1-pixel corridor
+and emit one valid, nearly equivalent YOLO ring, or pass `allow_lossy=True` only
+when filling the holes is acceptable. Other validation errors remain strict,
+and source labels are never changed.
+
+The closing kernel defaults to 5 pixels and is configurable for wider encoded
+bridges (it must be a positive odd integer):
+
+```python
+from dataset_fixer import Dataset, PolygonRepairConfig, Task
+
+dataset = Dataset.open(
+    "/path/to/yolo-seg",
+    task=Task.SEGMENT,
+    polygon_repair=PolygonRepairConfig(closing_kernel_px=9),
+)
+```
+
 Every skipped or ignored load-validation failure is also counted in
 `dataset.validation_audit`. Loading prints the total and renders at most four
 examples in a compact grid, prioritizing readable images and invalid geometry

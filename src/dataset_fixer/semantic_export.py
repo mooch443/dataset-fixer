@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
-from PIL import Image, ImageDraw
+import numpy as np
+from PIL import Image
 from tqdm.auto import tqdm
 
 from .artifacts import (
@@ -32,6 +33,7 @@ from .dataset_comparison import (
 )
 from .errors import DatasetValidationError, ValidationIssue
 from .models import Sample, Task
+from .segmentation import rasterize_annotations
 from .split_group_audit import (
     audit_split_groups,
     print_split_group_audit,
@@ -82,19 +84,18 @@ def export_semantic_masks(
     samples = [sample for sample in dataset._samples if sample.split in selected]
     if not samples:
         raise DatasetValidationError("No images selected for semantic-mask export")
-    missing_polygons = [
+    missing_geometry = [
         annotation.source_id
         for sample in samples
         for annotation in sample.annotations
-        if not annotation.polygon
+        if not annotation.polygon and annotation.rle is None
     ]
-    if missing_polygons:
+    if missing_geometry:
         raise DatasetValidationError(
             ValidationIssue(
-                "Semantic-mask export requires polygon geometry for every annotation",
-                value=missing_polygons[:10],
-                expected="one polygon per selected segmentation annotation",
-                suggestion="convert or remove RLE/multipart annotations before exporting semantic masks",
+                "Semantic-mask export requires mask geometry for every annotation",
+                value=missing_geometry[:10],
+                expected="polygon, polygon-with-holes, multipart polygons, or RLE",
             )
         )
     _assert_unique_mask_paths(samples)
@@ -109,6 +110,10 @@ def export_semantic_masks(
         "splits": sorted(selected),
         "mask_encoding": {"background": 0, "foreground": 255},
         "class_handling": "foreground_union",
+        "polygon_rasterization": {
+            "source_fill_rule": "even_odd",
+            "postprocessing": "none",
+        },
         "layout": "<split>/images and <split>/masks/0",
         "visualize": visualize,
         "visualize_kwargs": dict(visualize_kwargs_description),
@@ -158,12 +163,13 @@ def export_semantic_masks(
             mask_output.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(sample.image_path, image_output)
 
-            mask = Image.new("L", (sample.width, sample.height), 0)
-            draw = ImageDraw.Draw(mask)
-            for annotation in sample.annotations:
-                assert annotation.polygon is not None
-                draw.polygon(annotation.polygon, fill=255)
-            has_foreground = mask.getbbox() is not None
+            mask_array = rasterize_annotations(
+                sample.annotations,
+                width=sample.width,
+                height=sample.height,
+            ).astype(bool)
+            mask = Image.fromarray(mask_array.astype(np.uint8) * 255, mode="L")
+            has_foreground = bool(mask_array.any())
             mask.save(mask_output, format="PNG", optimize=False)
             record = _provenance_record(
                 dataset,
@@ -224,7 +230,7 @@ def export_semantic_masks(
         )
         plot = comparison.plot
         visuals = ["reports/plots.png"] if plot is not None else []
-        if load_validation.get("skipped_count", 0):
+        if load_validation.get("skipped_count", 0) or load_validation.get("fixed_count", 0):
             load_validation["report"] = (
                 "reports/dataset-info.json#audits.load_validation_audit"
             )

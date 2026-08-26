@@ -710,7 +710,13 @@ def _segments_after(
         if len(polygon) < 3:
             continue
         xs, ys = zip(*polygon)
-        output.append(annotation.clone(polygon=polygon, bbox=(min(xs), min(ys), max(xs), max(ys))))
+        output.append(
+            annotation.clone(
+                polygon=polygon,
+                polygon_holes=None,
+                bbox=(min(xs), min(ys), max(xs), max(ys)),
+            )
+        )
     return output, warnings
 
 
@@ -778,7 +784,10 @@ def _polygon_mask(sample: Sample, annotation: Annotation) -> np.ndarray:
     if not annotation.polygon:
         raise DatasetValidationError(f"Segmentation annotation {annotation.source_id} has no polygon")
     mask = Image.new("L", (sample.width, sample.height), 0)
-    ImageDraw.Draw(mask).polygon(annotation.polygon, fill=1)
+    draw = ImageDraw.Draw(mask)
+    draw.polygon(annotation.polygon, fill=1)
+    for ring in annotation.polygon_holes or []:
+        draw.polygon(ring, fill=0)
     return np.asarray(mask, dtype=np.uint8)
 
 

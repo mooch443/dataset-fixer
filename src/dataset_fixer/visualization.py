@@ -382,7 +382,7 @@ def draw_mask_outline(
         raise ValueError("mask and image dimensions must match")
     contours, _ = cv2.findContours(
         values.astype(np.uint8),
-        cv2.RETR_EXTERNAL,
+        cv2.RETR_CCOMP,
         cv2.CHAIN_APPROX_SIMPLE,
     )
     if not contours:
@@ -549,9 +549,10 @@ def visualize_validation_failures(
     save_to: Path,
     show: bool = True,
 ) -> None:
-    """Render a bounded grid of load-time validation failures."""
+    """Render bounded load failures or paired invalid/repaired geometry."""
 
-    columns = 1 if len(examples) == 1 else 2
+    has_repairs = any(example.repaired_annotations for example in examples)
+    columns = 1 if has_repairs or len(examples) == 1 else 2
 
     def prepare(example: "ValidationFailureExample") -> VisualizationItem:
         annotations = (
@@ -559,12 +560,18 @@ def visualize_validation_failures(
             if example.annotation is not None and example.annotation.polygon is None
             else []
         )
+        source_image: Image.Image | None = None
         if (
             example.image_path is not None
             and example.image_path.is_file()
             and example.width is not None
             and example.height is not None
         ):
+            try:
+                with Image.open(example.image_path) as opened:
+                    source_image = ImageOps.exif_transpose(opened).convert("RGB")
+            except Exception:
+                source_image = None
             sample = Sample(
                 image_path=example.image_path,
                 relative_path=example.relative_path or Path(example.image_path.name),
@@ -597,20 +604,76 @@ def visualize_validation_failures(
             max_lines=2,
             placeholder=" …",
         )
+        repaired_mask: np.ndarray | None = None
+        if example.repaired_annotations and example.width and example.height:
+            from .segmentation import rasterize_annotations
+
+            repaired_mask = rasterize_annotations(
+                example.repaired_annotations,
+                width=example.width,
+                height=example.height,
+            ).astype(bool)
         foreground = np.ones(np.asarray(rendered).shape[:2], dtype=bool)
-        if example.annotation is not None and example.annotation.polygon:
+        if repaired_mask is not None:
+            foreground = repaired_mask
+        elif example.annotation is not None and example.annotation.polygon:
             foreground = _annotation_focus_mask(
                 example.annotation,
                 width=rendered.width,
                 height=rendered.height,
             )
+        panels = [
+            VisualizationPanel(title="Source polygon", image=np.asarray(rendered))
+        ]
+        if example.repaired_annotations:
+            fixed_image = source_image or _draw_failure_placeholder()
+            from .segmentation import rasterize_annotations
+
+            exterior_mask = rasterize_annotations(
+                (
+                    annotation.clone(polygon_holes=None)
+                    for annotation in example.repaired_annotations
+                ),
+                width=fixed_image.width,
+                height=fixed_image.height,
+            ).astype(bool)
+            hole_mask = exterior_mask & ~repaired_mask
+            fixed_rendered = draw_mask_outline(
+                np.asarray(fixed_image),
+                repaired_mask,
+                color="#22c55e",
+                line_width=2,
+                outline_width=1,
+                alpha=1.0,
+            )
+            fixed_rendered = draw_mask_outline(
+                fixed_rendered,
+                hole_mask,
+                color="#f97316",
+                line_width=2,
+                outline_width=1,
+                alpha=1.0,
+            )
+            holes = sum(
+                len(annotation.polygon_holes or [])
+                for annotation in example.repaired_annotations
+            )
+            panels.append(
+                VisualizationPanel(
+                    title=(
+                        f"Fixed · green foreground · orange {holes} preserved hole(s)"
+                    ),
+                    image=fixed_rendered,
+                )
+            )
         return VisualizationItem(
             image_path=example.image_path or Path("unavailable"),
             label=(
-                f"Skipped · {example.split or 'unknown split'} · "
+                f"{'Fixed' if example.repaired_annotations else 'Skipped'} · "
+                f"{example.split or 'unknown split'} · "
                 f"{textwrap.shorten(source, width=78, placeholder='…')}\n{message}"
             ),
-            panels=(VisualizationPanel(title="Validation failure", image=np.asarray(rendered)),),
+            panels=tuple(panels),
             foreground=foreground,
         )
 
@@ -628,7 +691,8 @@ def visualize_validation_failures(
         options=options,
         prepare=prepare,
         title=(
-            f"Load validation skips — {dataset_name} — {total_count} failed item(s); "
+            f"Load validation {'fixes' if has_repairs else 'skips'} — {dataset_name} — "
+            f"{total_count} {'fixed' if has_repairs else 'failed'} item(s); "
             f"showing {len(examples)}"
         ),
     )
@@ -730,12 +794,8 @@ def _highlight_invalid_annotation(
         width=width,
         height=height,
     )
-    if not reasons:
-        return image
-
     rendered = image.convert("RGB").copy()
     draw = ImageDraw.Draw(rendered)
-
     finite_polygon = [
         (x, y)
         for x, y in annotation.polygon
@@ -746,6 +806,9 @@ def _highlight_invalid_annotation(
             [finite_polygon[0]] if len(finite_polygon) >= 3 else []
         )
         draw.line(closed_polygon, fill="#dc2626", width=4, joint="curve")
+    if not reasons:
+        return rendered
+
     if finite_polygon:
         for index, (x, y) in enumerate(finite_polygon):
             draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill="white", outline="#dc2626", width=2)
@@ -935,13 +998,20 @@ def visualize_semantic_masks(
 def _sample_foreground_mask(sample: Sample, task: Task) -> np.ndarray:
     """Rasterize annotation geometry only for shared visualization cropping."""
 
+    if task is Task.SEGMENT:
+        from .segmentation import rasterize_annotations
+
+        return rasterize_annotations(
+            sample.annotations,
+            width=sample.width,
+            height=sample.height,
+        ).astype(bool)
+
     canvas = Image.new("1", (sample.width, sample.height), 0)
     draw = ImageDraw.Draw(canvas)
     for annotation in sample.annotations:
         if annotation.bbox is not None and task in {Task.DETECT, Task.POSE}:
             draw.rectangle(annotation.bbox, fill=1)
-        if annotation.polygon:
-            draw.polygon(annotation.polygon, fill=1)
         if annotation.point is not None:
             x, y = annotation.point
             radius = max(1.0, float(annotation.radius or 1.0))
@@ -1027,8 +1097,11 @@ def render_annotated_sample(
                     font=font,
                 )
         if annotation.polygon:
-            points = [(x * scale_x, y * scale_y) for x, y in annotation.polygon]
-            if len(points) >= 2:
+            rings = [annotation.polygon, *(annotation.polygon_holes or [])]
+            for ring in rings:
+                points = [(x * scale_x, y * scale_y) for x, y in ring]
+                if len(points) < 2:
+                    continue
                 closed = [*points, points[0]]
                 draw.line(
                     closed,

@@ -919,6 +919,8 @@ def annotation_to_yolo(annotation: Annotation, task: Task, width: int, height: i
     if task is Task.SEGMENT:
         if not annotation.polygon:
             raise ValueError("Segmentation annotation is not representable as one YOLO polygon")
+        if annotation.polygon_holes:
+            raise ValueError("YOLO segmentation rows cannot represent polygon holes")
         coords = " ".join(f"{x / width:.6f} {y / height:.6f}" for x, y in annotation.polygon)
         return f"{cls} {coords}"
     assert annotation.bbox is not None and annotation.keypoints is not None and metadata.kpt_shape is not None

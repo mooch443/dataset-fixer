@@ -29,6 +29,7 @@ class ValidationFailureExample:
     width: int | None = None
     height: int | None = None
     annotation: Annotation | None = None
+    repaired_annotations: tuple[Annotation, ...] = ()
 
 
 def add_failure_example(
@@ -48,13 +49,20 @@ def build_load_validation_audit(
     *,
     dataset_name: str,
 ) -> tuple[dict[str, Any], Path | None]:
-    """Count skipped validation failures and render at most four examples."""
+    """Count skipped/fixed validation events and render at most four examples."""
 
     failure_warnings = [warning for warning in warnings if _is_skip_failure(warning)]
-    if not failure_warnings:
+    repair_warnings = [warning for warning in warnings if _is_repair(warning)]
+    audit_warnings = [
+        warning
+        for warning in warnings
+        if _is_skip_failure(warning) or _is_repair(warning)
+    ]
+    if not audit_warnings:
         return {
             "status": "passed",
             "skipped_count": 0,
+            "fixed_count": 0,
             "counts_by_category": {},
             "visualized_count": 0,
             "max_visualized_examples": MAX_VISUALIZED_FAILURES,
@@ -63,14 +71,14 @@ def build_load_validation_audit(
         }, None
 
     category_counts = (
-        pd.Series(failure_warnings, dtype="string")
+        pd.Series(audit_warnings, dtype="string")
         .map(_failure_category)
         .value_counts()
         .sort_index()
     )
     categories = {str(name): int(count) for name, count in category_counts.items()}
     examples = list(structured_examples[:MAX_VISUALIZED_FAILURES])
-    remaining = list(failure_warnings)
+    remaining = list(audit_warnings)
     for example in examples:
         try:
             remaining.remove(example.warning)
@@ -94,24 +102,43 @@ def build_load_validation_audit(
 
     audit_dir = Path(tempfile.mkdtemp(prefix="dataset-fixer-validation-audit-"))
     visualization = audit_dir / VISUALIZATION_NAME
-    print(
-        f"Validation skip audit: {len(failure_warnings)} failed item(s); "
-        f"showing {len(examples)} example(s) (maximum {MAX_VISUALIZED_FAILURES})."
-    )
+    if failure_warnings and not repair_warnings:
+        print(
+            f"Validation skip audit: {len(failure_warnings)} failed item(s); "
+            f"showing {len(examples)} example(s) (maximum {MAX_VISUALIZED_FAILURES})."
+        )
+    elif repair_warnings and not failure_warnings:
+        print(
+            f"Validation repair audit: {len(repair_warnings)} fixed item(s); "
+            f"showing {len(examples)} example(s) (maximum {MAX_VISUALIZED_FAILURES})."
+        )
+    else:
+        print(
+            f"Validation load audit: {len(failure_warnings)} skipped, "
+            f"{len(repair_warnings)} fixed; showing {len(examples)} example(s) "
+            f"(maximum {MAX_VISUALIZED_FAILURES})."
+        )
     from .visualization import visualize_validation_failures
 
     visualize_validation_failures(
         examples,
         task,
         metadata,
-        total_count=len(failure_warnings),
+        total_count=len(audit_warnings),
         dataset_name=dataset_name,
         save_to=visualization,
         show=True,
     )
     return {
-        "status": "passed_with_skips",
+        "status": (
+            "passed_with_skips_and_fixes"
+            if failure_warnings and repair_warnings
+            else "passed_with_skips"
+            if failure_warnings
+            else "passed_with_fixes"
+        ),
         "skipped_count": len(failure_warnings),
+        "fixed_count": len(repair_warnings),
         "counts_by_category": categories,
         "visualized_count": len(examples),
         "max_visualized_examples": MAX_VISUALIZED_FAILURES,
@@ -130,7 +157,7 @@ def stage_load_validation_audit(
     detail = dict(audit)
     report_path = reports_dir / REPORT_NAME
     visualization_path = reports_dir / VISUALIZATION_NAME
-    if int(detail.get("skipped_count", 0)) <= 0:
+    if int(detail.get("skipped_count", 0)) + int(detail.get("fixed_count", 0)) <= 0:
         report_path.unlink(missing_ok=True)
         visualization_path.unlink(missing_ok=True)
         detail["report"] = None
@@ -162,6 +189,10 @@ def _is_skip_failure(warning: str) -> bool:
     return warning.startswith("Skipped ") or warning.startswith("Ignored ")
 
 
+def _is_repair(warning: str) -> bool:
+    return warning.startswith("Repaired polygon ")
+
+
 def _concise_warning(warning: str) -> str:
     without_fix = warning.split("; fix:", 1)[0]
     return without_fix.rsplit(": ", 1)[-1]
@@ -180,6 +211,7 @@ def _failure_category(warning: str) -> str:
         "Ignored incomplete provenance",
         "Ignored orphan label",
         "Ignored invalid manifest",
+        "Repaired polygon",
     )
     return next((prefix for prefix in prefixes if warning.startswith(prefix)), "other")
 

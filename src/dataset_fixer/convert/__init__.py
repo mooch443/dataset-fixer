@@ -613,7 +613,12 @@ def _prepare_yolo_seg(
         instances = 0
         for sample in retained:
             for annotation in sample.annotations:
-                if not annotation.polygon or len(annotation.polygon) < 3 or annotation.rle:
+                if (
+                    not annotation.polygon
+                    or len(annotation.polygon) < 3
+                    or annotation.polygon_holes
+                    or annotation.rle
+                ):
                     failures.append(str(sample.relative_path))
                 else:
                     instances += 1

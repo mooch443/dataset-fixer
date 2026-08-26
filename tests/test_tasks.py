@@ -9,17 +9,20 @@ import numpy as np
 import pytest
 import yaml
 from PIL import Image, ImageChops
+from shapely.geometry import Polygon
 
 from dataset_fixer import (
     Dataset,
     DatasetValidationError,
     Model,
     ModelCollection,
+    PolygonRepairConfig,
     PredictionResult,
     Task,
 )
 from dataset_fixer import tiling as tiling_module
 from dataset_fixer.models import Annotation, Sample
+from dataset_fixer.segmentation import rasterize_annotation, repair_polygon_annotation
 from dataset_fixer.visualization import (
     COMMON_VISUALIZE_PARAMETERS,
     _focus_invalid_annotation,
@@ -122,6 +125,261 @@ def test_invalid_segmentation_can_be_skipped_virtually(tmp_path: Path) -> None:
     assert semantic.manifest["validation"]["load_validation"]["skipped_count"] == 1
     assert "load_validation_audit" in semantic.manifest["audits"]
     assert (semantic.location / "reports" / "plots.png").is_file()
+
+
+def test_polygon_repair_config_repairs_invalid_segmentation_virtually(tmp_path: Path) -> None:
+    invalid_row = "0 0.2 0.2 0.8 0.8 0.8 0.2 0.2 0.8"
+    valid_row = "0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"
+    source = make_yolo_dataset(
+        tmp_path / "segment_with_repairable_polygon",
+        task="segment",
+        names=["fruit"],
+        train_rows=[f"{invalid_row}\n{valid_row}"],
+        val_rows=[valid_row],
+    )
+    source_label = next((source / "train" / "labels").rglob("*.txt"))
+    original_label = source_label.read_text(encoding="utf-8")
+
+    dataset = Dataset.open(
+        source,
+        task="segment",
+        polygon_repair=PolygonRepairConfig(),
+        progress=False,
+    )
+
+    assert sum(len(sample.annotations) for sample in dataset._samples) == 3
+    assert all(
+        Polygon(annotation.polygon).is_valid
+        for sample in dataset._samples
+        for annotation in sample.annotations
+        if annotation.polygon is not None
+    )
+    assert any("Repaired polygon" in warning for warning in dataset.warnings)
+    assert dataset.validation_audit["status"] == "passed_with_fixes"
+    assert dataset.validation_audit["skipped_count"] == 0
+    assert dataset.validation_audit["fixed_count"] == 3
+    assert dataset.validation_audit["visualized_count"] == 3
+    with Image.open(dataset.validation_audit["visualization"]) as audit_image:
+        assert audit_image.width > 0 and audit_image.height > 0
+    assert source_label.read_text(encoding="utf-8") == original_label
+
+    exported = dataset.export(
+        destination=tmp_path / "segment_with_repaired_polygon",
+        visualize=False,
+        progress=False,
+    )
+    exported_train_label = next((exported.location / "train" / "labels").rglob("*.txt"))
+    assert len(exported_train_label.read_text(encoding="utf-8").splitlines()) == 2
+    Dataset.open(exported.location, task="segment", progress=False)
+
+
+def test_polygon_repair_config_rejects_polygon_without_repairable_area(tmp_path: Path) -> None:
+    source = make_yolo_dataset(
+        tmp_path / "segment_with_collinear_polygon",
+        task="segment",
+        names=["fruit"],
+        train_rows=["0 0.2 0.2 0.5 0.5 0.8 0.8"],
+        val_rows=["0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"],
+    )
+
+    with pytest.raises(DatasetValidationError, match="automatic repair produced no polygonal area"):
+        Dataset.open(
+            source,
+            task="segment",
+            polygon_repair=PolygonRepairConfig(),
+            progress=False,
+        )
+    with pytest.raises(ValueError, match="errors must be 'raise' or 'skip'"):
+        Dataset.open(
+            source,
+            task="segment",
+            errors="fix-or-raise",  # type: ignore[arg-type]
+            progress=False,
+        )
+
+
+def test_polygon_repair_closes_rasterized_bridges_and_preserves_holes() -> None:
+    annotation = Annotation(
+        class_id=0,
+        polygon=[
+            (5, 5), (95, 5), (95, 95), (5, 95),
+            (5, 70), (20, 70), (20, 60), (40, 60), (40, 80),
+            (20, 80), (20, 70), (5, 70),
+            (5, 30), (60, 30), (60, 20), (80, 20), (80, 40),
+            (60, 40), (60, 30), (5, 30), (5, 5),
+        ],
+    )
+
+    raw_mask = rasterize_annotation(annotation, width=100, height=100)
+    repaired = repair_polygon_annotation(
+        annotation,
+        width=100,
+        height=100,
+        config=PolygonRepairConfig(),
+    )
+    repaired_mask = np.zeros_like(raw_mask)
+    for part in repaired:
+        repaired_mask |= rasterize_annotation(part, width=100, height=100)
+
+    assert np.count_nonzero(repaired_mask & ~raw_mask) > 0
+    assert sum(len(part.polygon_holes or []) for part in repaired) == 2
+    assert repaired_mask[70, 30] == 0
+    assert repaired_mask[30, 70] == 0
+    assert all(
+        Polygon(part.polygon, part.polygon_holes or None).is_valid
+        for part in repaired
+    )
+
+
+def test_polygon_repair_detects_valid_slit_encoded_hole(tmp_path: Path) -> None:
+    polygon = [
+        (5, 5),
+        (95, 5),
+        (95, 95),
+        (5, 95),
+        (5, 51),
+        (30, 51),
+        (30, 70),
+        (70, 70),
+        (70, 30),
+        (30, 30),
+        (30, 49),
+        (5, 49),
+    ]
+    annotation = Annotation(class_id=0, polygon=polygon)
+    assert Polygon(polygon).is_valid
+
+    source_mask = rasterize_annotation(annotation, width=100, height=100)
+    repaired = repair_polygon_annotation(
+        annotation,
+        width=100,
+        height=100,
+        config=PolygonRepairConfig(closing_kernel_px=5),
+    )
+    repaired_mask = rasterize_annotation(repaired[0], width=100, height=100)
+
+    assert len(repaired) == 1
+    assert len(repaired[0].polygon_holes or []) == 1
+    assert source_mask[50, 10] == 0
+    assert repaired_mask[50, 10] == 1
+    assert repaired_mask[50, 50] == 0
+    with pytest.raises(ValueError, match="positive odd integer"):
+        PolygonRepairConfig(closing_kernel_px=4)
+
+    row = "0 " + " ".join(
+        f"{coordinate / 100:g}"
+        for point in polygon
+        for coordinate in point
+    )
+    valid_row = "0 0.1 0.1 0.2 0.1 0.2 0.2 0.1 0.2"
+    source = make_yolo_dataset(
+        tmp_path / "segment_with_valid_slit",
+        task="segment",
+        names=["fruit"],
+        train_rows=[row],
+        val_rows=[valid_row],
+        size=(100, 100),
+    )
+    dataset = Dataset.open(
+        source,
+        task="segment",
+        polygon_repair={"closing_kernel_px": 5},
+        progress=False,
+    )
+
+    assert dataset.validation_audit["fixed_count"] == 2
+    assert dataset.validation_audit["repair_policy"]["closing_kernel_px"] == 5
+    assert any("Repaired polygon" in warning for warning in dataset.warnings)
+    assert len(dataset._samples[0].annotations[0].polygon_holes or []) == 1
+
+
+def test_polygon_repair_config_preserves_holes_for_semantic_export(
+    tmp_path: Path,
+) -> None:
+    # One repeated bridge connects the exterior to a clockwise interior ring.
+    # Raster-first repair closes the bridge and extracts one explicit hole.
+    polygon_with_hole = (
+        "0 0.1 0.1 0.9 0.1 0.9 0.9 0.1 0.9 "
+        "0.1 0.5 0.3 0.5 0.3 0.3 0.7 0.3 0.7 0.7 0.3 0.7 "
+        "0.3 0.5 0.1 0.5"
+    )
+    valid_row = "0 0.1 0.1 0.2 0.1 0.2 0.2 0.1 0.2"
+    source = make_yolo_dataset(
+        tmp_path / "segment_with_encoded_hole",
+        task="segment",
+        names=["fruit"],
+        train_rows=[polygon_with_hole],
+        val_rows=[valid_row],
+        size=(100, 100),
+    )
+    dataset = Dataset.open(
+        source,
+        task="segment",
+        polygon_repair=PolygonRepairConfig(),
+        progress=False,
+    )
+
+    repaired = dataset._samples[0].annotations[0]
+    assert repaired.polygon is not None
+    assert repaired.polygon_holes is not None
+    assert len(repaired.polygon_holes) == 1
+    assert Polygon(repaired.polygon, repaired.polygon_holes).is_valid
+
+    semantic = dataset.export(
+        destination=tmp_path / "semantic_with_hole",
+        format="semantic_masks",
+        visualize=False,
+        progress=False,
+    )
+    train_mask = next(semantic.mask_dirs["train"].rglob("*.png"))
+    with Image.open(train_mask) as mask:
+        assert mask.getpixel((20, 20)) == 255
+        assert mask.getpixel((50, 50)) == 0
+
+    with Image.open(dataset.validation_audit["visualization"]) as audit_image:
+        colors = list(audit_image.convert("RGB").getdata())
+    assert any(g > 130 and g > r * 1.2 and g > b * 1.2 for r, g, b in colors)
+    assert any(r > 170 and 60 < g < 180 and b < 100 for r, g, b in colors)
+
+    with pytest.raises(DatasetValidationError, match="holes cannot be represented"):
+        dataset.export(
+            destination=tmp_path / "strict_yolo_with_hole",
+            visualize=False,
+            progress=False,
+        )
+    bridged = dataset.export(
+        destination=tmp_path / "bridged_yolo_with_hole",
+        allow_lossy="bridge-holes",
+        visualize=False,
+        progress=False,
+    )
+    bridged_annotation = next(
+        annotation
+        for sample in bridged._samples
+        if sample.split == "train"
+        for annotation in sample.annotations
+    )
+    assert bridged_annotation.polygon_holes is None
+    assert Polygon(bridged_annotation.polygon).is_valid
+    assert any("Bridged 1 polygon hole" in warning for warning in bridged.warnings)
+    bridged_semantic = bridged.export(
+        destination=tmp_path / "bridged_semantic_with_hole",
+        format="semantic_masks",
+        visualize=False,
+        progress=False,
+    )
+    bridged_mask = next(bridged_semantic.mask_dirs["train"].rglob("*.png"))
+    with Image.open(bridged_mask) as mask:
+        assert mask.getpixel((20, 20)) == 255
+        assert mask.getpixel((50, 50)) == 0
+
+    lossy = dataset.export(
+        destination=tmp_path / "lossy_yolo_without_hole",
+        allow_lossy=True,
+        visualize=False,
+        progress=False,
+    )
+    assert any("Lossy YOLO conversion filled 1 hole" in warning for warning in lossy.warnings)
 
 
 def test_skip_audit_counts_all_failures_and_visualizes_at_most_four(

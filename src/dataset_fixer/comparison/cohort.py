@@ -20,6 +20,7 @@ def annotation_dict(annotation: Annotation) -> dict[str, Any]:
         "class_id": annotation.class_id,
         "bbox": annotation.bbox,
         "polygon": annotation.polygon,
+        "polygon_holes": annotation.polygon_holes,
         "rle": annotation.rle,
         "keypoints": annotation.keypoints,
         "point": annotation.point,

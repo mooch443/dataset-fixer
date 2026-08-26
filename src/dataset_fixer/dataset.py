@@ -47,6 +47,7 @@ from .planning import (
     select_empty_images,
 )
 from .semantic_export import export_semantic_masks
+from .segmentation import PolygonRepairConfig
 from .tabular import frame
 from .tiling import tile_dataset
 from .tracing import DatasetTrace, trace_dataset
@@ -172,6 +173,7 @@ class Dataset:
             or {
                 "status": "passed",
                 "skipped_count": 0,
+                "fixed_count": 0,
                 "counts_by_category": {},
                 "visualized_count": 0,
                 "max_visualized_examples": 4,
@@ -221,6 +223,7 @@ class Dataset:
         radii: Mapping[int, float] | None = None,
         deep: bool = False,
         errors: Literal["raise", "skip"] = "raise",
+        polygon_repair: PolygonRepairConfig | Mapping[str, Any] | None = None,
         progress: bool = True,
     ) -> "Dataset":
         """Load YOLO, COCO, or semantic-mask data and validate it.
@@ -242,6 +245,10 @@ class Dataset:
                 :attr:`validation_audit`. Up to four failures are visualized
                 outside the source tree. Source files are never changed.
                 Errors that make the dataset unusable still raise.
+            polygon_repair: Raster-first polygon repair settings. Pass a
+                :class:`PolygonRepairConfig` or equivalent mapping to rasterize,
+                close, and re-vectorize every segmentation polygon in memory.
+                The default ``None`` leaves polygon geometry unchanged.
             progress: Show image-loading and validation progress bars.
 
         Returns:
@@ -265,6 +272,11 @@ class Dataset:
         errors = errors.lower()
         if errors not in {"raise", "skip"}:
             raise ValueError("errors must be 'raise' or 'skip'")
+        repair_config = (
+            PolygonRepairConfig._parse(polygon_repair)
+            if polygon_repair is not None
+            else None
+        )
         if names is None or isinstance(names, (list, tuple)):
             parsed_names = list(names) if names is not None else None
         else:
@@ -296,6 +308,8 @@ class Dataset:
             errors=errors,
             warnings=warnings,
         )
+        if repair_config is not None and resolved_task is not Task.SEGMENT:
+            raise ValueError("polygon_repair is only available for segmentation datasets")
         failure_examples: list[ValidationFailureExample] = []
         warnings.extend(
             validate_dataset(
@@ -305,6 +319,7 @@ class Dataset:
                 deep=deep,
                 progress=progress,
                 errors=errors,
+                polygon_repair=repair_config,
                 failure_examples=failure_examples,
             )
         )
@@ -339,9 +354,20 @@ class Dataset:
             metadata,
             dataset_name=dataset.name,
         )
-        if int(audit.get("skipped_count", 0)) > 0 or int(
-            dataset._validation_audit.get("skipped_count", 0)
-        ) == 0:
+        if repair_config is not None and int(audit.get("fixed_count", 0)) > 0:
+            audit["repair_policy"] = {
+                "source_fill_rule": "even_odd",
+                **repair_config._to_dict(),
+                "vectorization": "connected_exteriors_with_hole_hierarchy",
+            }
+        if (
+            int(audit.get("skipped_count", 0)) > 0
+            or int(audit.get("fixed_count", 0)) > 0
+            or (
+                int(dataset._validation_audit.get("skipped_count", 0)) == 0
+                and int(dataset._validation_audit.get("fixed_count", 0)) == 0
+            )
+        ):
             dataset._validation_audit = audit
             dataset._validation_audit_visualization = visualization
         return dataset
@@ -1684,7 +1710,9 @@ class Dataset:
                 for sample in self._samples
                 if sample.split in selected
                 for annotation in sample.annotations
-                if annotation.rle is not None or not annotation.polygon
+                if annotation.rle is not None
+                or annotation.polygon_holes
+                or not annotation.polygon
             ]
             if unsupported:
                 raise DatasetValidationError(
@@ -1755,7 +1783,7 @@ class Dataset:
         name: str | None = None,
         format: Literal["yolo", "semantic_masks"] = "yolo",
         splits: Iterable[Literal["train", "val", "test"]] | None = None,
-        allow_lossy: bool = False,
+        allow_lossy: bool | Literal["bridge-holes"] = False,
         visualize: bool = True,
         visualize_kwargs: Mapping[str, Any] | None = None,
         progress: bool = True,
@@ -1778,8 +1806,11 @@ class Dataset:
                 foreground-union masks and also returns a :class:`Dataset`.
             splits: Splits included in the published output; ``None`` publishes
                 every available split. Unselected splits are omitted.
-            allow_lossy: Permit explicit lossy conversion of COCO RLE/multipart
-                masks to one YOLO polygon.
+            allow_lossy: ``True`` permits explicit lossy conversion of COCO
+                RLE/multipart masks and fills polygon holes.
+                ``"bridge-holes"`` instead opens each polygon hole to the
+                exterior with a 0.1-pixel corridor, producing a valid YOLO
+                ring while retaining the hole everywhere except that slit.
             visualize: Render pending operation audits and display the final
                 canonical ``reports/plots.png`` inline when possible.
             visualize_kwargs: Options forwarded to final report rendering;
@@ -1797,6 +1828,8 @@ class Dataset:
         format = format.lower()
         if format not in {"yolo", "semantic_masks"}:
             raise ValueError("format must be 'yolo' or 'semantic_masks'")
+        if not isinstance(allow_lossy, bool) and allow_lossy != "bridge-holes":
+            raise ValueError("allow_lossy must be False, True, or 'bridge-holes'")
         if format == "semantic_masks" and allow_lossy:
             raise ValueError("allow_lossy applies only to YOLO export; semantic masks use polygon unions directly")
         visualization_options = normalize_visualize_kwargs(visualize_kwargs)
@@ -1854,7 +1887,7 @@ class Dataset:
         *,
         name: str | None = None,
         splits: Iterable[Literal["train", "val", "test"]] | None = None,
-        allow_lossy: bool = False,
+        allow_lossy: bool | Literal["bridge-holes"] = False,
         visualize: bool = True,
         visualize_kwargs: Mapping[str, Any] | None = None,
         progress: bool = True,
@@ -1873,8 +1906,9 @@ class Dataset:
                 to their final output roots.
             name: Optional dataset name stored in each output's metadata.
             splits: Splits published in every requested format.
-            allow_lossy: Permit lossy conversion for the YOLO output. This is
-                rejected when YOLO is not requested.
+            allow_lossy: Permit lossy conversion for the YOLO output. Pass
+                ``"bridge-holes"`` to retain holes behind 0.1-pixel corridors.
+                This is rejected when YOLO is not requested.
             visualize: Render pending operation audits and display each final
                 canonical report inline when possible.
             visualize_kwargs: Options forwarded to report rendering; currently
@@ -2780,10 +2814,13 @@ class Dataset:
         elif self.data_yaml is not None:
             lines.append(f"  data_yaml: {self.data_yaml}")
         skipped = int(self._validation_audit.get("skipped_count", 0))
+        fixed = int(self._validation_audit.get("fixed_count", 0))
         validation_status = str(self._validation_audit.get("status", "unknown"))
         validation = f"  validation: {validation_status} | warnings: {len(self.warnings)}"
         if skipped:
             validation += f" | skipped: {skipped} (see validation_audit)"
+        if fixed:
+            validation += f" | fixed: {fixed} (see validation_audit)"
         lines.append(validation)
         return "\n".join(lines)
 
@@ -3001,7 +3038,7 @@ class Dataset:
         name: str | None,
         format: str,
         splits: Iterable[str] | None,
-        allow_lossy: bool,
+        allow_lossy: bool | Literal["bridge-holes"],
         visualize: bool,
         visualize_kwargs: Mapping[str, Any],
         visualize_kwargs_description: Mapping[str, Any],

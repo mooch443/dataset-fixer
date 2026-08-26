@@ -6,8 +6,10 @@ import tempfile
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Hashable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Hashable, Iterable, Literal, Mapping
 
+from shapely.geometry import LineString, Polygon
+from shapely.ops import nearest_points
 from tqdm.auto import tqdm
 
 from .errors import DatasetValidationError, ValidationIssue
@@ -546,7 +548,7 @@ def export_dataset(
     destination: str | Path | None,
     name: str | None,
     splits: Iterable[str] | None,
-    allow_lossy: bool,
+    allow_lossy: bool | Literal["bridge-holes"],
     visualize: bool,
     visualize_kwargs: Mapping[str, Any],
     visualize_kwargs_description: Mapping[str, Any],
@@ -681,15 +683,41 @@ def rebalance_empty_dataset(
         raise
 
 
-def _make_representable(annotation: Annotation, allow_lossy: bool, builder: OutputBuilder) -> Annotation:
-    if annotation.rle is None:
+def _make_representable(
+    annotation: Annotation,
+    allow_lossy: bool | Literal["bridge-holes"],
+    builder: OutputBuilder,
+) -> Annotation:
+    if annotation.rle is None and not annotation.polygon_holes:
         return annotation
-    if not allow_lossy:
+    if annotation.polygon_holes:
+        if not allow_lossy:
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Segmentation holes cannot be represented in a YOLO polygon row",
+                    value={
+                        "annotation": annotation.source_id,
+                        "holes": len(annotation.polygon_holes),
+                    },
+                    suggestion=(
+                        "export semantic_masks to preserve holes, or re-run YOLO export "
+                        "with allow_lossy=True to fill them"
+                    ),
+                )
+            )
+        if allow_lossy == "bridge-holes":
+            return _bridge_polygon_holes(annotation, builder)
+        builder.warnings.append(
+            f"Lossy YOLO conversion filled {len(annotation.polygon_holes)} hole(s) "
+            f"for annotation {annotation.source_id}"
+        )
+        return annotation.clone(polygon_holes=None)
+    if allow_lossy is not True:
         raise DatasetValidationError(
             ValidationIssue(
                 "Segmentation cannot be represented as one YOLO polygon",
                 value=annotation.source_id,
-                suggestion="re-run export with allow_lossy=True",
+                suggestion="re-run export with allow_lossy=True; bridge-holes applies only to polygon holes",
             )
         )
     if "multipart" in annotation.rle:
@@ -711,6 +739,97 @@ def _make_representable(annotation: Annotation, allow_lossy: bool, builder: Outp
         polygon = [tuple(map(float, point)) for point in max(valid, key=cv2.contourArea)]
     builder.warnings.append(f"Lossy segmentation conversion for annotation {annotation.source_id}")
     return annotation.clone(polygon=polygon, rle=None)
+
+
+def _bridge_polygon_holes(
+    annotation: Annotation,
+    builder: OutputBuilder,
+    *,
+    corridor_width: float = 0.1,
+) -> Annotation:
+    """Open interior rings through subpixel corridors for valid YOLO output."""
+
+    assert annotation.polygon is not None and annotation.polygon_holes
+    geometry = Polygon(annotation.polygon, annotation.polygon_holes)
+    original_area = float(geometry.area)
+    original_holes = len(geometry.interiors)
+    for _ in range(original_holes + 1):
+        if not geometry.interiors:
+            break
+        previous_holes = len(geometry.interiors)
+        exterior_point, hole_point = nearest_points(
+            geometry.exterior,
+            geometry.interiors[0],
+        )
+        dx = hole_point.x - exterior_point.x
+        dy = hole_point.y - exterior_point.y
+        distance = (dx * dx + dy * dy) ** 0.5
+        if distance <= 1e-12:
+            corridor = exterior_point.buffer(corridor_width / 2, quad_segs=1)
+        else:
+            unit_x, unit_y = dx / distance, dy / distance
+            bridge = LineString(
+                [
+                    (
+                        exterior_point.x - unit_x * corridor_width,
+                        exterior_point.y - unit_y * corridor_width,
+                    ),
+                    (
+                        hole_point.x + unit_x * corridor_width,
+                        hole_point.y + unit_y * corridor_width,
+                    ),
+                ]
+            )
+            corridor = bridge.buffer(
+                corridor_width / 2,
+                cap_style="flat",
+                join_style="mitre",
+            )
+        opened = geometry.difference(corridor)
+        if (
+            not isinstance(opened, Polygon)
+            or opened.is_empty
+            or not opened.is_valid
+            or len(opened.interiors) >= previous_holes
+        ):
+            raise DatasetValidationError(
+                ValidationIssue(
+                    "Could not bridge polygon holes into one valid YOLO ring",
+                    value={
+                        "annotation": annotation.source_id,
+                        "remaining_holes": previous_holes,
+                        "result_geometry": opened.geom_type,
+                    },
+                    suggestion="export semantic_masks to preserve the exact hole hierarchy",
+                )
+            )
+        geometry = opened
+    if geometry.interiors:
+        raise DatasetValidationError(
+            ValidationIssue(
+                "Could not bridge every polygon hole",
+                value={
+                    "annotation": annotation.source_id,
+                    "remaining_holes": len(geometry.interiors),
+                },
+                suggestion="export semantic_masks to preserve the exact hole hierarchy",
+            )
+        )
+    polygon = [
+        (float(x), float(y))
+        for x, y in list(geometry.exterior.coords)[:-1]
+    ]
+    min_x, min_y, max_x, max_y = map(float, geometry.bounds)
+    area_loss = max(0.0, original_area - float(geometry.area))
+    builder.warnings.append(
+        f"Bridged {original_holes} polygon hole(s) with {corridor_width:.1f}px "
+        f"corridors for annotation {annotation.source_id}; area loss={area_loss:.6f}px²"
+    )
+    return annotation.clone(
+        bbox=(min_x, min_y, max_x, max_y),
+        polygon=polygon,
+        polygon_holes=None,
+    )
 
 
 def _flat_polygon_area(flat: list[float]) -> float:

@@ -52,12 +52,18 @@ class Annotation:
     point: tuple[float, float] | None = None
     radius: float | None = None
     source_id: str | int | None = None
+    polygon_holes: list[list[tuple[float, float]]] | None = None
 
     def clone(self, **updates: Any) -> "Annotation":
         values = {
             "class_id": self.class_id,
             "bbox": self.bbox,
             "polygon": list(self.polygon) if self.polygon else None,
+            "polygon_holes": (
+                [list(ring) for ring in self.polygon_holes]
+                if self.polygon_holes
+                else None
+            ),
             "rle": dict(self.rle) if self.rle else None,
             "keypoints": list(self.keypoints) if self.keypoints else None,
             "point": self.point,

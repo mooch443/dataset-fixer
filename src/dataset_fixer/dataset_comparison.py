@@ -16,6 +16,7 @@ from PIL import Image
 
 from .comparison.reporting import combine_report_plots
 from .models import DatasetMetadata, Sample, Task
+from .segmentation import rasterize_annotations
 from .static_rendering import format_label, save_chart
 from .tabular import chart_data, frame, stable_sort
 from .utils import settings_fingerprint, sha256_file
@@ -552,32 +553,44 @@ def _example_chart(
         sample = row["sample"]
         with Image.open(sample.image_path) as opened:
             source = np.asarray(opened.convert("RGB"))
+        task = Task.parse(state.task) or Task.DETECT
         mask = None
         if row.get("mask_path") and Path(row["mask_path"]).is_file():
             with Image.open(row["mask_path"]) as opened:
                 mask = np.asarray(opened.convert("L")) > 0
+        elif task is Task.SEGMENT:
+            mask = rasterize_annotations(
+                sample.annotations,
+                width=sample.width,
+                height=sample.height,
+            ).astype(bool)
         rendered = (
             source
             if mask is not None
             else np.asarray(render_annotated_sample(
                 sample,
-                Task.parse(state.task) or Task.DETECT,
+                task,
                 state.metadata or DatasetMetadata(names=state.classes),
                 show_names=False,
                 line_width=options.get("line_width"),
                 outline_width=options.get("outline_width"),
             ))
         )
-        label = label_fn(sample.image_path) if label_fn else (
-            f"{state.name} · {sample.split} · {sample.relative_path} · "
-            f"{len(sample.annotations)} object(s)"
-        )
+        label = label_fn(sample.image_path) if label_fn else sample.relative_path.name
         if label is not None and not isinstance(label, str):
             raise TypeError("label_fn must return a string or None")
         return VisualizationItem(
             image_path=sample.image_path,
             label=label or "",
-            panels=(VisualizationPanel(title=state.name, image=rendered, mask=mask),),
+            panels=(
+                VisualizationPanel(
+                    title=state.name,
+                    image=rendered,
+                    mask=mask,
+                    color="#ff00ff",
+                    footer=f"{sample.split} · {len(sample.annotations)} object(s)",
+                ),
+            ),
             foreground=np.ones(source.shape[:2], dtype=bool),
         )
 
@@ -585,7 +598,7 @@ def _example_chart(
         selected,
         options=VisualizationOptions(
             samples=None, columns=4, panel_size=3.2, show=False,
-            label_mode=options.get("label_mode", "middle"),
+            label_mode=options.get("label_mode", "wrap"),
             line_width=options.get("line_width"),
             outline_width=options.get("outline_width", 1.0),
         ),

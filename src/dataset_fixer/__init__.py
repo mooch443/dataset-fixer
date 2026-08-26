@@ -13,6 +13,7 @@ from .geometry import Geometry
 from .model import ImagePrediction, Model, ModelCollection, ModelInput, PredictionResult
 from .models import SemanticComparisonResult, Task
 from .prediction_cache import PredictionCache
+from .segmentation import PolygonRepairConfig
 from .comparison.plot_labels import (
     ModelBadge,
     ModelPresentation,
@@ -48,6 +49,7 @@ __all__ = [
     "PredictionCache",
     "PredictionCacheMissError",
     "PredictionScoreUnavailableError",
+    "PolygonRepairConfig",
     "SemanticComparisonResult",
     "SampleTrace",
     "Task",
