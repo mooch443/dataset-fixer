@@ -273,6 +273,7 @@ class PredictionCache:
                         mask=mask,
                         native_mask=native_mask,
                         reference_mask_path=source.mask_path,
+                        reference_annotations=source.reference_annotations,
                         foreground_probability=foreground_probability,
                         metadata=metadata,
                     )

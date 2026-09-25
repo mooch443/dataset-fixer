@@ -24,6 +24,9 @@ from .comparison.plot_labels import (
 )
 from .tracing import DatasetTrace, DatasetTraceNode, SampleTrace
 from .utils import bounded_slug
+from .training import (train, ModelTypes, TrainingConfig, CheckpointConfig, CheckpointProvider,
+                       Checkpoints, WandbConfig, TrainingEvent, TrainingSession, TrainingResult,
+                       preview_augmentations)
 
 try:
     from ._version import __version__
@@ -31,6 +34,8 @@ except ImportError:  # source tree before setuptools-scm has generated the file
     __version__ = "0.1.0"
 
 __all__ = [
+    "train", "ModelTypes", "TrainingConfig", "CheckpointConfig", "CheckpointProvider", "Checkpoints",
+    "WandbConfig", "TrainingEvent", "TrainingSession", "TrainingResult", "preview_augmentations",
     "Dataset",
     "DatasetComparisonResult",
     "calibrate_prediction_thresholds",

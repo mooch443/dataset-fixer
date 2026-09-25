@@ -79,7 +79,9 @@ def _model_family(framework: Any, task: Any, preparation: Any) -> str | None:
     if "nnunet" in framework_name:
         return "nnunet"
     if "ultralytics" in framework_name or "yolo" in framework_name:
-        return "yolo-sem" if "semantic" in task_name else "yolo-seg"
+        return "yolo-sem" if "semantic" in task_name else {"segment": "yolo-seg", "pose": "yolo-pose", "detect": "yolo-detect", "polo": "yolo-polo"}.get(task_name, "yolo")
+    if "rfdetr" in framework_name:
+        return f"rfdetr-{task_name}"
     return None
 
 
@@ -382,6 +384,9 @@ def upload(
     run: Any,
     bundle: Bundle,
     outcome: Outcome | None = None,
+    *,
+    artifact: bool = False,
+    timeout: int = 600,
 ) -> Bundle:
     """Upload a local bundle to an existing run without creating or logging in.
 
@@ -392,6 +397,8 @@ def upload(
         run: Explicit existing W&B run, or ``None`` to use ``wandb.run``.
         bundle: Local bundle returned by :func:`dataset_fixer.bundle.create`.
         outcome: Optional result metadata written after a successful upload.
+        artifact: Use a versioned model artifact and wait for server confirmation.
+        timeout: Seconds to wait for artifact publication when artifact is True.
 
     Returns:
         A bundle retaining its local path and recording any remote outcome.
@@ -411,7 +418,18 @@ def upload(
         print(f"Uploading model bundle to W&B: {bundle.path.name} ({bundle.size:,} bytes) ...")
         remote_url = None
         upload_file = getattr(selected, "upload_file", None)
-        if callable(upload_file):
+        artifact_ref = None
+        if artifact:
+            import wandb
+            if getattr(getattr(selected, "settings", None), "mode", None) in {"offline", "disabled", "dryrun"}:
+                raise RuntimeError("Offline W&B cannot confirm remote checkpoint publication")
+            item = wandb.Artifact(f"model-{selected.id}", type="model", metadata={"sha256": bundle.sha256, "bundle_file": bundle.path.name})
+            item.add_file(str(bundle.path), name=bundle.path.name)
+            logged = selected.log_artifact(item, aliases=["latest"])
+            committed = logged.wait(timeout=timeout)
+            artifact_ref = committed.qualified_name
+            remote_url = getattr(committed, "url", None)
+        elif callable(upload_file):
             try:
                 supports_root = "root" in inspect.signature(upload_file).parameters
             except (TypeError, ValueError):
@@ -441,6 +459,10 @@ def upload(
             "evaluation_bundle_sha256": bundle.sha256,
             "evaluation_bundle_size": bundle.size,
         }
+        if artifact_ref:
+            summary_values["checkpoint_artifact"] = artifact_ref
+            if outcome is not None and outcome.checkpoint is not None:
+                summary_values["best_model_artifact"] = artifact_ref
         if outcome is not None:
             summary_values.update(
                 {

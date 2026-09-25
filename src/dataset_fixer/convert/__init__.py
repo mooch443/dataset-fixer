@@ -34,6 +34,8 @@ class Kind(str, Enum):
 
     YOLO_SEM = "yolo-sem"
     YOLO_SEG = "yolo-seg"
+    YOLO = "yolo"
+    RFDETR = "rfdetr"
     NNUNET = "nnunet"
 
 
@@ -205,7 +207,7 @@ def _attach_config(
     if device is not None:
         training["device"] = str(device)
 
-    if prepared.kind in {Kind.YOLO_SEM, Kind.YOLO_SEG}:
+    if prepared.kind in {Kind.YOLO_SEM, Kind.YOLO_SEG, Kind.YOLO, Kind.RFDETR}:
         unsupported = {
             "plans": plans,
             "configuration": configuration,
@@ -225,8 +227,8 @@ def _attach_config(
             training["base_model"] = str(base_model)
         if serialized_input_size is not None:
             training["imgsz"] = serialized_input_size
-        framework = "ultralytics"
-        task = "semantic" if prepared.kind == Kind.YOLO_SEM else "segment"
+        framework = "rfdetr" if prepared.kind == Kind.RFDETR else "ultralytics"
+        task = "semantic" if prepared.kind == Kind.YOLO_SEM else prepared.backend.get("task", "segment")
     else:
         if base_model is not None:
             raise ValueError("nnU-Net preparation does not accept base_model")
@@ -559,12 +561,13 @@ def _prepare_yolo_sem(
     return paths, statistics, backend
 
 
-def _prepare_yolo_seg(
+def _prepare_yolo_vectors(
     dataset: Any,
     root: Path,
     *,
     geometry: Geometry,
     errors: Literal["raise", "skip"],
+    flat: bool = False,
 ) -> tuple[dict[str, Path], dict[str, dict[str, int]], dict[str, Any]]:
     if dataset.format == "semantic_masks":
         raise DatasetValidationError(
@@ -574,8 +577,6 @@ def _prepare_yolo_seg(
                 suggestion="Semantic masks are never converted to polygons.",
             )
         )
-    if dataset.task.value != "segment":
-        raise DatasetValidationError("YOLO-SEG preparation requires task='segment'")
     failures: list[str] = []
     skipped: list[dict[str, Any]] = []
     retained_by_split: dict[str, list[Any]] = {}
@@ -613,7 +614,7 @@ def _prepare_yolo_seg(
         instances = 0
         for sample in retained:
             for annotation in sample.annotations:
-                if (
+                if dataset.task.value == "segment" and (
                     not annotation.polygon
                     or len(annotation.polygon) < 3
                     or annotation.polygon_holes
@@ -651,8 +652,11 @@ def _prepare_yolo_seg(
         images_root.mkdir(parents=True, exist_ok=True)
         labels_root.mkdir(parents=True, exist_ok=True)
         for sample in samples:
-            image_output = images_root / sample.relative_path
-            label_output = labels_root / sample.relative_path.with_suffix(".txt")
+            relative = sample.relative_path
+            if flat:
+                relative = Path(hashlib.sha256(relative.as_posix().encode()).hexdigest()[:16] + "-" + relative.name)
+            image_output = images_root / relative
+            label_output = labels_root / relative.with_suffix(".txt")
             image_output.parent.mkdir(parents=True, exist_ok=True)
             label_output.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(sample.image_path, image_output)
@@ -676,6 +680,10 @@ def _prepare_yolo_seg(
             {
                 **_yolo_split_entries(dataset.splits),
                 "names": {int(key): value for key, value in dataset.classes.items()},
+                **({"kpt_shape": list(dataset._metadata.kpt_shape)} if dataset._metadata.kpt_shape else {}),
+                **({"flip_idx": dataset._metadata.flip_idx} if dataset._metadata.flip_idx else {}),
+                **({"kpt_names": dataset._metadata.kpt_names} if dataset._metadata.kpt_names else {}),
+                **({"kpt_oks_sigmas": dataset._metadata.kpt_oks_sigmas} if dataset._metadata.kpt_oks_sigmas else {}),
             },
             sort_keys=False,
         ),
@@ -690,7 +698,7 @@ def _prepare_yolo_seg(
         )
         paths["skips"] = skip_report
     return paths, statistics, {
-        "task": "segment",
+        "task": dataset.task.value,
         "conversion": "canonical-yolo-layout",
         "layout": _YOLO_LAYOUT_REVISION,
         "polygon_audit": "passed",
@@ -776,7 +784,7 @@ def _prepare_nnunet(
     _write_json(
         dataset_json,
         {
-            "channel_names": {"0": "RGB"},
+            "channel_names": {"0": "R", "1": "G", "2": "B"},
             "labels": {"background": 0, "foreground": 1},
             "numTraining": len(records),
             "file_ending": ".png",
@@ -854,6 +862,7 @@ def prepare(
     *,
     name: str | None = None,
     native_tile_size: int | tuple[int, int] | None = None,
+    input_size: int | tuple[int, int] | None = None,
     upscale_factor: int = 1,
     destination: str | Path | None = None,
     workers: int = 4,
@@ -884,6 +893,8 @@ def prepare(
         name: Model and run name. When supplied, the result includes a complete
             :class:`dataset_fixer.bundle.Config` as ``prepared.config``.
         native_tile_size: Source tile edge or two-item size before upscaling.
+        input_size: Explicit training image size; when supplied, replaces the
+            derived integer-scale input geometry.
         upscale_factor: Positive integer source-to-training scale.
         destination: Explicit preparation root. The automatic content cache is
             used when omitted.
@@ -965,14 +976,15 @@ def prepare(
             native = next(iter(sizes))
     geometry = Geometry.create(
         native_tile_size=native,
-        upscale_factor=upscale_factor,
+        upscale_factor=upscale_factor if input_size is None else None,
+        input_size=input_size,
         source=dataset.name,
     )
     settings = {
         "layout_revision": (
             _YOLO_LAYOUT_REVISION
-            if target_kind in {Kind.YOLO_SEM, Kind.YOLO_SEG}
-            else None
+            if target_kind in {Kind.YOLO_SEM, Kind.YOLO_SEG, Kind.YOLO, Kind.RFDETR}
+            else "nnunet-rgb-channels-v2"
         ),
         "native_tile_size": geometry.native_tile_size,
         "upscale_factor": geometry.upscale_factor,
@@ -1029,12 +1041,15 @@ def prepare(
                 progress=progress,
                 errors=errors,
             )
-        elif target_kind == Kind.YOLO_SEG:
-            paths, statistics, backend = _prepare_yolo_seg(
+        elif target_kind in {Kind.YOLO_SEG, Kind.YOLO, Kind.RFDETR}:
+            if target_kind == Kind.YOLO_SEG and dataset.task.value != "segment":
+                raise DatasetValidationError("YOLO-SEG preparation requires task='segment'")
+            paths, statistics, backend = _prepare_yolo_vectors(
                 dataset,
                 temporary,
                 geometry=geometry,
                 errors=errors,
+                flat=target_kind == Kind.RFDETR,
             )
         else:
             paths, statistics, backend = _prepare_nnunet(

@@ -216,6 +216,10 @@ def predict_model_inputs(
 ]:
     """Adapter entry point used by the public :class:`Model` API."""
 
+    if model.kind == "rfdetr":
+        from ..rfdetr_engine import predict_inputs
+        return predict_inputs(model, inputs, resolution=resolution, confidence=confidence,
+                              device=device, progress=progress, backend=backend)
     if backend == "sahi":
         return _predict_sahi_inputs(
             model,

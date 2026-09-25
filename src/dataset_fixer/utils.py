@@ -140,7 +140,7 @@ def package_versions() -> dict[str, str]:
     result: dict[str, str] = {}
     for name in (
         "dataset-fixer", "numpy", "Pillow", "PyYAML", "altair", "vl-convert-python", "shapely", "tqdm",
-        "albumentations", "ultralytics", "sahi", "nnunetv2",
+        "albumentations", "ultralytics", "sahi", "nnunetv2", "rfdetr",
     ):
         try:
             result[name] = importlib.metadata.version(name)

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import tempfile
+import warnings
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -184,17 +185,21 @@ def _model_type(value: Any, *, kind: str, task: str | None = None) -> str:
 
     stem = Path(raw.removeprefix("ultralytics:")).stem
     matches = re.findall(
-        r"(?:yolox|yolo(?:\d+)?[nslmx]?)(?:-(?:sem|seg))?",
+        r"(?:yolox|yolo(?:v?\d+)?[a-z]?)(?:-(?:sem|seg|pose|locate))?",
         stem,
     )
     normalized = matches[-1] if matches else stem
     if normalized in {"best", "last", "model", "weights", "checkpoint"}:
         normalized = ""
-    if normalized and not normalized.endswith(("-sem", "-seg")):
+    if normalized and not normalized.endswith(("-sem", "-seg", "-pose", "-locate")):
         if task in {"semantic", "semantic_segment"}:
             normalized += "-sem"
         elif task == "segment":
             normalized += "-seg"
+        elif task == "pose":
+            normalized += "-pose"
+        elif task == "polo":
+            normalized += "-locate"
     if normalized:
         return normalized
     return "ultralytics-sem" if task in {"semantic", "semantic_segment"} else "ultralytics-seg"
@@ -267,18 +272,24 @@ def _manifest_geometry(manifest: Mapping[str, Any], source: str) -> Geometry:
 def _validate_checkpoint(path: Path, manifest: Mapping[str, Any], *, progress: bool) -> str:
     model = dict(manifest.get("model") or {})
     outcome = dict(manifest.get("outcome") or manifest.get("training_outcome") or {})
-    expected = first_value(
-        model.get("checkpoint_sha256"),
-        outcome.get("checkpoint_sha256"),
-        manifest.get("checkpoint_sha256"),
-    )
+    # A bundle can contain selected weights and a different full-state checkpoint.
+    # Match the archive-relative path, including nnU-Net's fold, before falling
+    # back to the primary-checkpoint digest used by older bundles.
+    entries = [entry for entry in manifest.get("files", ()) if isinstance(entry, Mapping)]
+    expected = [entry["sha256"] for entry in entries
+                if entry.get("sha256") and path.as_posix().endswith("/" + str(entry.get("path", "")))]
+    primary = first_value(model.get("checkpoint"), outcome.get("checkpoint"), manifest.get("checkpoint"))
+    if primary is None or path.name == Path(str(primary)).name:
+        legacy = first_value(model.get("checkpoint_sha256"), outcome.get("checkpoint_sha256"), manifest.get("checkpoint_sha256"))
+        if legacy is not None:
+            expected.append(legacy)
     actual = sha256_progress(path, progress=progress)
-    if expected is not None and str(expected).lower() != actual:
+    if any(str(digest).lower() != actual for digest in expected):
         raise DatasetValidationError(
             ValidationIssue(
                 "Model checkpoint SHA-256 does not match its bundle manifest",
                 value=actual,
-                expected=str(expected),
+                expected=expected,
                 source=str(path),
             )
         )
@@ -320,7 +331,18 @@ def _resolve_bundle(path: Path, *, name: str | None, progress: bool) -> Resolved
     is_nnunet = bundle_format == "dataset-fixer-nnunet-model-folder-v1" or str(
         first_value(model_metadata.get("framework"), manifest.get("framework"), "")
     ).lower() in {"nnunet", "nnunetv2", "nnunet-v2"}
-    if is_nnunet:
+    is_rfdetr = str(model_metadata.get("framework") or manifest.get("framework")) == "rfdetr"
+    if is_rfdetr:
+        checkpoint = model_metadata.get("checkpoint")
+        if not checkpoint:
+            raise ValueError("RF-DETR bundle must identify its selected checkpoint")
+        source_path = _one(list(manifest_root.rglob(Path(checkpoint).name)), "RF-DETR checkpoint")
+        _validate_checkpoint(source_path, manifest, progress=progress)
+        options.update(kind="rfdetr", task=model_metadata.get("task", manifest.get("task")),
+                       model_type=model_metadata.get("model_name", "rfdetr"))
+        if geometry.input_size and geometry.input_size[0] == geometry.input_size[1]:
+            options["resolution"] = geometry.input_size[0]
+    elif is_nnunet:
         candidates = [
             value.parent
             for value in extracted.root.rglob("plans.json")
@@ -386,12 +408,13 @@ def _resolve_bundle(path: Path, *, name: str | None, progress: bool) -> Resolved
             candidates = [value for value in manifest_root.rglob("best.pt") if value.is_file()]
         source_path = _one(candidates, "Ultralytics checkpoint")
         _validate_checkpoint(source_path, manifest, progress=progress)
-        resolved_task = _task(model_metadata.get("task"))
+        resolved_task = _task(model_metadata.get("task", manifest.get("task")))
         options.update(
             kind="ultralytics",
             task=resolved_task,
             model_type=_model_type(
                 first_value(
+                    model_metadata.get("model_name"),
                     model_metadata.get("model_weights"),
                     model_metadata.get("initialization_source"),
                     model_metadata.get("base_model"),
@@ -464,7 +487,7 @@ def _wandb_file(run: Any, requested: str | None) -> Any:
     zipped = sorted(name for name in files if name.lower().endswith(".zip"))
     if len(zipped) == 1:
         return files[zipped[0]]
-    best = sorted(name for name in files if Path(name).name.lower() == "best.pt")
+    best = sorted(name for name in files if Path(name).name.lower() in {"best.pt", "best.pth", "checkpoint_best_total.pth", "checkpoint_best.pth"})
     if not zipped and len(best) == 1:
         return files[best[0]]
     raise DatasetValidationError(
@@ -500,7 +523,42 @@ def _download_wandb(
             "Loading wandb: model sources requires W&B; reinstall dataset-fixer"
         ) from exc
     run_path = normalize_wandb_run(reference)
-    run = sdk.Api().run(run_path)
+    api = sdk.Api()
+    run = api.run(run_path)
+    summary = dict(getattr(run, "summary", {}) or {})
+    artifact_ref = summary.get("best_model_artifact") or summary.get("checkpoint_artifact")
+    if artifact_ref is None and requested is None and callable(getattr(run, "logged_artifacts", None)):
+        try:
+            best_artifacts = [a for a in run.logged_artifacts() if a.type == "model" and "best" in a.aliases]
+        except Exception:
+            # Artifact discovery is optional for legacy runs. An explicitly
+            # recorded artifact below remains authoritative and must verify.
+            warnings.warn("Unable to discover W&B model artifacts; trying legacy run files.", RuntimeWarning, stacklevel=2)
+            best_artifacts = []
+        if len(best_artifacts) == 1:
+            artifact_ref = best_artifacts[0].qualified_name
+    if artifact_ref and requested is None:
+        artifact = api.artifact(str(artifact_ref))
+        identity = {"name": artifact.qualified_name, "digest": artifact.digest}
+        identity_hash = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
+        root = cache_root() / "models" / "wandb-artifacts" / identity_hash
+        artifact.download(root=str(root))
+        artifact.verify(root=str(root))
+        metadata = dict(artifact.metadata or {})
+        bundles = list(root.rglob("*.zip"))
+        if metadata.get("bundle_file"):
+            path = (root / metadata["bundle_file"]).resolve()
+            if not path.is_relative_to(root.resolve()) or not path.is_file():
+                raise ValueError("Artifact bundle path is missing or invalid")
+            if metadata.get("sha256") and sha256_progress(path, progress=False) != metadata["sha256"]:
+                raise ValueError("Downloaded artifact bundle checksum does not match")
+        elif len(bundles) == 1:
+            path = bundles[0]
+        else:
+            candidates = [p for p in root.rglob("*") if p.name in {"best.pt", "best.pth", "checkpoint_best_total.pth", "checkpoint_best.pth"}]
+            path = _one(candidates, "best checkpoint in model artifact")
+        path.with_suffix(path.suffix + ".artifact.json").write_text(json.dumps(identity))
+        return path, run
     remote = _wandb_file(run, requested)
     identity = _remote_identity(run, remote)
     identity_hash = hashlib.sha256(
@@ -626,6 +684,16 @@ def _checkpoint_metadata(path: Path) -> dict[str, Any]:
         train_args = dict(checkpoint.get("train_args") or {})
         serialized = checkpoint.get("model") or checkpoint.get("ema")
         model_args = dict(getattr(serialized, "args", {}) or {})
+        architecture = dict(getattr(serialized, "yaml", {}) or {})
+        if architecture.get("yaml_file"):
+            model_args.setdefault("model", architecture["yaml_file"])
+        if train_args.get("data"):
+            names = getattr(serialized, "names", None)
+            if names:
+                names = dict(enumerate(names)) if isinstance(names, list) else names
+                values["checkpoint_schema"] = {"classes": {str(k): v for k, v in names.items()}}
+                if architecture.get("kpt_shape"):
+                    values["checkpoint_schema"]["kpt_shape"] = list(architecture["kpt_shape"])
         checkpoint_created_at = first_value(
             checkpoint.get("checkpoint_created_at"),
             checkpoint.get("date"),
@@ -737,6 +805,8 @@ def resolve_model_source(
         source_key = raw
         path = local_source(Path(source), progress=progress)
         resolved_name = name
+    provenance_path = path.with_suffix(path.suffix + ".artifact.json")
+    source_metadata = {"source_artifact": _read_json(provenance_path)} if provenance_path.is_file() else {}
     if path.is_dir():
         if path.name.startswith("fold_") and not (path / "plans.json").is_file():
             parent = path.parent
@@ -827,6 +897,7 @@ def resolve_model_source(
         )
     if path.suffix.lower() == ".zip":
         resolved = _resolve_bundle(path, name=resolved_name, progress=progress)
+        resolved = replace(resolved, manifest={**resolved.manifest, **source_metadata})
         options = dict(resolved.options)
         if created_at := _creation_time(resolved.manifest, run=run):
             options["source_created_at"] = created_at
@@ -842,8 +913,20 @@ def resolve_model_source(
         return replace(
             resolved,
             source=source_key,
+            manifest={**resolved.manifest, **source_metadata},
             options={**resolved.options, **_wandb_option(run, source_key)},
         )
+    if path.suffix.lower() in {".pth", ".ckpt"}:
+        if path.parent.name.startswith("fold_") and (path.parent.parent / "plans.json").is_file():
+            resolved = resolve_model_source(path.parent, name=resolved_name, progress=progress)
+            return replace(resolved, options={**resolved.options, "checkpoint": path.name},
+                           manifest={**resolved.manifest, **source_metadata}, source=source_key)
+        from .rfdetr_engine import checkpoint_metadata
+        metadata = checkpoint_metadata(path)
+        return ResolvedModelSource(path, str(resolved_name or path.stem),
+            options={"kind": "rfdetr", "task": metadata["task"], "model_type": metadata["model_name"],
+                     "resolution": metadata["model_config"].get("resolution"), **_wandb_option(run, source_key)},
+            manifest={**metadata, **source_metadata}, source=source_key)
     raise DatasetValidationError(
         ValidationIssue(
             "Unsupported model source",

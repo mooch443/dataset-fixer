@@ -31,7 +31,7 @@ from .visualization import (
     visualization_options,
 )
 
-ModelKind = Literal["ultralytics", "nnunet"]
+ModelKind = Literal["ultralytics", "nnunet", "rfdetr"]
 PredictionTask = Literal["detect", "segment", "pose", "polo", "semantic_segment"]
 ModelTask = PredictionTask | Literal["auto", "locate", "semantic"]
 _MAX_INFERENCE_BATCH_SIZE = 128
@@ -112,6 +112,8 @@ class ModelInput:
             prediction never reads it.
         image_sha256: Optional already-computed image digest used to avoid
             hashing frozen comparison inputs again for prediction caching.
+        reference_annotations: Vector annotations retained for visualization;
+            inference never reads them.
     """
 
     image_id: str
@@ -121,6 +123,7 @@ class ModelInput:
     relative_path: str
     mask_path: Path | None = None
     image_sha256: str | None = None
+    reference_annotations: tuple[dict[str, Any], ...] = field(default=(), compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,7 @@ class ImagePrediction:
             selected semantic operating threshold and can therefore be reused
             for calibration without rerunning inference.
         metadata: Backend-specific non-tensor prediction metadata.
+        reference_annotations: Vector ground truth retained for pose rendering.
     """
 
     image_id: str
@@ -161,6 +165,7 @@ class ImagePrediction:
         compare=False,
     )
     metadata: dict[str, Any] = field(default_factory=dict)
+    reference_annotations: tuple[dict[str, Any], ...] = field(default=(), compare=False, repr=False)
 
     @property
     def count(self) -> int:
@@ -654,6 +659,13 @@ class PredictionResult:
             foreground = prediction.copy()
             if reference is not None:
                 foreground |= reference
+            reference_image, predicted_image = image, image
+            if self.task == "pose":
+                from .comparison.reporting import _draw_panel
+
+                original = Image.fromarray(image)
+                reference_image = np.asarray(_draw_panel(original, list(record.reference_annotations), truth=True))
+                predicted_image = np.asarray(_draw_panel(original, list(record.objects), truth=False))
             return VisualizationItem(
                 image_path=record.image_path,
                 label=_prediction_key(record.relative_path),
@@ -661,9 +673,9 @@ class PredictionResult:
                     VisualizationPanel(title="Original", image=image),
                     VisualizationPanel(
                         title="Annotation",
-                        image=image,
+                        image=reference_image,
                         mask=(
-                            np.zeros_like(prediction)
+                            None if self.task == "pose" else np.zeros_like(prediction)
                             if reference is None
                             else reference
                         ),
@@ -671,8 +683,8 @@ class PredictionResult:
                     ),
                     VisualizationPanel(
                         title="Prediction",
-                        image=image,
-                        mask=prediction,
+                        image=predicted_image,
+                        mask=None if self.task == "pose" else prediction,
                         color="#C86552",
                         heading=model_heading,
                     ),
@@ -774,7 +786,7 @@ class Model:
         source: str | Path,
         *,
         name: str | None = None,
-        kind: Literal["auto", "ultralytics", "nnunet"] = "auto",
+        kind: Literal["auto", "ultralytics", "nnunet", "rfdetr"] = "auto",
         task: ModelTask | None = None,
         source_key: str | None = None,
         model_type: str | None = None,
@@ -816,8 +828,8 @@ class Model:
                     folds = (path.name.removeprefix("fold_"),)
                 path = candidate
         resolved_kind = self._detect_kind(path) if kind == "auto" else kind
-        if resolved_kind not in {"ultralytics", "nnunet"}:
-            raise ValueError("kind must be 'auto', 'ultralytics', or 'nnunet'")
+        if resolved_kind not in {"ultralytics", "nnunet", "rfdetr"}:
+            raise ValueError("kind must be 'auto', 'ultralytics', 'rfdetr', or 'nnunet'")
         parsed_name = str(name or (path.stem if path.is_file() else path.name)).strip()
         if not parsed_name:
             raise ValueError("Model name must be non-empty")
@@ -997,7 +1009,11 @@ class Model:
                 )
             self._digest = sha256_file(path)
             if self._resolved_task is None:
-                self._resolved_task = _task_from_args(path)
+                if resolved_kind == "rfdetr":
+                    from .rfdetr_engine import checkpoint_metadata
+                    self._resolved_task = checkpoint_metadata(path)["task"]
+                else:
+                    self._resolved_task = _task_from_args(path)
         if self._source_created_at is None:
             self._source_created_at = _file_creation_timestamp(
                 self._checkpoint_files or (path,)
@@ -1015,6 +1031,14 @@ class Model:
         if path.is_dir() and (path / "dataset.json").is_file() and (path / "plans.json").is_file():
             return "nnunet"
         if path.is_file():
+            if path.suffix.lower() in {".pth", ".ckpt"}:
+                from .rfdetr_engine import NotRFDETRCheckpoint, checkpoint_metadata
+                try:
+                    checkpoint_metadata(path)
+                except NotRFDETRCheckpoint:
+                    pass  # Preserve existing file loading unless RF-DETR is identified.
+                else:
+                    return "rfdetr"
             return "ultralytics"
         raise DatasetValidationError(
             ValidationIssue(
@@ -1926,6 +1950,7 @@ class Model:
                         height=value.height,
                         objects=tuple(by_id[value.image_id]),
                         reference_mask_path=value.mask_path,
+                        reference_annotations=value.reference_annotations,
                         metadata={"backend": backend},
                     )
                     for value in inputs
@@ -2712,7 +2737,7 @@ class ModelCollection:
                 group_by=group_by,
                 model_identity=model_identity,
             )
-        if any(model.kind != "ultralytics" for model in self.models):
+        if any(model.kind not in {"ultralytics", "rfdetr"} for model in self.models):
             raise DatasetValidationError(
                 ValidationIssue(
                     "Dataset-native comparison cannot evaluate semantic model folders",
@@ -3245,6 +3270,7 @@ def _load_prediction_cache_request(
                     height=value.height,
                     objects=tuple(by_image[value.image_id]),
                     reference_mask_path=value.mask_path,
+                    reference_annotations=value.reference_annotations,
                     metadata={"backend": backend},
                 )
                 for value in inputs
@@ -3666,6 +3692,7 @@ def normalize_model_inputs(
                     height=record.height,
                     relative_path=record.relative_path,
                     image_sha256=record.image_sha256,
+                    reference_annotations=record.annotations,
                 )
                 for record in source.records
             ),

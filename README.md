@@ -33,6 +33,95 @@ before atomic publication, records every effective setting and tool/environment
 version, and maps each output image back to its parent and ultimate original in
 the compressed `reports/lineage.json.gz` index.
 
+## Unified training
+
+`train()` uses native Ultralytics, RF-DETR, or nnU-Net trainers behind one
+interface. The task is inferred from the validated dataset; incompatible task
+overrides fail before training. Available YOLO versions/sizes come from the
+installed Ultralytics model catalogue.
+
+```python
+import dataset_fixer as df
+
+dataset = df.Dataset.open("/datasets/poses.zip")
+result = df.train(dataset, type=df.ModelTypes.YOLO, version=26, s="s")
+# Announces yolo26s-pose.pt for a pose dataset.
+```
+
+Use a managed session to include evaluation in the same W&B run and ensure
+publication also runs after errors. `CheckpointConfig()` keeps best weights
+and resumable latest state, and publishes after each epoch. A backup directory
+adds a verified atomic filesystem copy. W&B is opt-in; login remains the
+caller's responsibility.
+
+```python
+settings = df.TrainingConfig(resolution=1296, epochs=50, batch_size=14)
+with df.TrainingSession(
+    wandb=df.WandbConfig(project="wolf-poses"),
+    checkpointing=df.CheckpointConfig(backup_dir="/content/drive/MyDrive/models"),
+    disconnect="after_safe",  # optional, Colab only; default is False
+) as session:
+    result = df.train(dataset, type=df.ModelTypes.RFDETR, config=settings, session=session)
+    evaluation = result.evaluate(samples=32, plots=6)
+```
+
+`result.model`, `result.best_weights`, `result.resumable_checkpoint`, and
+`result.bundle` expose the outputs. Failed publication preserves local files
+and keeps Colab connected; `session.finish()` retries without retraining.
+Normal interruptions finalize too. Abrupt runtime loss can recover only
+already-published epochs. Disconnect requires confirmation from every
+configured persistent destination and waits 30 seconds before unassigning.
+
+To initialize a **new** run from a finished run, use `weights=` with its W&B
+run reference, bundle ZIP, or local checkpoint. It resets optimizer/scheduler
+state and records the parent artifact and checksum. Resolution may change if
+the architecture supports it (RF-DETR pose requires multiples of 24).
+`resume=` is separate and requires optimizer state; it cannot be combined
+with `weights=` or a resolution change.
+
+```python
+result = df.train(dataset, weights="wandb:entity/project/run-id",
+                  config=df.TrainingConfig(resolution=1536, epochs=20))
+```
+
+The standard installation continues to include Ultralytics and nnU-Net.
+Install `dataset-fixer[rfdetr,roboflow]` to add RF-DETR and Roboflow
+downloads. `Dataset.open("roboflow:workspace/project/5")` downloads and validates
+a pinned YOLO export, caches completed downloads, and retains pose metadata.
+Authentication uses `ROBOFLOW_API_KEY` from the environment or Colab Secrets,
+or the SDK's existing authentication.
+
+Keep augmentation configuration separate from run settings, then pass the
+same object to `preview_augmentations()` and `train()`:
+
+```python
+augmentations = {"Affine": {"rotate": (-20, 20), "p": 0.5}}
+df.preview_augmentations(dataset, augmentations, type=df.ModelTypes.RFDETR,
+                         config=settings, samples=3)
+```
+
+Previews use native augmented samples and dataset-fixer's existing renderer.
+RF-DETR accepts its augmentation dictionary; YOLO accepts native augmentation
+settings or an Albumentations transform list; nnU-Net accepts a callable
+customizing its native transform pipeline. Backend-specific transforms are
+not silently translated between libraries.
+
+Optional `callbacks=[callback, ...]` receive `TrainingEvent` objects for
+`train_start`, `epoch_end`, `checkpoint_saved`, `train_end`, and `error`.
+They supplement default checkpointing. A custom `CheckpointProvider` supplies
+`config: CheckpointConfig` and `checkpoints(trainer, defaults) -> Checkpoints`;
+only fully written files may be returned. The shared publisher still verifies
+and uploads them. Session defaults can be overridden per `train()` call.
+
+`TrainingConfig.backend_options` passes advanced native settings. It also
+accepts `native_callbacks` (Ultralytics event mapping or Lightning callback
+list) and `trainer` (YOLO/nnU-Net trainer class; RF-DETR callable receiving the
+fully configured native Trainer and returning a Trainer). RF-DETR additionally
+accepts `model` and `trainer_options` dictionaries. Reserved lifecycle paths and
+conflicting common/native options are rejected. nnU-Net uses semantic masks,
+native planning, and verifies architecture compatibility before loading all
+weights, including segmentation heads.
+
 ## Loading and validation
 
 `Dataset.open()` accepts a dataset root, a YOLO `data.yaml`, or a COCO JSON/root.
@@ -533,7 +622,7 @@ name. Model panels show masks only, with Dice and IoU beneath them. The
 not expose model-loading or model-comparison methods; load models with
 `Model.load_many(...)` and call `models.compare(masks, ...)`.
 
-The official backend is included by `pip install dataset-fixer`. Comparison calls
+The standard installation includes the official nnU-Net backend. Comparison calls
 `nnUNetv2_predict_from_modelfolder` for whole-image prediction and
 `nnUNetv2_evaluate_folder` for every reported metric, verifies
 that every model predicted the exact same image set, and ranks the official

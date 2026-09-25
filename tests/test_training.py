@@ -1,0 +1,491 @@
+from __future__ import annotations
+
+import io
+import json
+import shutil
+import sys
+import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+from dataclasses import replace
+
+import pytest
+import torch
+import yaml
+
+import dataset_fixer as df
+from dataset_fixer.training.selection import select
+from dataset_fixer.training.backends import prepare_data, rfdetr_configs
+from dataset_fixer.training.session import verified_copy
+from conftest import make_yolo_dataset
+
+
+@pytest.fixture(autouse=True)
+def training_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr("dataset_fixer.convert.cache_root", lambda: tmp_path / "cache")
+    monkeypatch.setattr("dataset_fixer.training.session.cache_root", lambda: tmp_path / "cache")
+
+
+@pytest.fixture
+def pose(tmp_path):
+    keypoints = " ".join(f"{0.25 + i * .06} 0.5 2" for i in range(8))
+    root = make_yolo_dataset(tmp_path / "pose", task="pose", names=["wolf"],
+        train_rows=[f"0 0.5 0.5 0.8 0.8 {keypoints}"], val_rows=[f"0 0.5 0.5 0.8 0.8 {keypoints}"],
+        extra={"kpt_shape": [8, 3], "flip_idx": [0, 3, 2, 1, 4, 5, 6, 7]})
+    from PIL import Image, ImageDraw
+    for path in root.rglob("*.jpg"):
+        with Image.open(path) as image:
+            drawing = ImageDraw.Draw(image)
+            drawing.ellipse((20, 35, 140, 85), fill=(170, 150, 80))
+            drawing.line([(40, 60), (112, 60)], fill="white", width=2)
+            image.save(path)
+    return df.Dataset.open(root, progress=False)
+
+
+def test_yolo_inference_uses_installed_catalogue(pose, monkeypatch):
+    from ultralytics.utils import downloads
+    monkeypatch.setattr(downloads, "GITHUB_ASSETS_NAMES", {"yolo26s-pose.pt", "yolo99z-pose.pt", "yolo26s.pt"})
+    assert select(pose, type=df.ModelTypes.YOLO, version=26, s="s").name == "yolo26s-pose.pt"
+    assert select(pose, type=df.ModelTypes.YOLO, version=99, s="z").name == "yolo99z-pose.pt"
+    with pytest.raises(ValueError, match="no pretrained"):
+        select(pose, type=df.ModelTypes.YOLO, version=88)
+    with pytest.raises(ValueError, match="incompatible"):
+        select(pose, model_type="detect")
+    with pytest.raises(ValueError, match="does not support"):
+        select(pose, type=df.ModelTypes.NNUNET)
+
+
+def test_polygon_and_mask_tasks_remain_distinct(tmp_path):
+    root = make_yolo_dataset(tmp_path / "polygons", task="segment", names=["island"],
+        train_rows=["0 .2 .2 .8 .2 .8 .8 .2 .8"], val_rows=["0 .2 .2 .8 .2 .8 .8 .2 .8"])
+    polygons = df.Dataset.open(root, progress=False)
+    assert select(polygons, version=26, s="n").name == "yolo26n-seg.pt"
+    assert select(polygons, type=df.ModelTypes.NNUNET).task == "semantic_segment"
+    masks = polygons.export(destination=tmp_path / "masks", format="semantic_masks", visualize=False, progress=False)
+    assert select(masks, version=26, s="n").name == "yolo26n-sem.pt"
+    with pytest.raises(ValueError, match="does not support"):
+        select(masks, type=df.ModelTypes.RFDETR)
+    with pytest.raises(ValueError, match="incompatible"):
+        select(masks, model_type="segment")
+
+
+class Artifact:
+    def __init__(self, name, type, metadata):
+        self.name, self.type, self.metadata = name, type, metadata
+        self.files, self.waited, self.fail = {}, False, False
+        self.qualified_name = f"team/project/{name}:v3"
+        self.url = "https://wandb.ai/team/project/artifacts/model/test/v3"
+        self.digest = "digest"
+
+    def add_file(self, path, name):
+        self.files[name] = Path(path).read_bytes()
+
+    def wait(self, timeout):
+        if self.fail:
+            raise TimeoutError("upload timeout")
+        self.waited = True
+        return self
+
+
+class Config(dict):
+    def update(self, values, **_):
+        super().update(values)
+
+
+class Run:
+    id, project, entity = "test", "project", "team"
+    def __init__(self):
+        self.summary, self.config, self.tags, self.artifacts = {}, Config(), (), []
+        self.settings = SimpleNamespace(mode="online")
+        self.fail, self.closed = False, False
+    def log_artifact(self, artifact, aliases):
+        artifact.fail = self.fail
+        self.artifacts.append(artifact)
+        return artifact
+    def finish(self, **kwargs):
+        self.closed = True
+    def log(self, *args, **kwargs):
+        pass
+
+
+@pytest.fixture
+def run(monkeypatch):
+    value = Run()
+    import wandb
+    monkeypatch.setattr(wandb, "Artifact", Artifact)
+    return value
+
+
+def job(pose, tmp_path, run=None, **session_options):
+    session = df.TrainingSession(**session_options)
+    config = df.TrainingConfig(output_dir=tmp_path / "output", resolution=96, epochs=2, workers=0)
+    selection = select(pose, type=df.ModelTypes.RFDETR, config=config)
+    result = session._register(pose, selection, config, wandb=df.WandbConfig(run=run) if run else False)
+    return session, result
+
+
+def checkpoints(tmp_path, epoch=0):
+    from rfdetr.config import RFDETRKeypointPreviewConfig
+    mc = RFDETRKeypointPreviewConfig(resolution=96, model_name="RFDETRKeypointPreview", num_classes=1, num_keypoints_per_class=[8])
+    best, latest = tmp_path / "best.pth", tmp_path / "last.ckpt"
+    payload = {"model": {"weight": torch.ones(1)}, "epoch": epoch, "model_name": "RFDETRKeypointPreview", "model_config": mc.model_dump(), "args": {"class_names": ["wolf"]}}
+    torch.save(payload, best)
+    torch.save({**payload, "optimizer_states": [{"state": {"lr": .01}}]}, latest)
+    return df.Checkpoints(best, latest, epoch, "val/keypoint_map_50_95", .7)
+
+
+def test_confirmed_upload_backup_bundle_and_warm_start(pose, tmp_path, run):
+    session, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(backup_dir=tmp_path / "drive"))
+    result._capture(None, checkpoints(tmp_path))
+    assert result.uploaded_digest == result.copied_digest == result.bundle.sha256
+    assert run.artifacts[-1].waited
+    assert run.summary["best_model_artifact"].endswith(":v3")
+    loaded = df.Model.load_many(result.bundle.path)[0]
+    assert loaded.kind == "rfdetr" and loaded.task == "pose"
+    selected = select(pose, weights=result.bundle.path, config=df.TrainingConfig(resolution=192))
+    assert selected.weights and selected.resume is None
+    assert selected.provenance["sha256"]
+    resumed = select(pose, resume=result.bundle.path, config=df.TrainingConfig(resolution=96))
+    assert resumed.resume.name == "last.ckpt"
+    from dataset_fixer.model_sources import _validate_checkpoint
+    resumed.resume.write_bytes(b"corrupt latest checkpoint")
+    with pytest.raises(df.DatasetValidationError, match="SHA-256"):
+        _validate_checkpoint(resumed.resume, resumed.metadata, progress=False)
+    with pytest.raises(ValueError, match="optimizer"):
+        select(pose, resume=result.best_weights)
+
+
+def test_timeout_keeps_backup_and_runtime_then_retry(pose, tmp_path, run, monkeypatch):
+    session, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(backup_dir=tmp_path / "drive", final_attempts=1), disconnect="after_safe", disconnect_delay=0)
+    calls = []
+    monkeypatch.setattr("dataset_fixer.training.session.in_colab", lambda: True)
+    monkeypatch.setitem(sys.modules, "google.colab", SimpleNamespace(runtime=SimpleNamespace(unassign=lambda: calls.append(True))))
+    run.fail = True
+    with pytest.warns(RuntimeWarning):
+        result._capture(None, checkpoints(tmp_path))
+    assert result.copied_digest and result.uploaded_digest is None
+    with pytest.warns(RuntimeWarning), pytest.raises(RuntimeError, match="Publication incomplete"):
+        session.finish()
+    assert calls == [] and not run.closed
+    run.fail = False
+    assert session.finish()
+    assert calls == [True] and run.closed
+
+
+def test_verified_copy_retains_previous_on_corruption(tmp_path, monkeypatch):
+    source, destination = tmp_path / "new", tmp_path / "old"
+    source.write_bytes(b"new weights")
+    destination.write_bytes(b"old weights")
+    monkeypatch.setattr(shutil, "copyfile", lambda _, target: Path(target).write_bytes(b"corrupt"))
+    with pytest.raises(OSError, match="verification"):
+        verified_copy(source, destination)
+    assert destination.read_bytes() == b"old weights"
+
+
+@pytest.mark.parametrize("failure", [ValueError, KeyboardInterrupt])
+def test_session_finalizes_on_error_and_preserves_original(pose, tmp_path, run, failure):
+    session, result = job(pose, tmp_path, run)
+    with pytest.raises(failure, match="evaluation failed"):
+        with session:
+            result._capture(None, checkpoints(tmp_path))
+            raise failure("evaluation failed")
+    assert result.finished
+    with zipfile.ZipFile(result.bundle.path) as archive:
+        assert "failure.txt" in archive.namelist()
+        assert "evaluation failed" in archive.read("failure.txt").decode()
+
+
+def test_resolution_validation_and_pe_resize():
+    from dataset_fixer.rfdetr_engine import resolution_overrides
+    config = {"patch_size": 12, "num_windows": 2, "resolution": 576, "positional_encoding_size": 48}
+    assert resolution_overrides(config, 1296) == {"resolution": 1296, "positional_encoding_size": 108}
+    with pytest.raises(ValueError, match="divisible"):
+        resolution_overrides(config, 1280)
+    assert resolution_overrides({**config, "positional_encoding_size": 37}, 1296) == {"resolution": 1296}
+
+
+def test_real_rfdetr_data_and_augmentation(pose, tmp_path):
+    from rfdetr import RFDETRDataModule
+    session, result = job(pose, tmp_path)
+    prepared = prepare_data(result)
+    variant, mc, options = rfdetr_configs(result.selection, result.config, prepared, {})
+    tc = variant._train_config_class(dataset_dir=str(prepared.location), dataset_file="yolo", **options)
+    assert tc.keypoint_flip_pairs == [1, 3]
+    data = RFDETRDataModule(mc, tc)
+    data.setup("fit")
+    images, targets = next(iter(data.val_dataloader()))
+    assert targets[0]["keypoints"].shape == (1, 8, 3)
+    assert images.tensors.shape[-1] == 96
+    output = tmp_path / "augmentation.png"
+    df.preview_augmentations(pose, {"HorizontalFlip": {"p": 1}}, type=df.ModelTypes.RFDETR, config=replace(result.config, resolution=384),
+                             samples=1, destination=output, show=False)
+    assert output.stat().st_size > 1000
+    shutil.copyfile(output, "/tmp/dataset-fixer-native-augmentation.png")
+
+
+def test_roboflow_download_is_cached_and_source_layout_normalized(pose, tmp_path, monkeypatch):
+    calls = []
+    class Version:
+        def download(self, format, location):
+            calls.append(location)
+            assert not Path(location).exists()
+            shutil.copytree(pose.location, location)
+            yaml_path = Path(location) / "data.yaml"
+            content = yaml.safe_load(yaml_path.read_text())
+            content.pop("path", None)
+            content.update(train="../train/images", val="../val/images")
+            yaml_path.write_text(yaml.safe_dump(content))
+    client = SimpleNamespace(workspace=lambda _: SimpleNamespace(project=lambda _: SimpleNamespace(version=lambda _: Version())))
+    monkeypatch.setitem(sys.modules, "roboflow", SimpleNamespace(Roboflow=lambda **_: client))
+    first = df.Dataset.open("roboflow:workspace/project/5", progress=False)
+    second = df.Dataset.open("roboflow:workspace/project/5", progress=False)
+    assert first.classes == second.classes == {0: "wolf"}
+    assert len(calls) == 1
+    image = next((first.location / "train").rglob("*.jpg"))
+    image.unlink()
+    df.Dataset.open("roboflow:workspace/project/5", progress=False)
+    assert len(calls) == 2
+    image = next((first.location / "train").rglob("*.jpg"))
+    image.write_bytes(b"x" * image.stat().st_size)
+    recovered = df.Dataset.open("roboflow:workspace/project/5", progress=False)
+    assert len(calls) == 3 and recovered._metadata.flip_idx == pose._metadata.flip_idx
+
+
+def test_train_announces_model_and_callbacks(pose, tmp_path, monkeypatch, capsys):
+    from dataset_fixer.training.backends import ADAPTERS
+    events = []
+    def fake(result, prepared, augmentations):
+        result._announce(result.config.resolution)
+        result._emit("train_start")
+        result._capture(None, checkpoints(tmp_path))
+        result._emit("train_end")
+    monkeypatch.setitem(ADAPTERS, df.ModelTypes.RFDETR, fake)
+    result = df.train(pose, type=df.ModelTypes.RFDETR, config=df.TrainingConfig(output_dir=tmp_path / "training", resolution=96),
+                      callbacks=[lambda event: events.append(event.name)])
+    assert result.finished and result.bundle
+    assert events == ["train_start", "checkpoint_saved", "train_end"]
+    assert "RFDETRKeypointPreview: task=pose, resolution=96" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("interval", [1, 10])
+def test_real_lightning_adapter_keeps_resumable_current_epoch(pose, tmp_path, monkeypatch, run, interval):
+    import pytorch_lightning as pl
+    import rfdetr
+    from pytorch_lightning.callbacks import ModelCheckpoint
+    from rfdetr.training.callbacks.best_model import BestModelCallback
+    class Tiny(pl.LightningModule):
+        def __init__(self, mc, tc):
+            super().__init__()
+            self.model_config, self.train_config = mc, tc
+            self.model = torch.nn.Linear(1, 1)
+        def training_step(self, batch, batch_idx):
+            return self.model(batch).square().mean()
+        def validation_step(self, batch, batch_idx):
+            self.log("val/keypoint_map_50_95", torch.tensor(.5 + .1 * self.current_epoch))
+        def configure_optimizers(self):
+            return torch.optim.Adam(self.parameters(), lr=.01)
+    class Data(pl.LightningDataModule):
+        def __init__(self, *args):
+            super().__init__()
+        def train_dataloader(self):
+            return torch.utils.data.DataLoader(torch.ones(2, 1), batch_size=1)
+        def val_dataloader(self):
+            return self.train_dataloader()
+    def build(tc, mc, **kwargs):
+        last = ModelCheckpoint(dirpath=tc.output_dir, filename="last", save_top_k=1, enable_version_counter=False)
+        best = BestModelCallback(tc.output_dir, monitor_regular="val/keypoint_map_50_95", run_test=False)
+        return pl.Trainer(accelerator="cpu", devices=1, max_epochs=2, callbacks=[last, best], logger=False,
+                          enable_progress_bar=False, enable_model_summary=False, num_sanity_val_steps=0)
+    monkeypatch.setattr(rfdetr, "RFDETRModelModule", Tiny)
+    monkeypatch.setattr(rfdetr, "RFDETRDataModule", Data)
+    monkeypatch.setattr(rfdetr, "build_trainer", build)
+    cfg = df.TrainingConfig(output_dir=tmp_path / "native-training", epochs=2, resolution=96, workers=0,
+                            backend_options={"model": {"pretrain_weights": None}, "checkpoint_interval": interval})
+    result = df.train(pose, type=df.ModelTypes.RFDETR, config=cfg, wandb=df.WandbConfig(run=run))
+    assert len(run.artifacts) >= 2
+    for epoch, artifact in enumerate(run.artifacts[:2]):
+        with zipfile.ZipFile(io.BytesIO(next(iter(artifact.files.values())))) as zipped:
+            latest = torch.load(io.BytesIO(zipped.read("weights/last.ckpt")), weights_only=False)
+            best = torch.load(io.BytesIO(zipped.read("weights/checkpoint_best_regular.pth")), weights_only=False)
+            assert latest["epoch"] == best["epoch"] == epoch
+            assert latest["optimizer_states"]
+            assert latest["dataset_schema"]["kpt_shape"] == [8, 3]
+    assert result.best_weights.name == "checkpoint_best_total.pth"
+
+
+def test_native_yolo_one_epoch(pose, tmp_path):
+    from ultralytics import YOLO
+    torch.set_num_threads(1)
+    initial = tmp_path / "initial.pt"
+    native = YOLO("yolo26n-pose.yaml")
+    native.save(initial)
+    result = df.train(pose, weights=initial, config=df.TrainingConfig(output_dir=tmp_path / "yolo-training",
+        epochs=1, resolution=64, batch_size=1, workers=0, device="cpu", backend_options={"amp": False, "plots": False, "val": True, "nbs": 1, "warmup_epochs": 0}))
+    assert result.best_weights.is_file() and result.resumable_checkpoint.is_file()
+    assert torch.load(result.resumable_checkpoint, weights_only=False)["optimizer"] is not None
+    assert result.model.kind == "ultralytics"
+    starts = []
+    def started(event):
+        if event.name == "train_start":
+            starts.append((event.trainer.start_epoch, len(event.trainer.optimizer.state)))
+    warmed = df.train(pose, weights=result.bundle.path, callbacks=[started], config=replace(result.config,
+                      output_dir=tmp_path / "warm-start", resolution=96))
+    assert starts == [(0, 0)] and warmed.best_weights.is_file()
+    assert warmed.selection.provenance["sha256"]
+    with pytest.raises(ValueError, match="Change resolution"):
+        select(pose, resume=result.bundle.path, config=df.TrainingConfig(resolution=96))
+    starts.clear()
+    resumed = df.train(pose, resume=result.bundle.path, callbacks=[started], config=replace(result.config,
+                      output_dir=tmp_path / "resumed", epochs=2))
+    assert starts[0][0] == 1 and starts[0][1] > 0 and resumed.best_weights.is_file()
+    df.preview_augmentations(pose, {"mosaic": 0.0}, type=df.ModelTypes.YOLO, version=26, s="n",
+                            config=df.TrainingConfig(resolution=64, workers=0), samples=1,
+                            destination=tmp_path / "yolo-augmentation.png", show=False)
+    shutil.copyfile(tmp_path / "yolo-augmentation.png", "/tmp/dataset-fixer-yolo-augmentation.png")
+
+
+def test_native_nnunet_one_epoch(tmp_path, monkeypatch):
+    import os
+    monkeypatch.setenv("PATH", str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("nnUNet_compile", "false")
+    torch.set_num_threads(1)
+    root = make_yolo_dataset(tmp_path / "segmentation", task="segment", names=["island"], size=(64, 64),
+        train_rows=["0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"], val_rows=["0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"])
+    data = df.Dataset.open(root, task="segment", progress=False).export(destination=tmp_path / "semantic", format="semantic_masks", visualize=False, progress=False)
+    result = df.train(data, type=df.ModelTypes.NNUNET, config=df.TrainingConfig(output_dir=tmp_path / "nnunet-training",
+        epochs=1, resolution=64, batch_size=1, workers=0, device="cpu",
+        backend_options={"num_iterations_per_epoch": 1, "num_val_iterations_per_epoch": 1}))
+    assert result.best_weights.is_file() and result.resumable_checkpoint.is_file()
+    saved = torch.load(result.resumable_checkpoint, weights_only=False)
+    assert saved["optimizer_state"] and saved["trainer_name"] == "nnUNetTrainer"
+    assert result.model.kind == "nnunet"
+    assert json.loads((result.output_dir / "native/plans.json").read_text())["configurations"]["2d"]["batch_size"] == 1
+    loaded = df.Model.load_many(result.bundle.path)[0]
+    assert loaded.kind == "nnunet"
+    assert select(data, weights=result.bundle.path).family == df.ModelTypes.NNUNET
+    assert select(data, weights=result.best_weights).name == "nnUNetPlannerResEncM"
+    df.preview_augmentations(data, type=df.ModelTypes.NNUNET, config=result.config, samples=1,
+                             destination=tmp_path / "nnunet-augmentation.png", show=False)
+    shutil.copyfile(tmp_path / "nnunet-augmentation.png", "/tmp/dataset-fixer-nnunet-augmentation.png")
+
+
+def test_rfdetr_predictions_use_existing_eval_and_renderer(pose, tmp_path, monkeypatch):
+    import numpy as np
+    import rfdetr
+    session, result = job(pose, tmp_path)
+    result._capture(None, checkpoints(tmp_path))
+    def predict(path, **kwargs):
+        return SimpleNamespace(data={"xyxy": np.array([[16, 12, 144, 108]])},
+            detection_confidence=np.array([.95]), class_id=np.array([0]),
+            xy=np.array([[[160 * (.25 + i * .06), 60] for i in range(8)]]),
+            keypoint_confidence=np.ones((1, 8)))
+    monkeypatch.setattr(rfdetr, "from_checkpoint", lambda *args, **kwargs: SimpleNamespace(predict=predict))
+    evaluated = result.evaluate(samples=1, plots=1)
+    assert len(evaluated.ranking) == 1
+    assert result.metrics["evaluation"]
+    assert (result.output_dir / "predictions.png").is_file()
+    shutil.copyfile(result.output_dir / "predictions.png", "/tmp/dataset-fixer-training-predictions.png")
+
+
+def test_wandb_artifact_source_round_trip(pose, tmp_path, run, monkeypatch):
+    import wandb
+    session, result = job(pose, tmp_path, run)
+    result._capture(None, checkpoints(tmp_path))
+    artifact = run.artifacts[-1]
+    def download(root):
+        Path(root).mkdir(parents=True, exist_ok=True)
+        for name, content in artifact.files.items():
+            (Path(root) / name).write_bytes(content)
+    artifact.download = download
+    verified = []
+    artifact.verify = lambda root: verified.append(root)
+    monkeypatch.setattr(wandb, "Api", lambda: SimpleNamespace(run=lambda _: run, artifact=lambda _: artifact))
+    resolved = select(pose, weights="wandb:team/project/test", config=df.TrainingConfig(resolution=192))
+    assert resolved.provenance["name"] == artifact.qualified_name
+    assert resolved.provenance["digest"] == artifact.digest and verified
+
+
+def test_custom_checkpoint_provider_and_no_checkpoint_disconnect(pose, tmp_path, monkeypatch):
+    calls = []
+    class Provider:
+        config = df.CheckpointConfig()
+        def checkpoints(self, trainer, defaults):
+            calls.append(defaults)
+            return defaults
+    session, result = job(pose, tmp_path, checkpointing=Provider())
+    assert not session.finish()
+    result._capture(None, checkpoints(tmp_path))
+    assert len(calls) == 1
+    assert session.finish()
+
+
+def test_nnunet_rejects_incompatible_plans_before_loading(tmp_path, monkeypatch):
+    from dataset_fixer.training.backends import train_nnunet
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    (parent / "plans.json").write_text(json.dumps({"configurations": {"2d": {"architecture": {"name": "old"}}}}))
+    preprocessed = tmp_path / "preprocessed" / "Dataset001_test"
+    preprocessed.mkdir(parents=True)
+    (preprocessed / "testPlans.json").write_text(json.dumps({"configurations": {"2d": {"architecture": {"name": "new"}}}}))
+    dataset_json = tmp_path / "dataset.json"
+    dataset_json.write_text('{}')
+    prepared = SimpleNamespace(backend={"environment": {"nnUNet_preprocessed": str(preprocessed.parent)}, "dataset_name": preprocessed.name},
+                               paths={"dataset_json": dataset_json})
+    selection = SimpleNamespace(weights=parent / "best.pth", resume=None, metadata={"model_folder": str(parent)})
+    result = SimpleNamespace(config=df.TrainingConfig(), selection=selection)
+    with pytest.raises(ValueError, match="architecture"):
+        train_nnunet(result, prepared, None)
+
+
+def test_backup_failure_does_not_block_upload_or_other_runs(pose, tmp_path, run, monkeypatch):
+    session, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(backup_dir=tmp_path / "drive", final_attempts=1))
+    def fail_backup(source, destination):
+        if tmp_path / "drive" in destination.parents:
+            raise OSError("Drive unavailable")
+        verified_copy(source, destination)
+    monkeypatch.setattr("dataset_fixer.training.session.verified_copy", fail_backup)
+    with pytest.warns(UserWarning, match="backup failed"):
+        result._capture(None, checkpoints(tmp_path))
+    assert result.uploaded_digest and result.copied_digest is None
+    other = session._register(pose, result.selection, replace(result.config, output_dir=tmp_path / "other"),
+                             checkpointing=df.CheckpointConfig())
+    other._capture(None, checkpoints(tmp_path))
+    with pytest.warns(UserWarning), pytest.raises(RuntimeError, match="Publication incomplete"):
+        session.finish()
+    assert other.finished and not result.finished
+    monkeypatch.setattr("dataset_fixer.training.session.verified_copy", verified_copy)
+    assert session.finish()
+    result._capture(None, checkpoints(tmp_path, epoch=1))
+    assert len(list((tmp_path / "drive" / result.output_dir.name).glob("*.zip"))) == 1
+    assert len(list((result.output_dir / "bundles").glob("*.zip"))) == 1
+
+
+def test_legacy_rf_metadata_and_native_positional_interpolation(pose, tmp_path):
+    from dataset_fixer.rfdetr_engine import checkpoint_metadata
+    from rfdetr.models.weights import interpolate_position_embeddings
+    path = tmp_path / "checkpoint_best_total.pth"
+    torch.save({"model": {"class_embed.weight": torch.zeros(2, 256), "_kp_active_mask": torch.ones(1, 8)},
+                "args": SimpleNamespace(pretrain_weights="rf-detr-keypoint-preview.pth", class_names=["wolf"], resolution=96)}, path)
+    selected = select(pose, weights=path)
+    assert selected.task == "pose" and selected.name == "RFDETRKeypointPreview"
+    metadata = checkpoint_metadata(path)
+    assert metadata["model_config"]["num_keypoints_per_class"] == [8]
+    key = "backbone.embeddings.position_embeddings"
+    state = {key: torch.arange(65 * 4, dtype=torch.float32).reshape(1, 65, 4), "trained_head": torch.ones(2, 4)}
+    class_token = state[key][:, :1].clone()
+    interpolate_position_embeddings(state, 16)
+    assert state[key].shape == (1, 257, 4)
+    assert torch.equal(state[key][:, :1], class_token) and torch.equal(state["trained_head"], torch.ones(2, 4))
+
+
+def test_failure_before_first_checkpoint_uploads_report_without_disconnect(pose, tmp_path, run, monkeypatch):
+    session, result = job(pose, tmp_path, run, disconnect="after_safe", disconnect_delay=0)
+    calls = []
+    monkeypatch.setattr("dataset_fixer.training.session.in_colab", lambda: True)
+    monkeypatch.setitem(sys.modules, "google.colab", SimpleNamespace(runtime=SimpleNamespace(unassign=lambda: calls.append(True))))
+    with pytest.raises(RuntimeError, match="failed before epoch"):
+        with session:
+            raise RuntimeError("failed before epoch")
+    assert not calls and result.best_weights is None and run.artifacts[-1].waited
+    with zipfile.ZipFile(result.bundle.path) as archive:
+        assert "failed before epoch" in archive.read("failure.txt").decode()

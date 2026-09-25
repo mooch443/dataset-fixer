@@ -260,8 +260,10 @@ class Dataset:
         from .sources import resolve_dataset_source
 
         source_path = Path(location).expanduser()
-        requested = resolve_dataset_source(source_path, progress=progress)
-        if source_path.suffix.lower() == ".zip":
+        requested = resolve_dataset_source(location, progress=progress)
+        if str(location).startswith("roboflow:"):
+            source_name = str(location)
+        elif source_path.suffix.lower() == ".zip":
             source_name = source_path.name
         elif source_path.is_dir():
             source_name = source_path.name
