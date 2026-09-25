@@ -40,7 +40,7 @@ dependencies = [
   "torchvision>=0.17",
   "tqdm>=4.66",
   "ultralytics>=8.3",
-  "wandb>=0.19",
+  "wandb>=0.30",
 ]
 
 [project.optional-dependencies]
