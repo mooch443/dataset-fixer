@@ -58,16 +58,30 @@ class CheckpointConfig:
         every_n_epochs: Publish after this many completed epochs.
         upload_timeout: Seconds to await confirmed W&B artifact completion.
         final_attempts: Publication attempts during each finish() call.
+        keep_wandb_versions: Retain this many confirmed checkpoint bundles per
+            run after replacement is safe; None preserves all versions.
+        wandb_contents: 'best' uploads optimizer-free best weights; 'full' also
+            uploads resumable state. Filesystem backups always retain full state.
     """
     backup_dir: str | Path | None = None
     every_n_epochs: int = 1
     upload_timeout: int = 600
     final_attempts: int = 3
+    keep_wandb_versions: int | None = 1
+    wandb_contents: str = "best"
 
     def __post_init__(self):
         if any(isinstance(v, bool) or not isinstance(v, int) or v < 1
                for v in (self.every_n_epochs, self.upload_timeout, self.final_attempts)):
             raise ValueError("Checkpoint intervals, timeouts, and attempts must be positive")
+        if self.keep_wandb_versions is not None and (
+            isinstance(self.keep_wandb_versions, bool)
+            or not isinstance(self.keep_wandb_versions, int)
+            or self.keep_wandb_versions < 1
+        ):
+            raise ValueError("keep_wandb_versions must be a positive integer or None")
+        if self.wandb_contents not in ("best", "full"):
+            raise ValueError("wandb_contents must be 'best' or 'full'")
 
 
 @dataclass(frozen=True)

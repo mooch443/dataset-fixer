@@ -380,6 +380,41 @@ def _heldout_breakdown_values(
     return {f"heldout_breakdown/{key}": value for key, value in values.items()}, None
 
 
+def _prune_checkpoint_artifacts(run: Any, *, sha256: str, keep_versions: int, timeout: int) -> None:
+    """Retire only older bundles from this run after verifying its replacement."""
+    import wandb
+
+    prefix = f"{run.entity}/{run.project}/model-{run.id}:v"
+    current_ref = str(run.summary["checkpoint_artifact"])
+    if not current_ref.startswith(prefix) or not current_ref[len(prefix):].isdigit():
+        raise ValueError("Checkpoint artifact does not belong to this run's model collection")
+    current_version = int(current_ref[len(prefix):])
+    api = wandb.Api(timeout=timeout)
+    current = api.artifact(current_ref, type="model")
+    if current.state != "COMMITTED" or current.metadata.get("sha256") != sha256:
+        raise RuntimeError("Replacement checkpoint artifact is not confirmed with the expected checksum")
+
+    # Complete pagination before deletion: changing a collection while paging
+    # through it can skip versions. Run outputs exclude other runs' artifacts.
+    artifacts = list(api.run(f"{run.entity}/{run.project}/{run.id}").logged_artifacts())
+    older = {}
+    for artifact in artifacts:
+        reference = artifact.qualified_name
+        if artifact.type != "model" or not reference.startswith(prefix):
+            continue
+        version = reference[len(prefix):]
+        if not version.isdigit() or int(version) >= current_version or artifact.state != "COMMITTED":
+            continue
+        metadata = artifact.metadata
+        if not metadata.get("sha256") or not str(metadata.get("bundle_file", "")).endswith(".zip"):
+            continue
+        older[int(version)] = artifact
+    for version in sorted(older, reverse=True)[keep_versions - 1:]:
+        # Never remove manually assigned/protected aliases. Also protects an
+        # older 'latest' alias if the server has not moved it yet.
+        older[version].delete(delete_aliases=False)
+
+
 def upload(
     run: Any,
     bundle: Bundle,

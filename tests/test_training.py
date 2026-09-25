@@ -78,6 +78,7 @@ class Artifact:
         self.qualified_name = f"team/project/{name}:v3"
         self.url = "https://wandb.ai/team/project/artifacts/model/test/v3"
         self.digest = "digest"
+        self.state, self.aliases, self.deleted, self.owner = "PENDING", [], False, None
 
     def add_file(self, path, name):
         self.files[name] = Path(path).read_bytes()
@@ -85,8 +86,22 @@ class Artifact:
     def wait(self, timeout):
         if self.fail:
             raise TimeoutError("upload timeout")
+        if self.owner:
+            for artifact in self.owner.artifacts:
+                if (artifact is not self and "latest" in artifact.aliases
+                    and artifact.qualified_name.rsplit(":", 1)[0] == self.qualified_name.rsplit(":", 1)[0]):
+                    artifact.aliases.remove("latest")
+            self.owner.events.append(("confirmed", self.qualified_name))
+        self.state, self.aliases = "COMMITTED", ["latest"]
         self.waited = True
         return self
+
+    def delete(self, delete_aliases=False):
+        assert not delete_aliases
+        if self.owner.fail_delete or self.aliases:
+            raise PermissionError("artifact deletion refused")
+        self.owner.events.append(("deleted", self.qualified_name))
+        self.deleted = True
 
 
 class Config(dict):
@@ -100,10 +115,15 @@ class Run:
         self.summary, self.config, self.tags, self.artifacts = {}, Config(), (), []
         self.settings = SimpleNamespace(mode="online")
         self.fail, self.closed = False, False
+        self.fail_delete, self.events = False, []
     def log_artifact(self, artifact, aliases):
         artifact.fail = self.fail
+        artifact.owner = self
+        artifact.qualified_name = f"{self.entity}/{self.project}/{artifact.name}:v{len(self.artifacts) + 3}"
         self.artifacts.append(artifact)
         return artifact
+    def logged_artifacts(self):
+        return (artifact for artifact in self.artifacts if not artifact.deleted)
     def finish(self, **kwargs):
         self.closed = True
     def log(self, *args, **kwargs):
@@ -115,6 +135,10 @@ def run(monkeypatch):
     value = Run()
     import wandb
     monkeypatch.setattr(wandb, "Artifact", Artifact)
+    def get_artifact(reference, type):
+        return next(artifact for artifact in value.artifacts
+                    if artifact.qualified_name == reference and artifact.type == type and not artifact.deleted)
+    monkeypatch.setattr(wandb, "Api", lambda **_: SimpleNamespace(run=lambda _: value, artifact=get_artifact))
     return value
 
 
@@ -139,9 +163,20 @@ def checkpoints(tmp_path, epoch=0):
 def test_confirmed_upload_backup_bundle_and_warm_start(pose, tmp_path, run):
     session, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(backup_dir=tmp_path / "drive"))
     result._capture(None, checkpoints(tmp_path))
-    assert result.uploaded_digest == result.copied_digest == result.bundle.sha256
+    assert result.uploaded_digest == result.wandb_bundle.sha256
+    assert result.copied_digest == result.bundle.sha256 != result.uploaded_digest
     assert run.artifacts[-1].waited
     assert run.summary["best_model_artifact"].endswith(":v3")
+    with zipfile.ZipFile(result.wandb_bundle.path) as archive:
+        assert "weights/last.ckpt" not in archive.namelist()
+        saved = torch.load(io.BytesIO(archive.read("weights/best.pth")), weights_only=False)
+        assert torch.equal(saved["model"]["weight"], torch.ones(1))
+    assert result.wandb_bundle.size < result.bundle.size
+    assert select(pose, weights=result.wandb_bundle.path, config=df.TrainingConfig(resolution=192)).weights
+    with pytest.raises(ValueError, match="optimizer state"):
+        select(pose, resume=result.wandb_bundle.path)
+    backup = tmp_path / "drive" / result.output_dir.name / "model.zip"
+    assert backup.read_bytes() == result.bundle.path.read_bytes()
     loaded = df.Model.load_many(result.bundle.path)[0]
     assert loaded.kind == "rfdetr" and loaded.task == "pose"
     selected = select(pose, weights=result.bundle.path, config=df.TrainingConfig(resolution=192))
@@ -172,6 +207,168 @@ def test_timeout_keeps_backup_and_runtime_then_retry(pose, tmp_path, run, monkey
     run.fail = False
     assert session.finish()
     assert calls == [True] and run.closed
+
+
+@pytest.mark.parametrize("keep,remaining", [(1, 1), (2, 2), (None, 3)])
+def test_wandb_retention_keeps_best_and_resume_after_confirmation(pose, tmp_path, run, keep, remaining):
+    _, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(keep_wandb_versions=keep, wandb_contents="full"))
+    result._capture(None, checkpoints(tmp_path))
+    best = result.best_weights
+    for epoch in (1, 2):
+        result._capture(None, replace(checkpoints(tmp_path, epoch), best=best))
+    assert len(list(run.logged_artifacts())) == remaining
+    assert not result.retention_pending
+    for index, (event, _) in enumerate(run.events):
+        if event == "deleted":
+            assert sum(name == "confirmed" for name, _ in run.events[:index]) >= 2
+    with zipfile.ZipFile(io.BytesIO(next(iter(run.artifacts[-1].files.values())))) as archive:
+        best = torch.load(io.BytesIO(archive.read("weights/best.pth")), weights_only=False)
+        latest = torch.load(io.BytesIO(archive.read("weights/last.ckpt")), weights_only=False)
+        assert best["epoch"] == 0 and latest["epoch"] == 2
+        assert latest["optimizer_states"]
+
+
+def test_wandb_retention_waits_for_upload_and_verified_backup(pose, tmp_path, run, monkeypatch):
+    session, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(backup_dir=tmp_path / "drive"))
+    result._capture(None, checkpoints(tmp_path))
+    first = run.artifacts[-1]
+    run.fail = True
+    with pytest.warns(RuntimeWarning, match="upload failed"):
+        result._capture(None, checkpoints(tmp_path, 1))
+    assert not first.deleted
+    run.fail = False
+    def fail_backup(source, destination):
+        if tmp_path / "drive" in destination.parents:
+            raise OSError("Drive unavailable")
+        verified_copy(source, destination)
+    monkeypatch.setattr("dataset_fixer.training.session.verified_copy", fail_backup)
+    with pytest.warns(UserWarning, match="backup failed"):
+        result._capture(None, checkpoints(tmp_path, 2))
+    assert not first.deleted and result.uploaded_digest == result.wandb_bundle.sha256
+    monkeypatch.setattr("dataset_fixer.training.session.verified_copy", verified_copy)
+    assert session.finish()
+    assert first.deleted and not result.retention_pending
+
+
+def test_wandb_cleanup_retry_preserves_confirmed_upload_and_disconnect(pose, tmp_path, run, monkeypatch):
+    session, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(final_attempts=1),
+                          disconnect="after_safe", disconnect_delay=0)
+    calls = []
+    monkeypatch.setattr("dataset_fixer.training.session.in_colab", lambda: True)
+    monkeypatch.setitem(sys.modules, "google.colab", SimpleNamespace(runtime=SimpleNamespace(unassign=lambda: calls.append(True))))
+    result._capture(None, checkpoints(tmp_path))
+    first = run.artifacts[-1]
+    run.fail_delete = True
+    with pytest.warns(RuntimeWarning, match="cleanup failed"):
+        result._capture(None, checkpoints(tmp_path, 1))
+    assert result.uploaded_digest == result.wandb_bundle.sha256 and result.retention_pending and not first.deleted
+    with pytest.warns(RuntimeWarning, match="cleanup failed"):
+        assert session.finish()
+    assert calls == [True] and run.closed and result.finished
+    run.fail_delete = False
+    assert session.finish()
+    assert first.deleted and not result.retention_pending and len(run.artifacts) == 2 and calls == [True]
+    assert result.wandb_bundle.uploaded
+
+
+def test_wandb_retention_is_scoped_numeric_and_checksum_verified(run):
+    from dataset_fixer.wandb import _prune_checkpoint_artifacts
+    def add(reference, *, type="model", metadata=None, state="COMMITTED"):
+        artifact = Artifact("unused", type, metadata or {"sha256": "verified", "bundle_file": "model.zip"})
+        artifact.qualified_name, artifact.state, artifact.owner = reference, state, run
+        run.artifacts.append(artifact)
+        return artifact
+    old = [add(f"team/project/model-test:v{version}") for version in (2, 9, 3, 10)]
+    untouched = [add("team/project/model-test:v11"), add("team/project/model-other:v1"),
+                 add("elsewhere/project/model-test:v1"), add("team/project/model-test:v1", type="dataset"),
+                 add("team/project/model-test:v4", metadata={"bundle_file": "custom.zip"}),
+                 add("team/project/model-test:v5", state="PENDING")]
+    run.summary["checkpoint_artifact"] = old[-1].qualified_name
+    with pytest.raises(RuntimeError, match="checksum"):
+        _prune_checkpoint_artifacts(run, sha256="incorrect", keep_versions=2, timeout=10)
+    assert not any(a.deleted for a in run.artifacts)
+    _prune_checkpoint_artifacts(run, sha256="verified", keep_versions=2, timeout=10)
+    assert [a.deleted for a in old] == [True, False, True, False]
+    assert not any(a.deleted for a in untouched)
+    run.summary["checkpoint_artifact"] = "team/project/model-other:v1"
+    with pytest.raises(ValueError, match="belong"):
+        _prune_checkpoint_artifacts(run, sha256="verified", keep_versions=1, timeout=10)
+
+
+def test_wandb_retention_preserves_manual_aliases(pose, tmp_path, run):
+    session, result = job(pose, tmp_path, run)
+    result._capture(None, checkpoints(tmp_path))
+    first = run.artifacts[-1]
+    first.aliases.append("pinned")
+    with pytest.warns(RuntimeWarning, match="cleanup failed"):
+        result._capture(None, checkpoints(tmp_path, 1))
+    assert not first.deleted and first.aliases == ["pinned"]
+    first.aliases.clear()
+    assert session.finish() and first.deleted
+    assert len(run.artifacts) == 2
+
+
+@pytest.mark.parametrize("keep", [0, -1, True, 1.5, "1"])
+def test_checkpoint_retention_rejects_invalid_counts(keep):
+    with pytest.raises(ValueError, match="keep_wandb_versions"):
+        df.CheckpointConfig(keep_wandb_versions=keep)
+
+
+@pytest.mark.parametrize("contents", ["latest", "none", False, None])
+def test_checkpoint_rejects_invalid_wandb_contents(contents):
+    with pytest.raises(ValueError, match="wandb_contents"):
+        df.CheckpointConfig(wandb_contents=contents)
+
+
+@pytest.mark.parametrize("family,model_key,state_keys", [
+    (df.ModelTypes.YOLO, "model", ("optimizer", "scaler")),
+    (df.ModelTypes.RFDETR, "model", ("optimizer_states", "lr_schedulers")),
+    (df.ModelTypes.NNUNET, "network_weights", ("optimizer_state", "grad_scaler_state")),
+])
+def test_weights_checkpoint_preserves_parameters_and_original_state(tmp_path, family, model_key, state_keys):
+    from dataset_fixer.training.backends import weights_checkpoint
+    source, destination = tmp_path / "original.pt", tmp_path / "upload" / "best.pt"
+    weight = torch.tensor([0.123456789, 1.23456789], dtype=torch.float64)
+    saved = {model_key: {"weight": weight}, "epoch": 17, "model_config": {"resolution": 1536},
+             **{key: {"state": torch.ones(1024)} for key in state_keys}}
+    torch.save(saved, source)
+    original = source.read_bytes()
+    assert weights_checkpoint(source, family, destination) == destination
+    stripped = torch.load(destination, weights_only=False)
+    assert all(key not in stripped for key in state_keys)
+    assert stripped["epoch"] == 17 and stripped["model_config"] == saved["model_config"]
+    assert stripped[model_key]["weight"].dtype == weight.dtype
+    assert torch.equal(stripped[model_key]["weight"], weight)
+    assert source.read_bytes() == original and destination.stat().st_size < source.stat().st_size
+    assert weights_checkpoint(destination, family, tmp_path / "unnecessary.pt") == destination
+
+
+def test_weights_bundle_failure_preserves_previous_upload_and_retry(pose, tmp_path, run, monkeypatch):
+    from dataset_fixer.training.backends import weights_checkpoint
+    session, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(backup_dir=tmp_path / "drive", final_attempts=1))
+    result._capture(None, checkpoints(tmp_path))
+    first = run.artifacts[-1]
+    def fail(*args):
+        raise OSError("cannot create upload weights")
+    monkeypatch.setattr("dataset_fixer.training.backends.weights_checkpoint", fail)
+    with pytest.warns(UserWarning, match="upload failed"):
+        result._capture(None, checkpoints(tmp_path, 1))
+    assert result.copied_digest == result.bundle.sha256
+    assert result.wandb_bundle is None and not first.deleted
+    with pytest.warns(UserWarning), pytest.raises(RuntimeError, match="Publication incomplete"):
+        session.finish()
+    monkeypatch.setattr("dataset_fixer.training.backends.weights_checkpoint", weights_checkpoint)
+    assert session.finish() and first.deleted
+
+
+def test_before_best_weights_available_uploads_recovery_checkpoint(pose, tmp_path, run):
+    _, result = job(pose, tmp_path, run)
+    result._capture(None, replace(checkpoints(tmp_path), best=None))
+    assert result.wandb_bundle.sha256 == result.bundle.sha256 == result.uploaded_digest
+    with zipfile.ZipFile(result.wandb_bundle.path) as archive:
+        saved = torch.load(io.BytesIO(archive.read("weights/last.ckpt")), weights_only=False)
+        assert saved["optimizer_states"]
+    assert "best_model_artifact" not in run.summary
 
 
 def test_verified_copy_retains_previous_on_corruption(tmp_path, monkeypatch):
@@ -440,7 +637,8 @@ def test_real_lightning_adapter_keeps_resumable_current_epoch(pose, tmp_path, mo
     monkeypatch.setattr(rfdetr, "build_trainer", build)
     cfg = df.TrainingConfig(output_dir=tmp_path / "native-training", epochs=2, resolution=96, workers=0,
                             backend_options={"model": {"pretrain_weights": None}, "checkpoint_interval": interval})
-    result = df.train(pose, type=df.ModelTypes.RFDETR, config=cfg, wandb=df.WandbConfig(run=run))
+    result = df.train(pose, type=df.ModelTypes.RFDETR, config=cfg, wandb=df.WandbConfig(run=run),
+                      checkpointing=df.CheckpointConfig(wandb_contents="full"))
     assert len(run.artifacts) >= 2
     for epoch, artifact in enumerate(run.artifacts[:2]):
         with zipfile.ZipFile(io.BytesIO(next(iter(artifact.files.values())))) as zipped:
@@ -452,7 +650,7 @@ def test_real_lightning_adapter_keeps_resumable_current_epoch(pose, tmp_path, mo
     assert result.best_weights.name == "checkpoint_best_total.pth"
 
 
-def test_native_yolo_one_epoch(pose, tmp_path):
+def test_native_yolo_one_epoch(pose, tmp_path, run):
     import albumentations as A
     from ultralytics import YOLO
     from ultralytics.data.augment import Albumentations
@@ -468,7 +666,7 @@ def test_native_yolo_one_epoch(pose, tmp_path):
                           if isinstance(t, Albumentations))
             applied.append((event.trainer.args.mosaic, event.trainer.args.mixup,
                             custom.transform.transforms[0].p))
-    result = df.train(pose, weights=initial, augmentations=augmentations, callbacks=[observe],
+    result = df.train(pose, weights=initial, augmentations=augmentations, callbacks=[observe], wandb=df.WandbConfig(run=run),
         config=df.TrainingConfig(output_dir=tmp_path / "yolo-training",
         epochs=1, resolution=64, batch_size=1, workers=0, device="cpu", backend_options={"amp": False, "plots": False, "val": True, "nbs": 1, "warmup_epochs": 0}))
     assert applied == [(0.0, 0.0, 1.0)]
@@ -479,7 +677,9 @@ def test_native_yolo_one_epoch(pose, tmp_path):
     def started(event):
         if event.name == "train_start":
             starts.append((event.trainer.start_epoch, len(event.trainer.optimizer.state)))
-    warmed = df.train(pose, weights=result.bundle.path, callbacks=[started], config=replace(result.config,
+    with pytest.raises(ValueError, match="optimizer state"):
+        select(pose, resume=result.wandb_bundle.path)
+    warmed = df.train(pose, weights=result.wandb_bundle.path, callbacks=[started], config=replace(result.config,
                       output_dir=tmp_path / "warm-start", resolution=96))
     assert starts == [(0, 0)] and warmed.best_weights.is_file()
     assert warmed.selection.provenance["sha256"]
@@ -554,7 +754,7 @@ def test_yolo_augmented_masks_use_native_dataset_builder(tmp_path, semantic):
     shutil.copyfile(output, f"/tmp/dataset-fixer-yolo-mask-semantic-{semantic}.png")
 
 
-def test_native_nnunet_one_epoch(tmp_path, monkeypatch):
+def test_native_nnunet_one_epoch(tmp_path, monkeypatch, run):
     import os
     monkeypatch.setenv("PATH", str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("nnUNet_compile", "false")
@@ -562,7 +762,7 @@ def test_native_nnunet_one_epoch(tmp_path, monkeypatch):
     root = make_yolo_dataset(tmp_path / "segmentation", task="segment", names=["island"], size=(64, 64),
         train_rows=["0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"], val_rows=["0 0.2 0.2 0.8 0.2 0.8 0.8 0.2 0.8"])
     data = df.Dataset.open(root, task="segment", progress=False).export(destination=tmp_path / "semantic", format="semantic_masks", visualize=False, progress=False)
-    result = df.train(data, type=df.ModelTypes.NNUNET, config=df.TrainingConfig(output_dir=tmp_path / "nnunet-training",
+    result = df.train(data, type=df.ModelTypes.NNUNET, wandb=df.WandbConfig(run=run), config=df.TrainingConfig(output_dir=tmp_path / "nnunet-training",
         epochs=1, resolution=64, batch_size=1, workers=0, device="cpu",
         backend_options={"num_iterations_per_epoch": 1, "num_val_iterations_per_epoch": 1}))
     assert result.best_weights.is_file() and result.resumable_checkpoint.is_file()
@@ -573,6 +773,9 @@ def test_native_nnunet_one_epoch(tmp_path, monkeypatch):
     loaded = df.Model.load_many(result.bundle.path)[0]
     assert loaded.kind == "nnunet"
     assert select(data, weights=result.bundle.path).family == df.ModelTypes.NNUNET
+    assert select(data, weights=result.wandb_bundle.path).family == df.ModelTypes.NNUNET
+    with pytest.raises(ValueError, match="optimizer state"):
+        select(data, resume=result.wandb_bundle.path)
     assert select(data, weights=result.best_weights).name == "nnUNetPlannerResEncM"
     df.preview_augmentations(data, type=df.ModelTypes.NNUNET, config=result.config, samples=1,
                              destination=tmp_path / "nnunet-augmentation.png", show=False)
@@ -667,7 +870,7 @@ def test_backup_failure_does_not_block_upload_or_other_runs(pose, tmp_path, run,
     assert session.finish()
     result._capture(None, checkpoints(tmp_path, epoch=1))
     assert len(list((tmp_path / "drive" / result.output_dir.name).glob("*.zip"))) == 1
-    assert len(list((result.output_dir / "bundles").glob("*.zip"))) == 1
+    assert set((result.output_dir / "bundles").glob("*.zip")) == {result.bundle.path, result.wandb_bundle.path}
 
 
 def test_legacy_rf_metadata_and_native_positional_interpolation(pose, tmp_path):

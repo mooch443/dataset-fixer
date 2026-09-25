@@ -56,6 +56,7 @@ class TrainingResult:
         best_weights: Stable snapshot of the selected model weights.
         resumable_checkpoint: Stable full-state checkpoint.
         bundle: Most recently created model bundle.
+        wandb_bundle: W&B publication bundle; optimizer-free best weights by default.
         metrics: Training and evaluation metrics.
         metadata: Native model/training configuration.
         auxiliary_files: Completed report files included in publication.
@@ -63,7 +64,8 @@ class TrainingResult:
         error: Original traceback, if training or evaluation failed.
         uploaded_digest: Last confirmed W&B bundle checksum.
         copied_digest: Last verified filesystem backup checksum.
-        finished: Whether publication and W&B cleanup completed.
+        retained_digest: Last confirmed bundle whose W&B retention was applied.
+        finished: Whether checkpoint publication and run finalization completed.
         best_epoch: Epoch at which the selected metric improved.
         best_value: Selected native metric value.
         prepared: Reusable prepared dataset.
@@ -82,6 +84,7 @@ class TrainingResult:
     best_weights: Path | None = None
     resumable_checkpoint: Path | None = None
     bundle: Any = None
+    wandb_bundle: Any = None
     metrics: dict = field(default_factory=dict)
     metadata: dict = field(default_factory=dict)
     auxiliary_files: dict = field(default_factory=dict)
@@ -89,6 +92,7 @@ class TrainingResult:
     error: str | None = None
     uploaded_digest: str | None = None
     copied_digest: str | None = None
+    retained_digest: str | None = None
     finished: bool = False
     best_epoch: int | None = None
     best_value: float | None = None
@@ -98,6 +102,15 @@ class TrainingResult:
     def _announce(self, resolution):
         source = self.selection.resume or self.selection.weights or "native pretrained/default"
         print(f"Training {self.selection.name}: task={self.selection.task}, resolution={resolution}, initialization={source}")
+
+    @property
+    def retention_pending(self) -> bool:
+        """Whether confirmed W&B checkpoints still need old-version cleanup."""
+        return bool(self.checkpoint_config.keep_wandb_versions is not None
+                    and self.wandb_run is not None and self.wandb_bundle is not None
+                    and (self.best_weights is not None or self.resumable_checkpoint is not None)
+                    and self.uploaded_digest == self.wandb_bundle.sha256
+                    and self.retained_digest != self.wandb_bundle.sha256)
 
     @property
     def model(self):
@@ -185,19 +198,19 @@ class TrainingResult:
         report.write_text(self.error)
         self.auxiliary_files["failure.txt"] = report
 
-    def _publish(self):
+    def _bundle_inputs(self, *, resumable=True):
         has_checkpoint = self.best_weights is not None or self.resumable_checkpoint is not None
-        if not has_checkpoint and self.error is None:
-            return False
-        report = self.output_dir / "training.json"
-        _atomic_json(report, {"model": self.selection.name, "task": self.selection.task, "metrics": self.metrics,
-                              "epoch": self.checkpoints.epoch, "failed": self.error is not None})
-        files = {**self.auxiliary_files, "training.json": report}
+        files = {**self.auxiliary_files, "training.json": self.output_dir / "training.json"}
         selected = self.best_weights
-        latest = self.resumable_checkpoint
+        latest = self.resumable_checkpoint if resumable else None
+        if selected and not resumable:
+            from .backends import weights_checkpoint
+            digest = sha256_progress(selected, progress=False)
+            selected = weights_checkpoint(selected, self.selection.family,
+                                          self.output_dir / "upload-weights" / digest / selected.name)
         if self.selection.family == ModelTypes.NNUNET and has_checkpoint:
             # Preserve the official folder layout without duplicating checkpoint bytes.
-            chosen = selected or latest
+            chosen = self.best_weights or self.resumable_checkpoint
             fold = chosen.parent.name
             for name in ("plans.json", "dataset.json"):
                 files[f"model/{name}"] = chosen.parent.parent / name
@@ -213,13 +226,23 @@ class TrainingResult:
         model_meta = {**self.metadata, "model_name": self.selection.name.removesuffix(".pt"), "dataset_schema": dataset_schema(self.dataset),
                       "checkpoint": (selected or latest).name if has_checkpoint else None, "latest_checkpoint": latest.name if latest else None,
                       "selection_role": "best" if selected else "latest" if latest else "none", "parent": self.selection.provenance}
-        self.bundle_config = Config(name=self.output_dir.name, framework=self.selection.family.value, task=self.selection.task,
+        bundle_config = Config(name=self.output_dir.name, framework=self.selection.family.value, task=self.selection.task,
             geometry=Geometry.create(input_size=self.metadata.get("resolution", self.config.resolution)),
             dataset=self.prepared or {"dataset_source": self.dataset._source_name, "classes": dataset_schema(self.dataset)["classes"]},
             model=model_meta, training={**self.metadata.get("training", {}), **{k: v for k, v in {"epochs": self.config.epochs, "batch_size": self.config.batch_size, "seed": self.config.seed}.items() if v is not None}},
             run={"id": getattr(self.wandb_run, "id", None)}, files=files)
         outcome = Outcome(checkpoint=outcome_path, metrics=self.metrics, selected_epoch=self.best_epoch,
                           selection_metric=self.checkpoints.metric, selection_value=self.checkpoints.value)
+        return bundle_config, outcome
+
+    def _publish(self):
+        has_checkpoint = self.best_weights is not None or self.resumable_checkpoint is not None
+        if not has_checkpoint and self.error is None:
+            return False
+        report = self.output_dir / "training.json"
+        _atomic_json(report, {"model": self.selection.name, "task": self.selection.task, "metrics": self.metrics,
+                              "epoch": self.checkpoints.epoch, "failed": self.error is not None})
+        self.bundle_config, outcome = self._bundle_inputs()
         try:
             self.bundle = create(self.bundle_config, outcome, destination=self.output_dir / "bundles", progress=False)
         except Exception as exc:
@@ -234,31 +257,61 @@ class TrainingResult:
                 self.copied_digest = digest
             except Exception as exc:
                 warnings.warn(f"Checkpoint backup failed: {exc}")
-        if self.wandb_run is not None and self.uploaded_digest != digest:
+        if self.wandb_run is not None:
             from ..wandb import configure, upload
+            previous_upload = self.wandb_bundle
+            self.wandb_bundle = None
             try:
-                configure(self.wandb_run, self.bundle_config)
-                published = upload(self.wandb_run, self.bundle, outcome if selected else None,
-                                   artifact=True, timeout=self.checkpoint_config.upload_timeout)
-                if published.uploaded:
-                    self.uploaded_digest = digest
-                    self.bundle = published
-                    if selected and self.selection.family == ModelTypes.NNUNET:
-                        self.wandb_run.summary["best_model_artifact"] = self.wandb_run.summary["checkpoint_artifact"]
+                upload_config, upload_outcome = self.bundle_config, outcome
+                self.wandb_bundle = self.bundle
+                # Until a best checkpoint exists, publish full recovery state.
+                if self.checkpoint_config.wandb_contents == "best" and self.best_weights:
+                    self.wandb_bundle = None
+                    upload_config, upload_outcome = self._bundle_inputs(resumable=False)
+                    self.wandb_bundle = create(upload_config, upload_outcome, destination=self.output_dir / "bundles", progress=False)
+                if self.uploaded_digest == self.wandb_bundle.sha256:
+                    self.wandb_bundle = (previous_upload if previous_upload and previous_upload.sha256 == self.uploaded_digest
+                                         else replace(self.wandb_bundle, uploaded=True))
+                else:
+                    configure(self.wandb_run, upload_config)
+                    published = upload(self.wandb_run, self.wandb_bundle, upload_outcome if self.best_weights else None,
+                                       artifact=True, timeout=self.checkpoint_config.upload_timeout)
+                    if published.uploaded:
+                        self.uploaded_digest = published.sha256
+                        self.wandb_bundle = published
+                        if published.path == self.bundle.path:
+                            self.bundle = published
+                        if self.best_weights and self.selection.family == ModelTypes.NNUNET:
+                            self.wandb_run.summary["best_model_artifact"] = self.wandb_run.summary["checkpoint_artifact"]
             except Exception as exc:
                 warnings.warn(f"Checkpoint upload failed: {exc}")
-        safe = (has_checkpoint and (self.wandb_run is None or self.uploaded_digest == digest)
+        safe = (has_checkpoint and (self.wandb_run is None or (
+                    self.wandb_bundle is not None and self.uploaded_digest == self.wandb_bundle.sha256))
                 and (not self.checkpoint_config.backup_dir or self.copied_digest == digest))
         if safe:
+            if self.retention_pending:
+                from ..wandb import _prune_checkpoint_artifacts
+                try:
+                    _prune_checkpoint_artifacts(self.wandb_run, sha256=self.uploaded_digest,
+                                                keep_versions=self.checkpoint_config.keep_wandb_versions,
+                                                timeout=self.checkpoint_config.upload_timeout)
+                    self.retained_digest = self.uploaded_digest
+                except Exception as exc:
+                    warnings.warn(f"W&B checkpoint cleanup failed: {exc}. New checkpoints are safe; "
+                                  "cleanup will retry on publication or session.finish().", RuntimeWarning)
             # Keep immutable files during publication, then retire superseded
             # local copies. Long Colab runs must not accumulate two models/epoch.
             retained = {path.relative_to(self.output_dir / "snapshots").parts[0]
                         for path in (self.best_weights, self.resumable_checkpoint) if path}
-            for folder in (self.output_dir / "snapshots").iterdir():
-                if folder.name not in retained:
-                    shutil.rmtree(folder)
+            for directory in ("snapshots", "upload-weights"):
+                for folder in (self.output_dir / directory).glob("*"):
+                    if folder.name not in retained:
+                        shutil.rmtree(folder)
+            bundles = {self.bundle.path}
+            if self.wandb_bundle is not None:
+                bundles.add(self.wandb_bundle.path)
             for bundle_path in (self.output_dir / "bundles").glob("*.zip"):
-                if bundle_path != self.bundle.path:
+                if bundle_path not in bundles:
                     bundle_path.unlink()
         return safe
 
@@ -360,7 +413,7 @@ class TrainingSession:
         all_safe = bool(self.results)
         failures = []
         for result in self.results:
-            if result.finished:
+            if result.finished and not result.retention_pending:
                 continue
             safe = False
             for attempt in range(result.checkpoint_config.final_attempts):
@@ -368,12 +421,12 @@ class TrainingSession:
                     safe = result._publish()
                 except Exception as failure:
                     warnings.warn(f"Publication failed for {result.output_dir}: {failure}")
-                if safe or (result.best_weights is None and result.resumable_checkpoint is None):
+                if (safe and not result.retention_pending) or (result.best_weights is None and result.resumable_checkpoint is None):
                     break
             all_safe = all_safe and safe
             if safe:
                 try:
-                    if result.wandb_run is not None and (result.owns_run or self.disconnect):
+                    if not result.finished and result.wandb_run is not None and (result.owns_run or self.disconnect):
                         result.wandb_run.finish(exit_code=1 if result.error else 0)
                     result.finished = True
                     result._model = None

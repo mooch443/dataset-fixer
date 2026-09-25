@@ -601,6 +601,21 @@ def test_new_bundle_round_trip_loads_geometry(tmp_path: Path) -> None:
     assert loaded[0].geometry == Geometry((128, 128), 2, (256, 256))
 
 
+def test_bundle_compresses_checkpoint_bytes_losslessly(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "best.pt"
+    payload = b"checkpoint-weights-and-optimizer-state\0" * 50_000
+    checkpoint.write_bytes(payload)
+    config = Config(name="compressed", framework="ultralytics", task="detect",
+                    geometry=Geometry.create(input_size=64), dataset={})
+    bundle = create(config, Outcome(checkpoint=checkpoint), destination=tmp_path / "bundle", progress=False)
+    with zipfile.ZipFile(bundle.path) as archive:
+        info = archive.getinfo("weights/best.pt")
+        assert info.compress_type == zipfile.ZIP_DEFLATED
+        assert info.compress_size < info.file_size / 10
+        assert archive.read(info) == payload
+    assert checkpoint.read_bytes() == payload
+
+
 def test_wandb_model_name_uses_dataset_run_model_and_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -72,11 +72,36 @@ with df.TrainingSession(
 ```
 
 `result.model`, `result.best_weights`, `result.resumable_checkpoint`, and
-`result.bundle` expose the outputs. Failed publication preserves local files
+`result.bundle` expose the local outputs; `result.wandb_bundle` is the upload.
+Failed publication preserves local files
 and keeps Colab connected; `session.finish()` retries without retraining.
 Normal interruptions finalize too. Abrupt runtime loss can recover only
 already-published epochs. Disconnect requires confirmation from every
 configured persistent destination and waits 30 seconds before unassigning.
+
+Checkpoint bundles already use lossless ZIP compression. W&B receives the best
+weights without optimizer/scaler/scheduler state by default. These support
+inference and `weights=` initialization, including a different compatible
+resolution. Local bundles and configured filesystem backups keep both best
+weights and the latest full state for `resume=`. Without a filesystem backup,
+the default W&B upload supports a new run, not exact continuation after runtime
+loss. Use `CheckpointConfig(wandb_contents="full")` to keep full resume state in
+W&B too. Until a best checkpoint exists, W&B receives available recovery state.
+Checkpoint copies retain the original weight values, precision, and model
+metadata; native checkpoint files are never stripped in place.
+
+`CheckpointConfig(keep_wandb_versions=1)` is the training default: after the
+replacement is confirmed uploaded and any configured backup is verified, older
+checkpoint artifacts from that same run are deleted. Set it to a larger count,
+or `None` to preserve every version. Other runs/artifact collections and native
+checkpoint files are not pruned. Artifacts with manually assigned/protected
+aliases are preserved with a warning if W&B refuses deletion.
+
+Cleanup failures do not invalidate a confirmed upload or block safe disconnect.
+Cleanup is retried at subsequent publication and finalization; a later
+`session.finish()` also retries it without uploading the same bundle again.
+W&B storage reclamation follows its own artifact deletion/garbage-collection
+schedule.
 
 To initialize a **new** run from a finished run, use `weights=` with its W&B
 run reference, bundle ZIP, or local checkpoint. It resets optimizer/scheduler

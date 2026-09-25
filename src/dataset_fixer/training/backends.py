@@ -51,6 +51,34 @@ def _existing(path):
     return path if path.is_file() else None
 
 
+def weights_checkpoint(source, family, destination):
+    """Make a native initialization checkpoint, preserving weight values/dtypes."""
+    import torch
+    if destination.is_file():
+        return destination
+    saved = torch.load(source, map_location="cpu", weights_only=False)
+    training_keys = {
+        ModelTypes.YOLO: ("optimizer", "scaler"),
+        ModelTypes.RFDETR: ("optimizer", "optimizer_states", "lr_scheduler", "lr_schedulers",
+                           "scaler", "native_amp_scaling_state", "amp_scaling_state"),
+        ModelTypes.NNUNET: ("optimizer_state", "grad_scaler_state"),
+    }[family]
+    if not any(saved.get(key) is not None for key in training_keys):
+        return source  # Native RF-DETR best weights are already stripped.
+    for key in training_keys:
+        saved.pop(key, None)
+    # Native Ultralytics strip_optimizer also casts model weights to FP16.
+    # This derived copy removes only training state and never edits the source.
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".partial")
+    try:
+        torch.save(saved, temporary)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
 def _yolo_options(config, augmentations):
     """Resolve the same native settings for training and augmentation previews."""
     aliases = {"resolution": "imgsz", "epochs": "epochs", "batch_size": "batch", "device": "device", "workers": "workers", "seed": "seed"}
