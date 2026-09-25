@@ -70,6 +70,7 @@ class TrainingResult:
         best_value: Selected native metric value.
         prepared: Reusable prepared dataset.
         _model: Lazily loaded prediction model.
+        _uploaded_best: Native best selection last confirmed in W&B.
     """
     dataset: Any
     selection: Any
@@ -98,6 +99,23 @@ class TrainingResult:
     best_value: float | None = None
     prepared: Any = field(default=None, repr=False)
     _model: Any = field(default=None, repr=False)
+    _uploaded_best: Any = field(default=None, repr=False)
+
+    @property
+    def _best_selection(self):
+        if self.best_weights is None:
+            return None
+        # Native finalizers may rename or strip the same best checkpoint.
+        # Its selection metric/epoch identifies improvements without treating
+        # serialization-only changes as a new best. Custom providers without
+        # scores fall back to their immutable snapshot identity.
+        return ((self.checkpoints.metric, self.best_epoch, self.best_value)
+                if self.best_value is not None else (self.best_weights,))
+
+    @property
+    def _best_upload_pending(self):
+        return (self.wandb_run is not None and self.checkpoint_config.wandb_upload == "best"
+                and self._best_selection is not None and self._best_selection != self._uploaded_best)
 
     def _announce(self, resolution):
         source = self.selection.resume or self.selection.weights or "native pretrained/default"
@@ -151,8 +169,10 @@ class TrainingResult:
                 for key in ("plans.json", "dataset.json"):
                     verified_copy(Path(self.metadata["model_folder"]) / key, snapshot.parent.parent / key)
             frozen[role] = snapshot
+        previous_best = self.best_weights
         self.best_weights = frozen.get("best", self.best_weights)
-        if self.best_weights and (self.best_epoch is None or self.best_value != checkpoints.value):
+        if self.best_weights and (self.best_epoch is None or self.best_value != checkpoints.value
+                                  or (checkpoints.value is None and previous_best != self.best_weights)):
             self.best_epoch, self.best_value = checkpoints.epoch, checkpoints.value
         self.resumable_checkpoint = frozen.get("latest", self.resumable_checkpoint)
         self.checkpoints = replace(checkpoints, best=self.best_weights, latest=self.resumable_checkpoint)
@@ -165,7 +185,7 @@ class TrainingResult:
                 warnings.warn(f"W&B metrics logging failed: {exc}")
         self.auxiliary_files.update(checkpoints.files)
         self._emit("checkpoint_saved", trainer=trainer, epoch=checkpoints.epoch, checkpoints=self.checkpoints, metrics=self.metrics)
-        if final or (checkpoints.epoch is not None and (checkpoints.epoch + 1) % self.checkpoint_config.every_n_epochs == 0):
+        if final or self._best_upload_pending or (checkpoints.epoch is not None and (checkpoints.epoch + 1) % self.checkpoint_config.every_n_epochs == 0):
             self._publish()
 
     def evaluate(self, *, samples=32, plots=6, split="val"):
@@ -235,7 +255,7 @@ class TrainingResult:
                           selection_metric=self.checkpoints.metric, selection_value=self.checkpoints.value)
         return bundle_config, outcome
 
-    def _publish(self):
+    def _publish(self, *, final=False):
         has_checkpoint = self.best_weights is not None or self.resumable_checkpoint is not None
         if not has_checkpoint and self.error is None:
             return False
@@ -257,7 +277,7 @@ class TrainingResult:
                 self.copied_digest = digest
             except Exception as exc:
                 warnings.warn(f"Checkpoint backup failed: {exc}")
-        if self.wandb_run is not None:
+        if self.wandb_run is not None and (final or self.checkpoint_config.wandb_upload == "interval" or self._best_upload_pending):
             from ..wandb import configure, upload
             previous_upload = self.wandb_bundle
             self.wandb_bundle = None
@@ -283,6 +303,8 @@ class TrainingResult:
                             self.bundle = published
                         if self.best_weights and self.selection.family == ModelTypes.NNUNET:
                             self.wandb_run.summary["best_model_artifact"] = self.wandb_run.summary["checkpoint_artifact"]
+                if self.uploaded_digest == self.wandb_bundle.sha256:
+                    self._uploaded_best = self._best_selection
             except Exception as exc:
                 warnings.warn(f"Checkpoint upload failed: {exc}")
         safe = (has_checkpoint and (self.wandb_run is None or (
@@ -418,7 +440,7 @@ class TrainingSession:
             safe = False
             for attempt in range(result.checkpoint_config.final_attempts):
                 try:
-                    safe = result._publish()
+                    safe = result._publish(final=True)
                 except Exception as failure:
                     warnings.warn(f"Publication failed for {result.output_dir}: {failure}")
                 if (safe and not result.retention_pending) or (result.best_weights is None and result.resumable_checkpoint is None):

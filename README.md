@@ -90,6 +90,19 @@ W&B too. Until a best checkpoint exists, W&B receives available recovery state.
 Checkpoint copies retain the original weight values, precision, and model
 metadata; native checkpoint files are never stripped in place.
 
+To upload to W&B only when the native trainer selects a new best during training:
+
+```python
+checkpointing = df.CheckpointConfig(backup_dir=BACKUP_DIR, wandb_upload="best")
+```
+
+`wandb_contents="best"` controls the payload; `wandb_upload="best"` controls the
+trigger. Full backups continue at `every_n_epochs` (default 1), and a new best
+publishes immediately even between scheduled epochs. Failed best uploads remain
+pending and retry. Finalization still publishes the final evaluation/error
+report bundle, even when the best weights have not changed. The default
+`wandb_upload="interval"` preserves periodic uploads.
+
 `CheckpointConfig(keep_wandb_versions=1)` is the training default: after the
 replacement is confirmed uploaded and any configured backup is verified, older
 checkpoint artifacts from that same run are deleted. Set it to a larger count,

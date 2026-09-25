@@ -55,13 +55,16 @@ class CheckpointConfig:
 
     Parameters:
         backup_dir: Optional persistent filesystem destination, such as Drive.
-        every_n_epochs: Publish after this many completed epochs.
+        every_n_epochs: Regular publication/backup interval in completed epochs;
+            a new best may also trigger immediate publication.
         upload_timeout: Seconds to await confirmed W&B artifact completion.
         final_attempts: Publication attempts during each finish() call.
         keep_wandb_versions: Retain this many confirmed checkpoint bundles per
             run after replacement is safe; None preserves all versions.
         wandb_contents: 'best' uploads optimizer-free best weights; 'full' also
             uploads resumable state. Filesystem backups always retain full state.
+        wandb_upload: 'interval' uploads at every_n_epochs; 'best' uploads each
+            newly selected best immediately. Finalization still publishes reports.
     """
     backup_dir: str | Path | None = None
     every_n_epochs: int = 1
@@ -69,6 +72,7 @@ class CheckpointConfig:
     final_attempts: int = 3
     keep_wandb_versions: int | None = 1
     wandb_contents: str = "best"
+    wandb_upload: str = "interval"
 
     def __post_init__(self):
         if any(isinstance(v, bool) or not isinstance(v, int) or v < 1
@@ -82,6 +86,8 @@ class CheckpointConfig:
             raise ValueError("keep_wandb_versions must be a positive integer or None")
         if self.wandb_contents not in ("best", "full"):
             raise ValueError("wandb_contents must be 'best' or 'full'")
+        if self.wandb_upload not in ("interval", "best"):
+            raise ValueError("wandb_upload must be 'interval' or 'best'")
 
 
 @dataclass(frozen=True)

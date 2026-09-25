@@ -320,6 +320,82 @@ def test_checkpoint_rejects_invalid_wandb_contents(contents):
         df.CheckpointConfig(wandb_contents=contents)
 
 
+@pytest.mark.parametrize("mode", ["epoch", "all", False, None])
+def test_checkpoint_rejects_invalid_wandb_upload_mode(mode):
+    with pytest.raises(ValueError, match="wandb_upload"):
+        df.CheckpointConfig(wandb_upload=mode)
+
+
+@pytest.mark.parametrize("contents", ["best", "full"])
+def test_best_upload_skips_plateaus_keeps_backups_and_final_reports(pose, tmp_path, run, contents):
+    session, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(
+        backup_dir=tmp_path / "drive", wandb_upload="best", wandb_contents=contents))
+    result._capture(None, checkpoints(tmp_path))
+    selected = result.best_weights
+    first_upload, first_backup = result.uploaded_digest, result.copied_digest
+    result._capture(None, replace(checkpoints(tmp_path, 1), best=selected), {"train/loss": 0.4})
+    assert len(run.artifacts) == 1 and result.uploaded_digest == first_upload
+    assert result.copied_digest != first_backup and result.copied_digest == result.bundle.sha256
+    backup = tmp_path / "drive" / result.output_dir.name / "model.zip"
+    with zipfile.ZipFile(backup) as archive:
+        best = torch.load(io.BytesIO(archive.read("weights/best.pth")), weights_only=False)
+        latest = torch.load(io.BytesIO(archive.read("weights/last.ckpt")), weights_only=False)
+        assert best["epoch"] == 0 and latest["epoch"] == 1
+    improved = replace(checkpoints(tmp_path, 2), value=0.8)
+    result._capture(None, improved)
+    assert len(run.artifacts) == 2 and run.artifacts[0].deleted
+    renamed = tmp_path / "final-best.pth"
+    torch.save(torch.load(result.best_weights, weights_only=False), renamed)
+    result._capture(None, replace(checkpoints(tmp_path, 3), best=renamed, value=0.8), final=True)
+    assert len(run.artifacts) == 2  # Renaming/stripping does not improve the metric.
+    report = tmp_path / "evaluation.json"
+    report.write_text('{"map": 0.8}')
+    result.auxiliary_files["evaluation/metrics.json"] = report
+    assert session.finish()
+    assert len(run.artifacts) == 3 and run.artifacts[1].deleted
+    with zipfile.ZipFile(result.wandb_bundle.path) as archive:
+        assert archive.read("evaluation/metrics.json") == report.read_bytes()
+    assert session.finish() and len(run.artifacts) == 3
+
+
+def test_best_upload_is_immediate_and_retries_between_intervals(pose, tmp_path, run):
+    _, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(
+        every_n_epochs=5, wandb_upload="best", backup_dir=tmp_path / "drive"))
+    run.fail = True
+    with pytest.warns(RuntimeWarning, match="upload failed"):
+        result._capture(None, checkpoints(tmp_path))
+    selected = result.best_weights
+    assert len(run.artifacts) == 1 and result.uploaded_digest is None
+    run.fail = False
+    result._capture(None, replace(checkpoints(tmp_path, 1), best=selected))
+    assert len(run.artifacts) == 2 and result.wandb_bundle.uploaded
+    result._capture(None, replace(checkpoints(tmp_path, 2), best=selected))
+    assert len(run.artifacts) == 2
+    result._capture(None, replace(checkpoints(tmp_path, 3), value=0.8))
+    assert len(run.artifacts) == 3
+
+
+def test_best_upload_without_selected_best_waits_until_final_recovery(pose, tmp_path, run):
+    session, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(
+        wandb_upload="best", backup_dir=tmp_path / "drive"))
+    result._capture(None, replace(checkpoints(tmp_path), best=None))
+    assert not run.artifacts and result.copied_digest == result.bundle.sha256
+    result._record_error(RuntimeError("failed before best selection"))
+    assert session.finish() and len(run.artifacts) == 1
+    with zipfile.ZipFile(result.wandb_bundle.path) as archive:
+        assert "failure.txt" in archive.namelist() and "weights/last.ckpt" in archive.namelist()
+
+
+def test_best_upload_custom_provider_without_metric_uses_snapshot(pose, tmp_path, run):
+    _, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(wandb_upload="best"))
+    result._capture(None, replace(checkpoints(tmp_path), value=None))
+    selected = result.best_weights
+    result._capture(None, replace(checkpoints(tmp_path, 1), best=selected, value=None))
+    assert len(run.artifacts) == 1
+    result._capture(None, replace(checkpoints(tmp_path, 2), value=None))
+    assert len(run.artifacts) == 2 and result.best_epoch == 2
+
+
 @pytest.mark.parametrize("family,model_key,state_keys", [
     (df.ModelTypes.YOLO, "model", ("optimizer", "scaler")),
     (df.ModelTypes.RFDETR, "model", ("optimizer_states", "lr_schedulers")),
@@ -604,11 +680,13 @@ def test_train_announces_model_and_callbacks(pose, tmp_path, monkeypatch, capsys
 
 
 @pytest.mark.parametrize("interval", [1, 10])
-def test_real_lightning_adapter_keeps_resumable_current_epoch(pose, tmp_path, monkeypatch, run, interval):
+@pytest.mark.parametrize("upload", ["interval", "best"])
+def test_real_lightning_adapter_keeps_resumable_current_epoch(pose, tmp_path, monkeypatch, run, interval, upload):
     import pytorch_lightning as pl
     import rfdetr
     from pytorch_lightning.callbacks import ModelCheckpoint
     from rfdetr.training.callbacks.best_model import BestModelCallback
+    scores = (.5, .5, .6) if upload == "best" else (.5, .6)
     class Tiny(pl.LightningModule):
         def __init__(self, mc, tc):
             super().__init__()
@@ -617,7 +695,7 @@ def test_real_lightning_adapter_keeps_resumable_current_epoch(pose, tmp_path, mo
         def training_step(self, batch, batch_idx):
             return self.model(batch).square().mean()
         def validation_step(self, batch, batch_idx):
-            self.log("val/keypoint_map_50_95", torch.tensor(.5 + .1 * self.current_epoch))
+            self.log("val/keypoint_map_50_95", torch.tensor(scores[self.current_epoch]))
         def configure_optimizers(self):
             return torch.optim.Adam(self.parameters(), lr=.01)
     class Data(pl.LightningDataModule):
@@ -630,17 +708,17 @@ def test_real_lightning_adapter_keeps_resumable_current_epoch(pose, tmp_path, mo
     def build(tc, mc, **kwargs):
         last = ModelCheckpoint(dirpath=tc.output_dir, filename="last", save_top_k=1, enable_version_counter=False)
         best = BestModelCallback(tc.output_dir, monitor_regular="val/keypoint_map_50_95", run_test=False)
-        return pl.Trainer(accelerator="cpu", devices=1, max_epochs=2, callbacks=[last, best], logger=False,
+        return pl.Trainer(accelerator="cpu", devices=1, max_epochs=len(scores), callbacks=[last, best], logger=False,
                           enable_progress_bar=False, enable_model_summary=False, num_sanity_val_steps=0)
     monkeypatch.setattr(rfdetr, "RFDETRModelModule", Tiny)
     monkeypatch.setattr(rfdetr, "RFDETRDataModule", Data)
     monkeypatch.setattr(rfdetr, "build_trainer", build)
-    cfg = df.TrainingConfig(output_dir=tmp_path / "native-training", epochs=2, resolution=96, workers=0,
+    cfg = df.TrainingConfig(output_dir=tmp_path / "native-training", epochs=len(scores), resolution=96, workers=0,
                             backend_options={"model": {"pretrain_weights": None}, "checkpoint_interval": interval})
     result = df.train(pose, type=df.ModelTypes.RFDETR, config=cfg, wandb=df.WandbConfig(run=run),
-                      checkpointing=df.CheckpointConfig(wandb_contents="full"))
+                      checkpointing=df.CheckpointConfig(wandb_contents="full", wandb_upload=upload))
     assert len(run.artifacts) >= 2
-    for epoch, artifact in enumerate(run.artifacts[:2]):
+    for epoch, artifact in zip((0, len(scores) - 1), run.artifacts[:2]):
         with zipfile.ZipFile(io.BytesIO(next(iter(artifact.files.values())))) as zipped:
             latest = torch.load(io.BytesIO(zipped.read("weights/last.ckpt")), weights_only=False)
             best = torch.load(io.BytesIO(zipped.read("weights/checkpoint_best_regular.pth")), weights_only=False)
