@@ -4,7 +4,9 @@ import io
 import json
 import shutil
 import sys
+import warnings
 import zipfile
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from dataclasses import replace
@@ -15,7 +17,7 @@ import yaml
 
 import dataset_fixer as df
 from dataset_fixer.training.selection import select
-from dataset_fixer.training.backends import prepare_data, rfdetr_configs
+from dataset_fixer.training.backends import prepare_data, rfdetr_configs, rfdetr_data_module
 from dataset_fixer.training.session import verified_copy
 from conftest import make_yolo_dataset
 
@@ -221,6 +223,76 @@ def test_real_rfdetr_data_and_augmentation(pose, tmp_path):
                              samples=1, destination=output, show=False)
     assert output.stat().st_size > 1000
     shutil.copyfile(output, "/tmp/dataset-fixer-native-augmentation.png")
+
+
+@pytest.mark.parametrize("annotation_ids", [(0, 1), (9, 17), ()])
+def test_rfdetr_evaluation_ids_leave_source_data_unchanged(pose, tmp_path, monkeypatch, annotation_ids):
+    from rfdetr.datasets import yolo
+    original_samples, original_metadata = deepcopy((pose._samples, pose._metadata))
+    original_files = {p: p.read_bytes() for p in pose.location.rglob("*") if p.is_file()}
+    _, result = job(pose, tmp_path)
+    prepared = prepare_data(result)
+    prepared_files = {p: p.read_bytes() for p in prepared.location.rglob("*") if p.is_file()}
+    variant, mc, options = rfdetr_configs(result.selection, result.config, prepared, {})
+    tc = variant._train_config_class(dataset_dir=str(prepared.location), dataset_file="yolo", **options)
+    build_coco = yolo._build_coco_api_from_samples
+    originals = []
+    def capture(*args, **kwargs):
+        coco = build_coco(*args, **kwargs)
+        annotation = coco.dataset["annotations"][0]
+        coco.dataset["annotations"] = [{**annotation, "id": i} for i in annotation_ids]
+        coco.createIndex()
+        originals.append((coco, deepcopy(coco.dataset)))
+        return coco
+    monkeypatch.setattr(yolo, "_build_coco_api_from_samples", capture)
+    data = rfdetr_data_module(mc, tc)
+    for stage in ("fit", "validate", "test", "predict", "fit", "test"):
+        data.setup(stage)
+    assert len(originals) == 3  # Repeated setup neither reloads nor renumbers.
+    for native, (original, before) in zip((data._dataset_train, data._dataset_val, data._dataset_test), originals):
+        assert original.dataset == before
+        expected_ids = list(range(1, len(annotation_ids) + 1)) if 0 in annotation_ids else list(annotation_ids)
+        assert list(native.coco.anns) == expected_ids
+        expected = {**before, "annotations": [
+            {**ann, "id": i} for ann, i in zip(before["annotations"], expected_ids)
+        ]}
+        assert native.coco.dataset == expected
+        assert all(native.coco.anns[ann["id"]] is ann for ann in native.coco.imgToAnns[0])
+        assert (native.coco is original) == (0 not in annotation_ids)
+    assert pose._samples == original_samples and pose._metadata == original_metadata
+    assert {p: p.read_bytes() for p in pose.location.rglob("*") if p.is_file()} == original_files
+    assert {p: p.read_bytes() for p in prepared.location.rglob("*") if p.is_file()} == prepared_files
+
+
+def test_rfdetr_keypoint_metric_counts_first_annotation(pose, tmp_path):
+    from rfdetr.training.callbacks.coco_eval import COCOEvalCallback
+    _, result = job(pose, tmp_path)
+    prepared = prepare_data(result)
+    variant, mc, options = rfdetr_configs(result.selection, result.config, prepared, {})
+    tc = variant._train_config_class(dataset_dir=str(prepared.location), dataset_file="yolo", **options)
+    data = rfdetr_data_module(mc, tc)
+    data.setup("fit")
+    data.setup("test")
+    callback = COCOEvalCallback(keypoint_oks_sigmas=[0.1] * 8)
+    for split in ("train", "val", "val_ema", "test"):
+        native = getattr(data, f"_dataset_{split.removesuffix('_ema')}")
+        annotation, = native.coco.dataset["annotations"]
+        assert annotation["id"] > 0
+        assert annotation["category_id"] == annotation["image_id"] == 0
+        x, y, w, h = annotation["bbox"]
+        predictions = {annotation["image_id"]: {
+            "boxes": torch.tensor([[x, y, x + w, y + h]]),
+            "labels": torch.tensor([annotation["category_id"]]),
+            "scores": torch.ones(1),
+            "keypoints": torch.tensor(annotation["keypoints"]).reshape(1, 8, 3),
+        }}
+        metric = callback._get_or_create_keypoint_oks_metric(SimpleNamespace(datamodule=data), split)
+        metric.update(predictions)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message="Found annotation id 0.*")
+            scores = metric.compute()
+        assert scores["map"] == pytest.approx(1.0)
+        assert scores["mar"] == pytest.approx(1.0)
 
 
 def test_rfdetr_native_augmentation_options_override_defaults(pose, tmp_path):

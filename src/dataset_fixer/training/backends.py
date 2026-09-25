@@ -200,8 +200,35 @@ def rfdetr_configs(selection, config, prepared, augmentations):
     return variant, mc, options
 
 
+def rfdetr_data_module(model_config, train_config):
+    """Adapt RF-DETR's private COCO evaluation input without changing source data."""
+    from copy import copy
+    from rfdetr import RFDETRDataModule
+
+    class NativeData(RFDETRDataModule):
+        def setup(self, stage):
+            super().setup(stage)
+            for name in ("_dataset_train", "_dataset_val", "_dataset_test"):
+                native = getattr(self, name, None)
+                coco = getattr(native, "coco", None)
+                if coco is None or 0 not in coco.anns:
+                    continue
+                # RF-DETR 1.8.3 numbers YOLO annotations from zero, which COCO
+                # evaluation reserves for unmatched detections. Replace only
+                # the native evaluation object; keep classes/image IDs intact.
+                corrected = copy(coco)
+                corrected.dataset = {**coco.dataset, "annotations": [
+                    {**annotation, "id": index}
+                    for index, annotation in enumerate(coco.dataset["annotations"], start=1)
+                ]}
+                corrected.createIndex()
+                native.coco = corrected
+
+    return NativeData(model_config, train_config)
+
+
 def train_rfdetr(result, prepared, augmentations):
-    from rfdetr import RFDETRDataModule, RFDETRModelModule, build_trainer
+    from rfdetr import RFDETRModelModule, build_trainer
     from rfdetr.models.weights import load_pretrain_weights
     from rfdetr.detr import RFDETR
     from pytorch_lightning.callbacks import Checkpoint, ModelCheckpoint
@@ -237,7 +264,7 @@ def train_rfdetr(result, prepared, augmentations):
             load_pretrain_weights(module.model, mc)
         finally:
             handle.remove()
-    data = RFDETRDataModule(mc, tc)
+    data = rfdetr_data_module(mc, tc)
     trainer = build_trainer(tc, mc, **trainer_options)
     if trainer_factory is not None:
         required_callbacks = list(trainer.callbacks)

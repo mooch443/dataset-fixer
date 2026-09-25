@@ -40,6 +40,12 @@ interface. The task is inferred from the validated dataset; incompatible task
 overrides fail before training. Available YOLO versions/sizes come from the
 installed Ultralytics model catalogue.
 
+The RF-DETR adapter gives its private COCO evaluation annotations positive IDs
+when its YOLO loader generates ID `0` (reserved by COCO for unmatched detections).
+This protects pose validation and best-checkpoint selection without changing
+source files, the caller's `Dataset` or metadata, class IDs, or image IDs.
+YOLO and nnU-Net training do not use this adapter.
+
 ```python
 import dataset_fixer as df
 
