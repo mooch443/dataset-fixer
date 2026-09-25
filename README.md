@@ -46,6 +46,14 @@ This protects pose validation and best-checkpoint selection without changing
 source files, the caller's `Dataset` or metadata, class IDs, or image IDs.
 YOLO and nnU-Net training do not use this adapter.
 
+RF-DETR prediction and post-training evaluation automatically call native
+`optimize_for_inference(compile=False)`, using FP16 on CUDA and FP32 on CPU or
+explicitly selected MPS devices. Optimization is cached per model, resolution,
+and device; predictions run with gradients disabled. The native inference copy
+is optimized without JIT tracing startup costs, and training/checkpoint weights
+remain unchanged. The adapter also supplies the model config to RF-DETR 1.8.3's
+inference context so optimized pose outputs remain keypoints, not masks.
+
 ```python
 import dataset_fixer as df
 

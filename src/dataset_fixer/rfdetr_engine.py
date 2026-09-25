@@ -83,7 +83,8 @@ def predict_inputs(model, inputs, *, resolution, confidence, device, progress, b
         raise ValueError("RF-DETR currently supports inference='native'")
     import rfdetr
     import torch
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = str(torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu")))
+    dtype = torch.float16 if torch.device(device).type == "cuda" else torch.float32
     from tqdm.auto import tqdm
     from .comparison.types import Prediction
     key = ("rfdetr", resolution, device)
@@ -91,14 +92,21 @@ def predict_inputs(model, inputs, *, resolution, confidence, device, progress, b
     if native is None:
         metadata = checkpoint_metadata(model.path)
         overrides = resolution_overrides(metadata["model_config"], resolution)
-        if device is not None:
-            overrides["device"] = device
+        overrides["device"] = device
         native = rfdetr.from_checkpoint(str(model.path), **overrides)
+        # RF-DETR 1.8.3 reads the task here when decoding optimized tuple outputs,
+        # but its ModelContext constructor omits the config (pose becomes masks).
+        native.model.model_config = native.model_config
+        # Native export + dtype casting avoid JIT startup costs for small evals.
+        # Keep the original module intact; only the inference copy is optimized.
+        with torch.inference_mode():
+            native.optimize_for_inference(compile=False, dtype=dtype)
         model._runtime[key] = native
     task = model.task or checkpoint_metadata(model.path)["task"]
     output = {}
     for item in tqdm(inputs, desc="RF-DETR predictions", disable=not progress):
-        result = native.predict(str(item.image_path), threshold=confidence, include_source_image=False)
+        with torch.inference_mode():
+            result = native.predict(str(item.image_path), threshold=confidence, include_source_image=False)
         objects = []
         boxes = result.data["xyxy"] if task == "pose" else result.xyxy
         scores = result.detection_confidence if task == "pose" else result.confidence
@@ -115,4 +123,5 @@ def predict_inputs(model, inputs, *, resolution, confidence, device, progress, b
                                       keypoints=points, polygons=polygons, polygon=max(polygons, key=len) if polygons else None,
                                       metadata={"backend": "rfdetr"}))
         output[item.image_id] = objects
-    return output, task, {"resolved_batch_size": 1, "backend": "rfdetr"}
+    return output, task, {"resolved_batch_size": 1, "backend": "rfdetr", "device": device,
+                          "optimized_for_inference": True, "inference_dtype": str(dtype).removeprefix("torch.")}

@@ -866,12 +866,18 @@ def test_rfdetr_predictions_use_existing_eval_and_renderer(pose, tmp_path, monke
     session, result = job(pose, tmp_path)
     result._capture(None, checkpoints(tmp_path))
     def predict(path, **kwargs):
+        assert torch.is_inference_mode_enabled()
         return SimpleNamespace(data={"xyxy": np.array([[16, 12, 144, 108]])},
             detection_confidence=np.array([.95]), class_id=np.array([0]),
             xy=np.array([[[160 * (.25 + i * .06), 60] for i in range(8)]]),
             keypoint_confidence=np.ones((1, 8)))
-    monkeypatch.setattr(rfdetr, "from_checkpoint", lambda *args, **kwargs: SimpleNamespace(predict=predict))
+    optimized = []
+    native = SimpleNamespace(model=SimpleNamespace(), model_config=SimpleNamespace(use_grouppose_keypoints=True),
+                             predict=predict, optimize_for_inference=lambda **kwargs: optimized.append(kwargs))
+    monkeypatch.setattr(rfdetr, "from_checkpoint", lambda *args, **kwargs: native)
     evaluated = result.evaluate(samples=1, plots=1)
+    assert len(optimized) == 1
+    assert native.model.model_config is native.model_config
     assert len(evaluated.ranking) == 1
     assert result.metrics["evaluation"]
     assert (result.output_dir / "predictions.png").is_file()
