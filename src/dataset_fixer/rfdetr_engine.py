@@ -121,7 +121,8 @@ def predict_inputs(model, inputs, *, resolution, confidence, device, progress, b
                 polygons = [c.reshape(-1, 2).astype(float).tolist() for c in contours if len(c) >= 3]
             objects.append(Prediction(class_id=int(result.class_id[i]), score=float(scores[i]), bbox=tuple(map(float, box)),
                                       keypoints=points, polygons=polygons, polygon=max(polygons, key=len) if polygons else None,
-                                      metadata={"backend": "rfdetr"}))
+                                      # Pose uncertainty fusion can legitimately amplify scores above 1.
+                                      metadata={"backend": "rfdetr", "score_domain": "nonnegative" if task == "pose" else "probability"}))
         output[item.image_id] = objects
     return output, task, {"resolved_batch_size": 1, "backend": "rfdetr", "device": device,
                           "optimized_for_inference": True, "inference_dtype": str(dtype).removeprefix("torch.")}

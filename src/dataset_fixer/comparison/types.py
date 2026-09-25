@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
@@ -52,6 +53,13 @@ class Prediction:
     polygons: list[list[tuple[float, float]]] | None = None
     keypoints: list[tuple[float, float, float | None]] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def valid_score(self) -> bool:
+        """Probability scores are bounded; explicit native rankings need not be."""
+        domain = self.metadata.get("score_domain", "probability")
+        return (math.isfinite(self.score) and self.score >= 0
+                and (domain == "nonnegative" or (domain == "probability" and self.score <= 1)))
 
 
 @dataclass(frozen=True)

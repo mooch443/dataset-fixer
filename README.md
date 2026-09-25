@@ -53,6 +53,11 @@ and device; predictions run with gradients disabled. The native inference copy
 is optimized without JIT tracing startup costs, and training/checkpoint weights
 remain unchanged. The adapter also supplies the model config to RF-DETR 1.8.3's
 inference context so optimized pose outputs remain keypoints, not masks.
+RF-DETR pose uncertainty fusion produces nonnegative ranking scores that can
+exceed 1. Evaluation and prediction caches retain those native values and their
+ordering; they are not clipped or treated as probabilities. Other prediction
+outputs retain their probability validation, and negative/non-finite scores
+remain invalid.
 
 ```python
 import dataset_fixer as df
@@ -86,6 +91,10 @@ and keeps Colab connected; `session.finish()` retries without retraining.
 Normal interruptions finalize too. Abrupt runtime loss can recover only
 already-published epochs. Disconnect requires confirmation from every
 configured persistent destination and waits 30 seconds before unassigning.
+Training/evaluation failures print their original traceback before finalization
+and disconnect. W&B's summary records `session_failed`, `failure_type`,
+`failure_message`, and the bundled `failure.txt` report, so a safely uploaded
+checkpoint is not mistaken for successful evaluation.
 
 Checkpoint bundles already use lossless ZIP compression. W&B receives the best
 weights without optimizer/scaler/scheduler state by default. These support

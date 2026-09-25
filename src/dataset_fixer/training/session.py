@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 import time
 import traceback
@@ -213,10 +214,22 @@ class TrainingResult:
             raise
 
     def _record_error(self, error):
+        if self.error is not None:
+            return  # Preserve and report the original failure once, including during __exit__.
         self.error = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        # Colab may stop the kernel in finish() before Python can display the
+        # re-raised exception. Emit it while the notebook and W&B capture are live.
+        print(f"Training session failed; available checkpoints will still be published.\n{self.error}",
+              file=sys.stderr, flush=True)
         report = self.output_dir / "failure.txt"
         report.write_text(self.error)
         self.auxiliary_files["failure.txt"] = report
+        if self.wandb_run is not None:
+            try:
+                self.wandb_run.summary.update({"session_failed": True, "failure_type": type(error).__name__,
+                    "failure_message": str(error)[:1000] or type(error).__name__, "failure_report": "failure.txt"})
+            except Exception as exc:
+                warnings.warn(f"Could not record W&B failure summary; failure.txt is retained: {exc}")
 
     def _bundle_inputs(self, *, resumable=True):
         has_checkpoint = self.best_weights is not None or self.resumable_checkpoint is not None
@@ -466,7 +479,8 @@ class TrainingSession:
             raise RuntimeError("Publication incomplete; " + "; ".join(failures) + ". Retry session.finish().")
         if self.disconnect and all_safe and not self.disconnected and in_colab():
             from google.colab import runtime
-            print(f"Checkpoints confirmed safe. Disconnecting in {self.disconnect_delay} seconds.")
+            status = "Session failed; checkpoints and failure reports confirmed safe." if any(r.error for r in self.results) else "Checkpoints confirmed safe."
+            print(f"{status} Disconnecting in {self.disconnect_delay} seconds.", flush=True)
             time.sleep(self.disconnect_delay)
             runtime.unassign()
             self.disconnected = True

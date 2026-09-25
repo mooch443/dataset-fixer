@@ -136,3 +136,60 @@ def test_failed_optimization_is_not_cached(tmp_path, monkeypatch):
         predict_inputs(model, (), resolution=96, confidence=0, device="cpu", progress=False, backend="native")
     assert raised.value is error and not model.loaded
     assert not torch.is_inference_mode_enabled() and torch.is_grad_enabled()
+
+
+def test_native_pose_fusion_scores_survive_evaluation_and_cache(tmp_path):
+    from rfdetr.models.postprocess import PostProcess
+    from dataset_fixer.comparison.cache import load_package_cache, save_package_cache
+    from dataset_fixer.comparison.inference import _assert_exact_predictions
+    from dataset_fixer.comparison.metrics import evaluate_configuration
+    from dataset_fixer.comparison.types import Cohort, CohortRecord, Prediction
+
+    # Native learned localization precision can amplify object scores above one.
+    points = torch.zeros(1, 2, 8, 8)
+    points[..., :2] = .5
+    points[..., 2:4] = 5
+    points[..., 4] = points[..., 6] = 5
+    outputs = {"pred_logits": torch.tensor([[[4.], [3.]]]),
+               "pred_boxes": torch.tensor([[[.5, .5, .8, .8], [.05, .05, .1, .1]]]),
+               "pred_keypoints": points}
+    native = PostProcess(num_select=2, num_keypoints_per_class=[8], trace_alpha=.2)(outputs, torch.tensor([[96, 96]]))[0]
+    scores = native["scores"].tolist()
+    assert scores[0] > scores[1] > 1
+    predictions = [Prediction(0, score, bbox=tuple(native["boxes"][i].tolist()),
+                              keypoints=[(48., 48., 1.)] * 8,
+                              metadata={"backend": "rfdetr", "score_domain": "nonnegative"})
+                   for i, score in enumerate(scores)]
+    truth = {"class_id": 0, "bbox": predictions[0].bbox, "keypoints": [(48., 48., 2)] * 8}
+    record = CohortRecord("image", tmp_path / "image.jpg", "image.jpg", "val", 96, 96,
+                          "image-sha", "annotation-sha", "original", (truth,))
+    cohort = Cohort("val", "fingerprint", (record,), "pose", {0: "animal"}, {"kpt_shape": [8, 3]})
+    by_image = {"image": predictions}
+    _assert_exact_predictions(cohort, by_image, "rfdetr")
+    metrics = evaluate_configuration(cohort, by_image, .5)
+    assert metrics["summary"]["map50_95"] == pytest.approx(1.0)
+    save_package_cache(tmp_path / "cache", cohort, {}, {.7: by_image})
+    loaded, _, complete = load_package_cache(tmp_path / "cache", cohort, (.7,))
+    assert complete
+    np.testing.assert_allclose([p.score for p in loaded[.7]["image"]], scores)
+    _assert_exact_predictions(cohort, loaded[.7], "rfdetr")
+
+
+@pytest.mark.parametrize("domain,score", [
+    ("nonnegative", -.1), ("nonnegative", float("nan")), ("nonnegative", float("inf")),
+    ("probability", 2.73), (None, 2.73), ("invalid", .5),
+])
+def test_invalid_prediction_scores_are_rejected_in_fresh_and_cached_results(tmp_path, domain, score):
+    from dataset_fixer.comparison.cache import _validate_cached_predictions
+    from dataset_fixer.comparison.inference import _assert_exact_predictions
+    from dataset_fixer.comparison.types import Cohort, CohortRecord, Prediction
+
+    metadata = {} if domain is None else {"score_domain": domain}
+    prediction = Prediction(0, score, bbox=(0, 0, 10, 10), metadata=metadata)
+    record = CohortRecord("image", tmp_path / "image.jpg", "image.jpg", "val", 96, 96,
+                          "image-sha", "annotation-sha", "original", ())
+    cohort = Cohort("val", "fingerprint", (record,), "detect", {0: "animal"}, {})
+    with pytest.raises(df.DatasetValidationError, match="Prediction score"):
+        _assert_exact_predictions(cohort, {"image": [prediction]}, "model")
+    with pytest.raises(df.DatasetValidationError, match="Cached prediction score"):
+        _validate_cached_predictions([prediction], record, cohort, tmp_path / "cache.npz")

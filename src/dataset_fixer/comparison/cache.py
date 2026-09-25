@@ -310,13 +310,14 @@ def _validate_cached_predictions(
                     value=value.class_id,
                 )
             )
-        if not np.isfinite(value.score) or not 0 <= value.score <= 1:
+        if not value.valid_score:
             raise DatasetValidationError(
                 ValidationIssue(
-                    "Cached prediction score must be finite and in [0, 1]",
+                    "Cached prediction score is non-finite or outside its declared domain",
                     source=str(source),
                     line=index + 1,
                     value=value.score,
+                    expected="finite nonnegative score" if value.metadata.get("score_domain") == "nonnegative" else "finite probability in [0, 1]",
                 )
             )
         if value.bbox is not None:

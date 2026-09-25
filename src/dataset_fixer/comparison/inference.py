@@ -1474,8 +1474,9 @@ def _assert_exact_predictions(cohort: Cohort, values: dict[str, list[Prediction]
         for index, prediction in enumerate(values[record.image_id], start=1):
             if prediction.class_id not in cohort.classes:
                 issues.append(ValidationIssue("Prediction uses a class outside the frozen schema", source=f"{model_name}:{record.relative_path}", line=index, value=prediction.class_id))
-            if not math.isfinite(prediction.score) or not 0 <= prediction.score <= 1:
-                issues.append(ValidationIssue("Prediction score is not finite and in [0, 1]", source=f"{model_name}:{record.relative_path}", line=index, value=prediction.score))
+            if not prediction.valid_score:
+                issues.append(ValidationIssue("Prediction score is non-finite or outside its declared domain", source=f"{model_name}:{record.relative_path}", line=index, value=prediction.score,
+                                              expected="finite nonnegative score" if prediction.metadata.get("score_domain") == "nonnegative" else "finite probability in [0, 1]"))
             if cohort.task == "polo" and prediction.point is None:
                 issues.append(ValidationIssue("POLO prediction has no point", source=f"{model_name}:{record.relative_path}", line=index))
             if cohort.task in {"detect", "segment", "pose"} and prediction.bbox is None:

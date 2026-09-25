@@ -458,16 +458,38 @@ def test_verified_copy_retains_previous_on_corruption(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("failure", [ValueError, KeyboardInterrupt])
-def test_session_finalizes_on_error_and_preserves_original(pose, tmp_path, run, failure):
-    session, result = job(pose, tmp_path, run)
+def test_session_finalizes_on_error_and_preserves_original(pose, tmp_path, run, failure, monkeypatch, capsys):
+    session, result = job(pose, tmp_path, run, disconnect="after_safe", disconnect_delay=0)
+    events = []
+    monkeypatch.setattr("dataset_fixer.training.session.in_colab", lambda: True)
+
+    def close(exit_code):
+        assert run.summary["failure_type"] == failure.__name__
+        assert "evaluation failed" in capsys.readouterr().err
+        events.append(("finished", exit_code))
+        run.closed = True
+
+    def disconnect():
+        assert events == [("finished", 1)]
+        assert "Session failed; checkpoints and failure reports confirmed safe" in capsys.readouterr().out
+        events.append(("disconnected", None))
+
+    monkeypatch.setattr(run, "finish", close)
+    monkeypatch.setitem(sys.modules, "google.colab", SimpleNamespace(runtime=SimpleNamespace(unassign=disconnect)))
     with pytest.raises(failure, match="evaluation failed"):
         with session:
             result._capture(None, checkpoints(tmp_path))
             raise failure("evaluation failed")
-    assert result.finished
+    assert result.finished and session.disconnected
+    assert events == [("finished", 1), ("disconnected", None)]
+    assert run.summary["session_failed"] and run.summary["failure_message"] == "evaluation failed"
     with zipfile.ZipFile(result.bundle.path) as archive:
         assert "failure.txt" in archive.namelist()
         assert "evaluation failed" in archive.read("failure.txt").decode()
+    original = result.error
+    result._record_error(RuntimeError("later cleanup failure"))
+    assert result.error == original
+    assert "later cleanup failure" not in capsys.readouterr().err
 
 
 def test_resolution_validation_and_pe_resize():
@@ -868,7 +890,7 @@ def test_rfdetr_predictions_use_existing_eval_and_renderer(pose, tmp_path, monke
     def predict(path, **kwargs):
         assert torch.is_inference_mode_enabled()
         return SimpleNamespace(data={"xyxy": np.array([[16, 12, 144, 108]])},
-            detection_confidence=np.array([.95]), class_id=np.array([0]),
+            detection_confidence=np.array([2.73]), class_id=np.array([0]),
             xy=np.array([[[160 * (.25 + i * .06), 60] for i in range(8)]]),
             keypoint_confidence=np.ones((1, 8)))
     optimized = []
