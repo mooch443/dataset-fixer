@@ -906,9 +906,10 @@ def test_rfdetr_predictions_use_existing_eval_and_renderer(pose, tmp_path, monke
     shutil.copyfile(result.output_dir / "predictions.png", "/tmp/dataset-fixer-training-predictions.png")
 
 
-def test_wandb_artifact_source_round_trip(pose, tmp_path, run, monkeypatch):
+@pytest.mark.parametrize("contents", ["best", "full"])
+def test_wandb_artifact_source_round_trip(pose, tmp_path, run, monkeypatch, contents):
     import wandb
-    session, result = job(pose, tmp_path, run)
+    session, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(wandb_contents=contents))
     result._capture(None, checkpoints(tmp_path))
     artifact = run.artifacts[-1]
     def download(root):
@@ -917,11 +918,18 @@ def test_wandb_artifact_source_round_trip(pose, tmp_path, run, monkeypatch):
             (Path(root) / name).write_bytes(content)
     artifact.download = download
     verified = []
-    artifact.verify = lambda root: verified.append(root)
+    def verify(root):
+        actual = {p.relative_to(root).as_posix(): p.read_bytes() for p in Path(root).rglob("*") if p.is_file()}
+        assert actual == artifact.files
+        verified.append(root)
+    artifact.verify = verify
     monkeypatch.setattr(wandb, "Api", lambda: SimpleNamespace(run=lambda _: run, artifact=lambda _: artifact))
-    resolved = select(pose, weights="wandb:team/project/test", config=df.TrainingConfig(resolution=192))
-    assert resolved.provenance["name"] == artifact.qualified_name
-    assert resolved.provenance["digest"] == artifact.digest and verified
+    for _ in range(2):
+        resolved = select(pose, weights="wandb:team/project/test", config=df.TrainingConfig(resolution=192))
+        assert resolved.weights.name == result.best_weights.name and resolved.resume is None
+        assert resolved.provenance["name"] == artifact.qualified_name
+        assert resolved.provenance["digest"] == artifact.digest
+    assert len(verified) == 2
 
 
 def test_custom_checkpoint_provider_and_no_checkpoint_disconnect(pose, tmp_path, monkeypatch):

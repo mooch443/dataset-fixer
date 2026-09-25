@@ -20,7 +20,7 @@ from tqdm.auto import tqdm
 
 from .errors import DatasetValidationError, ValidationIssue
 from .geometry import Geometry, first_value, from_metadata
-from .sources import cache_root, extract_archive, local_source, sha256_progress
+from .sources import _atomic_json, cache_root, extract_archive, local_source, sha256_progress
 
 
 SUPPORTED_BUNDLE_FORMATS = {
@@ -510,6 +510,13 @@ def _remote_identity(run: Any, remote: Any) -> dict[str, Any]:
     }
 
 
+def _artifact_provenance_path(path: Path) -> Path:
+    # W&B verifies every file under the download root, including extra files.
+    # Keep our metadata outside that root, also for nested artifact members.
+    key = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
+    return cache_root() / "models" / "artifact-provenance" / f"{key}.json"
+
+
 def _download_wandb(
     reference: str,
     *,
@@ -543,6 +550,20 @@ def _download_wandb(
         identity_hash = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
         root = cache_root() / "models" / "wandb-artifacts" / identity_hash
         artifact.download(root=str(root))
+        # Older releases added local provenance beside the downloaded weights.
+        # Remove only our matching sidecars, never manifest members or unknown
+        # extras; let the SDK continue to reject corrupt or unexpected files.
+        for sidecar in root.rglob("*.artifact.json"):
+            relative = sidecar.relative_to(root).as_posix()
+            entries = artifact.manifest.entries
+            if relative in entries or relative.removesuffix(".artifact.json") not in entries:
+                continue
+            try:
+                owned = _read_json(sidecar) == identity
+            except DatasetValidationError:
+                owned = False
+            if owned:
+                sidecar.unlink(missing_ok=True)
         artifact.verify(root=str(root))
         metadata = dict(artifact.metadata or {})
         bundles = list(root.rglob("*.zip"))
@@ -557,7 +578,7 @@ def _download_wandb(
         else:
             candidates = [p for p in root.rglob("*") if p.name in {"best.pt", "best.pth", "checkpoint_best_total.pth", "checkpoint_best.pth"}]
             path = _one(candidates, "best checkpoint in model artifact")
-        path.with_suffix(path.suffix + ".artifact.json").write_text(json.dumps(identity))
+        _atomic_json(_artifact_provenance_path(path), identity)
         return path, run
     remote = _wandb_file(run, requested)
     identity = _remote_identity(run, remote)
@@ -805,8 +826,11 @@ def resolve_model_source(
         source_key = raw
         path = local_source(Path(source), progress=progress)
         resolved_name = name
-    provenance_path = path.with_suffix(path.suffix + ".artifact.json")
-    source_metadata = {"source_artifact": _read_json(provenance_path)} if provenance_path.is_file() else {}
+    source_metadata = {}
+    for provenance_path in (_artifact_provenance_path(path), path.with_suffix(path.suffix + ".artifact.json")):
+        if provenance_path.is_file():
+            source_metadata = {"source_artifact": _read_json(provenance_path)}
+            break
     if path.is_dir():
         if path.name.startswith("fold_") and not (path / "plans.json").is_file():
             parent = path.parent
