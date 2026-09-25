@@ -190,7 +190,7 @@ def _is_skip_failure(warning: str) -> bool:
 
 
 def _is_repair(warning: str) -> bool:
-    return warning.startswith("Repaired polygon ")
+    return warning.startswith(("Repaired polygon ", "Resolved cross-split duplicate:"))
 
 
 def _concise_warning(warning: str) -> str:
@@ -212,6 +212,7 @@ def _failure_category(warning: str) -> str:
         "Ignored orphan label",
         "Ignored invalid manifest",
         "Repaired polygon",
+        "Resolved cross-split duplicate",
     )
     return next((prefix for prefix in prefixes if warning.startswith(prefix)), "other")
 

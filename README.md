@@ -88,6 +88,34 @@ The standard installation continues to include Ultralytics and nnU-Net.
 Install `dataset-fixer[rfdetr,roboflow]` to add RF-DETR and Roboflow
 downloads. `Dataset.open("roboflow:workspace/project/5")` downloads and validates
 a pinned YOLO export, caches completed downloads, and retains pose metadata.
+
+YOLO loading reads and validates images/labels in parallel (eight readers by
+default; `workers=1` is sequential). Pixel decoding and EXIF orientation checks
+are retained. Missing split paths from relocated exports, such as
+`../train/images` or `/old/export/train/images`, fall back to the local split
+suffix with a warning. Existing paths take precedence; ambiguous or missing
+fallbacks still fail. The source YAML is not rewritten.
+
+To resolve byte-identical images appearing in different splits, provide an
+ordered hierarchy:
+
+```python
+dataset = df.Dataset.open(
+    DATASET_SOURCE,
+    workers=8,
+    duplicate_splits=("train", "val", "test"),
+)
+```
+
+This enables content hashing automatically and keeps each duplicate group in
+the highest-priority split where it already exists. A validation/test conflict
+without a training copy stays in validation. Rank all three splits once;
+`valid` and `validation` are aliases for `val`. Copies within the winning split
+are retained. Copies in other splits are excluded in memory and from subsequent
+exports/training preparation. Source files stay intact. `dataset.warnings`
+records every retained/excluded path and the priority; `dataset.validation_audit`
+records the policy and fix count. Other validation errors still fail. With no
+hierarchy, the existing strict validation behavior is unchanged.
 Authentication uses `ROBOFLOW_API_KEY` from the environment or Colab Secrets,
 or the SDK's existing authentication.
 
@@ -145,6 +173,11 @@ native options such as `multi_scale`, `expanded_scales`,
 `backend_options`. The adapter defaults the three resize flags to `False`,
 and explicit values override those defaults. YOLO-specific options such as
 `mosaic` are rejected as unsupported RF-DETR training options.
+Unknown augmentation names, invalid values, and ignored Albumentations
+parameters (including nested transforms) raise errors in both preview and
+training. RF-DETR's native warn-and-skip behavior is not used for user-provided
+augmentation configurations. nnU-Net requires a callable transform customizer;
+YOLO/RF-DETR dictionaries are rejected.
 
 Optional `callbacks=[callback, ...]` receive `TrainingEvent` objects for
 `train_start`, `epoch_end`, `checkpoint_saved`, `train_end`, and `error`.

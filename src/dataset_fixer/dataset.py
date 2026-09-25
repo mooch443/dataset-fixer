@@ -52,7 +52,7 @@ from .tabular import frame
 from .tiling import tile_dataset
 from .tracing import DatasetTrace, trace_dataset
 from .utils import IMAGE_SUFFIXES, ensure_safe_destination, normalize_split, settings_fingerprint, slugify
-from .validation import validate_dataset
+from .validation import validate_dataset, _duplicate_split_order
 from .validation_audit import ValidationFailureExample, build_load_validation_audit
 from .visualization import (
     display_report,
@@ -222,6 +222,8 @@ class Dataset:
         names: Mapping[int, str] | Sequence[str] | None = None,
         radii: Mapping[int, float] | None = None,
         deep: bool = False,
+        duplicate_splits: Sequence[str] | None = None,
+        workers: int = 8,
         errors: Literal["raise", "skip"] = "raise",
         polygon_repair: PolygonRepairConfig | Mapping[str, Any] | None = None,
         progress: bool = True,
@@ -238,6 +240,15 @@ class Dataset:
             names: Optional zero-based class-name sequence or ID/name mapping.
             radii: Optional POLO class-radius mapping, in source pixels.
             deep: Hash image bytes to detect duplicate content across splits.
+            duplicate_splits: Optional split priority, for example
+                ``("train", "val", "test")``. Byte-identical images stay in
+                the first split in this order where they occur; copies in
+                other splits are excluded in memory and audited. Rank all
+                three splits once (``valid``/``validation`` alias ``val``).
+                Enables deep hashing automatically. The default ``None``
+                leaves duplicate handling to the existing validation policy.
+            workers: Parallel YOLO image/label readers (default 8). Use 1 for
+                sequential loading. Pixel decoding and EXIF checks are retained.
             errors: ``"raise"`` fails on the first validation batch.
                 ``"skip"`` virtually omits recoverably bad images,
                 annotations, duplicate records, and orphan labels while
@@ -259,6 +270,10 @@ class Dataset:
         # signature remains identical for directories, manifests, and archives.
         from .sources import resolve_dataset_source
 
+        duplicate_splits = _duplicate_split_order(duplicate_splits)
+        deep = deep or duplicate_splits is not None
+        if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+            raise ValueError("workers must be a positive integer")
         source_path = Path(location).expanduser()
         requested = resolve_dataset_source(location, progress=progress)
         if str(location).startswith("roboflow:"):
@@ -293,6 +308,7 @@ class Dataset:
                 name=name,
                 names=parsed_names,
                 deep=deep,
+                duplicate_splits=duplicate_splits,
                 errors=errors,
                 progress=progress,
                 source_name=source_name,
@@ -309,7 +325,9 @@ class Dataset:
             progress=progress,
             errors=errors,
             warnings=warnings,
+            workers=workers,
         )
+        loaded_samples = list(samples) if duplicate_splits is not None else samples
         if repair_config is not None and resolved_task is not Task.SEGMENT:
             raise ValueError("polygon_repair is only available for segmentation datasets")
         failure_examples: list[ValidationFailureExample] = []
@@ -319,6 +337,7 @@ class Dataset:
                 metadata,
                 resolved_task,
                 deep=deep,
+                duplicate_splits=duplicate_splits,
                 progress=progress,
                 errors=errors,
                 polygon_repair=repair_config,
@@ -333,7 +352,7 @@ class Dataset:
             else "coco"
         )
         if source_format == "yolo":
-            _assert_no_orphan_labels(root, samples, errors=errors, warnings=warnings)
+            _assert_no_orphan_labels(root, loaded_samples, errors=errors, warnings=warnings)
         dataset = cls(
             location=root,
             source_name=source_name,
@@ -356,12 +375,14 @@ class Dataset:
             metadata,
             dataset_name=dataset.name,
         )
-        if repair_config is not None and int(audit.get("fixed_count", 0)) > 0:
+        if repair_config is not None and audit.get("counts_by_category", {}).get("Repaired polygon", 0):
             audit["repair_policy"] = {
                 "source_fill_rule": "even_odd",
                 **repair_config._to_dict(),
                 "vectorization": "connected_exteriors_with_hole_hierarchy",
             }
+        if duplicate_splits is not None:
+            audit["duplicate_splits"] = list(duplicate_splits)
         if (
             int(audit.get("skipped_count", 0)) > 0
             or int(audit.get("fixed_count", 0)) > 0
@@ -384,6 +405,7 @@ class Dataset:
         name: str | None,
         names: dict[int, str] | list[str] | None,
         deep: bool,
+        duplicate_splits: tuple[str, ...] | None,
         errors: Literal["raise", "skip"],
         progress: bool,
         source_name: str,
@@ -428,12 +450,16 @@ class Dataset:
                 metadata,
                 Task.SEGMENT,
                 deep=deep,
+                duplicate_splits=duplicate_splits,
                 progress=progress,
                 errors=errors,
                 failure_examples=failure_examples,
             )
         )
         inherited_warnings = [str(value) for value in manifest.get("warnings") or []]
+        retained = {sample.image_path.resolve() for sample in samples}
+        mask_paths = {path: mask for path, mask in mask_paths.items() if path in retained}
+        mask_statistics = {path: stats for path, stats in mask_statistics.items() if path in retained}
         dataset = cls(
             location=root,
             source_name=source_name,
@@ -469,6 +495,8 @@ class Dataset:
             )
             dataset._validation_audit = audit
             dataset._validation_audit_visualization = visualization
+        if duplicate_splits is not None:
+            dataset._validation_audit["duplicate_splits"] = list(duplicate_splits)
         return dataset
 
     @property
@@ -604,7 +632,7 @@ class Dataset:
 
     @property
     def validation_audit(self) -> dict[str, Any]:
-        """Load-time skip totals, categories, and bounded visualization metadata."""
+        """Load-time skip/fix totals, policies, and bounded visualization metadata."""
         return dict(self._validation_audit)
 
     @property

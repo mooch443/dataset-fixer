@@ -408,7 +408,6 @@ def resolve_dataset_source(location: str | Path, *, progress: bool = True) -> Pa
 def _roboflow_source(reference: str, *, progress: bool) -> Path:
     """Download a pinned export; only publish the cache after validation."""
     import re
-    import yaml
 
     match = re.fullmatch(r"roboflow:([\w-]+)/([\w-]+)/([1-9][0-9]*)", reference)
     if match is None:
@@ -447,21 +446,8 @@ def _roboflow_source(reference: str, *, progress: bool) -> Path:
             "yolov8", location=str(staging / "dataset")
         )
         dataset_root = find_dataset_root(staging / "dataset")
-        yaml_path = dataset_root if dataset_root.is_file() else dataset_root / "data.yaml"
-        if yaml_path.is_file():
-            values = yaml.safe_load(yaml_path.read_text())
-            for split, aliases in {"train": ("train",), "val": ("valid", "val"), "test": ("test",)}.items():
-                declared = values.get(split)
-                if not declared or not isinstance(declared, str):
-                    continue
-                candidates = [yaml_path.parent / name / "images" for name in aliases]
-                existing = [path for path in candidates if path.is_dir()]
-                if not (yaml_path.parent / declared).is_dir() and len(existing) == 1:
-                    values[split] = existing[0].relative_to(yaml_path.parent).as_posix()
-            values.pop("path", None)
-            yaml_path.write_text(yaml.safe_dump(values, sort_keys=False))
         from .dataset import Dataset
-        Dataset.open(dataset_root, progress=progress).assert_trainable()
+        Dataset.open(dataset_root, progress=progress).assert_trainable(backend=False)
         files = {p.relative_to(staging).as_posix(): {"size": p.stat().st_size, "sha256": sha256_progress(p, progress=False)}
                  for p in staging.rglob("*") if p.is_file()}
         _atomic_json(staging / "download.json", {"source": reference, "files": files})

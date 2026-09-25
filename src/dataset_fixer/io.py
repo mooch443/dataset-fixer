@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import math
+import warnings as python_warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from PIL import Image, ImageOps
+from PIL import Image
 from tqdm.auto import tqdm
 
 from .errors import DatasetValidationError, ValidationIssue
@@ -25,6 +27,7 @@ def load_source(
     progress: bool,
     errors: Literal["raise", "skip"] = "raise",
     warnings: list[str] | None = None,
+    workers: int = 8,
 ) -> tuple[Path, str, Task, DatasetMetadata, list[Sample], dict[str, Any]]:
     warnings = warnings if warnings is not None else []
     location = location.expanduser().resolve()
@@ -50,6 +53,7 @@ def load_source(
             name=name,
             names_override=names,
             radii_override=radii,
+            workers=workers,
             progress=progress,
             errors=errors,
             warnings=warnings,
@@ -78,6 +82,7 @@ def load_source(
         name=name,
         names_override=names,
         radii_override=radii,
+        workers=workers,
         progress=progress,
         errors=errors,
         warnings=warnings,
@@ -111,12 +116,16 @@ def _load_yolo(
     progress: bool,
     errors: Literal["raise", "skip"],
     warnings: list[str],
+    workers: int = 8,
 ) -> tuple[Path, str, Task, DatasetMetadata, list[Sample], dict[str, Any]]:
     raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
     yaml_dir = yaml_path.parent.resolve()
-    configured_root = Path(raw.get("path") or yaml_dir)
+    configured_root = Path(str(raw.get("path") or yaml_dir).replace("\\", "/")).expanduser()
     root = configured_root if configured_root.is_absolute() else (yaml_dir / configured_root)
     root = root.resolve()
+    if not root.is_dir():
+        _path_fallback_warning(f"Dataset path {str(root)!r} was not found; using {str(yaml_dir)!r}", warnings)
+        root = yaml_dir
 
     parsed_names = _parse_names(names_override if names_override is not None else raw.get("names"))
     parsed_radii = {int(k): float(v) for k, v in (radii_override or raw.get("radii") or {}).items()}
@@ -174,6 +183,7 @@ def _load_yolo(
         progress=progress,
         errors=errors,
         warnings=warnings,
+        workers=workers,
     )
     if not metadata.names:
         max_id = max((a.class_id for s in samples for a in s.annotations), default=-1)
@@ -181,6 +191,45 @@ def _load_yolo(
     manifest = _load_manifest(yaml_dir, errors=errors, warnings=warnings)
     dataset_name = name or manifest.get("name") or raw.get("name") or root.name
     return root, dataset_name, resolved_task, metadata, samples, manifest
+
+
+def _path_fallback_warning(message: str, warnings: list[str]) -> None:
+    message = f"Dataset path fallback: {message}"
+    warnings.append(message)
+    python_warnings.warn(message, UserWarning, stacklevel=3)
+
+
+def _resolve_yolo_path(value: str, *, root: Path, yaml_dir: Path, warnings: list[str]) -> Path:
+    """Respect existing paths, then recover portable split suffixes in relocated exports."""
+    declared = Path(value.replace("\\", "/")).expanduser()
+    path = (declared if declared.is_absolute() else root / declared).resolve()
+    if path.exists():
+        return path
+    candidates = []
+    if not declared.is_absolute():
+        candidates.append(yaml_dir / declared)
+    split_names = {"train", "val", "valid", "validation", "test"}
+    for index, part in enumerate(declared.parts):
+        if part not in split_names:
+            continue
+        suffix = declared.parts[index + 1:]
+        if ".." in suffix:
+            continue
+        aliases = (part,) if part not in {"val", "valid", "validation"} else (part, "val", "valid", "validation")
+        for base in (root, yaml_dir):
+            candidates.extend(base / alias / Path(*suffix) for alias in aliases)
+            if index and declared.parts[index - 1] == "images":
+                candidates.extend(base / "images" / alias / Path(*suffix) for alias in aliases)
+    existing = list(dict.fromkeys(candidate.resolve() for candidate in candidates if candidate.exists()))
+    if len(existing) > 1:
+        raise DatasetValidationError(ValidationIssue(
+            "Ambiguous dataset path fallback", source=value, value=[str(p) for p in existing],
+            suggestion="set an explicit existing split path in data.yaml",
+        ))
+    if existing:
+        _path_fallback_warning(f"{value!r} was not found; using {str(existing[0])!r}", warnings)
+        return existing[0]
+    return path
 
 
 def _expand_yolo_split(
@@ -194,11 +243,7 @@ def _expand_yolo_split(
     values = value if isinstance(value, list) else [value]
     result: list[tuple[Path, Path]] = []
     for item in values:
-        path = Path(str(item))
-        path = path if path.is_absolute() else (root / path)
-        if not path.exists() and str(item).startswith("./"):
-            path = yaml_dir / str(item)[2:]
-        path = path.resolve()
+        path = _resolve_yolo_path(str(item), root=root, yaml_dir=yaml_dir, warnings=warnings)
         if path.suffix.lower() == ".txt" and path.is_file():
             try:
                 lines = path.read_text(encoding="utf-8").splitlines()
@@ -211,9 +256,7 @@ def _expand_yolo_split(
             for line in lines:
                 if not line.strip():
                     continue
-                image = Path(line.strip())
-                if not image.is_absolute():
-                    image = (path.parent / image).resolve()
+                image = _resolve_yolo_path(line.strip(), root=path.parent, yaml_dir=yaml_dir, warnings=warnings)
                 result.append((image, _relative_image_path(image)))
         elif path.is_dir():
             images = image_files(path)
@@ -313,29 +356,27 @@ def _parse_yolo_images(
     progress: bool,
     errors: Literal["raise", "skip"],
     warnings: list[str],
+    workers: int = 8,
 ) -> list[Sample]:
-    samples: list[Sample] = []
-    iterator = tqdm(split_images, desc="Loading YOLO dataset", unit="image", disable=not progress)
-    issues: list[ValidationIssue] = []
-    for split, image_path, relative_path in iterator:
+    def parse(item):
+        split, image_path, relative_path = item
+        sample_warnings: list[str] = []
+        sample_issues: list[ValidationIssue] = []
+        def report(issue, kind):
+            if errors == "skip":
+                sample_warnings.append(f"Skipped invalid {kind}: {issue.format()}")
+            else:
+                sample_issues.append(issue)
         if not image_path.is_file():
             issue = ValidationIssue("Image referenced by dataset does not exist", source=str(image_path))
-            if errors == "skip":
-                warnings.append(f"Skipped invalid image: {issue.format()}")
-            else:
-                issues.append(issue)
-            continue
+            report(issue, "image")
+            return None, sample_issues, sample_warnings
         try:
-            with Image.open(image_path) as opened:
-                image = ImageOps.exif_transpose(opened)
-                width, height = image.size
+            width, height = _image_size(image_path)
         except Exception as exc:
             issue = ValidationIssue(f"Unreadable image: {exc}", source=str(image_path))
-            if errors == "skip":
-                warnings.append(f"Skipped invalid image: {issue.format()}")
-            else:
-                issues.append(issue)
-            continue
+            report(issue, "image")
+            return None, sample_issues, sample_warnings
         annotations: list[Annotation] = []
         label_path = _label_path_for_image(image_path, relative_path)
         if label_path.is_file():
@@ -343,12 +384,8 @@ def _parse_yolo_images(
                 label_lines = label_path.read_text(encoding="utf-8").splitlines()
             except OSError as exc:
                 issue = ValidationIssue(f"Unreadable label file: {exc}", source=str(label_path))
-                if errors == "skip":
-                    warnings.append(f"Skipped invalid label file: {issue.format()}")
-                    label_lines = []
-                else:
-                    issues.append(issue)
-                    label_lines = []
+                report(issue, "label file")
+                label_lines = []
             for line_no, line in enumerate(label_lines, 1):
                 if not line.strip():
                     continue
@@ -364,14 +401,34 @@ def _parse_yolo_images(
                         value=line,
                         suggestion="fix or remove this label row",
                     )
-                    if errors == "skip":
-                        warnings.append(f"Skipped invalid annotation: {issue.format()}")
-                    else:
-                        issues.append(issue)
-        samples.append(Sample(image_path, relative_path, split, width, height, annotations))
+                    report(issue, "annotation")
+        return Sample(image_path, relative_path, split, width, height, annotations), sample_issues, sample_warnings
+
+    samples: list[Sample] = []
+    issues: list[ValidationIssue] = []
+    # Workers hold at most one decoded image each; only metadata is returned.
+    # map preserves source order, including diagnostics, across worker counts.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = map(parse, split_images) if workers == 1 else pool.map(parse, split_images)
+        for sample, sample_issues, sample_warnings in tqdm(results, total=len(split_images),
+                desc="Loading YOLO dataset", unit="image", disable=not progress):
+            if sample is not None:
+                samples.append(sample)
+            issues.extend(sample_issues)
+            warnings.extend(sample_warnings)
     if issues:
         raise DatasetValidationError(issues)
     return samples
+
+
+def _image_size(path: Path) -> tuple[int, int]:
+    """Validate decoded pixels and read oriented dimensions without copying them."""
+    with Image.open(path) as opened:
+        opened.load()
+        width, height = opened.size
+        if opened.getexif().get(274) in {5, 6, 7, 8}:
+            width, height = height, width
+        return width, height
 
 
 def _parse_yolo_line(line: str, task: Task, metadata: DatasetMetadata, width: int, height: int) -> Annotation:
@@ -428,6 +485,7 @@ def _load_flat_yolo(
     progress: bool,
     errors: Literal["raise", "skip"],
     warnings: list[str],
+    workers: int = 8,
 ) -> tuple[Path, str, Task, DatasetMetadata, list[Sample], dict[str, Any]]:
     split_directories = [
         (split, root / split / "images")
@@ -468,6 +526,7 @@ def _load_flat_yolo(
         progress=progress,
         errors=errors,
         warnings=warnings,
+        workers=workers,
     )
     if not metadata.names:
         max_id = max((a.class_id for s in samples for a in s.annotations), default=-1)
@@ -736,8 +795,7 @@ def _load_coco(
                 continue
             output_paths[output_key] = image_path
             try:
-                with Image.open(image_path) as opened:
-                    actual_width, actual_height = ImageOps.exif_transpose(opened).size
+                actual_width, actual_height = _image_size(image_path)
             except Exception as exc:
                 issue = ValidationIssue(f"Unreadable COCO image: {exc}", source=str(image_path))
                 if errors == "skip":

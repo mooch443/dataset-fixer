@@ -10,7 +10,7 @@ import pytest
 import torch
 import yaml
 
-from dataset_fixer import Dataset, DatasetValidationError, Model
+from dataset_fixer import Dataset, Model
 from dataset_fixer.model_sources import _download_wandb
 from dataset_fixer.model import ModelInput
 
@@ -65,13 +65,17 @@ def test_visualization_annotations_preserve_prediction_input_identity(tmp_path):
     assert annotated == original and cached[annotated] == "cached prediction"
 
 
-def test_local_dataset_paths_are_not_silently_redirected(detect_dataset):
+def test_local_dataset_path_recovery_is_explicit_and_read_only(detect_dataset):
     yaml_path = detect_dataset / "data.yaml"
     values = yaml.safe_load(yaml_path.read_text())
     values["train"] = "../train/images"
     yaml_path.write_text(yaml.safe_dump(values))
-    with pytest.raises(DatasetValidationError):
-        Dataset.open(detect_dataset, progress=False)
+    original = yaml_path.read_bytes()
+    with pytest.warns(UserWarning, match="Dataset path fallback.*../train/images"):
+        dataset = Dataset.open(detect_dataset, progress=False)
+    assert len(dataset._samples) == 6
+    assert any("../train/images" in warning for warning in dataset.warnings)
+    assert yaml_path.read_bytes() == original
 
 
 def test_legacy_wandb_file_survives_optional_artifact_discovery_failure(tmp_path, monkeypatch):

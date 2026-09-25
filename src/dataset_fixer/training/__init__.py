@@ -47,12 +47,14 @@ def train(dataset: Dataset | str | Path, *, type: ModelTypes | str | None = None
     from .selection import select
     if not isinstance(dataset, Dataset):
         dataset = Dataset.open(dataset)
-    dataset.assert_trainable()
+    dataset.assert_trainable(backend=False)
     if not {"train", "val"} <= set(dataset.splits):
         raise ValueError("Training requires explicit train and validation splits")
     config = config or TrainingConfig()
     selection = select(dataset, type=type, version=version, s=s, model_type=model_type,
                        weights=weights, resume=resume, config=config)
+    from .augmentations import validate_augmentations
+    validate_augmentations(selection.family, config, augmentations)
     if session is None:
         with TrainingSession() as owned:
             return _train(dataset, selection, config, augmentations, checkpointing, wandb, callbacks, owned)

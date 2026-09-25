@@ -60,11 +60,15 @@ def _yolo_options(config, augmentations):
         if forbidden in options:
             raise ValueError(f"{forbidden} is managed by dataset-fixer; use its public settings")
     if augmentations is not None:
-        from .preview import yolo_augmentations
+        from .augmentations import yolo_augmentations
         overrides = yolo_augmentations(augmentations)
         if set(overrides) & (managed | set(aliases.values())):
             raise ValueError("Put training settings in TrainingConfig, not the augmentation configuration")
         options.update(overrides)
+    from ultralytics.cfg import get_cfg
+    from .augmentations import validate_yolo_transforms
+    get_cfg(overrides={k: v for k, v in options.items() if k not in {"native_callbacks", "trainer"}})
+    validate_yolo_transforms(options.get("augmentations"))
     return options
 
 
@@ -174,6 +178,8 @@ def rfdetr_configs(selection, config, prepared, augmentations):
     options.setdefault("do_random_resize_via_padding", False)
     options.setdefault("use_ema", False)
     if selection.task == "pose":
+        if options.get("augmentation_backend", "cpu") != "cpu":
+            raise ValueError("RF-DETR pose requires augmentation_backend='cpu'; other backends would discard keypoint handling")
         schema = infer_yolo_keypoint_schema(prepared.data_yaml)
         model_values.update(num_classes=len(schema.class_names), num_keypoints_per_class=schema.num_keypoints_per_class)
         options.update(class_names=schema.class_names, keypoint_flip_pairs=schema.keypoint_flip_pairs,
@@ -185,6 +191,9 @@ def rfdetr_configs(selection, config, prepared, augmentations):
         model_values["num_classes"] = len(names)
     if augmentations is not None:
         options["aug_config"] = augmentations
+    from .augmentations import validate_rfdetr_augmentations
+    validate_rfdetr_augmentations(options.get("aug_config"),
+                                 flip_pairs=options.get("keypoint_flip_pairs") if selection.task == "pose" else None)
     if (selection.weights or selection.resume) and metadata["model_config"].get("num_classes") != model_values["num_classes"]:
         raise ValueError("RF-DETR checkpoint class count differs from the dataset; implicit head replacement is disabled")
     mc = variant._model_config_class(**model_values)

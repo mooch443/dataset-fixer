@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -18,6 +19,7 @@ from .io import _label_path_for_image, _parse_yolo_line
 from .models import Annotation, DatasetMetadata, Sample, Task
 from .segmentation import PolygonRepairConfig, repair_polygon_annotation
 from .validation_audit import ValidationFailureExample, add_failure_example
+from .utils import normalize_split
 
 
 MAX_STAGED_VALIDATION_ISSUES = 100
@@ -333,12 +335,24 @@ def _validate_staged_provenance(root: Path, records: list[dict[str, Any]], add_i
         )
 
 
+def _duplicate_split_order(value) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or any(not isinstance(split, str) for split in value):
+        raise ValueError("duplicate_splits must rank train, val, and test exactly once")
+    order = tuple(normalize_split(split) for split in value)
+    if len(order) != 3 or set(order) != {"train", "val", "test"}:
+        raise ValueError("duplicate_splits must rank train, val, and test exactly once")
+    return order
+
+
 def validate_dataset(
     samples: list[Sample],
     metadata: DatasetMetadata,
     task: Task,
     *,
     deep: bool = False,
+    duplicate_splits: tuple[str, ...] | None = None,
     progress: bool = False,
     errors: Literal["raise", "skip"] = "raise",
     polygon_repair: PolygonRepairConfig | None = None,
@@ -346,6 +360,8 @@ def validate_dataset(
 ) -> list[str]:
     if errors not in {"raise", "skip"}:
         raise ValueError("errors must be 'raise' or 'skip'")
+    duplicate_splits = _duplicate_split_order(duplicate_splits)
+    deep = deep or duplicate_splits is not None
     issues: list[ValidationIssue] = []
     warnings: list[str] = []
     if not samples:
@@ -406,19 +422,24 @@ def validate_dataset(
 
     seen_paths: dict[Path, str] = {}
     seen_hashes: dict[str, tuple[Path, str]] = {}
-    valid_samples: list[Sample] | None = [] if errors == "skip" else None
-    iterator = tqdm(samples, desc="Validating dataset", unit="image", disable=not progress)
+    valid_samples: list[Sample] | None = [] if errors == "skip" or duplicate_splits is not None else None
+    ordered = sorted(samples, key=lambda sample: duplicate_splits.index(sample.split)) if duplicate_splits else samples
+    iterator = tqdm(ordered, desc="Validating dataset", unit="image", disable=not progress)
     for sample in iterator:
         resolved = sample.image_path.resolve()
         sample_issues: list[ValidationIssue] = []
         digest: str | None = None
+        duplicate: tuple[Path, str] | None = None
         if resolved in seen_paths:
             message = (
                 "Same image appears in multiple splits"
                 if seen_paths[resolved] != sample.split
                 else "Same image is listed more than once in a split"
             )
-            sample_issues.append(ValidationIssue(message, source=str(resolved)))
+            if duplicate_splits is not None and seen_paths[resolved] != sample.split:
+                duplicate = (resolved, seen_paths[resolved])
+            else:
+                sample_issues.append(ValidationIssue(message, source=str(resolved)))
         if sample.width <= 0 or sample.height <= 0:
             sample_issues.append(ValidationIssue("Image dimensions must be positive", source=str(resolved)))
         if deep:
@@ -428,13 +449,27 @@ def validate_dataset(
                 sample_issues.append(ValidationIssue(f"Could not hash image: {exc}", source=str(resolved)))
             else:
                 if digest in seen_hashes and seen_hashes[digest][1] != sample.split:
-                    sample_issues.append(
-                        ValidationIssue(
+                    if duplicate_splits is not None:
+                        duplicate = seen_hashes[digest]
+                    else:
+                        sample_issues.append(ValidationIssue(
                             "Byte-identical images appear in multiple splits",
                             source=str(resolved),
                             suggestion=f"also present at {seen_hashes[digest][0]}",
-                        )
-                    )
+                        ))
+        if duplicate is not None:
+            kept, split = duplicate
+            warning = (
+                f"Resolved cross-split duplicate: Byte-identical images appear in multiple splits; "
+                f"kept {kept} ({split}), excluded {resolved} ({sample.split}) in memory; "
+                f"priority {' > '.join(duplicate_splits)}; source files were not changed"
+            )
+            warnings.append(warning)
+            add_failure_example(failure_examples, ValidationFailureExample(
+                warning=warning, summary=f"Kept in {split}; excluded from {sample.split}",
+                image_path=sample.image_path, relative_path=sample.relative_path,
+                split=sample.split, width=sample.width, height=sample.height,
+            ))
         if sample_issues and errors == "skip":
             messages = "; ".join(dict.fromkeys(issue.message for issue in sample_issues))
             details = " | ".join(issue.format() for issue in sample_issues)
@@ -453,9 +488,10 @@ def validate_dataset(
                 ),
             )
             continue
-        seen_paths[resolved] = sample.split
-        if digest is not None:
-            seen_hashes[digest] = (resolved, sample.split)
+        if duplicate is None:
+            seen_paths[resolved] = sample.split
+            if digest is not None:
+                seen_hashes.setdefault(digest, (resolved, sample.split))
         issues.extend(sample_issues)
         valid_annotations = []
         for annotation in sample.annotations:
@@ -547,11 +583,11 @@ def validate_dataset(
                     warnings.append(f"{resolved}: segmentation requires explicit allow_lossy=True for YOLO export")
         if errors == "skip" or polygon_repair is not None:
             sample.annotations = valid_annotations
-        if valid_samples is not None:
+        if valid_samples is not None and duplicate is None:
             valid_samples.append(sample)
-    if errors == "skip":
-        assert valid_samples is not None
-        samples[:] = valid_samples
+    if valid_samples is not None:
+        retained = {id(sample) for sample in valid_samples}
+        samples[:] = [sample for sample in samples if id(sample) in retained]
         if not samples:
             issues.append(ValidationIssue("Dataset contains no valid images after skipping recoverable errors"))
     if issues:

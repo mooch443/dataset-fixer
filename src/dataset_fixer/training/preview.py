@@ -10,16 +10,7 @@ from PIL import Image
 
 from .config import ModelTypes, TrainingConfig
 from .selection import select
-
-
-def yolo_augmentations(value):
-    """Accept native augmentation settings or an Albumentations transform list."""
-    from ultralytics.cfg import get_cfg
-    options = dict(value) if isinstance(value, dict) else {"augmentations": value}
-    # Native validation includes Python-only options absent from default.yaml,
-    # including custom Albumentations transforms alongside mosaic/mixup/etc.
-    get_cfg(overrides=options)
-    return options
+from .augmentations import validate_augmentations
 
 
 def _annotations(target, width, height):
@@ -82,6 +73,7 @@ def preview_augmentations(dataset, augmentations=None, *, type=None, version=Non
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     selection = select(dataset, type=type, version=version, s=s, weights=weights, model_type=model_type, config=config)
+    validate_augmentations(selection.family, config, augmentations)
     with tempfile.TemporaryDirectory(prefix="dataset-fixer-preview-") as temporary:
         root = Path(temporary)
         result = SimpleNamespace(dataset=dataset, selection=selection, config=config, output_dir=root,

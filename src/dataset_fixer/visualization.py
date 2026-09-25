@@ -551,8 +551,10 @@ def visualize_validation_failures(
 ) -> None:
     """Render bounded load failures or paired invalid/repaired geometry."""
 
-    has_repairs = any(example.repaired_annotations for example in examples)
-    columns = 1 if has_repairs or len(examples) == 1 else 2
+    from .validation_audit import _is_repair
+
+    has_repairs = any(_is_repair(example.warning) for example in examples)
+    columns = 1 if any(example.repaired_annotations for example in examples) or len(examples) == 1 else 2
 
     def prepare(example: "ValidationFailureExample") -> VisualizationItem:
         annotations = (
@@ -623,7 +625,10 @@ def visualize_validation_failures(
                 height=rendered.height,
             )
         panels = [
-            VisualizationPanel(title="Source polygon", image=np.asarray(rendered))
+            VisualizationPanel(
+                title="Source polygon" if example.annotation is not None and example.annotation.polygon else "Source image",
+                image=np.asarray(rendered),
+            )
         ]
         if example.repaired_annotations:
             fixed_image = source_image or _draw_failure_placeholder()
@@ -669,7 +674,7 @@ def visualize_validation_failures(
         return VisualizationItem(
             image_path=example.image_path or Path("unavailable"),
             label=(
-                f"{'Fixed' if example.repaired_annotations else 'Skipped'} · "
+                f"{'Fixed' if _is_repair(example.warning) else 'Skipped'} · "
                 f"{example.split or 'unknown split'} · "
                 f"{textwrap.shorten(source, width=78, placeholder='…')}\n{message}"
             ),

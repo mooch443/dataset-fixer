@@ -235,6 +235,61 @@ def test_rfdetr_native_augmentation_options_override_defaults(pose, tmp_path):
         rfdetr_configs(result.selection, replace(config, backend_options={"mosaic": 1.0}), prepared, {})
 
 
+@pytest.mark.parametrize("augmentations", [
+    {"mosaic": 1.0},
+    {"Mosaik": {}},
+    {"HorizontalFlip": {"p": 2.0}},
+    {"HorizontalFlip": {"probability": 0.5}},
+    {"OneOf": {"transforms": [{"Blur": {"typo": 3}}]}},
+    {"OneOf": {"p": 0.2, "transforms": [{"Blur": {"p": 1}}]}},
+    {"SomeOf": {"transforms": ["Blur"]}},
+])
+@pytest.mark.parametrize("preview", [False, True])
+def test_rfdetr_invalid_augmentations_fail_before_preparation(pose, monkeypatch, augmentations, preview):
+    monkeypatch.setattr("dataset_fixer.training.backends.prepare_data", lambda *_: pytest.fail("prepared invalid options"))
+    command = df.preview_augmentations if preview else df.train
+    with pytest.raises(ValueError):
+        command(pose, type=df.ModelTypes.RFDETR, augmentations=augmentations,
+                config=df.TrainingConfig(resolution=96))
+
+
+def test_augmentation_validation_covers_native_option_routes(pose, monkeypatch):
+    from dataset_fixer.training.augmentations import validate_augmentations
+    monkeypatch.setattr("dataset_fixer.training.backends.prepare_data", lambda *_: pytest.fail("prepared invalid options"))
+    with pytest.raises(ValueError, match="mosaic"):
+        df.train(pose, type=df.ModelTypes.RFDETR,
+                 config=df.TrainingConfig(backend_options={"aug_config": {"mosaic": 0}}))
+    with pytest.raises(ValueError, match="nnU-Net augmentations"):
+        validate_augmentations(df.ModelTypes.NNUNET, df.TrainingConfig(), {"mosaic": 0})
+    with pytest.raises(ValueError, match="mosaic"):
+        df.train(pose, augmentations={"mosaic": 2.0})
+    with pytest.raises(ValueError, match="Albumentations"):
+        df.train(pose, augmentations={"augmentations": ["Blur"]})
+    with pytest.raises(SyntaxError, match="mosaik"):
+        df.train(pose, config=df.TrainingConfig(backend_options={"mosaik": 0}))
+
+
+def test_rfdetr_nested_valid_config_and_missing_flip_metadata(pose, tmp_path):
+    _, result = job(pose, tmp_path)
+    prepared = prepare_data(result)
+    aug = {"HorizontalFlip": {"p": 0.5}, "OneOf": [{"Blur": {"p": 0.3}}, {"GaussianBlur": {"p": 0.7}}]}
+    _, _, options = rfdetr_configs(result.selection, result.config, prepared, aug)
+    assert options["aug_config"] == aug
+    from dataset_fixer.training.augmentations import validate_rfdetr_augmentations
+    with pytest.raises(ValueError, match="no keypoint flip pairs"):
+        validate_rfdetr_augmentations(aug, flip_pairs=[])
+    with pytest.raises(ValueError, match="augmentation_backend='cpu'"):
+        rfdetr_configs(result.selection, replace(result.config, backend_options={"augmentation_backend": "gpu"}), prepared, aug)
+
+
+def test_yolo_rejects_already_constructed_transform_with_ignored_parameters(pose):
+    import albumentations as A
+    with pytest.warns(UserWarning, match="not valid"):
+        transform = A.Blur(typo=3)
+    with pytest.raises(ValueError, match="typo"):
+        df.train(pose, augmentations={"mosaic": 0, "augmentations": [transform]})
+
+
 def test_roboflow_download_is_cached_and_source_layout_normalized(pose, tmp_path, monkeypatch):
     calls = []
     class Version:
