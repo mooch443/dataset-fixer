@@ -602,6 +602,35 @@ def test_rfdetr_native_augmentation_options_override_defaults(pose, tmp_path):
         rfdetr_configs(result.selection, replace(config, backend_options={"mosaic": 1.0}), prepared, {})
 
 
+@pytest.mark.parametrize("backend_options,expected", [
+    ({}, "TQDMProgressBar"),
+    ({"progress_bar": "rich"}, "RichProgressBar"),
+    ({"progress_bar": None}, None),
+    ({"progress_bar": False}, None),
+    ({"trainer_options": {"enable_progress_bar": False}}, None),
+])
+@pytest.mark.parametrize("resume", [False, True])
+def test_rfdetr_native_progress_default_and_overrides(pose, tmp_path, backend_options, expected, resume):
+    from rfdetr import build_trainer
+    _, result = job(pose, tmp_path)
+    config = replace(result.config, device="cpu", backend_options=backend_options)
+    selection = result.selection
+    if resume:
+        path = checkpoints(tmp_path).latest
+        saved = torch.load(path, weights_only=False)
+        saved["args"]["progress_bar"] = None  # Older checkpoints inherited the silent default.
+        torch.save(saved, path)
+        selection = select(pose, resume=path, config=config)
+    prepared = prepare_data(result)
+    variant, mc, options = rfdetr_configs(selection, config, prepared, {})
+    trainer_options = options.pop("trainer_options", {})
+    tc = variant._train_config_class(dataset_dir=str(prepared.location), dataset_file="yolo",
+                                    output_dir=str(tmp_path / "native"), wandb=False, tensorboard=False, **options)
+    trainer = build_trainer(tc, mc, **trainer_options)
+    progress = trainer.progress_bar_callback
+    assert (type(progress).__name__ if progress else None) == expected
+
+
 @pytest.mark.parametrize("augmentations", [
     {"mosaic": 1.0},
     {"Mosaik": {}},

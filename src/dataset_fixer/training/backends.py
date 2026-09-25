@@ -170,6 +170,9 @@ def rfdetr_configs(selection, config, prepared, augmentations):
     unknown = set(options) - set(variant._train_config_class.model_fields) - {"model", "native_callbacks", "trainer", "trainer_options"}
     if unknown:
         raise ValueError(f"Unknown RF-DETR training options: {sorted(unknown)}")
+    # Show native batch progress and ETA, including the initial sanity check.
+    # Presentation uses this run's settings, not a resumed checkpoint's defaults.
+    options.setdefault("progress_bar", None if options.get("trainer_options", {}).get("enable_progress_bar") is False else "tqdm")
     if selection.resume:
         saved_options = {key: value for key, value in metadata["training_config"].items()
                          if key in variant._train_config_class.model_fields

@@ -256,6 +256,14 @@ conflicting common/native options are rejected. nnU-Net uses semantic masks,
 native planning, and verifies architecture compatibility before loading all
 weights, including segmentation heads.
 
+RF-DETR enables its native `tqdm` progress bar by default, showing training and
+validation batches, elapsed time, and ETA. Set `backend_options={"progress_bar":
+"rich"}` for Rich, or `{"progress_bar": None}` to disable it. The explicit
+`trainer_options={"enable_progress_bar": False}` override is also respected.
+Lightning's initial validation sanity check runs before training; RF-DETR's
+validation table labels that check as epoch 1, while the progress bar identifies
+it as a sanity check.
+
 ## Loading and validation
 
 `Dataset.open()` accepts a dataset root, a YOLO `data.yaml`, or a COCO JSON/root.
