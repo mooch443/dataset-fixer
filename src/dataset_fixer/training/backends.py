@@ -51,25 +51,33 @@ def _existing(path):
     return path if path.is_file() else None
 
 
+def _yolo_options(config, augmentations):
+    """Resolve the same native settings for training and augmentation previews."""
+    aliases = {"resolution": "imgsz", "epochs": "epochs", "batch_size": "batch", "device": "device", "workers": "workers", "seed": "seed"}
+    options = native_options(config, aliases)
+    managed = {"data", "project", "name", "exist_ok", "resume", "save", "save_dir"}
+    for forbidden in managed:
+        if forbidden in options:
+            raise ValueError(f"{forbidden} is managed by dataset-fixer; use its public settings")
+    if augmentations is not None:
+        from .preview import yolo_augmentations
+        overrides = yolo_augmentations(augmentations)
+        if set(overrides) & (managed | set(aliases.values())):
+            raise ValueError("Put training settings in TrainingConfig, not the augmentation configuration")
+        options.update(overrides)
+    return options
+
+
 def train_yolo(result, prepared, augmentations):
     from ultralytics import YOLO
     selection, config = result.selection, result.config
-    options = native_options(config, {"resolution": "imgsz", "epochs": "epochs", "batch_size": "batch", "device": "device", "workers": "workers", "seed": "seed"})
+    options = _yolo_options(config, augmentations)
     callbacks = options.pop("native_callbacks", {})
     trainer_class = options.pop("trainer", None)
-    for forbidden in ("data", "project", "name", "exist_ok", "resume", "save", "save_dir"):
-        if forbidden in options:
-            raise ValueError(f"{forbidden} is managed by dataset-fixer; use its public settings")
     native = YOLO(str(selection.resume or selection.weights or selection.name))
     from ..model import _normalize_prediction_task
     if _normalize_prediction_task(native.task) != selection.task:
         raise ValueError(f"Installed Ultralytics resolved task {native.task!r}, incompatible with {selection.task!r}")
-    if augmentations is not None:
-        from .preview import yolo_augmentations
-        overrides = yolo_augmentations(augmentations)
-        if set(overrides) & {"imgsz", "epochs", "batch", "device", "data", "project", "name", "save", "resume", "save_dir"}:
-            raise ValueError("Put training settings in TrainingConfig, not the augmentation configuration")
-        options.update(overrides)
     resolution = options.get("imgsz", native.overrides.get("imgsz", 640))
     stride = max(32, int(native.model.stride.max()))
     if not isinstance(resolution, int) or resolution < stride or resolution % stride:
@@ -127,6 +135,9 @@ def rfdetr_configs(selection, config, prepared, augmentations):
         model_values = variant._model_config_class().model_dump()
         model_values.update(resolution_overrides(model_values, config.resolution))
     options = native_options(config, {"epochs": "epochs", "batch_size": "batch_size", "workers": "num_workers", "seed": "seed"})
+    unknown = set(options) - set(variant._train_config_class.model_fields) - {"model", "native_callbacks", "trainer", "trainer_options"}
+    if unknown:
+        raise ValueError(f"Unknown RF-DETR training options: {sorted(unknown)}")
     if selection.resume:
         saved_options = {key: value for key, value in metadata["training_config"].items()
                          if key in variant._train_config_class.model_fields

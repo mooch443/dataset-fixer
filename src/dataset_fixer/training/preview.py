@@ -14,13 +14,12 @@ from .selection import select
 
 def yolo_augmentations(value):
     """Accept native augmentation settings or an Albumentations transform list."""
-    if isinstance(value, dict):
-        from ultralytics.cfg import DEFAULT_CFG_DICT
-        unknown = set(value) - DEFAULT_CFG_DICT.keys()
-        if unknown:
-            raise ValueError(f"YOLO augmentation settings must use native names; unknown: {sorted(unknown)}. Pass Albumentations objects as a list for custom transforms.")
-        return dict(value)
-    return {"augmentations": value}
+    from ultralytics.cfg import get_cfg
+    options = dict(value) if isinstance(value, dict) else {"augmentations": value}
+    # Native validation includes Python-only options absent from default.yaml,
+    # including custom Albumentations transforms alongside mosaic/mixup/etc.
+    get_cfg(overrides=options)
+    return options
 
 
 def _annotations(target, width, height):
@@ -71,7 +70,7 @@ def preview_augmentations(dataset, augmentations=None, *, type=None, version=Non
     from ..models import Sample
     from ..static_rendering import save_chart
     from ..visualization import VisualizationItem, VisualizationPanel, VisualizationOptions, visualize_records, render_annotated_sample
-    from .backends import prepare_data, rfdetr_configs, train_nnunet
+    from .backends import prepare_data, rfdetr_configs, train_nnunet, _yolo_options
     if not isinstance(dataset, Dataset):
         dataset = Dataset.open(dataset)
     config = config or TrainingConfig()
@@ -105,18 +104,17 @@ def preview_augmentations(dataset, augmentations=None, *, type=None, version=Non
                 rows.append((pixels, _annotations(target, pixels.shape[1], pixels.shape[0]), None))
         elif selection.family == ModelTypes.YOLO:
             from ultralytics.cfg import get_cfg
-            from ultralytics.data.dataset import YOLODataset
+            from ultralytics.data.build import build_yolo_dataset
             import yaml
             values = yaml.safe_load(prepared.data_yaml.read_text())
-            overrides = yolo_augmentations(augmentations) if augmentations is not None else {}
-            hyp = get_cfg(overrides={**{k: v for k, v in config.backend_options.items() if k not in {"native_callbacks", "trainer"}}, **overrides})
+            options = _yolo_options(config, augmentations)
+            for name in ("native_callbacks", "trainer"):
+                options.pop(name, None)
             task = "semantic" if selection.task == "semantic_segment" else selection.task
-            factory = YOLODataset
-            if task == "semantic":
-                from ultralytics.data.dataset import SemanticDataset
-                factory = SemanticDataset
-            native = factory(img_path=str(prepared.location / "train" / "images"), imgsz=config.resolution or 640,
-                             batch_size=config.batch_size or 1, augment=True, hyp=hyp, data=values, task=task)
+            hyp = get_cfg(overrides={**options, "task": task})
+            native = build_yolo_dataset(hyp, str(prepared.location / "train" / "images"),
+                                        batch=hyp.batch if isinstance(hyp.batch, int) and hyp.batch > 0 else 1,
+                                        data=values, mode="train")
             for i in range(min(samples, len(native))):
                 item = native[i]
                 pixels = item["img"].numpy().transpose(1, 2, 0)
@@ -124,7 +122,7 @@ def preview_augmentations(dataset, augmentations=None, *, type=None, version=Non
                 if task == "segment":
                     masks = np.asarray(item["masks"])
                     target["masks"] = np.stack([masks[0] == i + 1 for i in range(len(target["labels"]))]) if hyp.overlap_mask and len(target["labels"]) else masks
-                semantic = np.asarray(item["masks"]).squeeze() if task == "semantic" else None
+                semantic = np.asarray(item["semantic_mask"]).squeeze() if task == "semantic" else None
                 rows.append((pixels, _annotations(target, pixels.shape[1], pixels.shape[0]), semantic))
         else:
             def collect(trainer):
@@ -158,7 +156,8 @@ def preview_augmentations(dataset, augmentations=None, *, type=None, version=Non
             mask = None
             if semantic is not None:
                 import cv2
-                mask = cv2.resize(semantic.astype(np.uint8), display_size, interpolation=cv2.INTER_NEAREST) > 0
+                foreground = (semantic > 0) & (semantic != 255)
+                mask = cv2.resize(foreground.astype(np.uint8), display_size, interpolation=cv2.INTER_NEAREST) > 0
             items.append(VisualizationItem(path, f"Training sample {i+1}",
                 panels=(VisualizationPanel(title="Augmented image", image=pixels), VisualizationPanel(title="Training targets", image=rendered, mask=mask, color="#ff2020")),
                 foreground=np.ones(pixels.shape[:2], dtype=bool)))

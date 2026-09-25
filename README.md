@@ -106,6 +106,46 @@ settings or an Albumentations transform list; nnU-Net accepts a callable
 customizing its native transform pipeline. Backend-specific transforms are
 not silently translated between libraries.
 
+For YOLO, native controls and custom Albumentations transforms can share one
+augmentation dictionary. Other native trainer options belong in
+`TrainingConfig.backend_options`:
+
+```python
+import albumentations as A
+
+AUG_CONFIG = {
+    "mosaic": 1.0,          # 0.0 disables it
+    "mixup": 0.0,
+    "fliplr": 0.5,
+    "close_mosaic": 10,     # disable mosaic/mixing for the last 10 epochs
+    "augmentations": [A.Blur(p=0.1)],
+}
+settings = df.TrainingConfig(
+    resolution=1280, epochs=50, batch_size=14,
+    backend_options={"optimizer": "AdamW", "lr0": 1e-4, "cos_lr": True},
+)
+df.preview_augmentations(dataset, AUG_CONFIG, type=df.ModelTypes.YOLO,
+                         version=26, s="s", config=settings)
+result = df.train(dataset, type=df.ModelTypes.YOLO, version=26, s="s",
+                  config=settings, augmentations=AUG_CONFIG)
+```
+
+Omitted YOLO augmentation keys retain native defaults; `augmentations=None`
+or an empty settings dictionary does not turn them off. A supplied
+`"augmentations"` list replaces only YOLO's built-in Albumentations stage:
+use `[]` to disable that stage. Mosaic, geometry, color and flip settings remain
+independent. Native task restrictions still apply. Previews show the initial
+dataset transform pipeline; epoch schedules such as `close_mosaic` and
+trainer-side multi-scale resizing take effect during training.
+If the same augmentation key appears in both dictionaries, `AUG_CONFIG` wins.
+
+For RF-DETR, keep transform names such as `HorizontalFlip` in `AUG_CONFIG`;
+native options such as `multi_scale`, `expanded_scales`,
+`do_random_resize_via_padding`, `grad_accum_steps`, and `lr_encoder` go in
+`backend_options`. The adapter defaults the three resize flags to `False`,
+and explicit values override those defaults. YOLO-specific options such as
+`mosaic` are rejected as unsupported RF-DETR training options.
+
 Optional `callbacks=[callback, ...]` receive `TrainingEvent` objects for
 `train_start`, `epoch_end`, `checkpoint_saved`, `train_end`, and `error`.
 They supplement default checkpointing. A custom `CheckpointProvider` supplies

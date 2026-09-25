@@ -223,6 +223,18 @@ def test_real_rfdetr_data_and_augmentation(pose, tmp_path):
     shutil.copyfile(output, "/tmp/dataset-fixer-native-augmentation.png")
 
 
+def test_rfdetr_native_augmentation_options_override_defaults(pose, tmp_path):
+    _, result = job(pose, tmp_path)
+    prepared = prepare_data(result)
+    flags = {"multi_scale": True, "expanded_scales": True, "do_random_resize_via_padding": True, "lr_encoder": 5e-5}
+    config = replace(result.config, backend_options=flags)
+    variant, _, options = rfdetr_configs(result.selection, config, prepared, {})
+    native = variant._train_config_class(dataset_dir=str(prepared.location), dataset_file="yolo", **options)
+    assert all(getattr(native, key) == value for key, value in flags.items())
+    with pytest.raises(ValueError, match="Unknown RF-DETR training options.*mosaic"):
+        rfdetr_configs(result.selection, replace(config, backend_options={"mosaic": 1.0}), prepared, {})
+
+
 def test_roboflow_download_is_cached_and_source_layout_normalized(pose, tmp_path, monkeypatch):
     calls = []
     class Version:
@@ -314,13 +326,25 @@ def test_real_lightning_adapter_keeps_resumable_current_epoch(pose, tmp_path, mo
 
 
 def test_native_yolo_one_epoch(pose, tmp_path):
+    import albumentations as A
     from ultralytics import YOLO
+    from ultralytics.data.augment import Albumentations
     torch.set_num_threads(1)
     initial = tmp_path / "initial.pt"
     native = YOLO("yolo26n-pose.yaml")
     native.save(initial)
-    result = df.train(pose, weights=initial, config=df.TrainingConfig(output_dir=tmp_path / "yolo-training",
+    augmentations = {"mosaic": 0.0, "mixup": 0.0, "augmentations": [A.Blur(p=1.0)]}
+    applied = []
+    def observe(event):
+        if event.name == "train_start":
+            custom = next(t for t in event.trainer.train_loader.dataset.transforms.transforms
+                          if isinstance(t, Albumentations))
+            applied.append((event.trainer.args.mosaic, event.trainer.args.mixup,
+                            custom.transform.transforms[0].p))
+    result = df.train(pose, weights=initial, augmentations=augmentations, callbacks=[observe],
+        config=df.TrainingConfig(output_dir=tmp_path / "yolo-training",
         epochs=1, resolution=64, batch_size=1, workers=0, device="cpu", backend_options={"amp": False, "plots": False, "val": True, "nbs": 1, "warmup_epochs": 0}))
+    assert applied == [(0.0, 0.0, 1.0)]
     assert result.best_weights.is_file() and result.resumable_checkpoint.is_file()
     assert torch.load(result.resumable_checkpoint, weights_only=False)["optimizer"] is not None
     assert result.model.kind == "ultralytics"
@@ -342,6 +366,65 @@ def test_native_yolo_one_epoch(pose, tmp_path):
                             config=df.TrainingConfig(resolution=64, workers=0), samples=1,
                             destination=tmp_path / "yolo-augmentation.png", show=False)
     shutil.copyfile(tmp_path / "yolo-augmentation.png", "/tmp/dataset-fixer-yolo-augmentation.png")
+
+
+@pytest.mark.parametrize("mosaic,rect,effective", [(1.0, False, 1.0), (0.0, False, 0.0), (1.0, True, 0.0)])
+def test_yolo_preview_combines_native_and_custom_transforms(pose, tmp_path, monkeypatch, mosaic, rect, effective):
+    import albumentations as A
+    from ultralytics.data import build
+    from ultralytics.data.augment import Albumentations, Mosaic
+    original = build.build_yolo_dataset
+    seen = []
+    def capture(*args, **kwargs):
+        native = original(*args, **kwargs)
+        seen.append(native)
+        return native
+    monkeypatch.setattr(build, "build_yolo_dataset", capture)
+    output = tmp_path / "native-augmentations.png"
+    df.preview_augmentations(pose, {"mosaic": mosaic, "augmentations": [A.Blur(p=1.0)]},
+        type=df.ModelTypes.YOLO, version=26, s="n", samples=1, show=False, destination=output,
+        config=df.TrainingConfig(workers=0, backend_options={"rect": rect, "imgsz": 96, "batch": 1}))
+    native = seen[0]
+    assert native.imgsz == 96 and native.rect == rect
+    stages = native.transforms.transforms
+    assert next(t for t in stages[0].transforms if isinstance(t, Mosaic)).p == effective
+    transforms = next(t for t in stages if isinstance(t, Albumentations)).transform.transforms
+    assert len(transforms) == 1 and isinstance(transforms[0], A.Blur) and transforms[0].p == 1.0
+    assert output.stat().st_size > 1000
+    shutil.copyfile(output, f"/tmp/dataset-fixer-yolo-native-mosaic-{mosaic}-rect-{rect}.png")
+
+
+def test_yolo_augmentation_defaults_and_explicit_disable():
+    from ultralytics.cfg import DEFAULT_CFG_DICT, get_cfg
+    from ultralytics.data.augment import Albumentations
+    from dataset_fixer.training.backends import _yolo_options
+    defaults = get_cfg(overrides=_yolo_options(df.TrainingConfig(), {}))
+    assert defaults.mosaic == DEFAULT_CFG_DICT["mosaic"]
+    assert Albumentations().transform.transforms
+    disabled = get_cfg(overrides=_yolo_options(df.TrainingConfig(), {"mosaic": 0.0, "augmentations": []}))
+    assert disabled.mosaic == 0.0 and Albumentations(transforms=disabled.augmentations).transform.transforms == []
+    with pytest.raises(ValueError, match="Conflicting resolution"):
+        _yolo_options(df.TrainingConfig(resolution=64, backend_options={"imgsz": 96}), {})
+    with pytest.raises(ValueError, match="TrainingConfig"):
+        _yolo_options(df.TrainingConfig(), {"seed": 42})
+    with pytest.raises(SyntaxError, match="not a valid YOLO argument"):
+        _yolo_options(df.TrainingConfig(), {"mosaik": 1.0})
+
+
+@pytest.mark.parametrize("semantic", [False, True])
+def test_yolo_augmented_masks_use_native_dataset_builder(tmp_path, semantic):
+    import albumentations as A
+    root = make_yolo_dataset(tmp_path / "polygons", task="segment", names=["island"], size=(64, 64),
+        train_rows=["0 .2 .2 .8 .2 .8 .8 .2 .8"], val_rows=["0 .2 .2 .8 .2 .8 .8 .2 .8"])
+    data = df.Dataset.open(root, progress=False)
+    if semantic:
+        data = data.export(destination=tmp_path / "masks", format="semantic_masks", visualize=False, progress=False)
+    output = tmp_path / "mask-augmentation.png"
+    df.preview_augmentations(data, {"mosaic": 1.0, "augmentations": [A.Blur(p=1.0)]},
+        type=df.ModelTypes.YOLO, version=26, s="n", config=df.TrainingConfig(resolution=64, workers=0),
+        samples=1, show=False, destination=output)
+    assert output.stat().st_size > 1000
+    shutil.copyfile(output, f"/tmp/dataset-fixer-yolo-mask-semantic-{semantic}.png")
 
 
 def test_native_nnunet_one_epoch(tmp_path, monkeypatch):
