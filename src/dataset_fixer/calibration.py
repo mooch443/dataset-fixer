@@ -16,11 +16,12 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import maximum_bipartite_matching
 from tqdm.auto import tqdm
 
+from .comparison.grouping import resolve_evaluation_groups
+from .comparison.plot_labels import with_model_identities
 from .dataset import Dataset
 from .errors import PredictionCacheMissError, PredictionScoreUnavailableError
 from .model import ImagePrediction, Model, ModelCollection, PredictionResult
 from .prediction_cache import PredictionCache
-from .comparison.plot_labels import with_model_identities
 from .static_rendering import save_chart
 from .tabular import chart_data, frame
 from .utils import to_jsonable
@@ -53,7 +54,7 @@ def calibrate_prediction_thresholds(
     dataset: Dataset,
     *,
     split: str = "val",
-    group_by: Callable[[Path], Hashable],
+    group_by: Callable[[Path], Hashable] | None = None,
     thresholds: Sequence[float] | Mapping[str, Sequence[float]] = (
         0.10,
         0.20,
@@ -87,8 +88,9 @@ def calibrate_prediction_thresholds(
         models: Model source specifications, models, or a model collection.
         dataset: Semantic-mask dataset containing images and reference masks.
         split: Dataset split to calibrate.
-        group_by: Function mapping each image path to its independent group,
-            such as an AOI or island identifier.
+        group_by: Optional function mapping each image path to its independent
+            group, such as an AOI or island identifier. When omitted, every
+            image is treated as its own independent cross-validation group.
         thresholds: Shared threshold grid, or grids keyed by resolved model
             name.
         folds: Maximum number of deterministic group-balanced folds.
@@ -114,7 +116,7 @@ def calibrate_prediction_thresholds(
 
     if dataset.format != "semantic_masks":
         raise TypeError("Threshold calibration requires a semantic-mask Dataset")
-    if not callable(group_by):
+    if group_by is not None and not callable(group_by):
         raise TypeError("group_by must be a callable returning stable group labels")
     if folds < 2:
         raise ValueError("folds must be at least 2")
@@ -146,7 +148,18 @@ def calibrate_prediction_thresholds(
         reference_fingerprint=reference_fingerprint,
         progress=progress,
     )
-    groups = [str(group_by(path)) for path in paths]
+    resolved_groups = resolve_evaluation_groups(
+        (
+            (value.image_id, path)
+            for value, path in zip(inputs, paths)
+        ),
+        group_by,
+    )
+    groups = (
+        [resolved_groups[value.image_id] for value in inputs]
+        if resolved_groups is not None
+        else [f"image:{value.image_id}" for value in inputs]
+    )
     fold_ids = _grouped_folds(groups, folds=folds, seed=seed)
     cache_audit: list[dict[str, Any]] = []
     threshold_scores: list[dict[str, Any]] = []
@@ -486,6 +499,7 @@ def calibrate_prediction_thresholds(
         fold_ids=fold_ids,
         split=split,
         seed=seed,
+        grouping_mode="callback" if group_by is not None else "image",
         minimum_component_area=resolved_component_area,
         model_metadata=[model.describe() for model in collection],
     )
@@ -1307,6 +1321,7 @@ def _write_calibration_artifacts(
     fold_ids: Sequence[int],
     split: str,
     seed: int,
+    grouping_mode: str,
     minimum_component_area: float,
     model_metadata: list[dict[str, Any]],
 ) -> None:
@@ -1326,6 +1341,7 @@ def _write_calibration_artifacts(
         "schema": 1,
         "split": split,
         "seed": seed,
+        "grouping_mode": grouping_mode,
         "selection_metric": "macro_dice",
         "tie_breakers": [
             "micro_dice",

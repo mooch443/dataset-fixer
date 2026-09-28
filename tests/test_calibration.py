@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -128,7 +129,6 @@ def test_grouped_threshold_calibration_uses_cached_probabilities_only(
         (model,),
         dataset,
         split="val",
-        group_by=lambda path: path.stem,
         thresholds=(0.4, 0.5, 0.8),
         folds=2,
         destination=tmp_path / "calibration",
@@ -156,6 +156,13 @@ def test_grouped_threshold_calibration_uses_cached_probabilities_only(
     assert (result.location / "recommendations.json").is_file()
     assert (result.location / "threshold-curves.png").is_file()
     assert (result.location / "calibration-improvements.csv").is_file()
+    assignments = pd.read_csv(result.location / "grouped-cv-assignments.csv")
+    assert len(assignments) == 2
+    assert assignments["group"].str.startswith("image:").all()
+    payload = json.loads(
+        (result.location / "recommendations.json").read_text(encoding="utf-8")
+    )
+    assert payload["grouping_mode"] == "image"
     improvement = result.improvements.iloc[0]
     assert improvement["baseline_threshold"] == pytest.approx(0.4)
     assert improvement["recommended_threshold"] == pytest.approx(0.5)
