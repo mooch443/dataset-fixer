@@ -58,6 +58,13 @@ def _yolo_split_entries(splits: tuple[str, ...]) -> dict[str, str | None]:
     return entries
 
 
+def _yolo_relative_path(sample: Any, *, flat: bool) -> Path:
+    relative = sample.relative_path
+    if flat:
+        relative = Path(hashlib.sha256(relative.as_posix().encode()).hexdigest()[:16] + "-" + relative.name)
+    return relative
+
+
 @dataclass(frozen=True)
 class Prepared:
     """Typed identity and paths for one reusable prepared dataset.
@@ -355,6 +362,10 @@ def _mask_values(mask_path: Path, *, threshold: int) -> tuple[np.ndarray, dict[s
     return binary, mapping
 
 
+def _semantic_case_id(sample: Any) -> str:
+    return f"{sample.split}_{slugify(sample.relative_path.stem)}_{hashlib.sha1(str(sample.relative_path).encode()).hexdigest()[:8]}"
+
+
 def _convert_semantic_case(
     item: tuple[Any, Path, Path],
     *,
@@ -406,7 +417,7 @@ def _convert_semantic_case(
             (target[1], target[0]), Image.Resampling.NEAREST
         )
         mask = np.asarray(mask_image, dtype=np.uint8)
-    case_id = f"{sample.split}_{slugify(item[0].relative_path.stem)}_{hashlib.sha1(str(item[0].relative_path).encode()).hexdigest()[:8]}"
+    case_id = _semantic_case_id(sample)
     split_directory = _yolo_split_directory(sample.split)
     image_output = root / split_directory / "images" / f"{case_id}.png"
     mask_output = root / split_directory / "labels" / f"{case_id}.png"
@@ -652,9 +663,7 @@ def _prepare_yolo_vectors(
         images_root.mkdir(parents=True, exist_ok=True)
         labels_root.mkdir(parents=True, exist_ok=True)
         for sample in samples:
-            relative = sample.relative_path
-            if flat:
-                relative = Path(hashlib.sha256(relative.as_posix().encode()).hexdigest()[:16] + "-" + relative.name)
+            relative = _yolo_relative_path(sample, flat=flat)
             image_output = images_root / relative
             label_output = labels_root / relative.with_suffix(".txt")
             image_output.parent.mkdir(parents=True, exist_ok=True)

@@ -4,9 +4,9 @@ import math
 import random
 import re
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Sequence, TypeVar
 
 import cv2
 import numpy as np
@@ -40,12 +40,63 @@ ANNOTATION_COLORS = (
     "#ff1493",  # deep pink
 )
 
-_VISUALIZE_KWARGS = {"label_fn", "label_mode", "line_width", "outline_width"}
+_VISUALIZE_KWARGS = {"label_fn", "label_mode", "line_width", "outline_width", "markers"}
 
 COMMON_VISUALIZE_PARAMETERS = frozenset(
     "samples columns seed panel_size zoom context_fraction minimum_context "
-    "label_fn label_mode line_width outline_width outline_alpha destination show".split()
+    "label_fn label_mode line_width outline_width outline_alpha markers destination show".split()
 )
+
+
+@dataclass(frozen=True)
+class MarkerStyle:
+    """Annotation styling shared by dataset and native augmentation views.
+
+    Parameters:
+        radius: Marker radius in rendered panel pixels; None sizes automatically.
+        shape: Keypoint and POLO centre marker shape.
+        color: Uniform annotation colour; None uses the class palette.
+        keypoint_colors: Colours keyed by zero-based keypoint index or name.
+        fill: Fill closed markers; False draws hollow markers.
+        show_boxes: Draw detection and pose bounding boxes.
+        show_keypoints: Draw keypoints and POLO centre markers.
+        show_skeleton: Connect visible keypoints using dataset skeleton metadata.
+        show_labels: Draw class and keypoint names.
+        label_size: Label font size in rendered panel pixels.
+    """
+
+    radius: float | None = None
+    shape: Literal["circle", "square", "diamond", "cross"] = "circle"
+    color: str | None = None
+    keypoint_colors: Mapping[int | str, str] | None = None
+    fill: bool = True
+    show_boxes: bool = True
+    show_keypoints: bool = True
+    show_skeleton: bool = True
+    show_labels: bool = True
+    label_size: float = 12
+
+    def __post_init__(self):
+        for name in ("radius", "label_size"):
+            value = getattr(self, name)
+            if value is None and name == "radius":
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"markers.{name} must be a finite positive number")
+        if self.shape not in {"circle", "square", "diamond", "cross"}:
+            raise ValueError("markers.shape must be circle, square, diamond, or cross")
+        for name in ("fill", "show_boxes", "show_keypoints", "show_skeleton", "show_labels"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"markers.{name} must be a boolean")
+        if self.keypoint_colors is not None and not isinstance(self.keypoint_colors, Mapping):
+            raise TypeError("markers.keypoint_colors must map keypoint indices or names to colours")
+        for key in self.keypoint_colors or {}:
+            if isinstance(key, bool) or not isinstance(key, (int, str)) or (isinstance(key, int) and key < 0):
+                raise ValueError("keypoint colour keys must be non-negative indices or names")
+        for color in ([self.color] if self.color is not None else []) + list((self.keypoint_colors or {}).values()):
+            if not isinstance(color, str):
+                raise TypeError("marker colours must be colour strings")
+            ImageColor.getrgb(color)
 
 
 @dataclass(frozen=True)
@@ -62,6 +113,7 @@ class VisualizationOptions:
     line_width: float | None = None
     outline_width: float = 1.0
     outline_alpha: float = 1.0
+    markers: MarkerStyle | None = None
     destination: Path | None = None
     show: bool = True
 
@@ -74,6 +126,7 @@ class VisualizationPanel:
     color: str = "#C86552"
     footer: str | None = None
     heading: Any | None = None
+    render: Callable[[tuple[int, int, int, int], tuple[int, int]], Image.Image] | None = None
 
 
 @dataclass(frozen=True)
@@ -121,13 +174,7 @@ def visualize_records(
     prepare: Callable[[_VisualRecord], VisualizationItem],
     title: str | Callable[[int], str] | None = None,
 ) -> Any:
-    if not records:
-        raise ValueError("At least one image is required for visualization")
-    count = len(records) if options.samples is None else min(options.samples, len(records))
-    if count == len(records):
-        selected = list(records)
-    else:
-        selected = random.Random(options.seed).sample(list(records), count)
+    selected = select_visualization_records(records, options)
     items = [prepare(record) for record in selected]
     panel_count = len(items[0].panels)
     if panel_count == 0 or any(len(item.panels) != panel_count for item in items):
@@ -194,6 +241,10 @@ def visualize_records(
         panel_charts: list[Any] = []
         for panel in item.panels:
             image = np.asarray(panel.image)[y0:y1, x0:x1]
+            if panel.render is not None:
+                scale = min(viewport / image.shape[1], viewport / image.shape[0])
+                size = (max(1, round(image.shape[1] * scale)), max(1, round(image.shape[0] * scale)))
+                image = np.asarray(panel.render(bounds, size))
             mask_crop = (
                 None
                 if panel.mask is None
@@ -203,7 +254,7 @@ def visualize_records(
                 image = draw_mask_outline(
                     image,
                     mask_crop,
-                    color=panel.color,
+                    color=(options.markers.color if options.markers else None) or panel.color,
                     line_width=options.line_width,
                     outline_width=options.outline_width,
                     alpha=options.outline_alpha,
@@ -270,16 +321,27 @@ def visualize_records(
     )
 
 
+def select_visualization_records(records, options):
+    if not records:
+        raise ValueError("At least one image is required for visualization")
+    if options.samples is None or options.samples >= len(records):
+        return list(records)
+    return random.Random(options.seed).sample(list(records), options.samples)
+
+
 def visualization_options(**overrides: Any) -> VisualizationOptions:
-    unknown = sorted(set(overrides) - COMMON_VISUALIZE_PARAMETERS)
+    allowed = COMMON_VISUALIZE_PARAMETERS
+    unknown = sorted(set(overrides) - allowed)
     if unknown:
         raise TypeError("Unknown visualization options: " + ", ".join(unknown))
     defaults = VisualizationOptions()
     values = {
         name: getattr(defaults, name)
-        for name in COMMON_VISUALIZE_PARAMETERS
+        for name in allowed
     }
     values.update(overrides)
+    if values["markers"] is not None and not isinstance(values["markers"], MarkerStyle):
+        raise TypeError("markers must be a MarkerStyle or None")
     for name in ("columns", "minimum_context"):
         value = values[name]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -430,6 +492,8 @@ def normalize_visualize_kwargs(
             + ", ".join(sorted(_VISUALIZE_KWARGS))
         )
     normalized = dict(value)
+    if normalized.get("markers") is not None and not isinstance(normalized["markers"], MarkerStyle):
+        raise TypeError("visualize_kwargs['markers'] must be a MarkerStyle or None")
     label_fn = normalized.get("label_fn")
     if label_fn is not None and not callable(label_fn):
         raise TypeError("visualize_kwargs['label_fn'] must be callable or None")
@@ -899,6 +963,98 @@ def _annotation_focus_mask(
     return np.asarray(mask, dtype=bool)
 
 
+def annotations_from_values(values: Sequence[Any]) -> list[Annotation]:
+    """Adapt comparison dictionaries/predictions to the canonical annotation model."""
+    annotations = []
+    for value in values:
+        if isinstance(value, Annotation):
+            annotations.append(value)
+            continue
+        get = value.get if isinstance(value, Mapping) else lambda key, default=None: getattr(value, key, default)
+        data = {field.name: get(field.name) for field in fields(Annotation)}
+        polygons = get("polygons") or [get("polygon")]
+        for polygon in polygons:
+            annotations.append(Annotation(**{**data, "polygon": polygon}))
+    return annotations
+
+
+def draw_annotation_marker(draw, center, color, markers: MarkerStyle, line_width: int, outline_width: int):
+    """Draw every annotation/coverage marker using the same style and primitives."""
+    x, y = center
+    r = markers.radius or 3
+    box = (x - r, y - r, x + r, y + r)
+    fill = color if markers.fill else None
+    halo = max(line_width, outline_width)
+    padding = (halo - line_width) / 2
+    if markers.shape in {"circle", "square"}:
+        draw_shape = draw.ellipse if markers.shape == "circle" else draw.rectangle
+        draw_shape((box[0]-padding, box[1]-padding, box[2]+padding, box[3]+padding), outline="white", width=halo)
+        draw_shape(box, fill=fill, outline=color, width=line_width)
+    elif markers.shape == "diamond":
+        points = [(x, y-r), (x+r, y), (x, y+r), (x-r, y), (x, y-r)]
+        if fill:
+            draw.polygon(points, fill=fill)
+        draw.line(points, fill="white", width=halo, joint="curve")
+        draw.line(points, fill=color, width=line_width, joint="curve")
+    else:
+        for points in ((x-r, y, x+r, y), (x, y-r, x, y+r)):
+            draw.line(points, fill="white", width=halo)
+            draw.line(points, fill=color, width=line_width)
+
+
+def annotation_item(
+    sample: Sample,
+    task: Task,
+    metadata: DatasetMetadata,
+    options: VisualizationOptions,
+    *,
+    image: Image.Image | None = None,
+    mask: np.ndarray | None = None,
+    paired: bool = False,
+) -> VisualizationItem:
+    """Adapt annotation data into the shared layout, styling after crop/resize."""
+
+    if image is None:
+        with Image.open(sample.image_path) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+    source = image.convert("RGB")
+
+    def render(bounds, size):
+        base = source.crop(bounds).resize(size, Image.Resampling.LANCZOS)
+        if mask is not None:
+            x0, y0, x1, y1 = bounds
+            cropped_mask = Image.fromarray(mask[y0:y1, x0:x1]).resize(size, Image.Resampling.NEAREST)
+            return Image.fromarray(draw_mask_outline(
+                base, np.asarray(cropped_mask),
+                color=(options.markers.color if options.markers else None) or "#ff2020",
+                line_width=options.line_width, outline_width=options.outline_width,
+                alpha=options.outline_alpha,
+            ))
+        rendered = render_annotated_sample(
+            sample, task, metadata, image=source, crop_bounds=bounds, resize_to=size,
+            line_width=options.line_width, outline_width=options.outline_width,
+            markers=options.markers,
+        )
+        return Image.blend(base, rendered, options.outline_alpha)
+
+    panels = (VisualizationPanel(
+        title="Training targets" if paired else "Annotation",
+        image=np.asarray(source), render=render,
+    ),)
+    if paired:
+        panels = (VisualizationPanel(title="Augmented image", image=np.asarray(source)), *panels)
+    return VisualizationItem(
+        image_path=sample.image_path,
+        label=_sample_title(sample, None, default=(
+            f"{sample.relative_path}\n{sample.width}×{sample.height} | "
+            f"{len(sample.annotations)} annotations | {sample.split}"
+            if mask is None else f"{sample.split} · {sample.relative_path}\nforeground: {np.mean(mask):.1%}"
+        )) or "",
+        panels=panels,
+        foreground=_sample_foreground_mask(sample, task) if mask is None else mask,
+    )
+
+
 def visualize_samples(
     samples: list[Sample],
     task: Task,
@@ -906,45 +1062,21 @@ def visualize_samples(
     *,
     split: str | None,
     options: VisualizationOptions,
+    mask_paths: dict[Path, Path] | None = None,
 ):
     candidates = [s for s in samples if split is None or s.split == split]
-    title_split = split or "all splits"
 
-    def prepare(sample: Sample) -> VisualizationItem:
-        rendered = render_annotated_sample(
-            sample,
-            task,
-            metadata,
-            line_width=options.line_width,
-            outline_width=options.outline_width,
-        )
-        image = np.asarray(rendered)
-        if options.outline_alpha < 1:
-            with Image.open(sample.image_path) as opened:
-                source = np.asarray(ImageOps.exif_transpose(opened).convert("RGB"))
-            image = np.uint8(
-                source * (1 - options.outline_alpha) + image * options.outline_alpha
-            )
-        return VisualizationItem(
-            image_path=sample.image_path,
-            label=_sample_title(
-                sample,
-                None,
-                default=(
-                    f"{sample.relative_path}\n{sample.width}×{sample.height} | "
-                    f"{len(sample.annotations)} annotations | {sample.split}"
-                ),
-            )
-            or "",
-            panels=(VisualizationPanel(title="Annotation", image=image),),
-            foreground=_sample_foreground_mask(sample, task),
-        )
+    def prepare(sample):
+        mask = None
+        if mask_paths is not None:
+            with Image.open(mask_paths[sample.image_path.resolve()]) as opened:
+                mask = np.asarray(opened.convert("L")) > 0
+        return annotation_item(sample, task, metadata, options, mask=mask)
 
+    title = "Semantic-mask check" if mask_paths is not None else "Annotation check"
     figure = visualize_records(
-        candidates,
-        options=options,
-        prepare=prepare,
-        title=lambda count: f"Annotation check — {title_split} ({count} images)",
+        candidates, options=options, prepare=prepare,
+        title=lambda count: f"{title} — {split or 'all splits'} ({count} images)",
     )
     return finish_visualization(figure, options)
 
@@ -956,48 +1088,8 @@ def visualize_semantic_masks(
     split: str | None,
     options: VisualizationOptions,
 ):
-    """Render paired source images and binary-mask overlays."""
-
-    candidates = [sample for sample in samples if split is None or sample.split == split]
-
-    def prepare(sample: Sample) -> VisualizationItem:
-        mask_path = mask_paths[sample.image_path.resolve()]
-        with Image.open(sample.image_path) as opened_image, Image.open(mask_path) as opened_mask:
-            image = np.asarray(opened_image.convert("RGB"))
-            mask = opened_mask.convert("L")
-        mask_array = np.asarray(mask) > 0
-        foreground = sum(mask.histogram()[1:])
-        fraction = foreground / (mask.width * mask.height) if mask.width and mask.height else 0.0
-        return VisualizationItem(
-            image_path=sample.image_path,
-            label=_sample_title(
-                sample,
-                None,
-                default=(
-                    f"{sample.split} · {sample.relative_path}\n"
-                    f"foreground: {fraction:.1%}"
-                ),
-            )
-            or "",
-            panels=(
-                VisualizationPanel(
-                    title="Annotation",
-                    image=image,
-                    mask=mask_array,
-                    color="#ff2020",
-                ),
-            ),
-            foreground=mask_array,
-        )
-
-    title_split = split or "all splits"
-    figure = visualize_records(
-        candidates,
-        options=options,
-        prepare=prepare,
-        title=lambda count: f"Semantic-mask check — {title_split} ({count} images)",
-    )
-    return finish_visualization(figure, options)
+    return visualize_samples(samples, Task.SEGMENT, DatasetMetadata(names={}),
+                             split=split, options=options, mask_paths=mask_paths)
 
 
 def _sample_foreground_mask(sample: Sample, task: Task) -> np.ndarray:
@@ -1047,22 +1139,34 @@ def _sample_title(
 
 def render_annotated_sample(
     sample: Sample,
-    task: Task,
+    task: Task | None,
     metadata: DatasetMetadata,
     *,
     resize_to: tuple[int, int] | None = None,
-    show_names: bool = True,
     line_width: float | None = None,
     outline_width: float | None = None,
+    markers: MarkerStyle | None = None,
+    image: Image.Image | None = None,
+    crop_bounds: tuple[int, int, int, int] | None = None,
 ) -> Image.Image:
     """Render one sample for both public visualization and report previews."""
 
-    with Image.open(sample.image_path) as opened:
-        image = ImageOps.exif_transpose(opened).convert("RGB")
+    if image is None:
+        with Image.open(sample.image_path) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+    else:
+        image = image.convert("RGB").copy()
+    markers = markers or MarkerStyle()
+    show_names = markers.show_labels
+    x0, y0, x1, y1 = crop_bounds or (0, 0, sample.width, sample.height)
+    if crop_bounds is not None:
+        image = image.crop(crop_bounds)
     if resize_to is not None and image.size != resize_to:
         image = image.resize(resize_to, Image.Resampling.LANCZOS)
-    scale_x = image.width / max(1, sample.width)
-    scale_y = image.height / max(1, sample.height)
+    scale_x = image.width / max(1, x1 - x0)
+    scale_y = image.height / max(1, y1 - y0)
+    def point(x, y):
+        return ((x - x0) * scale_x, (y - y0) * scale_y)
     draw = ImageDraw.Draw(image)
     short_side = min(image.size)
     colour_width = (
@@ -1075,36 +1179,32 @@ def render_annotated_sample(
         if outline_width is not None
         else max(colour_width + 1, round(short_side / 140))
     )
-    marker_radius = max(3, round(short_side / 120))
-    font = ImageFont.load_default()
+    marker_radius = markers.radius or max(3, round(short_side / 120))
+    markers = replace(markers, radius=marker_radius)
+    font = ImageFont.load_default(size=markers.label_size)
+
+    def label(position, text, color):
+        bounds = draw.textbbox((0, 0), text, font=font)
+        width, height = bounds[2] - bounds[0], bounds[3] - bounds[1]
+        x = max(1, min(position[0], image.width - width - 3))
+        y = max(1, min(position[1], image.height - height - 3))
+        draw.text((x - bounds[0], y - bounds[1]), text, fill=color, font=font,
+                  stroke_width=1, stroke_fill="black")
 
     for annotation in sample.annotations:
-        color = ANNOTATION_COLORS[annotation.class_id % len(ANNOTATION_COLORS)]
+        color = markers.color or ANNOTATION_COLORS[annotation.class_id % len(ANNOTATION_COLORS)]
         name = metadata.names.get(annotation.class_id, str(annotation.class_id))
-        if annotation.bbox is not None and task in {Task.DETECT, Task.POSE}:
-            x1, y1, x2, y2 = annotation.bbox
-            box = (x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y)
+        if markers.show_boxes and annotation.bbox is not None and task in {None, Task.DETECT, Task.POSE}:
+            bx1, by1, bx2, by2 = annotation.bbox
+            box = (*point(bx1, by1), *point(bx2, by2))
             draw.rectangle(box, outline="white", width=resolved_outline_width)
             draw.rectangle(box, outline=color, width=colour_width)
             if show_names:
-                text_box = draw.textbbox((box[0], box[1]), name, font=font)
-                text_height = text_box[3] - text_box[1]
-                text_width = text_box[2] - text_box[0]
-                text_top = max(0, box[1] - text_height - 4)
-                draw.rectangle(
-                    (box[0], text_top, box[0] + text_width + 4, text_top + text_height + 4),
-                    fill=color,
-                )
-                draw.text(
-                    (box[0] + 2, text_top + 2),
-                    name,
-                    fill="white",
-                    font=font,
-                )
+                label((box[0] + 2, box[1] - markers.label_size - 4), name, color)
         if annotation.polygon:
             rings = [annotation.polygon, *(annotation.polygon_holes or [])]
             for ring in rings:
-                points = [(x * scale_x, y * scale_y) for x, y in ring]
+                points = [point(x, y) for x, y in ring]
                 if len(points) < 2:
                     continue
                 closed = [*points, points[0]]
@@ -1125,51 +1225,41 @@ def render_annotated_sample(
             skeleton_value = metadata.extra.get("skeleton", [])
             if isinstance(skeleton_value, dict):
                 skeleton_value = skeleton_value.get(annotation.class_id, skeleton_value.get(str(annotation.class_id), []))
-            for edge in skeleton_value or []:
+            for edge in (skeleton_value or []) if markers.show_skeleton else []:
                 if len(edge) != 2:
                     continue
                 # COCO and Ultralytics skeletons are conventionally 1-based.
                 first, second = int(edge[0]) - 1, int(edge[1]) - 1
                 if not (0 <= first < len(annotation.keypoints) and 0 <= second < len(annotation.keypoints)):
                     continue
-                x1, y1, v1 = annotation.keypoints[first]
-                x2, y2, v2 = annotation.keypoints[second]
+                kx1, ky1, v1 = annotation.keypoints[first]
+                kx2, ky2, v2 = annotation.keypoints[second]
                 if v1 != 0 and v2 != 0:
                     draw.line(
-                        (x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y),
+                        (*point(kx1, ky1), *point(kx2, ky2)),
                         fill=color,
                         width=colour_width,
                     )
             for idx, (x, y, visibility) in enumerate(annotation.keypoints):
-                if visibility == 0:
+                if visibility == 0 or not markers.show_keypoints:
                     continue
-                px, py = x * scale_x, y * scale_y
-                draw.ellipse(
-                    (px - marker_radius, py - marker_radius, px + marker_radius, py + marker_radius),
-                    fill=color,
-                    outline="white",
-                    width=1,
-                )
+                px, py = point(x, y)
+                name = names[idx] if idx < len(names) else str(idx)
+                colors = markers.keypoint_colors or {}
+                draw_annotation_marker(draw, (px, py), colors.get(idx, colors.get(name, color)), markers, colour_width, resolved_outline_width)
                 if show_names and idx < len(names):
-                    draw.text(
-                        (px + marker_radius + 1, py + 1),
-                        names[idx],
-                        fill="white",
-                        font=font,
-                    )
-        if annotation.point and annotation.radius is not None:
-            x, y = annotation.point[0] * scale_x, annotation.point[1] * scale_y
-            radius_x = annotation.radius * scale_x
-            radius_y = annotation.radius * scale_y
+                    label((px + marker_radius + 2, py + 1), name, "white")
+        if annotation.point:
+            x, y = point(*annotation.point)
+            radius_x = (annotation.radius or 0) * scale_x
+            radius_y = (annotation.radius or 0) * scale_y
             draw.ellipse(
                 (x - radius_x, y - radius_y, x + radius_x, y + radius_y),
-                outline="red",
+                outline=markers.color or "red",
                 width=colour_width,
             )
-            draw.ellipse(
-                (x - marker_radius, y - marker_radius, x + marker_radius, y + marker_radius),
-                fill="red",
-            )
+            if markers.show_keypoints:
+                draw_annotation_marker(draw, (x, y), markers.color or "red", markers, colour_width, resolved_outline_width)
     return image
 
 
@@ -1596,6 +1686,7 @@ def save_tiling_preview(
             metadata,
             line_width=render_options.get("line_width"),
             outline_width=render_options.get("outline_width"),
+            markers=render_options.get("markers"),
         ).convert("RGBA")
         draw = ImageDraw.Draw(rendered)
         preview_scale = max(rendered.size) / 400
@@ -1759,6 +1850,14 @@ def save_coverage_annotated_original(
             ),
             Image.Resampling.BILINEAR,
         )
+    style = settings.get("visualize_kwargs", {}).get("markers")
+    # Saved settings carry plain dictionaries; use the same public style on reload.
+    if isinstance(style, dict):
+        style = MarkerStyle(**style)
+    annotated = render_annotated_sample(
+        sample, None, DatasetMetadata(names={}), resize_to=annotated.size,
+        markers=style or MarkerStyle(show_labels=False),
+    ).convert("RGBA")
     overlay = Image.new("RGBA", annotated.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     width, height = annotated.size
@@ -1789,65 +1888,6 @@ def save_coverage_annotated_original(
         _text_box(draw, (tx, ty), text, bg_font, cyan + (230,), box_fill=(0, 0, 0, 135), pad=max(5, bg_size // 4))
 
     for label_idx, annotation in enumerate(sample.annotations):
-        geometry_color = (
-            (255, 0, 255),
-            (127, 255, 0),
-            (255, 95, 0),
-            (255, 255, 0),
-            (255, 20, 147),
-        )[annotation.class_id % len(ANNOTATION_COLORS)]
-        geometry_rgba = geometry_color + (235,)
-        if annotation.polygon:
-            polygon = [
-                (
-                    int(round(x * preview_scale)),
-                    int(round(y * preview_scale)),
-                )
-                for x, y in annotation.polygon
-            ]
-            if len(polygon) >= 3:
-                closed = [*polygon, polygon[0]]
-                draw.polygon(polygon, fill=geometry_color + (38,))
-                draw.line(
-                    closed,
-                    fill=(255, 255, 255, 245),
-                    width=underlay,
-                    joint="curve",
-                )
-                draw.line(
-                    closed,
-                    fill=geometry_rgba,
-                    width=line_width,
-                    joint="curve",
-                )
-                xs, ys = zip(*polygon)
-                bounds = (min(xs), min(ys), max(xs), max(ys))
-                draw.rectangle(
-                    bounds,
-                    outline=(255, 255, 255, 245),
-                    width=underlay,
-                )
-                draw.rectangle(
-                    bounds,
-                    outline=geometry_rgba,
-                    width=line_width,
-                )
-        elif annotation.bbox is not None:
-            bounds = tuple(
-                int(round(value * preview_scale))
-                for value in annotation.bbox
-            )
-            draw.rectangle(
-                bounds,
-                outline=(255, 255, 255, 245),
-                width=underlay,
-            )
-            draw.rectangle(
-                bounds,
-                outline=geometry_rgba,
-                width=line_width,
-            )
-
         if annotation.point is not None:
             anchor = annotation.point
         elif annotation.bbox is not None:
@@ -1868,13 +1908,9 @@ def save_coverage_annotated_original(
         coverage_type = coverage_types.get(label_idx, "sparse")
         color = coverage_color(100 * count / target if target else 0)
         rgba = color + (200,)
-        marker = (x - marker_radius, y - marker_radius, x + marker_radius, y + marker_radius)
-        if sample.split == "train":
-            draw.ellipse(marker, outline=(255, 255, 255, 235), width=underlay)
-            draw.ellipse(marker, outline=rgba, width=line_width)
-        else:
-            draw.rectangle(marker, outline=(255, 255, 255, 235), width=underlay)
-            draw.rectangle(marker, outline=rgba, width=line_width)
+        draw_annotation_marker(draw, (x, y), rgba, MarkerStyle(
+            radius=marker_radius, shape="circle" if sample.split == "train" else "square", fill=False,
+        ), line_width, underlay)
         draw.ellipse((x - center_radius, y - center_radius, x + center_radius, y + center_radius), fill=(255, 255, 255, 255))
         inner = max(1, center_radius // 2)
         draw.ellipse((x - inner, y - inner, x + inner, y + inner), fill=rgba)

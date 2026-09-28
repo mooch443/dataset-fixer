@@ -21,6 +21,7 @@ from .static_rendering import format_label, save_chart
 from .tabular import chart_data, frame, stable_sort
 from .utils import settings_fingerprint, sha256_file
 from .visualization import (
+    MarkerStyle,
     VisualizationItem,
     VisualizationOptions,
     VisualizationPanel,
@@ -571,7 +572,7 @@ def _example_chart(
                 sample,
                 task,
                 state.metadata or DatasetMetadata(names=state.classes),
-                show_names=False,
+                markers=options.get("markers") or MarkerStyle(show_labels=False),
                 line_width=options.get("line_width"),
                 outline_width=options.get("outline_width"),
             ))
@@ -601,6 +602,7 @@ def _example_chart(
             label_mode=options.get("label_mode", "wrap"),
             line_width=options.get("line_width"),
             outline_width=options.get("outline_width", 1.0),
+            markers=options.get("markers"),
         ),
         prepare=prepare,
         title="Deterministic annotated examples by dataset and split",

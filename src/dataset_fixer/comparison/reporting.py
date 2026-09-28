@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -11,10 +12,14 @@ import numpy as np
 import pandas as pd
 from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageFont
 
+from ..models import DatasetMetadata, Sample
 from ..static_rendering import save_chart
 from ..tabular import TableLike, chart_data, frame
 from ..utils import to_jsonable
 from ..visualization import (
+    MarkerStyle,
+    annotations_from_values,
+    render_annotated_sample,
     VisualizationItem,
     VisualizationOptions,
     VisualizationPanel,
@@ -533,14 +538,13 @@ def _count_figures(root: Path, rows: list[dict[str, Any]], order: list[str], met
     return paths
 
 
-def _draw_panel(image: Image.Image, values: list[Any], *, truth: bool) -> Image.Image:
-    rendered = image.convert("RGBA")
-    overlay = Image.new("RGBA", rendered.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    for value in values:
-        color = COLORS[2] if truth else COLORS[1]
-        _draw_value(draw, value, truth=truth, color=color, alpha=.9, linewidth=2)
-    return Image.alpha_composite(rendered, overlay).convert("RGB")
+def _draw_panel(image: Image.Image, values: list[Any], *, truth: bool,
+                markers: MarkerStyle | None = None, linewidth: float = 2) -> Image.Image:
+    style = markers or MarkerStyle(color=COLORS[2] if truth else COLORS[1], show_labels=False)
+    sample = Sample(Path("preview"), Path("preview"), "train", image.width, image.height,
+                    annotations_from_values(values))
+    return render_annotated_sample(sample, None, DatasetMetadata(names={}), image=image,
+                                   markers=style, line_width=linewidth)
 
 
 def _draw_matched_panel(
@@ -553,53 +557,27 @@ def _draw_matched_panel(
     from .metrics import optimal_match
 
     matched = optimal_match(truth, predictions, task, metadata)
-    rendered = image.convert("RGBA")
-    overlay = Image.new("RGBA", rendered.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+    rendered = image.convert("RGB")
+    style = MarkerStyle(show_labels=False)
     heading = (
         f"TP {len(matched['matches'])}  FP {len(matched['unmatched_pred'])}  "
         f"FN {len(matched['unmatched_gt'])}"
     )
+    def overlay(values, color, alpha=1.0, linewidth=2):
+        nonlocal rendered
+        layer = _draw_panel(rendered, values, truth=False,
+                            markers=replace(style, color=color), linewidth=linewidth)
+        rendered = Image.blend(rendered, layer, alpha)
+
     for truth_index, prediction_index, _ in matched["matches"]:
-        _draw_value(draw, truth[truth_index], truth=True, color="#FFFFFF", alpha=.75, linewidth=3)
-        _draw_value(draw, predictions[prediction_index], truth=False, color="#009E73", alpha=1, linewidth=2)
+        overlay([truth[truth_index]], "#FFFFFF", .75, 3)
+        overlay([predictions[prediction_index]], "#009E73")
         first, second = _center(truth[truth_index]), _center(predictions[prediction_index])
         if first and second:
-            draw.line((first, second), fill=(*ImageColor.getrgb("#009E73"), 205), width=1)
-    for index in matched["unmatched_pred"]:
-        _draw_value(draw, predictions[index], truth=False, color="#E69F00", alpha=1, linewidth=2)
-    for index in matched["unmatched_gt"]:
-        _draw_value(draw, truth[index], truth=True, color="#D55E00", alpha=1, linewidth=2)
-    return Image.alpha_composite(rendered, overlay).convert("RGB"), heading
-
-
-def _draw_value(draw: ImageDraw.ImageDraw, value: Any, *, truth: bool, color: str, alpha: float, linewidth: float) -> None:
-    get = value.get if truth else lambda key, default=None: getattr(value, key, default)
-    rgba = (*ImageColor.getrgb(color), round(255 * alpha))
-    width = max(1, round(linewidth))
-    box = get("bbox")
-    if box:
-        draw.rectangle(tuple(map(float, box)), outline=rgba, width=width)
-    polygons = get("polygons") or ([get("polygon")] if get("polygon") else [])
-    for polygon in polygons:
-        points = [tuple(map(float, point[:2])) for point in polygon]
-        if len(points) >= 2:
-            draw.line([*points, points[0]], fill=rgba, width=width, joint="curve")
-    point = get("point")
-    if point:
-        x, y = map(float, point)
-        radius_marker = max(3, width + 2)
-        draw.ellipse((x-radius_marker,y-radius_marker,x+radius_marker,y+radius_marker),fill=rgba,outline=(0,0,0,180),width=1)
-        radius = get("radius", None)
-        if radius:
-            draw.ellipse((x-radius,y-radius,x+radius,y+radius),outline=rgba,width=width)
-    keypoints = get("keypoints")
-    if keypoints:
-        for keypoint in keypoints:
-            if len(keypoint) >= 3 and keypoint[2] is not None and keypoint[2] <= 0:
-                continue
-            x, y = float(keypoint[0]), float(keypoint[1])
-            draw.ellipse((x-3,y-3,x+3,y+3),fill=rgba,outline=(0,0,0,180),width=1)
+            ImageDraw.Draw(rendered).line((first, second), fill="#009E73", width=1)
+    overlay([predictions[index] for index in matched["unmatched_pred"]], "#E69F00")
+    overlay([truth[index] for index in matched["unmatched_gt"]], "#D55E00")
+    return rendered, heading
 
 
 def _center(value: Any) -> tuple[float, float] | None:

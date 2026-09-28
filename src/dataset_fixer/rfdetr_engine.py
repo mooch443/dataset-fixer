@@ -11,12 +11,14 @@ class NotRFDETRCheckpoint(ValueError):
     """A file has no RF-DETR identity; another backend may support it."""
 
 
-def checkpoint_metadata(path: Path) -> dict[str, Any]:
+def checkpoint_metadata(path: Path, *, checkpoint: dict[str, Any] | None = None) -> dict[str, Any]:
     import torch
-    try:
-        saved = torch.load(path, map_location="cpu", weights_only=False)
-    except Exception as exc:
-        raise NotRFDETRCheckpoint(f"Cannot read RF-DETR checkpoint metadata: {path}") from exc
+    saved = checkpoint
+    if saved is None:
+        try:
+            saved = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            raise NotRFDETRCheckpoint(f"Cannot read RF-DETR checkpoint metadata: {path}") from exc
     if not isinstance(saved, dict):
         raise NotRFDETRCheckpoint(f"RF-DETR checkpoint metadata is missing: {path}. Load its dataset-fixer bundle instead.")
     raw_config = saved.get("model_config") or {}

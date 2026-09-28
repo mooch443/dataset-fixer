@@ -16,6 +16,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpg", ".mpeg", ".mts", ".m2ts", ".ts", ".wmv", ".flv"}
 STANDARD_SPLITS = ("train", "val", "test")
 SPLIT_ALIASES = {"validation": "val", "valid": "val"}
 

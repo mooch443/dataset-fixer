@@ -20,6 +20,7 @@ class Selection:
     resume: Path | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
+    resolution: int | None = None
 
 
 def infer_task(dataset, explicit=None):
@@ -147,7 +148,8 @@ def select(dataset, *, type=None, version=None, s=None, model_type=None, weights
             if name.removesuffix(".pt") != expected:
                 raise ValueError(f"Requested architecture {expected} conflicts with checkpoint {name}")
         selection = Selection(family, task, name, path if weights is not None else None, path if resume is not None else None, meta,
-                              {"source": str(source), "sha256": sha256_progress(path, progress=False), **dict(meta.get("source_artifact") or {})})
+                              {"source": resolved.source or str(source), "sha256": sha256_progress(path, progress=False), **dict(meta.get("source_artifact") or {})},
+                              resolved.options.get("resolution"))
     if selection is None:
         family = ModelTypes(type or ModelTypes.YOLO)
         if family == ModelTypes.YOLO:

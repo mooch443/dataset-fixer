@@ -786,9 +786,7 @@ def _prediction_from_json(value: Mapping[str, Any]) -> Any:
     from .comparison.types import Prediction
 
     score = float(value["score"])
-    if not math.isfinite(score) or not 0 <= score <= 1:
-        raise ValueError("prediction score is outside [0, 1]")
-    return Prediction(
+    prediction = Prediction(
         class_id=int(value["class_id"]),
         score=score,
         bbox=tuple(map(float, value["bbox"])) if value.get("bbox") is not None else None,
@@ -803,6 +801,9 @@ def _prediction_from_json(value: Mapping[str, Any]) -> Any:
         keypoints=[tuple(point) for point in value.get("keypoints") or []] or None,
         metadata=dict(value.get("metadata") or {}),
     )
+    if not prediction.valid_score:
+        raise ValueError("prediction score is invalid for its score domain")
+    return prediction
 
 
 def _validate_prediction_geometry(values: Sequence[Any], width: int, height: int) -> None:

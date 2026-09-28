@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import time
@@ -24,18 +25,21 @@ from .geometry import Geometry, filter_inputs_by_size, normalize_errors
 from .prediction_cache import PredictionCache
 from .utils import IMAGE_SUFFIXES, sha256_file, shorten_middle as _shorten_middle, slugify, to_jsonable
 from .visualization import (
+    MarkerStyle,
+    annotation_item,
+    annotations_from_values,
     finish_visualization,
     VisualizationItem,
     VisualizationPanel,
     visualize_records,
     visualization_options,
 )
+from .video import VideoPredictionResult
 
 ModelKind = Literal["ultralytics", "nnunet", "rfdetr"]
 PredictionTask = Literal["detect", "segment", "pose", "polo", "semantic_segment"]
 ModelTask = PredictionTask | Literal["auto", "locate", "semantic"]
 _MAX_INFERENCE_BATCH_SIZE = 128
-
 
 def _wandb_url(value: str | None) -> str | None:
     if value is None:
@@ -572,6 +576,7 @@ class PredictionResult:
         line_width: float | None = None,
         outline_width: float = 1.0,
         outline_alpha: float = 1.0,
+        markers: MarkerStyle | None = None,
         destination: str | Path | None = None,
         show: bool = True,
         show_model_slugs: bool = True,
@@ -599,6 +604,7 @@ class PredictionResult:
                 lines. Overlays are never filled, so source pixels remain visible.
             outline_alpha: Annotation and prediction outline opacity in
                 ``[0, 1]``. The default is fully opaque.
+            markers: Shared MarkerStyle for annotation and prediction markers.
             destination: Optional PNG/JPEG/PDF/SVG output path.
             show: Display in an active notebook or interactive backend.
             show_model_slugs: Show the canonical model identifier/hash with
@@ -620,6 +626,7 @@ class PredictionResult:
             line_width=line_width,
             outline_width=outline_width,
             outline_alpha=outline_alpha,
+            markers=markers,
             destination=destination,
             show=show,
         )
@@ -659,36 +666,32 @@ class PredictionResult:
             foreground = prediction.copy()
             if reference is not None:
                 foreground |= reference
-            reference_image, predicted_image = image, image
-            if self.task == "pose":
-                from .comparison.reporting import _draw_panel
+            vector_panels = None
+            if self.task in {"detect", "pose", "polo"}:
+                from .models import DatasetMetadata, Sample, Task
 
-                original = Image.fromarray(image)
-                reference_image = np.asarray(_draw_panel(original, list(record.reference_annotations), truth=True))
-                predicted_image = np.asarray(_draw_panel(original, list(record.objects), truth=False))
+                panels = []
+                for values, color in ((record.reference_annotations, "#D39A52"), (record.objects, "#C86552")):
+                    sample = Sample(record.image_path, Path(record.relative_path), "train",
+                                    record.width, record.height, annotations_from_values(values))
+                    style = markers or MarkerStyle(show_labels=False)
+                    styled = replace(options, markers=replace(style, color=style.color or color))
+                    item = annotation_item(sample, Task.parse(self.task), DatasetMetadata(names={}),
+                                           styled, image=Image.fromarray(image))
+                    foreground |= item.foreground
+                    panels.append(item.panels[0])
+                vector_panels = (replace(panels[0], title="Annotation"),
+                                 replace(panels[1], title="Prediction", heading=model_heading))
             return VisualizationItem(
                 image_path=record.image_path,
                 label=_prediction_key(record.relative_path),
-                panels=(
-                    VisualizationPanel(title="Original", image=image),
-                    VisualizationPanel(
-                        title="Annotation",
-                        image=reference_image,
-                        mask=(
-                            None if self.task == "pose" else np.zeros_like(prediction)
-                            if reference is None
-                            else reference
-                        ),
-                        color="#D39A52",
-                    ),
-                    VisualizationPanel(
-                        title="Prediction",
-                        image=predicted_image,
-                        mask=None if self.task == "pose" else prediction,
-                        color="#C86552",
-                        heading=model_heading,
-                    ),
-                ),
+                panels=(VisualizationPanel(title="Original", image=image), *(
+                    vector_panels if vector_panels is not None else (
+                        VisualizationPanel(title="Annotation", image=image, mask=reference, color="#D39A52"),
+                        VisualizationPanel(title="Prediction", image=image, mask=prediction,
+                                           color="#C86552", heading=model_heading),
+                    )
+                )),
                 foreground=foreground,
             )
 
@@ -721,14 +724,15 @@ class _PredictionCacheRequest:
 class Model:
     """Auto-detected model with a common prediction and comparison API.
 
-    A path to an official nnU-Net trained-model folder is detected from its
-    ``dataset.json``/``plans.json`` files. File checkpoints are treated as
-    Ultralytics-compatible models. Model-specific adapter settings live on the
+    W&B runs, model bundles, local checkpoints, and official nnU-Net folders
+    use the same source resolver as training and Model.load_many(). RF-DETR
+    and Ultralytics checkpoints are detected from their metadata. Model-specific adapter settings live on the
     model instead of being repeated at each evaluation call.
 
     Parameters:
-        source: Ultralytics-compatible checkpoint or official nnU-Net model
-            folder. Passing ``fold_N`` for nnU-Net is normalized to its parent.
+        source: Local Ultralytics/RF-DETR checkpoint, model bundle ZIP, W&B
+            run reference/URL, or official nnU-Net model folder. W&B weights
+            download automatically. Passing ``fold_N`` is normalized to its parent.
         name: Display name; defaults to the file stem or folder name.
         kind: Explicit adapter, or ``"auto"`` to inspect ``source``.
         task: Optional task override. nnU-Net is always semantic segmentation;
@@ -748,8 +752,10 @@ class Model:
         training_dataset: Optional training-data provenance path.
         inference: Default Ultralytics inference mode.
         device: Default inference device.
-        folds: nnU-Net folds selected for prediction.
-        checkpoint: nnU-Net checkpoint filename within each fold.
+        folds: nnU-Net folds selected for prediction; None uses source metadata
+            or fold 0 when unspecified.
+        checkpoint: nnU-Net checkpoint filename within each fold; None uses
+            source metadata or checkpoint_final.pth when unspecified.
         native_tile_size: Source tile size used to create training samples.
         upscale_factor: Input adapter scale used during training. ``None``
             preserves unknown standalone-checkpoint geometry.
@@ -797,8 +803,8 @@ class Model:
         training_dataset: str | Path | None = None,
         inference: Literal["native", "sahi"] = "native",
         device: str | None = None,
-        folds: tuple[int | str, ...] = (0,),
-        checkpoint: str = "checkpoint_final.pth",
+        folds: tuple[int | str, ...] | None = None,
+        checkpoint: str | None = None,
         native_tile_size: int | tuple[int, int] | None = None,
         upscale_factor: int | None = None,
         input_size: int | tuple[int, int] | None = None,
@@ -820,17 +826,30 @@ class Model:
         sahi_model_type: str | None = None,
         settings: Mapping[str, Any] | None = None,
     ) -> None:
-        path = Path(source).expanduser().resolve()
-        if path.name.startswith("fold_") and not (path / "plans.json").is_file():
-            candidate = path.parent
-            if (candidate / "dataset.json").is_file() and (candidate / "plans.json").is_file():
-                if folds == (0,):
-                    folds = (path.name.removeprefix("fold_"),)
-                path = candidate
-        resolved_kind = self._detect_kind(path) if kind == "auto" else kind
+        from .model_sources import resolve_model_source
+
+        resolved = resolve_model_source(source, progress=False)
+        defaults = resolved.options
+        path = resolved.path
+        resolved_kind = defaults.get("kind", "ultralytics") if kind == "auto" else kind
         if resolved_kind not in {"ultralytics", "nnunet", "rfdetr"}:
             raise ValueError("kind must be 'auto', 'ultralytics', 'rfdetr', or 'nnunet'")
-        parsed_name = str(name or (path.stem if path.is_file() else path.name)).strip()
+        parsed_name = str(name if name is not None else resolved.name).strip()
+        task = defaults.get("task") if task in {None, "auto"} else task
+        source_key = source_key or resolved.source
+        model_type = model_type or defaults.get("model_type")
+        source_dataset_zip = source_dataset_zip or defaults.get("source_dataset_zip")
+        source_created_at = source_created_at or defaults.get("source_created_at")
+        wandb = wandb or defaults.get("wandb")
+        folds = tuple(defaults.get("folds", (0,))) if folds is None else folds
+        checkpoint = defaults.get("checkpoint", "checkpoint_final.pth") if checkpoint is None else checkpoint
+        native_tile_size = resolved.geometry.native_tile_size if native_tile_size is None else native_tile_size
+        upscale_factor = resolved.geometry.upscale_factor if upscale_factor is None else upscale_factor
+        if input_size is None and resolution is None:
+            input_size = resolved.geometry.input_size
+        if resolution is None and input_size is None:
+            resolution = defaults.get("resolution")
+        self._resolved_source = resolved
         if not parsed_name:
             raise ValueError("Model name must be non-empty")
         if inference not in {"native", "sahi"}:
@@ -1025,31 +1044,8 @@ class Model:
         self._training_dataset = (
             Path(inferred_training).expanduser().resolve() if inferred_training else None
         )
-
-    @staticmethod
-    def _detect_kind(path: Path) -> ModelKind:
-        if path.is_dir() and (path / "dataset.json").is_file() and (path / "plans.json").is_file():
-            return "nnunet"
-        if path.is_file():
-            if path.suffix.lower() in {".pth", ".ckpt"}:
-                from .rfdetr_engine import NotRFDETRCheckpoint, checkpoint_metadata
-                try:
-                    checkpoint_metadata(path)
-                except NotRFDETRCheckpoint:
-                    pass  # Preserve existing file loading unless RF-DETR is identified.
-                else:
-                    return "rfdetr"
-            return "ultralytics"
-        raise DatasetValidationError(
-            ValidationIssue(
-                "Could not detect a supported model",
-                value=str(path),
-                expected=(
-                    "an Ultralytics-compatible model file or an official nnU-Net "
-                    "folder containing dataset.json and plans.json"
-                ),
-            )
-        )
+        if name is None and self.source_key.startswith("wandb:"):
+            self._apply_automatic_name()
 
     def _initialize_nnunet(
         self,
@@ -1462,7 +1458,7 @@ class Model:
             "settings": settings,
         }
         defaults.update(values)
-        return Model(self.path, name=name or self.name, **defaults)
+        return Model(self._resolved_source, name=name or self.name, **defaults)
 
     def _apply_automatic_name(self) -> None:
         """Build a compact dataset/run/architecture/resolution identity."""
@@ -1506,6 +1502,7 @@ class Model:
         errors: Literal["raise", "skip"] = "raise",
         progress: bool = True,
         destination: str | Path | None = None,
+        markers: MarkerStyle | None = None,
         prediction_cache: bool | str | Path | PredictionCache = True,
         cache_only: bool = False,
         require_probability_maps: bool = False,
@@ -1521,8 +1518,8 @@ class Model:
         sahi_postprocess_class_agnostic: bool | None = None,
         sahi_model_type: str | None = None,
         _keep_native: bool = False,
-    ) -> PredictionResult:
-        """Predict images, directories, datasets, exports, or frozen inputs.
+    ) -> PredictionResult | VideoPredictionResult:
+        """Predict images, videos, directories, datasets, exports, or frozen inputs.
 
         This is the shared inference entry point used by manual prediction,
         collection prediction, and comparison. Heavyweight runtimes and a
@@ -1530,9 +1527,9 @@ class Model:
         instance until :meth:`unload` is called.
 
         Parameters:
-            source: Image path, image directory, sequence of paths or
+            source: Image/video path, directory, sequence of paths or
                 :class:`ModelInput` values, a :class:`Dataset`, or an internal
-                frozen cohort.
+                frozen cohort. Video sources must contain videos only.
             split: Dataset/export split. Defaults to ``"val"`` for dataset-like
                 sources and is ignored for direct image inputs.
             inference: Explicit native or sliced SAHI inference.
@@ -1558,6 +1555,10 @@ class Model:
                 with the configured native tile geometry.
             progress: Show package-managed progress bars.
             destination: Optional new/empty directory receiving saved output.
+                Videos always export annotated MP4 and CSV files; the default
+                is a sibling ``<source-stem>-predictions`` directory.
+            markers: Shared annotation style for video overlays. Image results
+                accept this option on their visualize() method instead.
             prediction_cache: Verified prediction caching. The default ``True`` uses
                 the dataset-local comparison cache for :class:`Dataset`
                 inputs and package-managed storage otherwise. A path is an
@@ -1589,8 +1590,24 @@ class Model:
                 adapter-scale semantic mask.
 
         Returns:
-            Ordered :class:`PredictionResult` values with stable image IDs.
+            Ordered :class:`PredictionResult` values with stable image IDs, or
+            :class:`VideoPredictionResult` with one MP4/CSV pair per input video.
+            Video CSVs use zero-based frame/object indices, source timestamps,
+            and numeric keypoint columns. Object indices are not track IDs.
         """
+
+        # Forward the complete inference API so videos cannot drift from images.
+        video_kwargs = locals().copy()
+        from .video import predict_videos, video_sources
+
+        videos = video_sources(source)
+        if videos is not None:
+            for key in ("self", "source", "destination", "markers"):
+                video_kwargs.pop(key)
+            return predict_videos(self, source, videos, destination=destination,
+                                  markers=markers, predict_kwargs=video_kwargs)
+        if markers is not None:
+            raise ValueError("Pass markers to result.visualize() for image predictions")
 
         errors = normalize_errors(errors)
         if output_task not in {"native", "semantic_segment"}:
@@ -2118,6 +2135,7 @@ class Model:
         line_width: float | None = None,
         outline_width: float = 1.0,
         outline_alpha: float = 1.0,
+        markers: MarkerStyle | None = None,
         destination: str | Path | None = None,
         show: bool = True,
         errors: Literal["raise", "skip"] = "raise",
@@ -2145,6 +2163,7 @@ class Model:
             outline_width: White halo width around annotation and prediction lines.
             outline_alpha: Annotation and prediction outline opacity in
                 ``[0, 1]``. The default is fully opaque.
+            markers: Shared MarkerStyle for annotation and prediction markers.
             destination: Optional PNG/JPEG/PDF/SVG output path.
             show: Display in an active notebook or interactive backend.
             errors: Oversized-input policy forwarded to :meth:`predict`.
@@ -2172,6 +2191,7 @@ class Model:
             line_width=line_width,
             outline_width=outline_width,
             outline_alpha=outline_alpha,
+            markers=markers,
             destination=destination,
             show=show,
         )
@@ -2255,41 +2275,7 @@ class Model:
                     run_file=run_file,
                     progress=True,
                 )
-                known = {
-                    "kind",
-                    "task",
-                    "source_key",
-                    "model_type",
-                    "source_dataset_zip",
-                    "source_created_at",
-                    "wandb",
-                    "resolution",
-                    "training_dataset",
-                    "inference",
-                    "device",
-                    "folds",
-                    "checkpoint",
-                    "native_tile_size",
-                    "upscale_factor",
-                    "input_size",
-                    "model_input_size",
-                    "batch_size",
-                    "workers",
-                    "nnunet_tta",
-                    "confidence",
-                    "postprocess",
-                    "foreground_probability_threshold",
-                    "prediction_threshold",
-                    "sahi_slice_height",
-                    "sahi_slice_width",
-                    "sahi_overlap",
-                    "sahi_overlap_height_ratio",
-                    "sahi_overlap_width_ratio",
-                    "sahi_postprocess_type",
-                    "sahi_postprocess_match_metric",
-                    "sahi_postprocess_class_agnostic",
-                    "sahi_model_type",
-                }
+                known = set(inspect.signature(cls).parameters)
                 adapter_settings = dict(configuration.pop("settings", {}) or {})
                 adapter_settings.update(
                     {
@@ -2298,36 +2284,12 @@ class Model:
                         if key not in known
                     }
                 )
-                constructor = dict(resolved_source.options)
-                constructor.update(configuration)
-                constructor.setdefault(
-                    "native_tile_size", resolved_source.geometry.native_tile_size
-                )
-                constructor.setdefault(
-                    "upscale_factor", resolved_source.geometry.upscale_factor
-                )
-                constructor.setdefault("input_size", resolved_source.geometry.input_size)
-                constructor.setdefault(
-                    "source_key", resolved_source.source or str(raw_source)
-                )
-                model = Model(
-                    resolved_source.path,
-                    name=(
-                        str(raw_name)
-                        if raw_name is not None
-                        else str(explicit_name)
-                        if explicit_name is not None
-                        else resolved_source.name
-                    ),
+                model = cls(
+                    resolved_source,
+                    name=str(raw_name) if raw_name is not None else explicit_name,
                     settings=adapter_settings,
-                    **constructor,
+                    **configuration,
                 )
-                if (
-                    raw_name is None
-                    and explicit_name is None
-                    and model.source_key.startswith("wandb:")
-                ):
-                    model._apply_automatic_name()
             if model.name in seen_names or model.slug in seen_slugs:
                 raise DatasetValidationError(
                     ValidationIssue(
@@ -2472,7 +2434,9 @@ class ModelCollection:
         require_probability_maps: bool = False,
         output_task: Literal["native", "semantic_segment"] = "native",
         unload: bool = False,
-    ) -> dict[str, PredictionResult]:
+        destination: str | Path | None = None,
+        markers: MarkerStyle | None = None,
+    ) -> dict[str, PredictionResult | VideoPredictionResult]:
         """Run every independently configured model on the same inputs.
 
         Each item delegates to :meth:`Model.predict`; this collection method
@@ -2492,6 +2456,8 @@ class ModelCollection:
                 semantic projections. Instance polygons remain cached and are
                 rasterized only in the returned result.
             unload: Release each model runtime after producing its result.
+            destination: Optional output root with one directory per model.
+            markers: Shared MarkerStyle for video overlays.
 
         Returns:
             Prediction results keyed by model name. Resolution, backend,
@@ -2510,6 +2476,8 @@ class ModelCollection:
                 require_probability_maps=require_probability_maps,
                 output_task=output_task,
                 unload=unload,
+                destination=destination,
+                markers=markers,
             )
         }
 
@@ -2525,7 +2493,9 @@ class ModelCollection:
         require_probability_maps: bool = False,
         output_task: Literal["native", "semantic_segment"] = "native",
         unload: bool = False,
-    ) -> Iterator[tuple[Model, PredictionResult]]:
+        destination: str | Path | None = None,
+        markers: MarkerStyle | None = None,
+    ) -> Iterator[tuple[Model, PredictionResult | VideoPredictionResult]]:
         """Yield one independently configured model result at a time.
 
         This is the memory-bounded collection prediction API. Cache lookup,
@@ -2547,6 +2517,8 @@ class ModelCollection:
                 semantic projections.
             unload: Release each model runtime after its yielded result has
                 been consumed and iteration resumes.
+            destination: Optional output root with one directory per model.
+            markers: Shared MarkerStyle for video overlays.
 
         Returns:
             An iterator of ``(model, prediction_result)`` pairs in collection
@@ -2558,18 +2530,17 @@ class ModelCollection:
         # collection and let each Model.predict() consume the verified result.
         # Besides avoiding repeated work and progress bars, materializing the
         # inputs once guarantees that every model sees the identical cohort.
-        inputs, source_task, cache_context = normalize_model_inputs(
-            source,
-            split=split,
-            progress=progress,
-        )
-        normalized_override = (
-            source,
-            split,
-            tuple(inputs),
-            source_task,
-            dict(cache_context),
-        )
+        from .video import video_destination, video_sources
+
+        videos = video_sources(source)
+        if videos is not None:
+            normalized_override = None
+            destination = destination or video_destination(source, videos)
+        else:
+            inputs, source_task, cache_context = normalize_model_inputs(
+                source, split=split, progress=progress,
+            )
+            normalized_override = (source, split, tuple(inputs), source_task, dict(cache_context))
         missing = object()
 
         for model in self.models:
@@ -2589,6 +2560,8 @@ class ModelCollection:
                     cache_only=cache_only,
                     require_probability_maps=require_probability_maps,
                     output_task=output_task,
+                    destination=Path(destination) / model.slug if destination is not None else None,
+                    markers=markers,
                 )
             finally:
                 if previous_override is missing:
@@ -2802,6 +2775,7 @@ class ModelCollection:
         line_width: float | None = None,
         outline_width: float = 1.0,
         outline_alpha: float = 1.0,
+        markers: MarkerStyle | None = None,
         destination: str | Path | None = None,
         show: bool = True,
         include_empty: bool = False,
@@ -2829,6 +2803,7 @@ class ModelCollection:
             line_width: Annotation and prediction colour-line width.
             outline_width: White halo width around annotation and prediction lines.
             outline_alpha: Annotation and prediction opacity in ``[0, 1]``.
+            markers: Shared MarkerStyle for annotation and prediction markers.
             destination: Optional PNG/JPEG/PDF/SVG output path.
             show: Display in an active notebook or interactive backend.
             include_empty: Permit samples whose reference mask is empty.
@@ -2865,6 +2840,7 @@ class ModelCollection:
             line_width=line_width,
             outline_width=outline_width,
             outline_alpha=outline_alpha,
+            markers=markers,
             destination=destination,
             show=show,
         )

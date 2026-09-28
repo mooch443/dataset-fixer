@@ -12,7 +12,7 @@ import warnings
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -21,6 +21,9 @@ from tqdm.auto import tqdm
 from .errors import DatasetValidationError, ValidationIssue
 from .geometry import Geometry, first_value, from_metadata
 from .sources import _atomic_json, cache_root, extract_archive, local_source, sha256_progress
+
+if TYPE_CHECKING:
+    from .model import Model
 
 
 SUPPORTED_BUNDLE_FORMATS = {
@@ -702,6 +705,13 @@ def _checkpoint_metadata(path: Path) -> dict[str, Any]:
     except Exception:
         checkpoint = None
     if isinstance(checkpoint, Mapping):
+        from .rfdetr_engine import NotRFDETRCheckpoint, checkpoint_metadata
+        try:
+            rfdetr = checkpoint_metadata(path, checkpoint=checkpoint)
+        except NotRFDETRCheckpoint:
+            pass
+        else:
+            return {**values, **{key: value for key, value in rfdetr.items() if value is not None}}
         train_args = dict(checkpoint.get("train_args") or {})
         serialized = checkpoint.get("model") or checkpoint.get("ema")
         model_args = dict(getattr(serialized, "args", {}) or {})
@@ -736,6 +746,15 @@ def _resolve_checkpoint(
     progress: bool,
 ) -> ResolvedModelSource:
     metadata = _checkpoint_metadata(path)
+    if metadata.get("framework") == "rfdetr":
+        resolution = metadata["model_config"].get("resolution")
+        return ResolvedModelSource(
+            path, str(name or path.stem),
+            options={"kind": "rfdetr", "task": metadata["task"], "model_type": metadata["model_name"],
+                     "resolution": resolution},
+            geometry=Geometry.create(input_size=resolution),
+            manifest=metadata, source=str(path),
+        )
     train_args = dict(metadata.get("train_args") or {})
     model_args = dict(metadata.get("model_args") or {})
     run_config = dict(getattr(run, "config", {}) or {})
@@ -808,7 +827,7 @@ def _resolve_checkpoint(
 
 
 def resolve_model_source(
-    source: str | Path,
+    source: str | Path | Model | ResolvedModelSource,
     *,
     name: str | None = None,
     run_file: str | None = None,
@@ -816,6 +835,22 @@ def resolve_model_source(
 ) -> ResolvedModelSource:
     """Infer and locally resolve one supported model source."""
 
+    from .model import Model
+
+    if isinstance(source, ResolvedModelSource):
+        return replace(source, name=name) if name is not None else source
+    if isinstance(source, Model):
+        resolved = getattr(source, "_resolved_source", None) or resolve_model_source(source.path, progress=progress)
+        options = {**resolved.options, "kind": source.kind}
+        if source.task is not None:
+            options["task"] = source.task
+        if source.resolution is not None:
+            options["resolution"] = source.resolution
+        if source.kind == "nnunet":
+            options.update(folds=source.folds, checkpoint=source.checkpoint)
+        return replace(resolved, name=name or source.name, options=options, geometry=source.geometry, source=source.source_key)
+    if not isinstance(source, (str, Path)):
+        raise TypeError("weights must be a model path, W&B reference, or dataset-fixer Model")
     raw = str(source)
     run = None
     if raw.startswith("wandb:") or "wandb.ai/" in raw:
@@ -927,7 +962,11 @@ def resolve_model_source(
             options["source_created_at"] = created_at
         options.update(_wandb_option(run, source_key))
         return replace(resolved, source=source_key, options=options)
-    if path.suffix.lower() == ".pt":
+    if path.suffix.lower() in {".pth", ".ckpt"} and path.parent.name.startswith("fold_") and (path.parent.parent / "plans.json").is_file():
+        resolved = resolve_model_source(path.parent, name=resolved_name, progress=progress)
+        return replace(resolved, options={**resolved.options, "checkpoint": path.name},
+                       manifest={**resolved.manifest, **source_metadata}, source=source_key)
+    if path.suffix.lower() in {".pt", ".pth", ".ckpt"}:
         resolved = _resolve_checkpoint(
             path,
             name=resolved_name,
@@ -940,17 +979,8 @@ def resolve_model_source(
             manifest={**resolved.manifest, **source_metadata},
             options={**resolved.options, **_wandb_option(run, source_key)},
         )
-    if path.suffix.lower() in {".pth", ".ckpt"}:
-        if path.parent.name.startswith("fold_") and (path.parent.parent / "plans.json").is_file():
-            resolved = resolve_model_source(path.parent, name=resolved_name, progress=progress)
-            return replace(resolved, options={**resolved.options, "checkpoint": path.name},
-                           manifest={**resolved.manifest, **source_metadata}, source=source_key)
-        from .rfdetr_engine import checkpoint_metadata
-        metadata = checkpoint_metadata(path)
-        return ResolvedModelSource(path, str(resolved_name or path.stem),
-            options={"kind": "rfdetr", "task": metadata["task"], "model_type": metadata["model_name"],
-                     "resolution": metadata["model_config"].get("resolution"), **_wandb_option(run, source_key)},
-            manifest={**metadata, **source_metadata}, source=source_key)
+    if path.is_file() and path.suffix.lower() in {".onnx", ".torchscript", ".engine", ".mlmodel", ".tflite", ".pb"}:
+        return ResolvedModelSource(path, str(resolved_name or path.stem), options={"kind": "ultralytics"}, source=source_key)
     raise DatasetValidationError(
         ValidationIssue(
             "Unsupported model source",

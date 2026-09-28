@@ -5,6 +5,7 @@ import math
 import os
 import random
 import tempfile
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Hashable, Iterable, Literal, Mapping, Sequence
 
@@ -55,6 +56,7 @@ from .utils import IMAGE_SUFFIXES, ensure_safe_destination, normalize_split, set
 from .validation import validate_dataset, _duplicate_split_order
 from .validation_audit import ValidationFailureExample, build_load_validation_audit
 from .visualization import (
+    MarkerStyle,
     display_report,
     normalize_visualize_kwargs,
     visualization_options,
@@ -65,12 +67,15 @@ from .visualization import (
 if TYPE_CHECKING:
     from .dataset_comparison import DatasetComparisonResult
     from .model import Model, PredictionResult
+    from .training import ModelTypes, TrainingConfig
 
 
 def _visualize_kwargs_description(options: Mapping[str, Any]) -> dict[str, Any]:
     description = dict(options)
     if "label_fn" in description:
         description["label_fn"] = callback_description(options["label_fn"])
+    if description.get("markers") is not None:
+        description["markers"] = asdict(description["markers"])
     return description
 
 
@@ -1844,7 +1849,7 @@ class Dataset:
             visualize: Render pending operation audits and display the final
                 canonical ``reports/plots.png`` inline when possible.
             visualize_kwargs: Options forwarded to final report rendering;
-                currently ``label_fn``, ``line_width``, and ``outline_width``.
+                currently ``label_fn``, ``line_width``, ``outline_width``, and ``markers`` (MarkerStyle).
             progress: Show copying, transformation, and validation progress.
             dry_run: Validate the plan and print destinations/settings without
                 writing a dataset.
@@ -1942,7 +1947,7 @@ class Dataset:
             visualize: Render pending operation audits and display each final
                 canonical report inline when possible.
             visualize_kwargs: Options forwarded to report rendering; currently
-                ``label_fn``, ``line_width``, and ``outline_width``.
+                ``label_fn``, ``line_width``, ``outline_width``, and ``markers`` (MarkerStyle).
             progress: Show export progress and ETA.
             dry_run: Validate and print every export without writing outputs.
 
@@ -2034,7 +2039,7 @@ class Dataset:
             destination: Optional output PNG. When omitted, a temporary render
                 is displayed unless the canonical saved report already exists.
             visualize_kwargs: Report options: ``label_fn``, ``label_mode``,
-                ``line_width``, and ``outline_width``.
+                ``line_width``, ``outline_width``, and ``markers`` (MarkerStyle).
             show: Display the resulting PNG inline when possible.
             width: Report width in pixels.
 
@@ -2073,7 +2078,7 @@ class Dataset:
             destination: Optional PNG path or report directory. A directory
                 receives ``plots.png``; comparison tables remain on the result.
             visualize_kwargs: Report options: ``label_fn``, ``label_mode``,
-                ``line_width``, and ``outline_width``.
+                ``line_width``, ``outline_width``, and ``markers`` (MarkerStyle).
             show: Display the comparison PNG inline when possible.
             width: Report width in pixels.
         """
@@ -2094,6 +2099,13 @@ class Dataset:
     def visualize(
         self,
         *,
+        weights: str | Path | Model | None = None,
+        augmentations: Any = None,
+        type: ModelTypes | str | None = None,
+        version: int | None = None,
+        s: str | None = None,
+        model_type: str | None = None,
+        config: TrainingConfig | None = None,
         split: Literal["train", "val", "test"] | None = "train",
         samples: int | None = 12,
         seed: int = 42,
@@ -2107,15 +2119,30 @@ class Dataset:
         line_width: float | None = None,
         outline_width: float | None = None,
         outline_alpha: float = 1.0,
+        markers: MarkerStyle | None = None,
         destination: str | Path | None = None,
         show: bool = True,
     ) -> None:
-        """Render a deterministic contact sheet with task-aware annotations.
+        """Render annotations or native augmented training inputs in a contact sheet.
+
+        Supplying weights, augmentations, config, or a backend selector enables
+        the native training preview. With all omitted, show original annotations.
+        Augmented image/target pairs share all regular visualization options.
 
         Parameters:
+            weights: Base model source: local checkpoint, bundle, W&B run, or
+                loaded dataset-fixer Model. W&B sources download automatically.
+            augmentations: Native augmentation settings, identical to train().
+                None retains native defaults when preview mode is enabled.
+            type: Native backend; inferred from weights, otherwise YOLO.
+            version: Optional native architecture generation, as in train().
+            s: Optional model size/variant, as in train().
+            model_type: Optional task override, as in train().
+            config: Training settings controlling native input geometry/options.
             split: One split to sample, or ``None`` for all splits.
             samples: Maximum number of images, or ``None`` for all images.
-            seed: Deterministic image-sampling seed.
+            seed: Deterministic image-sampling and preview-augmentation seed.
+                Overrides config.seed for the preview only.
             columns: Contact-sheet column count.
             panel_size: Approximate width and height of each image panel in inches.
             zoom: Crop each image to its annotation extent. Empty images retain
@@ -2131,6 +2158,8 @@ class Dataset:
             line_width: Annotation-colour line width in rendered preview pixels.
             outline_width: White annotation-outline width in preview pixels.
             outline_alpha: Annotation opacity in ``[0, 1]``.
+            markers: MarkerStyle controlling marker size, shape, colours,
+                labels, boxes, keypoints, and skeleton visibility.
             destination: Optional PNG/JPEG/PDF/SVG output path.
             show: Display in an active notebook or interactive backend.
 
@@ -2155,12 +2184,21 @@ class Dataset:
             line_width=line_width,
             outline_width=outline_width,
             outline_alpha=outline_alpha,
+            markers=markers,
             destination=destination,
             show=show,
         )
         normalized = normalize_split(split) if split is not None else None
         if normalized is not None and normalized not in self.splits:
             raise ValueError(f"Unknown split {split!r}; available splits are {self.splits}")
+        if any(value is not None for value in (weights, augmentations, type, version, s, model_type, config)):
+            from .training.preview import visualize_augmentations
+
+            return visualize_augmentations(
+                self, augmentations=augmentations, weights=weights, type=type,
+                version=version, s=s, model_type=model_type, config=config,
+                split=normalized, options=options,
+            )
         if self.format == "semantic_masks":
             return visualize_semantic_masks(
                 self._samples,

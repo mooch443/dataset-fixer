@@ -514,7 +514,7 @@ def test_real_rfdetr_data_and_augmentation(pose, tmp_path):
     assert targets[0]["keypoints"].shape == (1, 8, 3)
     assert images.tensors.shape[-1] == 96
     output = tmp_path / "augmentation.png"
-    df.preview_augmentations(pose, {"HorizontalFlip": {"p": 1}}, type=df.ModelTypes.RFDETR, config=replace(result.config, resolution=384),
+    pose.visualize(augmentations={"HorizontalFlip": {"p": 1}}, type=df.ModelTypes.RFDETR, config=replace(result.config, resolution=384),
                              samples=1, destination=output, show=False)
     assert output.stat().st_size > 1000
     shutil.copyfile(output, "/tmp/dataset-fixer-native-augmentation.png")
@@ -643,9 +643,9 @@ def test_rfdetr_native_progress_default_and_overrides(pose, tmp_path, backend_op
 @pytest.mark.parametrize("preview", [False, True])
 def test_rfdetr_invalid_augmentations_fail_before_preparation(pose, monkeypatch, augmentations, preview):
     monkeypatch.setattr("dataset_fixer.training.backends.prepare_data", lambda *_: pytest.fail("prepared invalid options"))
-    command = df.preview_augmentations if preview else df.train
+    command = pose.visualize if preview else lambda **kwargs: df.train(pose, **kwargs)
     with pytest.raises(ValueError):
-        command(pose, type=df.ModelTypes.RFDETR, augmentations=augmentations,
+        command(type=df.ModelTypes.RFDETR, augmentations=augmentations,
                 config=df.TrainingConfig(resolution=96))
 
 
@@ -818,7 +818,7 @@ def test_native_yolo_one_epoch(pose, tmp_path, run):
     resumed = df.train(pose, resume=result.bundle.path, callbacks=[started], config=replace(result.config,
                       output_dir=tmp_path / "resumed", epochs=2))
     assert starts[0][0] == 1 and starts[0][1] > 0 and resumed.best_weights.is_file()
-    df.preview_augmentations(pose, {"mosaic": 0.0}, type=df.ModelTypes.YOLO, version=26, s="n",
+    pose.visualize(augmentations={"mosaic": 0.0}, type=df.ModelTypes.YOLO, version=26, s="n",
                             config=df.TrainingConfig(resolution=64, workers=0), samples=1,
                             destination=tmp_path / "yolo-augmentation.png", show=False)
     shutil.copyfile(tmp_path / "yolo-augmentation.png", "/tmp/dataset-fixer-yolo-augmentation.png")
@@ -837,7 +837,7 @@ def test_yolo_preview_combines_native_and_custom_transforms(pose, tmp_path, monk
         return native
     monkeypatch.setattr(build, "build_yolo_dataset", capture)
     output = tmp_path / "native-augmentations.png"
-    df.preview_augmentations(pose, {"mosaic": mosaic, "augmentations": [A.Blur(p=1.0)]},
+    pose.visualize(augmentations={"mosaic": mosaic, "augmentations": [A.Blur(p=1.0)]},
         type=df.ModelTypes.YOLO, version=26, s="n", samples=1, show=False, destination=output,
         config=df.TrainingConfig(workers=0, backend_options={"rect": rect, "imgsz": 96, "batch": 1}))
     native = seen[0]
@@ -876,7 +876,7 @@ def test_yolo_augmented_masks_use_native_dataset_builder(tmp_path, semantic):
     if semantic:
         data = data.export(destination=tmp_path / "masks", format="semantic_masks", visualize=False, progress=False)
     output = tmp_path / "mask-augmentation.png"
-    df.preview_augmentations(data, {"mosaic": 1.0, "augmentations": [A.Blur(p=1.0)]},
+    data.visualize(augmentations={"mosaic": 1.0, "augmentations": [A.Blur(p=1.0)]},
         type=df.ModelTypes.YOLO, version=26, s="n", config=df.TrainingConfig(resolution=64, workers=0),
         samples=1, show=False, destination=output)
     assert output.stat().st_size > 1000
@@ -906,7 +906,7 @@ def test_native_nnunet_one_epoch(tmp_path, monkeypatch, run):
     with pytest.raises(ValueError, match="optimizer state"):
         select(data, resume=result.wandb_bundle.path)
     assert select(data, weights=result.best_weights).name == "nnUNetPlannerResEncM"
-    df.preview_augmentations(data, type=df.ModelTypes.NNUNET, config=result.config, samples=1,
+    data.visualize(type=df.ModelTypes.NNUNET, config=result.config, samples=1,
                              destination=tmp_path / "nnunet-augmentation.png", show=False)
     shutil.copyfile(tmp_path / "nnunet-augmentation.png", "/tmp/dataset-fixer-nnunet-augmentation.png")
 

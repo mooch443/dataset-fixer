@@ -24,9 +24,10 @@ from .comparison.plot_labels import (
 )
 from .tracing import DatasetTrace, DatasetTraceNode, SampleTrace
 from .utils import bounded_slug
+from .visualization import MarkerStyle
+from .video import VideoPrediction, VideoPredictionResult
 from .training import (train, ModelTypes, TrainingConfig, CheckpointConfig, CheckpointProvider,
-                       Checkpoints, WandbConfig, TrainingEvent, TrainingSession, TrainingResult,
-                       preview_augmentations)
+                       Checkpoints, WandbConfig, TrainingEvent, TrainingSession, TrainingResult)
 
 try:
     from ._version import __version__
@@ -35,7 +36,7 @@ except ImportError:  # source tree before setuptools-scm has generated the file
 
 __all__ = [
     "train", "ModelTypes", "TrainingConfig", "CheckpointConfig", "CheckpointProvider", "Checkpoints",
-    "WandbConfig", "TrainingEvent", "TrainingSession", "TrainingResult", "preview_augmentations",
+    "WandbConfig", "TrainingEvent", "TrainingSession", "TrainingResult", "MarkerStyle",
     "Dataset",
     "DatasetComparisonResult",
     "calibrate_prediction_thresholds",
@@ -51,6 +52,8 @@ __all__ = [
     "ModelCollection",
     "ModelInput",
     "PredictionResult",
+    "VideoPrediction",
+    "VideoPredictionResult",
     "PredictionCache",
     "PredictionCacheMissError",
     "PredictionScoreUnavailableError",

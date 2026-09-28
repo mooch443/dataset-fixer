@@ -6,15 +6,15 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 if TYPE_CHECKING:
     from ..dataset import Dataset
+    from ..model import Model
 
 from .config import (ModelTypes, TrainingConfig, CheckpointConfig, CheckpointProvider,
                      Checkpoints, WandbConfig, TrainingEvent, TrainingCallback)
 from .session import TrainingResult, TrainingSession
-from .preview import preview_augmentations
 
 
 def train(dataset: Dataset | str | Path, *, type: ModelTypes | str | None = None, version: int | None = None,
-          s: str | None = None, model_type: str | None = None, weights: str | Path | None = None,
+          s: str | None = None, model_type: str | None = None, weights: str | Path | Model | None = None,
           resume: str | Path | None = None, config: TrainingConfig | None = None, augmentations: Any = None,
           checkpointing: CheckpointConfig | CheckpointProvider | None = None, wandb: WandbConfig | bool | None = None,
           callbacks: Sequence[TrainingCallback] = (), session: TrainingSession | None = None) -> TrainingResult:
@@ -31,7 +31,7 @@ def train(dataset: Dataset | str | Path, *, type: ModelTypes | str | None = None
         version: Installed YOLO architecture generation, or nnU-Net version 2.
         s: Installed native model size/variant selector.
         model_type: Explicit task override; None infers validated annotations.
-        weights: Best weights, bundle, or W&B run initializing a fresh optimizer.
+        weights: Best weights, bundle, W&B run, or Model initializing a fresh optimizer.
         resume: Full-state checkpoint or bundle; mutually exclusive with weights.
         config: Shared training settings and advanced native backend options.
         augmentations: Backend-native augmentation configuration, shared with preview.
@@ -84,4 +84,4 @@ def _train(dataset, selection, config, augmentations, checkpointing, wandb, call
 
 
 __all__ = ["train", "ModelTypes", "TrainingConfig", "CheckpointConfig", "CheckpointProvider", "Checkpoints",
-           "WandbConfig", "TrainingEvent", "TrainingCallback", "TrainingSession", "TrainingResult", "preview_augmentations"]
+           "WandbConfig", "TrainingEvent", "TrainingCallback", "TrainingSession", "TrainingResult"]

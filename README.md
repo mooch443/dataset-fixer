@@ -181,13 +181,58 @@ Authentication uses `ROBOFLOW_API_KEY` from the environment or Colab Secrets,
 or the SDK's existing authentication.
 
 Keep augmentation configuration separate from run settings, then pass the
-same object to `preview_augmentations()` and `train()`:
+same object to `dataset.visualize()` and `train()`:
 
 ```python
 augmentations = {"Affine": {"rotate": (-20, 20), "p": 0.5}}
-df.preview_augmentations(dataset, augmentations, type=df.ModelTypes.RFDETR,
-                         config=settings, samples=3)
+dataset.visualize(augmentations=augmentations, type=df.ModelTypes.RFDETR,
+                  config=settings, samples=3)
 ```
+
+`dataset.visualize()` replaces the standalone augmentation-preview function.
+Without model or training arguments it shows the original annotations. Supplying
+`weights`, `augmentations`, `config`, or backend selectors enables paired native
+augmented-image / training-target panels. `weights` accepts a W&B run reference,
+a local checkpoint or model bundle, or an existing `df.Model`; it uses the same
+resolver and download cache as model loading and training:
+
+```python
+style = df.MarkerStyle(
+    radius=5, shape="circle", color="#ff00ff", fill=False,
+    keypoint_colors={0: "cyan", "nose": "yellow"},
+    show_boxes=False, show_keypoints=True, show_skeleton=True,
+    show_labels=True, label_size=12,
+)
+dataset.visualize(
+    weights=weights,  # "wandb:entity/project/run-id", "/models/best.pt", or df.Model
+    augmentations=augmentations,
+    config=settings,
+    split="train", samples=6, seed=42, columns=2, panel_size=3,
+    zoom=True, context_fraction=0.2, minimum_context=100,
+    markers=style, line_width=2, outline_width=4, outline_alpha=0.9,
+    label_fn=lambda path: path.stem,
+)
+```
+
+All existing visualization arguments work in both modes, including `samples=None`,
+`split=None`, label callbacks, output formats, and `show=False`. `split` selects
+the source pool; preview mode applies the native **training** transforms to that
+pool, including when selecting validation or test images. Mixing/mosaic stays
+within that pool. Callbacks receive the original source image path (the anchor
+image for mixed samples). `seed` controls sampling and augmentation, overriding
+`config.seed` for this preview without changing the supplied config or caller's
+random state. A checkpoint's input resolution is used when available and not
+overridden in `config`. Model weights select the backend/geometry; previews do
+not run predictions or update weights.
+
+`MarkerStyle` is the single annotation style across datasets, predictions,
+comparison reports, and augmentation previews. Pass the same object to other
+`visualize(markers=style)` calls, or to report/export/tiling options with
+`visualize_kwargs={"markers": style}`. Shapes are `"circle"`, `"square"`,
+`"diamond"`, and `"cross"`; keypoint colours accept zero-based indices or names.
+Marker radius and font size are measured after zoom/resize in contact sheets.
+Skeletons use dataset metadata and omit invisible keypoints. Report renders
+use the same style in their raster's pixel coordinates.
 
 Previews use native augmented samples and dataset-fixer's existing renderer.
 RF-DETR accepts its augmentation dictionary; YOLO accepts native augmentation
@@ -213,8 +258,8 @@ settings = df.TrainingConfig(
     resolution=1280, epochs=50, batch_size=14,
     backend_options={"optimizer": "AdamW", "lr0": 1e-4, "cos_lr": True},
 )
-df.preview_augmentations(dataset, AUG_CONFIG, type=df.ModelTypes.YOLO,
-                         version=26, s="s", config=settings)
+dataset.visualize(augmentations=AUG_CONFIG, type=df.ModelTypes.YOLO,
+                  version=26, s="s", config=settings)
 result = df.train(dataset, type=df.ModelTypes.YOLO, version=26, s="s",
                   config=settings, augmentations=AUG_CONFIG)
 ```
@@ -502,7 +547,7 @@ coverage and position distributions when available, and deterministic annotated
 examples. Visualization callbacks and line styling are forwarded unchanged.
 All public `visualize()` entry points share `samples`, `columns`, `seed`,
 `panel_size`, `zoom`, `context_fraction`, `minimum_context`, `label_fn`,
-`label_mode`, `line_width`, `outline_width`, `outline_alpha`, `destination`,
+`label_mode`, `line_width`, `outline_width`, `outline_alpha`, `markers`, `destination`,
 and `show`. Visualizations use aligned, fixed-size letterboxed cards and return
 `None`. `show=True` renders a static PNG in notebooks; `destination` accepts
 PNG, JPEG, PDF, or SVG without enabling an interactive renderer.
@@ -905,6 +950,52 @@ utilities. Direct `Model.predict` defaults to native prediction. Configure a
 model with `inference="sahi"` to opt it into tiled inference; no
 availability-based selection or fallback is performed.
 
+Video paths, sequences of video paths, and directories containing videos are
+accepted by the same entry point:
+
+```python
+videos = model.predict(
+    "/data/wolves.mp4",
+    destination="/data/wolves-predictions",  # new or empty directory
+    batch_size=8,
+    markers=df.MarkerStyle(radius=3, shape="circle", show_boxes=False),
+)
+print(videos[0].video_path)  # annotated MP4
+print(videos[0].csv_path)    # one row per object, numeric keypoint columns
+```
+
+Video inference delegates bounded batches of lossless decoded frames to the
+same image predictors and verified cache. RF-DETR, YOLO, and nnU-Net retain
+their supported tasks, device/threshold settings, native/SAHI capabilities,
+and semantic projection options. `prediction_cache=False` avoids persisting
+frame predictions; `cache_only=True` requires every batch to be cached. Frame
+images are temporary and removed after prediction. `VideoPredictionResult`
+contains artifact paths and per-video statistics instead of keeping all frames
+or masks in memory. `ModelCollection.predict()` also accepts videos and writes
+one output directory per model.
+
+Each input produces an annotated H.264 MP4, a CSV, and an entry in
+`manifest.json`. The displayed frame dimensions and timestamps are retained,
+including rotation and variable frame timing; the first audio track is retained as AAC
+stereo. No external FFmpeg executable is needed. Without `destination`, output
+goes to a sibling `<source-stem>-predictions` directory. Existing nonempty
+destinations are rejected, and failed requests never publish partial output.
+Pass images and videos in separate requests.
+
+CSV `frame` and `object_index` are zero-based; `timestamp_seconds` is elapsed
+time from the first video frame. Coordinates are absolute displayed-frame pixels
+(after applying the video's rotation).
+Pose output has `keypoint_0_x`, `keypoint_0_y`,
+`keypoint_0_confidence`, and corresponding columns for subsequent keypoints.
+Class and keypoint names are recorded in the manifest when available from the
+model. Keypoint columns include poses first encountered late in the clip.
+Frames without detections have an `empty` row with blank object fields;
+semantic models have one `semantic` row per frame containing foreground pixel
+count and fraction. Instance polygons are stored in `polygons_json`.
+`object_index` identifies detections within a frame; prediction does not track
+identities across frames. Video overlays reuse the same `MarkerStyle` and
+annotation renderer as dataset and prediction visualizations.
+
 Direct prediction caching is enabled by default. Dataset inputs use the same
 cache base as `Model.compare()`, so either operation can reuse compatible
 predictions. Pass `prediction_cache=False` only when a result should not be
@@ -1080,9 +1171,19 @@ evaluation; changing one model recomputes only that model. Caching is always
 enabled and has no public switch.
 
 Dataset ZIPs are accepted directly by the unchanged `Dataset.open()` API.
-Likewise, `Model.load_many()` accepts local `.pt` files, nnU-Net folders,
-portable bundle ZIPs, `wandb:entity/project/run-id` references, full W&B run
-URLs, model objects, and mappings. Drive inputs are copied to local Colab
+Both `Model(source, ...)` and `Model.load_many(...)` resolve local YOLO/RF-DETR
+checkpoints (`.pt`, `.pth`, `.ckpt`), nnU-Net folders, portable bundle ZIPs,
+`wandb:entity/project/run-id` references (also with `/runs/run-id`), and full W&B
+run URLs. RF-DETR architecture, task, and input geometry come from checkpoint
+metadata. Direct construction accepts device and resolution overrides:
+
+```python
+model = Model(BASE_WEIGHTS, device="mps")
+dataset.visualize(weights=model, config=df.TrainingConfig(resolution=1296))
+```
+
+`Model.load_many()` also accepts model objects, sequences, and named mappings.
+Drive inputs are copied to local Colab
 storage, downloads and safe extraction are atomic, and unchanged inputs are
 reused from the automatic cache. Standalone checkpoints with unproven training
 geometry still load; configure only the missing values after resolving names:

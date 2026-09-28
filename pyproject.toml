@@ -22,6 +22,7 @@ classifiers = [
 dependencies = [
   "albumentations>=2.0.8,<3",
   "altair[save]>=6.2,<7",
+  "av>=18,<19",
   "batchgeneratorsv2>=0.3.2",
   "ipython>=7.34",
   "nnunetv2>=2.8.1,<3",
