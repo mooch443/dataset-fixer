@@ -23,6 +23,8 @@ def native_options(config, aliases):
 
 def prepare_data(result):
     selection, config = result.selection, result.config
+    if selection.family == ModelTypes.ID:
+        return None  # Identity samples already have lazy source references.
     kind = Kind.YOLO_SEM if selection.task == "semantic_segment" else Kind.YOLO
     if selection.family == ModelTypes.RFDETR:
         kind = Kind.RFDETR
@@ -62,6 +64,7 @@ def weights_checkpoint(source, family, destination):
         ModelTypes.RFDETR: ("optimizer", "optimizer_states", "lr_scheduler", "lr_schedulers",
                            "scaler", "native_amp_scaling_state", "amp_scaling_state"),
         ModelTypes.NNUNET: ("optimizer_state", "grad_scaler_state"),
+        ModelTypes.ID: ("optimizer_states", "lr_schedulers", "native_amp_scaling_state"),
     }[family]
     if not any(saved.get(key) is not None for key in training_keys):
         return source  # Native RF-DETR best weights are already stripped.

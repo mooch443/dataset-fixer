@@ -13,6 +13,8 @@
 writes safe, reproducible YOLO derivatives for detection, segmentation, pose,
 and POLO point-localization tasks.
 
+The optional [`dataset_fixer.id` module](docs/identification.md) trains individual-identification models with lazy image/NPZ sources, clip/tracklet diversity policies, enrollment galleries, and calibrated unknown rejection. Install it with `pip install 'dataset-fixer[id]'`.
+
 ```python
 from dataset_fixer import Dataset
 

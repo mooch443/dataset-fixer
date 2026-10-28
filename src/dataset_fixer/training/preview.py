@@ -59,9 +59,12 @@ def _preview_seed(seed):
 def visualize_augmentations(dataset, *, augmentations, weights, type, version, s,
                            model_type, config, split, options):
     """Prepare native targets, then delegate all presentation to visualization."""
+    if dataset.task.value == "id":
+        from ..id.evaluation import augmentation_preview
+        return augmentation_preview(dataset, augmentations, config, split, options, weights=weights)
     from ..convert import _semantic_case_id, _yolo_relative_path
     from ..planning import clone_sample
-    from ..visualization import annotation_item, finish_visualization, select_visualization_records, visualize_records
+    from ..visualization import annotation_item, finish_visualization, select_visualization_records, visualize_records, VisualizationItem
     from .backends import prepare_data
 
     candidates = [sample for sample in dataset._samples if split is None or sample.split == split]
@@ -113,8 +116,12 @@ def visualize_augmentations(dataset, *, augmentations, weights, type, version, s
                 import cv2
                 foreground = ((semantic > 0) & (semantic != 255)).astype(np.uint8)
                 mask = cv2.resize(foreground, (sample.width, sample.height), interpolation=cv2.INTER_NEAREST) > 0
-            items.append(annotation_item(sample, dataset.task, dataset._metadata, options,
-                                         image=Image.fromarray(pixels), mask=mask, paired=True))
+            augmented = annotation_item(sample, dataset.task, dataset._metadata, options,
+                                        image=Image.fromarray(pixels), mask=mask, paired=False)
+            original = annotation_item(source, dataset.task, dataset._metadata, options, paired=False)
+            items.append(VisualizationItem(source.image_path, augmented.label,
+                (replace(original.panels[0], title="Original"), replace(augmented.panels[0], title="Augmented")),
+                augmented.foreground))
         chart = visualize_records(items, options=replace(options, samples=None), prepare=lambda item: item,
                                   title=f"{selection.name} — native augmentation pipeline")
         return finish_visualization(chart, options)
@@ -193,3 +200,25 @@ def _native_samples(result, prepared, augmentations, source_lookup, selected):
                 torch.set_num_threads(old_threads)
         train_nnunet(result, prepared, augmentations, preview=collect)
     return rows
+
+
+
+def publish_augmentation_preview(result, augmentations):
+    """Shared startup artifact, rendered locally once and logged to the owned run."""
+    if result.config.augmentation_samples == 0:
+        return
+    from ..visualization import VisualizationOptions
+    config = result.config
+    if result.selection.family == ModelTypes.ID:
+        config = replace(config, backend_options={**config.backend_options,
+                         "preprocessing": result.metadata["identity"]["preprocessing"]})
+    path = result.output_dir / "augmentations.png"
+    options = VisualizationOptions(samples=config.augmentation_samples, columns=3, seed=config.seed, show=False, destination=path)
+    with _preview_seed(config.seed):
+        visualize_augmentations(result.dataset, augmentations=augmentations,
+            weights=result.selection.weights, type=result.selection.family, version=None, s=None,
+            model_type=result.selection.task, config=config, split="train", options=options)
+    result.auxiliary_files["training/augmentations.png"] = path
+    if result.wandb_run is not None:
+        import wandb
+        result.wandb_run.log({"training/augmentations": wandb.Image(str(path))})

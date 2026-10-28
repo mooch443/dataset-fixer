@@ -189,14 +189,32 @@ class TrainingResult:
         if final or self._best_upload_pending or (checkpoints.epoch is not None and (checkpoints.epoch + 1) % self.checkpoint_config.every_n_epochs == 0):
             self._publish()
 
-    def evaluate(self, *, samples=32, plots=6, split="val"):
+    def evaluate(self, *, samples=32, plots=6, split="val", rejection=None):
         """Bounded evaluation through the existing comparison and rendering APIs.
 
         Parameters:
-            samples: Maximum number of images in the evaluation cohort.
+            samples: Maximum detection evaluation images; ID uses its complete fixed cohort.
             plots: Maximum prediction examples; zero disables the example grid.
             split: Held-out dataset split, defaulting to validation.
+            rejection: Optional identity-gallery rejection calibration.
         """
+        if self.selection.family == ModelTypes.ID:
+            from ..id.evaluation import evaluate
+            protocol = self._identity_protocol
+            report = evaluate(self.model, protocol.queries[split], gallery=self._enrollment(),
+                              rejection=rejection, split=split, novel_identities=protocol.novel_identities[split],
+                              unknown_identities=protocol.unknown_identities[split],
+                              destination=self.output_dir / "evaluation" / split, limitations=protocol.limitations, plots=plots)
+            self.metrics[f"evaluation/{split}"] = to_jsonable(report.ranking.to_dict(orient="records"))
+            for path in report.location.rglob("*"):
+                if path.is_file():
+                    self.auxiliary_files[f"evaluation/{split}/{path.relative_to(report.location).as_posix()}"] = path
+            if self.wandb_run is not None:
+                self.wandb_run.summary.update({f"evaluation/{split}": self.metrics[f"evaluation/{split}"]})
+            self.finished = False
+            return report
+        if rejection is not None:
+            raise ValueError("rejection is only supported for identity models")
         try:
             cohort = self.dataset.sample(samples, split=split, seed=self.config.seed)
             result = self.model.compare(cohort, split=split, destination=self.output_dir / "evaluation", save_prediction_plots=False)
@@ -212,6 +230,32 @@ class TrainingResult:
         except BaseException as exc:
             self._record_error(exc)
             raise
+
+    def _enrollment(self):
+        from ..id.model import fingerprint
+        gallery = getattr(self, "_identity_gallery", None)
+        if gallery is None or gallery.model_fingerprint != fingerprint(self.model):
+            protocol = self._identity_protocol
+            gallery = self.model.enroll(protocol.references, samples_per_identity=protocol.gallery_samples)
+            self._identity_gallery = gallery
+            self.auxiliary_files["identity/gallery.npz"] = gallery.save(self.output_dir / "gallery.npz")
+        return gallery
+
+    def calibrate(self, *, target_fpir=0.01):
+        """Calibrate rejection using only reserved unknown validation queries.
+
+        Parameters:
+            target_fpir: Maximum requested false-positive identification rate.
+        """
+        if self.selection.family != ModelTypes.ID:
+            raise ValueError("calibrate() currently requires an identity model")
+        from ..id.evaluation import calibrate
+        protocol = self._identity_protocol
+        calibration = calibrate(self.model, protocol.queries["val"], gallery=self._enrollment(),
+                                unknown_identities=protocol.unknown_identities["val"], target_fpir=target_fpir)
+        self.auxiliary_files["identity/rejection.json"] = calibration.save(self.output_dir / "rejection.json")
+        self.finished = False
+        return calibration
 
     def _record_error(self, error):
         if self.error is not None:
@@ -404,7 +448,7 @@ class TrainingSession:
         if chosen is False:
             raise ValueError("Training requires checkpoints; supply a CheckpointProvider to customize them")
         if chosen is None:
-            settings = CheckpointConfig()
+            settings = CheckpointConfig(wandb_upload="best") if selection.family == ModelTypes.ID else CheckpointConfig()
         elif isinstance(chosen, CheckpointConfig):
             settings = chosen
         else:

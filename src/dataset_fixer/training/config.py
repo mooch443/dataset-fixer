@@ -11,6 +11,7 @@ class ModelTypes(str, Enum):
     YOLO = "ultralytics"
     RFDETR = "rfdetr"
     NNUNET = "nnunet"
+    ID = "id"
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class TrainingConfig:
         seed: Reproducibility seed.
         output_dir: New run directory; defaults to a unique local cache folder.
         backend_options: Native options, callbacks, and custom trainer settings.
+        augmentation_samples: Paired startup preview count; zero disables automatic grids.
     """
     resolution: int | None = None
     epochs: int | None = None
@@ -39,8 +41,11 @@ class TrainingConfig:
     seed: int = 7
     output_dir: str | Path | None = None
     backend_options: Mapping[str, Any] = field(default_factory=dict)
+    augmentation_samples: int = 12
 
     def __post_init__(self):
+        if isinstance(self.augmentation_samples, bool) or not isinstance(self.augmentation_samples, int) or self.augmentation_samples < 0:
+            raise ValueError("augmentation_samples must be a non-negative integer")
         for name in ("resolution", "epochs", "batch_size"):
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):

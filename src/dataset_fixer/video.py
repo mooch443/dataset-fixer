@@ -25,7 +25,20 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class VideoPrediction:
-    """Saved predictions for one video, without retaining decoded frames."""
+    """Saved predictions for one video, without retaining decoded frames.
+
+    Parameters:
+        source: Original input video.
+        video_path: Rendered prediction video.
+        csv_path: Per-frame prediction table.
+        frames: Number of processed frames.
+        width: Output frame width in pixels.
+        height: Output frame height in pixels.
+        fps: Output frame rate.
+        objects: Total object predictions.
+        inference_seconds: Time spent predicting frames.
+        audio: Whether the rendered video retains audio.
+    """
 
     source: Path
     video_path: Path
@@ -46,6 +59,12 @@ class VideoPredictionResult:
     ``result[0].video_path`` and ``result[0].csv_path`` locate the first pair.
     The manifest includes model identity, effective settings, and class and
     keypoint names. Frames and predictions are streamed instead of retained.
+
+    Parameters:
+        model_name: Predicting model's display name.
+        task: Prediction task.
+        location: Output artifact directory.
+        records: Saved artifacts in input-video order.
     """
 
     model_name: str

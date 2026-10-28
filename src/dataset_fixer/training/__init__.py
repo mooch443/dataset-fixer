@@ -15,7 +15,7 @@ from .session import TrainingResult, TrainingSession
 
 def train(dataset: Dataset | str | Path, *, type: ModelTypes | str | None = None, version: int | None = None,
           s: str | None = None, model_type: str | None = None, weights: str | Path | Model | None = None,
-          resume: str | Path | None = None, config: TrainingConfig | None = None, augmentations: Any = None,
+          resume: str | Path | None = None, backbone: Any = None, config: TrainingConfig | None = None, augmentations: Any = None,
           checkpointing: CheckpointConfig | CheckpointProvider | None = None, wandb: WandbConfig | bool | None = None,
           callbacks: Sequence[TrainingCallback] = (), session: TrainingSession | None = None) -> TrainingResult:
     """Train using a native backend and return selected weights and evaluation APIs.
@@ -33,6 +33,7 @@ def train(dataset: Dataset | str | Path, *, type: ModelTypes | str | None = None
         model_type: Explicit task override; None infers validated annotations.
         weights: Best weights, bundle, W&B run, or Model initializing a fresh optimizer.
         resume: Full-state checkpoint or bundle; mutually exclusive with weights.
+        backbone: Identity encoder name or registered custom model instance.
         config: Shared training settings and advanced native backend options.
         augmentations: Backend-native augmentation configuration, shared with preview.
         checkpointing: Checkpoint settings/provider overriding session defaults.
@@ -45,14 +46,29 @@ def train(dataset: Dataset | str | Path, *, type: ModelTypes | str | None = None
     """
     from ..dataset import Dataset
     from .selection import select
+    protocol = None
+    if type == "id" or getattr(getattr(dataset, "task", None), "value", None) == "id":
+        from ..id.evaluation import Protocol
+        protocol = dataset if isinstance(dataset, Protocol) else Protocol(dataset if isinstance(dataset, Dataset) else Dataset.open(dataset, format="identity_manifest"))
+        dataset = protocol.training
+        type = ModelTypes.ID
+    if backbone is not None and type != ModelTypes.ID:
+        raise ValueError("backbone is an identity-model option")
     if not isinstance(dataset, Dataset):
         dataset = Dataset.open(dataset)
     dataset.assert_trainable(backend=False)
     if not {"train", "val"} <= set(dataset.splits):
         raise ValueError("Training requires explicit train and validation splits")
     config = config or TrainingConfig()
-    selection = select(dataset, type=type, version=version, s=s, model_type=model_type,
-                       weights=weights, resume=resume, config=config)
+    if type == ModelTypes.ID:
+        from ..id.training import select_identity
+        if version is not None or s is not None or model_type not in (None, "id"):
+            raise ValueError("Identity models use backbone= instead of detector version/size/task selectors")
+        selection = select_identity(dataset, backbone=backbone, weights=weights, resume=resume, config=config)
+        selection.metadata["protocol"] = protocol
+    else:
+        selection = select(dataset, type=type, version=version, s=s, model_type=model_type,
+                           weights=weights, resume=resume, config=config)
     from .augmentations import validate_augmentations
     validate_augmentations(selection.family, config, augmentations)
     if session is None:
@@ -68,7 +84,14 @@ def _train(dataset, selection, config, augmentations, checkpointing, wandb, call
     result = session._register(dataset, selection, config, checkpointing=checkpointing, wandb=wandb, callbacks=callbacks)
     try:
         prepared = prepare_data(result)
-        ADAPTERS[selection.family](result, prepared, augmentations)
+        if selection.family == ModelTypes.ID:
+            from ..id.training import train_identity
+            result._identity_protocol = selection.metadata["protocol"]
+            train_identity(result, prepared, augmentations)
+        else:
+            from .preview import publish_augmentation_preview
+            publish_augmentation_preview(result, augmentations)
+            ADAPTERS[selection.family](result, prepared, augmentations)
         from ..comparison.inference import _clear_accelerator_memory
         _clear_accelerator_memory(config.device)
         if result.best_weights is None:

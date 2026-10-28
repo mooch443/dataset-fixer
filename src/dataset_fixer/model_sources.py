@@ -335,13 +335,14 @@ def _resolve_bundle(path: Path, *, name: str | None, progress: bool) -> Resolved
         first_value(model_metadata.get("framework"), manifest.get("framework"), "")
     ).lower() in {"nnunet", "nnunetv2", "nnunet-v2"}
     is_rfdetr = str(model_metadata.get("framework") or manifest.get("framework")) == "rfdetr"
-    if is_rfdetr:
+    is_id = str(model_metadata.get("framework") or manifest.get("framework")) == "id"
+    if is_rfdetr or is_id:
         checkpoint = model_metadata.get("checkpoint")
         if not checkpoint:
             raise ValueError("RF-DETR bundle must identify its selected checkpoint")
         source_path = _one(list(manifest_root.rglob(Path(checkpoint).name)), "RF-DETR checkpoint")
         _validate_checkpoint(source_path, manifest, progress=progress)
-        options.update(kind="rfdetr", task=model_metadata.get("task", manifest.get("task")),
+        options.update(kind="id" if is_id else "rfdetr", task=model_metadata.get("task", manifest.get("task")),
                        model_type=model_metadata.get("model_name", "rfdetr"))
         if geometry.input_size and geometry.input_size[0] == geometry.input_size[1]:
             options["resolution"] = geometry.input_size[0]
@@ -705,6 +706,8 @@ def _checkpoint_metadata(path: Path) -> dict[str, Any]:
     except Exception:
         checkpoint = None
     if isinstance(checkpoint, Mapping):
+        if checkpoint.get("identity", {}).get("framework") == "id":
+            return {**values, **checkpoint["identity"], "task": "id"}
         from .rfdetr_engine import NotRFDETRCheckpoint, checkpoint_metadata
         try:
             rfdetr = checkpoint_metadata(path, checkpoint=checkpoint)
@@ -746,6 +749,11 @@ def _resolve_checkpoint(
     progress: bool,
 ) -> ResolvedModelSource:
     metadata = _checkpoint_metadata(path)
+    if metadata.get("framework") == "id":
+        resolution = metadata["preprocessing"]["resolution"]
+        return ResolvedModelSource(path, str(name or path.stem),
+            options={"kind": "id", "task": "id", "model_type": metadata["backbone"], "resolution": resolution},
+            geometry=Geometry.create(input_size=resolution), manifest=metadata, source=str(path))
     if metadata.get("framework") == "rfdetr":
         resolution = metadata["model_config"].get("resolution")
         return ResolvedModelSource(

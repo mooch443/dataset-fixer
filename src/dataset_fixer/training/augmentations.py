@@ -62,7 +62,10 @@ def validate_rfdetr_augmentations(value, *, flip_pairs=None):
 
 def validate_augmentations(family, config, value):
     from .config import ModelTypes
-    if family == ModelTypes.YOLO:
+    if family == ModelTypes.ID:
+        from ..id.model import augmentation_pipeline
+        augmentation_pipeline(value, seed=config.seed)
+    elif family == ModelTypes.YOLO:
         from .backends import _yolo_options
         _yolo_options(config, value)
     elif family == ModelTypes.RFDETR:

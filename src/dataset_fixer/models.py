@@ -19,6 +19,7 @@ class Task(str, Enum):
     SEGMENT = "segment"
     POSE = "pose"
     POLO = "polo"
+    ID = "id"
 
     @classmethod
     def parse(
@@ -53,6 +54,7 @@ class Annotation:
     radius: float | None = None
     source_id: str | int | None = None
     polygon_holes: list[list[tuple[float, float]]] | None = None
+    identity_id: str | None = None
 
     def clone(self, **updates: Any) -> "Annotation":
         values = {
@@ -69,6 +71,7 @@ class Annotation:
             "point": self.point,
             "radius": self.radius,
             "source_id": self.source_id,
+            "identity_id": self.identity_id,
         }
         values.update(updates)
         return Annotation(**values)
@@ -84,6 +87,11 @@ class Sample:
     annotations: list[Annotation] = field(default_factory=list)
     source_sha256: str | None = None
     provenance: dict[str, Any] = field(default_factory=dict)
+    identity_id: str | None = None
+    clip_id: str | None = None
+    frame_index: int | None = None
+    local_id: int | None = None
+    image_ref: Any = None
 
 
 @dataclass

@@ -48,7 +48,10 @@ def freeze_cohort(dataset: "Dataset", split: str, *, progress: bool = False) -> 
     ):
         annotations = tuple(to_jsonable(annotation_dict(annotation)) for annotation in sample.annotations)
         encoded = json.dumps(annotations, sort_keys=True, separators=(",", ":")).encode()
-        image_hash = sample.source_sha256 or sha256_file(sample.image_path)
+        image_hash = sample.source_sha256 or (
+            hashlib.sha256(sample.image_ref.read().tobytes()).hexdigest()
+            if sample.image_ref is not None else sha256_file(sample.image_path)
+        )
         provenance = sample.provenance or {}
         original_hash = provenance.get("original_sha256") or image_hash
         # Combine content with the source-relative logical image name. Content

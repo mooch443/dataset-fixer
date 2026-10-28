@@ -1,8 +1,7 @@
 """Internal, content-addressed source caching and archive extraction.
 
-This module deliberately has no public cache knobs.  Dataset and model APIs
-use the same resolver so notebooks do not need to copy Drive files or unpack
-archives themselves.
+Dataset and model APIs use the same resolver. DATASET_FIXER_CACHE_DIR optionally
+chooses local scratch storage; otherwise the environment selects a default.
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ def in_colab() -> bool:
 def cache_root() -> Path:
     """Return the package-managed cache root for the current environment."""
 
-    root = (
+    root = Path(os.environ["DATASET_FIXER_CACHE_DIR"]).expanduser() if os.environ.get("DATASET_FIXER_CACHE_DIR") else (
         Path("/content/dataset-fixer-cache")
         if in_colab()
         else Path("~/.cache/dataset-fixer").expanduser()

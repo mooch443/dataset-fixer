@@ -45,6 +45,8 @@ def clone_sample(
         annotations=list(sample.annotations) if annotations is None else annotations,
         source_sha256=sample.source_sha256,
         provenance=dict(sample.provenance),
+        identity_id=sample.identity_id, clip_id=sample.clip_id,
+        frame_index=sample.frame_index, local_id=sample.local_id, image_ref=sample.image_ref,
     )
 
 
@@ -86,17 +88,8 @@ def plan_split(
             )
         locked[group] = target
 
-    counts: Counter[str] = Counter()
-    for group, target in locked.items():
-        counts[target] += len(groups[group])
-        assignments.update({str(sample.image_path): target for sample in groups[group]})
-    remaining = [group for group in groups if group not in locked]
-    random.Random(seed).shuffle(remaining)
-    targets = {split: ratio * len(chosen) for split, ratio in normalized.items()}
-    for group in remaining:
-        eligible = [split for split, ratio in normalized.items() if ratio > 0]
-        target = max(eligible, key=lambda split: (targets[split] - counts[split]) / max(targets[split], 1))
-        counts[target] += len(groups[group])
+    allocated = allocate_groups({key: len(value) for key, value in groups.items()}, normalized, locked, seed)
+    for group, target in allocated.items():
         assignments.update({str(sample.image_path): target for sample in groups[group]})
 
     resolved_groups = {
@@ -118,6 +111,23 @@ def plan_split(
     }
     projected = [clone_sample(sample, split=assignments[str(sample.image_path)]) for sample in chosen]
     return projected, settings, assignments
+
+
+def allocate_groups(sizes, ratios, locked, seed):
+    """Assign indivisible groups using the shared weighted-deficit policy."""
+    counts: Counter[str] = Counter()
+    assigned = dict(locked)
+    for group, target in locked.items():
+        counts[target] += sizes[group]
+    remaining = [group for group in sizes if group not in locked]
+    random.Random(seed).shuffle(remaining)
+    targets = {split: ratio * sum(sizes.values()) for split, ratio in ratios.items()}
+    eligible = [split for split, ratio in ratios.items() if ratio > 0]
+    for group in remaining:
+        target = max(eligible, key=lambda split: (targets[split] - counts[split]) / max(targets[split], 1))
+        counts[target] += sizes[group]
+        assigned[group] = target
+    return assigned
 
 
 def normalize_split_ratios(ratios: Mapping[str, float]) -> dict[str, float]:

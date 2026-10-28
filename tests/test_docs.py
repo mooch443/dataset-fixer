@@ -8,6 +8,7 @@ import dataset_fixer.bundle as bundle_api
 import dataset_fixer.comparison as comparison_api
 import dataset_fixer.convert as convert_api
 import dataset_fixer.wandb as wandb_api
+import dataset_fixer.id as identity_api
 from dataset_fixer import (
     ComparisonResult,
     Dataset,
@@ -43,6 +44,8 @@ def test_public_api_inventory_is_typed_and_documented() -> None:
         "provenance",
         "training_ready",
         "split",
+        "holdout",
+        "with_sampling",
         "move_images_with_classes",
         "move_n_groups",
         "remove_classes",
@@ -151,7 +154,7 @@ def _assert_parameters_documented(target: object, label: str) -> None:
 
 
 def test_every_exported_public_api_parameter_is_documented() -> None:
-    modules = (dataset_fixer, bundle_api, convert_api, wandb_api)
+    modules = (dataset_fixer, bundle_api, convert_api, wandb_api, identity_api)
     for module in modules:
         for name in module.__all__:
             exported = getattr(module, name)

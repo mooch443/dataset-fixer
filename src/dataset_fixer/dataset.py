@@ -232,8 +232,12 @@ class Dataset:
         errors: Literal["raise", "skip"] = "raise",
         polygon_repair: PolygonRepairConfig | Mapping[str, Any] | None = None,
         progress: bool = True,
+        format: str | None = None,
+        layout: str | None = None,
+        identities: str | Path | None = None,
+        trim_black_borders: bool | None = None,
     ) -> "Dataset":
-        """Load YOLO, COCO, or semantic-mask data and validate it.
+        """Load detection, semantic-mask, or explicitly selected identity data.
 
         Parameters:
             location: Dataset root, YOLO YAML, COCO JSON, or a
@@ -266,10 +270,22 @@ class Dataset:
                 close, and re-vectorize every segmentation polygon in memory.
                 The default ``None`` leaves polygon geometry unchanged.
             progress: Show image-loading and validation progress bars.
+            format: Optional identity_folders, identity_manifest, or trex_npz reader.
+            layout: Identity-folder template containing identity_id and image fields.
+            identities: TRex global-identity workbook; unmapped crops stay unlabeled.
+            trim_black_borders: Identity images lazily remove purely black outer rows/columns.
+                None preserves manifest settings and otherwise defaults to True; False disables trimming.
 
         Returns:
             A materialized, validated dataset index.
         """
+
+        if format in {"identity_folders", "identity_manifest", "trex_npz"}:
+            from .id.data import open_dataset
+            return open_dataset(location, format=format, layout=layout, identities=identities, name=name,
+                                trim_black_borders=trim_black_borders)
+        if format is not None:
+            raise ValueError(f"Unknown explicit input format: {format}")
 
         # ZIP handling belongs to the internal source resolver so this public
         # signature remains identical for directories, manifests, and archives.
@@ -676,6 +692,8 @@ class Dataset:
         self._attach_provenance()
 
     def _attach_provenance(self) -> None:
+        if not self._provenance:
+            return
         for sample in self._samples:
             try:
                 key = str(sample.image_path.resolve().relative_to(self._location))
@@ -715,7 +733,7 @@ class Dataset:
         *,
         name: str | None = None,
         source_splits: Iterable[Literal["train", "val", "test"]] | None = None,
-        group_by: Callable[[Path], Hashable] | None = None,
+        group_by: Callable[[Path], Hashable] | str | tuple[str, ...] | None = None,
         assign: Callable[[Path], Literal["train", "val", "test"] | None] | None = None,
         seed: int = 42,
         visualize: bool = True,
@@ -746,6 +764,10 @@ class Dataset:
             A virtual dataset with projected split membership.
         """
 
+        if self.task == Task.ID:
+            from .id.data import split_dataset
+            return split_dataset(self, ratios, group_by=group_by, assign=assign,
+                                 source_splits=source_splits, seed=seed, name=name)
         self._require_vector_annotations("Dataset.split")
         source_split_values = tuple(source_splits) if source_splits is not None else None
         projected, settings, _ = plan_split(
@@ -764,6 +786,30 @@ class Dataset:
             operation, samples=projected, name=name,
             planned_splits=tuple(split for split in ("train", "val", "test") if settings["ratios"].get(split, 0) > 0),
         )
+
+    def holdout(self, *, clip_id: str, identity_ids: Sequence[str] | None = None,
+                to_split: Literal["train", "val", "test"] = "test") -> "Dataset":
+        """Return an identity view holding out a clip or selected individuals.
+
+        Parameters:
+            clip_id: Complete observation/clip identifier.
+            identity_ids: Individuals to move; None moves every individual in the clip.
+            to_split: Destination split, defaulting to test.
+        """
+        from .id.data import holdout
+        return holdout(self, clip_id=clip_id, identity_ids=identity_ids, to_split=to_split)
+
+    def with_sampling(self, *, balance_by: Sequence[str] = ("identity_id", "clip_id"),
+                      samples_per_epoch: int | None = None, max_per_batch: Mapping[str, int] | None = None) -> "Dataset":
+        """Configure fresh hierarchical identity sampling and batch diversity caps.
+
+        Parameters:
+            balance_by: Metadata fields in hierarchical sampling order.
+            samples_per_epoch: Draw count per epoch; None uses the eligible row count.
+            max_per_batch: Optional clip_id/tracklet_id/identity_id caps; constrained batches may be smaller.
+        """
+        from .id.data import with_sampling
+        return with_sampling(self, balance_by=balance_by, samples_per_epoch=samples_per_epoch, max_per_batch=max_per_batch)
 
     def move_images_with_classes(
         self,
@@ -1816,7 +1862,7 @@ class Dataset:
         *,
         destination: str | Path | None = None,
         name: str | None = None,
-        format: Literal["yolo", "semantic_masks"] = "yolo",
+        format: Literal["yolo", "semantic_masks", "identity_manifest"] = "yolo",
         splits: Iterable[Literal["train", "val", "test"]] | None = None,
         allow_lossy: bool | Literal["bridge-holes"] = False,
         visualize: bool = True,
@@ -1859,6 +1905,16 @@ class Dataset:
             virtual dataset.
         """
 
+        if self.task == Task.ID:
+            from .id.data import export_manifest, index_of, as_dataset
+            if format != "identity_manifest":
+                raise ValueError("Identity data exports references with format='identity_manifest'")
+            if destination is None:
+                raise ValueError("Choose a destination for the identity manifest")
+            if dry_run:
+                return self
+            selected = as_dataset(index_of(self).where(split=list(splits)), parent=self) if splits else self
+            return export_manifest(selected, destination)
         self._require_vector_annotations("Dataset.export")
         format = format.lower()
         if format not in {"yolo", "semantic_masks"}:
@@ -2047,6 +2103,9 @@ class Dataset:
             The persistent report path, or ``None`` for a temporary display.
         """
 
+        if self.task == Task.ID:
+            from .id.inspection import dataset_report
+            return dataset_report(self, destination=destination, show=show, width=width)
         from .dataset_comparison import render_dataset_overview
 
         return render_dataset_overview(
@@ -2199,6 +2258,9 @@ class Dataset:
                 version=version, s=s, model_type=model_type, config=config,
                 split=normalized, options=options,
             )
+        if self.task == Task.ID:
+            from .id.evaluation import visualize_identity
+            return visualize_identity(self, options=options, split=normalized)
         if self.format == "semantic_masks":
             return visualize_semantic_masks(
                 self._samples,
@@ -2252,6 +2314,13 @@ class Dataset:
             raise ValueError(
                 f"Unknown split {split!r}; available splits are {self.splits}"
             )
+        if self.task == Task.ID:
+            from .id.data import index_of, as_dataset
+            index = index_of(self)
+            if normalized is not None:
+                index = index.where(split=normalized)
+            selected = sorted(random.Random(seed).sample(range(len(index)), min(n, len(index))))
+            return as_dataset(index.take(selected), parent=self)
         candidates = [
             sample
             for sample in self._samples
@@ -2346,6 +2415,17 @@ class Dataset:
             raise ValueError(
                 f"Unknown split {split!r}; available splits are {self.splits}"
             )
+        if self.task == Task.ID and has_prediction is not None:
+            from .id.data import filter_predictions
+            return filter_predictions(self, predictions, has_prediction=has_prediction,
+                                      gt_annotated=gt_annotated, split=normalized_split)
+        if self.task == Task.ID and has_prediction is None:
+            from .id.data import index_of, as_dataset
+            index = index_of(self)
+            if normalized_split is not None:
+                index = index.where(split=normalized_split)
+            matches = index.frame.identity_id.notna() == gt_annotated
+            return as_dataset(index.take(matches.to_numpy().nonzero()[0]), parent=self)
         if model is not None:
             from .model import Model
 
@@ -2637,6 +2717,14 @@ class Dataset:
                 )
             )
 
+        if self.task == Task.ID:
+            from .id.data import index_of
+            index = index_of(self)
+            for split in required_splits:
+                if not ((index.frame.split == normalize_split(split)) & index.frame.identity_id.notna()).any():
+                    raise DatasetValidationError(f"Identity training requires labeled {split} observations")
+            return
+
         issues: list[ValidationIssue] = []
         required = tuple(normalize_split(split) for split in required_splits)
         available_splits = {sample.split for sample in self._samples}
@@ -2893,6 +2981,9 @@ class Dataset:
         return "\n".join(lines)
 
     def _summary_counts(self) -> dict[str, Any]:
+        if self.task == Task.ID:
+            from .id.data import summary_counts
+            return summary_counts(self)
         samples = frame(
             (
                 {

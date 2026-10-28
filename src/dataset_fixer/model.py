@@ -36,8 +36,8 @@ from .visualization import (
 )
 from .video import VideoPredictionResult
 
-ModelKind = Literal["ultralytics", "nnunet", "rfdetr"]
-PredictionTask = Literal["detect", "segment", "pose", "polo", "semantic_segment"]
+ModelKind = Literal["ultralytics", "nnunet", "rfdetr", "id"]
+PredictionTask = Literal["detect", "segment", "pose", "polo", "semantic_segment", "id"]
 ModelTask = PredictionTask | Literal["auto", "locate", "semantic"]
 _MAX_INFERENCE_BATCH_SIZE = 128
 
@@ -172,9 +172,30 @@ class ImagePrediction:
     reference_annotations: tuple[dict[str, Any], ...] = field(default=(), compare=False, repr=False)
 
     @property
+    def embedding(self):
+        """Normalized identity features, when produced by an ID model."""
+        value = self.metadata.get("embedding")
+        return np.asarray(value, dtype=np.float32) if value is not None else None
+
+    @property
+    def identity_id(self):
+        return self.metadata.get("identity_id")
+
+    @property
+    def similarity(self):
+        """Cosine similarity to the best enrolled identity, never a probability."""
+        return self.metadata.get("similarity")
+
+    @property
+    def rejected(self):
+        return self.metadata.get("rejected")
+
+    @property
     def count(self) -> int:
         """Number of object predictions, or foreground pixels for a mask."""
 
+        if "identity_id" in self.metadata and "embedding" in self.metadata:
+            return int(self.identity_id is not None and not self.rejected)
         if self.mask is not None:
             return int(np.count_nonzero(self.mask))
         return len(self.objects)
@@ -520,6 +541,8 @@ class PredictionResult:
                         "relative_path": record.relative_path,
                         "width": record.width,
                         "height": record.height,
+                        **({"identity_id": record.identity_id, "similarity": record.similarity,
+                            "rejected": record.rejected, "metadata": record.metadata} if self.task == "id" else {}),
                         "predictions": [
                             {
                                 "class_id": value.class_id,
@@ -630,6 +653,9 @@ class PredictionResult:
             destination=destination,
             show=show,
         )
+        if self.task == "id":
+            from .id.evaluation import visualize_identity
+            return visualize_identity(self, options=options)
         if not self.records:
             raise ValueError("PredictionResult contains no images")
         if not isinstance(show_model_slugs, bool):
@@ -832,8 +858,8 @@ class Model:
         defaults = resolved.options
         path = resolved.path
         resolved_kind = defaults.get("kind", "ultralytics") if kind == "auto" else kind
-        if resolved_kind not in {"ultralytics", "nnunet", "rfdetr"}:
-            raise ValueError("kind must be 'auto', 'ultralytics', 'rfdetr', or 'nnunet'")
+        if resolved_kind not in {"ultralytics", "nnunet", "rfdetr", "id"}:
+            raise ValueError("kind must be 'auto', 'ultralytics', 'rfdetr', 'nnunet', or 'id'")
         parsed_name = str(name if name is not None else resolved.name).strip()
         task = defaults.get("task") if task in {None, "auto"} else task
         source_key = source_key or resolved.source
@@ -1486,6 +1512,43 @@ class Model:
         )
         self._slug = slugify(self._name)
 
+    def enroll(self, source, *, samples_per_identity=20, **kwargs):
+        """Enroll reference images without changing model weights.
+
+        Parameters:
+            source: Labeled identity dataset or lazy sample references.
+            samples_per_identity: Maximum clip-balanced references per individual.
+        """
+        if self.kind != "id":
+            raise ValueError("Enrollment requires an identity model")
+        from .id.gallery import enroll
+        return enroll(self, source, samples_per_identity=samples_per_identity, **kwargs)
+
+    def calibrate(self, source, *, gallery, unknown_identities, target_fpir=0.01):
+        """Calibrate rejection against explicit unknown validation identities.
+
+        Parameters:
+            source: Validation identity dataset.
+            gallery: Fixed enrollment gallery for the operating point.
+            unknown_identities: Validation individuals absent from the gallery.
+            target_fpir: Maximum requested false-positive identification rate.
+        """
+        if self.kind != "id":
+            raise ValueError("Identity rejection calibration requires an identity model")
+        from .id.evaluation import calibrate
+        return calibrate(self, source, gallery=gallery, unknown_identities=unknown_identities, target_fpir=target_fpir)
+
+    def embed(self, source, **kwargs):
+        """Return normalized identity embeddings in the shared PredictionResult.
+
+        Parameters:
+            source: Images, lazy references or identity dataset to embed.
+        """
+        if self.kind != "id":
+            raise ValueError("Embedding requires an identity model")
+        from .id.model import embed
+        return embed(self, source, **kwargs)
+
     def predict(
         self,
         source: Any,
@@ -1518,6 +1581,10 @@ class Model:
         sahi_postprocess_class_agnostic: bool | None = None,
         sahi_model_type: str | None = None,
         _keep_native: bool = False,
+        gallery: Any = None,
+        mode: str = "closed",
+        rejection: Any = None,
+        track_by: Any = None,
     ) -> PredictionResult | VideoPredictionResult:
         """Predict images, videos, directories, datasets, exports, or frozen inputs.
 
@@ -1527,6 +1594,10 @@ class Model:
         instance until :meth:`unload` is called.
 
         Parameters:
+            gallery: ID enrollment gallery; required for identification.
+            mode: ID query policy, closed or open.
+            rejection: Validation-calibrated rejection for open ID queries.
+            track_by: Optional supplied local tracking-group fields for feature aggregation.
             source: Image/video path, directory, sequence of paths or
                 :class:`ModelInput` values, a :class:`Dataset`, or an internal
                 frozen cohort. Video sources must contain videos only.
@@ -1597,6 +1668,14 @@ class Model:
         """
 
         # Forward the complete inference API so videos cannot drift from images.
+        if self.kind == "id":
+            from .id.model import predict
+            result = predict(self, source, gallery=gallery, mode=mode, rejection=rejection,
+                           split=split, batch_size=batch_size, device=device,
+                           prediction_cache=prediction_cache, cache_only=cache_only, track_by=track_by)
+            if destination is not None:
+                result.save(destination)
+            return result
         video_kwargs = locals().copy()
         from .video import predict_videos, video_sources
 
@@ -2062,10 +2141,18 @@ class Model:
         min_connected_component_area: float | None = None,
         group_by: Callable[[Path], Hashable] | None = None,
         model_identity: Literal["hash", "name", "both"] = "hash",
+        gallery: Any = None,
+        rejection: Any = None,
+        unknown_identities: Sequence[str] = (),
+        novel_identities: Sequence[str] = (),
     ) -> Any:
         """Evaluate this model on one frozen dataset cohort.
 
         Parameters:
+            gallery: ID enrollment gallery, or inferred from an id.Protocol source.
+            rejection: Optional gallery-specific ID rejection calibration.
+            unknown_identities: Explicit query identities absent from the gallery.
+            novel_identities: Enrolled query identities unseen during encoder training.
             source: Fixed, on-disk :class:`Dataset` to evaluate.
             split: Dataset split forming the frozen evaluation cohort.
             save_prediction_plots: Write annotated comparison grids under
@@ -2104,6 +2191,20 @@ class Model:
             settings come exclusively from this model.
         """
 
+        if self.kind == "id":
+            from .id.evaluation import Protocol, evaluate
+            from .id.data import index_of, as_dataset
+            if isinstance(source, Protocol):
+                gallery = gallery or self.enroll(source.references, samples_per_identity=source.gallery_samples)
+                unknown_identities, novel_identities = source.unknown_identities[split], source.novel_identities[split]
+                source = source.queries[split]
+            else:
+                source = as_dataset(index_of(source).where(split=split), parent=source)
+            if gallery is None:
+                raise ValueError("Pass an enrollment gallery or id.Protocol to compare identity models")
+            return evaluate(self, source, gallery=gallery, rejection=rejection, split=split,
+                            unknown_identities=unknown_identities, novel_identities=novel_identities, destination=destination,
+                            plots=6 if save_prediction_plots else 0)
         return ModelCollection((self,)).compare(
             source,
             split=split,
@@ -3840,7 +3941,7 @@ def _normalize_prediction_task(value: Any) -> PredictionTask | None:
     normalized = str(value).strip().lower()
     aliases = {"locate": "polo", "semantic": "semantic_segment"}
     normalized = aliases.get(normalized, normalized)
-    if normalized not in {"detect", "segment", "pose", "polo", "semantic_segment"}:
+    if normalized not in {"detect", "segment", "pose", "polo", "semantic_segment", "id"}:
         raise ValueError(
             "task must be 'auto', 'detect', 'segment', 'pose', 'polo'/'locate', "
             "or 'semantic_segment'/'semantic'"
