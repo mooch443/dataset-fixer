@@ -120,7 +120,7 @@ class TrainingResult:
 
     def _announce(self, resolution):
         source = self.selection.resume or self.selection.weights or "native pretrained/default"
-        print(f"Training {self.selection.name}: task={self.selection.task}, resolution={resolution}, initialization={source}")
+        print(f"Training {self.selection.name}: task={self.selection.task}, resolution={resolution}, initialization={source}", flush=True)
 
     @property
     def retention_pending(self) -> bool:
@@ -470,7 +470,9 @@ class TrainingSession:
                 options.update(project=selected_wandb.project, entity=selected_wandb.entity,
                                name=selected_wandb.name or output.name, dir=str(output))
                 options.setdefault("mode", "online")
+                print("Initializing W&B run", flush=True)
                 run, owns = sdk.init(**options), True
+                print("W&B run ready", flush=True)
         result = TrainingResult(dataset, selection, config, output, self, settings, provider,
                                 (*self.callbacks, *callbacks), run, owns)
         self.results.append(result)
@@ -478,11 +480,13 @@ class TrainingSession:
             folder = Path(settings.backup_dir)
             if Path("/content/drive") in folder.parents and not Path("/content/drive/MyDrive").is_dir():
                 raise RuntimeError("Mount Google Drive before enabling a Drive checkpoint backup")
+            print(f"Checking checkpoint backup directory: {folder}", flush=True)
             folder.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryFile(dir=folder) as probe:
                 probe.write(b"dataset-fixer backup probe")
                 probe.flush()
                 os.fsync(probe.fileno())
+            print("Checkpoint backup directory is writable", flush=True)
         if self.disconnect and run is None and not settings.backup_dir:
             raise ValueError("Safe disconnect needs W&B or a persistent backup destination")
         return result

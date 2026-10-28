@@ -275,6 +275,11 @@ def test_identity_wandb_lifecycle(identity_data, tmp_path, monkeypatch, run):
         assert len(run.artifacts) == 3  # first best plus two improvements, no plateau upload
         result.evaluate(split='test',plots=0)
     assert any('training/augmentations' in entry for entry in logged)
+    batches = [entry for entry in logged if 'progress/batch' in entry]
+    assert [entry['progress/epoch'] for entry in batches] == [0, 1, 2, 3]
+    assert all(entry['progress/batch'] == 1 and np.isfinite(entry['train/batch_loss']) for entry in batches)
+    assert all(a['progress/global_step'] < b['progress/global_step'] for a, b in zip(batches, batches[1:]))
+    assert any(args == ('train/batch_loss',) and kwargs['step_metric'] == 'progress/global_step' for args, kwargs in definitions)
     projections = [entry for entry in logged if 'embeddings/tsne' in entry]
     assert [entry['epoch'] for entry in projections] == [0,1,2,3]
     assert any(args == ('val/loss',) and kwargs['summary']=='min' for args,kwargs in definitions)
@@ -318,6 +323,48 @@ def test_resume_preserves_best_when_validation_does_not_improve(identity_data, t
     assert resumed.best_value == 1. and resumed.best_epoch == 0
     for key,value in original['state_dict'].items():
         assert torch.equal(value,selected['state_dict'][key])
+
+
+@pytest.mark.parametrize('accumulation', [1, 2])
+def test_native_plain_display_and_batch_telemetry(identity_data, tmp_path, monkeypatch, capsys, run, accumulation):
+    import dataset_fixer as df
+    from lightning.pytorch.callbacks import ModelSummary, TQDMProgressBar
+    from dataset_fixer.id import training
+    id.register_backbone('display-tiny', tiny_model, feature_dim=4,
+                         preprocessing=dict(resolution=16, mean=[0]*3, std=[1]*3))
+    logged, trainers, losses = [], [], []
+    monkeypatch.setattr(run, 'log', lambda value, **kw: logged.append(value))
+    monkeypatch.setattr(run, 'define_metric', lambda *args, **kwargs: None, raising=False)
+    original_step = training._IdentityModule._step
+    def step(self, batch, stage):
+        loss = original_step(self, batch, stage)
+        if stage == 'train':
+            losses.append(float(loss.detach()))
+        return loss
+    monkeypatch.setattr(training._IdentityModule, '_step', step)
+    native = training.Trainer
+    def build(**kwargs):
+        trainer = native(**kwargs)
+        trainers.append(trainer)
+        return trainer
+    monkeypatch.setattr(training, 'Trainer', build)
+    result = id.train(identity_data.with_sampling(samples_per_epoch=8), backbone='display-tiny',
+        augmentations=[], wandb=df.WandbConfig(run=run), config=TrainingConfig(
+            epochs=1, batch_size=4, workers=0, augmentation_samples=0, output_dir=tmp_path/'display',
+            backend_options=dict(pretrained=False, embedding_dim=4, embedding_samples=0,
+                                 trainer=dict(precision='bf16-mixed', log_every_n_steps=2,
+                                              accumulate_grad_batches=accumulation))))
+    assert any(type(cb) is TQDMProgressBar for cb in trainers[0].callbacks)
+    assert any(type(cb) is ModelSummary for cb in trainers[0].callbacks)
+    assert all('Rich' not in type(cb).__name__ for cb in trainers[0].callbacks)
+    progress = [entry for entry in logged if 'progress/batch' in entry]
+    assert [entry['progress/global_step'] for entry in progress] == ([1, 2] if accumulation == 1 else [0, 1])
+    assert all(np.isfinite(entry['train/batch_loss']) for entry in progress)
+    assert [entry['train/batch_loss'] for entry in progress] == pytest.approx(losses)
+    assert result.best_weights.is_file()
+    stdout = capsys.readouterr().out
+    assert 'validation sanity check complete' in stdout
+    assert 'first training batch completed' in stdout
 
 
 def test_custom_instance_freeze_and_cache(identity_data,tmp_path):

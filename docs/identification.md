@@ -110,6 +110,8 @@ Predefined backbones: `resnet18`, `efficientnet_v2_s`, `convnext_tiny`. Arbitrar
 
 Without explicit batch caps, the progress bar reports the complete batch count: `samples_per_epoch=50_000` and `batch_size=64` produce 782 training batches. Explicit `max_per_batch` caps can produce smaller batches and keep the count unknown until sampled.
 
+ID training explicitly uses Lightning's tqdm progress bar and plain model summary, avoiding an additional Rich live-rendering layer in notebooks with W&B console capture. Native `trainer.enable_progress_bar` and `trainer.enable_model_summary` switches still apply. Flushed startup messages identify W&B initialization, the backup-directory check, augmentation rendering, sampler preparation, monitor-cohort selection, validation sanity checks and the first completed training batch. Timings separate dataset preparation from actual training.
+
 By default every eligible validation image is evaluated every epoch. For a large dataset, set `backend_options={"validation_samples": 8192}` to select a fixed validation subset balanced across identities, clips and tracklets. It is selected once from the seed, is unchanged across epochs/resume, and is used for validation loss and checkpoint selection. The limit must cover every validation identity. Startup output and training metadata report selected/available counts. `None` retains full validation. Final `result.evaluate(split="test")` still uses the full test query cohort.
 
 On an NVIDIA L4, enable native Lightning mixed precision and PyTorch's faster float32 matmul policy explicitly:
@@ -214,6 +216,8 @@ No parallel plotting engine, identity-specific model/result hierarchy, or custom
 Every epoch renders a scikit-learn t-SNE projection of a fixed, balanced cohort of up to 512 training/validation crops, using the **current** encoder and deterministic preprocessing. Selection and monitoring preserve training RNGs and model mode. Identity colors and cohort membership remain fixed; refitted 2D coordinates are not a longitudinal distance metric. Set `backend_options={"embedding_samples": 512, "embedding_method": "tsne"}` (`"pca"` is also supported; samples `0` disables it).
 
 W&B receives one image per epoch under `embeddings/tsne`, giving a single media panel with step history/slider. `epoch` is the shared zero-based axis; captions display one-based epoch numbers. Monitor `train/loss`, `val/loss`, `val/monitor_rank1`, `optim/lr`, `time/epoch_seconds`, and `time/monitor_seconds`. The diagnostic Rank-1 uses only the small fixed cohort and is separate from final evaluation. Selection remains validation loss. The cohort manifest, latest coordinates and image enter the checkpoint bundle; local epoch images and W&B history retain earlier views.
+
+Before an epoch finishes, `progress/batch`, `progress/epoch` (zero-based) and `train/batch_loss` report completed batches against `progress/global_step` (optimizer steps). They update after the first batch of each epoch and every `backend_options['trainer']['log_every_n_steps']` batches (default 50; zero retains just the first-batch update). Batch loss is the loss for that batch before gradient-accumulation scaling; `train/loss` remains the epoch aggregate. These metrics help distinguish an inactive loader/process from a long epoch without changing checkpoint selection.
 
 ```python
 display(id.stats(data))  # samples, labeled/unlabeled, individuals, clips, tracklets

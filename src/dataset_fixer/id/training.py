@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset as TorchDataset, DataLoader, WeightedRandomSampler, Sampler
 from lightning.pytorch import LightningModule, LightningDataModule, Trainer, seed_everything
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint, ModelSummary, TQDMProgressBar
 
 from ..training.config import ModelTypes, Checkpoints, TrainingConfig
 from ..training.selection import Selection
@@ -252,7 +252,30 @@ class _TrainingBridge(ModelCheckpoint):
 
     def on_train_start(self, trainer, pl_module):
         super().on_train_start(trainer, pl_module)
+        print("ID setup complete; starting training batches", flush=True)
         self.result._emit("train_start", trainer=trainer)
+
+    def on_sanity_check_start(self, trainer, pl_module):
+        print("ID validation sanity check: loading the first batches", flush=True)
+
+    def on_sanity_check_end(self, trainer, pl_module):
+        print("ID validation sanity check complete", flush=True)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        super().on_train_batch_end(trainer, pl_module, outputs, batch, batch_idx)
+        if not trainer.is_global_zero:
+            return
+        if batch_idx == 0:
+            print(f"ID epoch {trainer.current_epoch + 1}: first training batch completed", flush=True)
+        interval = trainer.log_every_n_steps
+        if self.result.wandb_run is not None and (batch_idx == 0 or (interval > 0 and (batch_idx + 1) % interval == 0)):
+            self.result.wandb_run.log({
+                "progress/global_step": trainer.global_step,
+                "progress/epoch": trainer.current_epoch,
+                "progress/batch": batch_idx + 1,
+                # Lightning divides callback loss by the accumulation factor.
+                "train/batch_loss": float(outputs["loss"].detach()) * trainer.accumulate_grad_batches,
+            })
 
     def on_train_epoch_start(self, trainer, pl_module):
         self.epoch_started = time.monotonic()
@@ -332,6 +355,7 @@ def train_identity(result, prepared, augmentations):
     labels = sorted(index.frame.loc[(index.frame.split == "train") & index.frame.identity_id.notna(), "identity_id"].unique())
     saved_meta = selection.metadata.get("identity", {})
     options = dict(config.backend_options)
+    print("Initializing ID encoder and dataset fingerprint", flush=True)
     identity = {**saved_meta, **{k: v for k, v in options.items() if k not in {"trainer", "pretrained"}},
                 "framework": "id", "backbone": selection.name, "identities": labels,
                 "augmentation_rng": "shared_stream_v2",
@@ -360,13 +384,24 @@ def train_identity(result, prepared, augmentations):
                            training={"loss": module.identity.get("loss", "subcenter_arcface"), "unlabeled_excluded": int(index.frame.identity_id.isna().sum())})
     result._announce(module.identity["preprocessing"]["resolution"])
     from ..training.preview import publish_augmentation_preview
+    started = time.monotonic()
+    if config.augmentation_samples:
+        print(f"Preparing augmentation grid ({config.augmentation_samples} samples)", flush=True)
     publish_augmentation_preview(result, serialized)
+    if config.augmentation_samples:
+        print(f"Augmentation grid ready ({time.monotonic() - started:.1f}s)", flush=True)
+    started = time.monotonic()
+    print("Preparing ID sampling and fixed validation subset", flush=True)
     data = _IdentityDataModule(result.dataset, module, config, serialized)
     result.metadata["training"].update(validation_samples=len(data.val_data), validation_total=data.validation_total)
     print(f"ID epoch: {data.batch_sampler.workload:,} training images; "
-          f"{len(data.val_data):,}/{data.validation_total:,} fixed validation images")
+          f"{len(data.val_data):,}/{data.validation_total:,} fixed validation images "
+          f"(prepared in {time.monotonic() - started:.1f}s)", flush=True)
     from .monitoring import prepare_monitor
+    started = time.monotonic()
+    print("Selecting fixed embedding-monitor cohort", flush=True)
     prepare_monitor(result)
+    print(f"Embedding-monitor cohort ready ({time.monotonic() - started:.1f}s)", flush=True)
     trainer_options = dict(options.get("trainer", {}))
     managed = {"callbacks", "logger", "enable_checkpointing", "default_root_dir", "max_epochs", "use_distributed_sampler", "reload_dataloaders_every_n_epochs"}
     if managed & trainer_options.keys():
@@ -379,7 +414,16 @@ def train_identity(result, prepared, augmentations):
     if trainer_options["devices"] != 1 and trainer_options["devices"] != devices:
         raise ValueError("Identity sampling currently supports one device per run")
     bridge = _TrainingBridge(result)
+    # Use Lightning's standard callbacks explicitly. Recent Lightning versions
+    # otherwise select Rich when installed, introducing another console/live
+    # rendering layer alongside Colab and W&B's output capture.
+    native_callbacks = [bridge]
+    if trainer_options.get("enable_progress_bar", True):
+        native_callbacks.append(TQDMProgressBar())
+    if trainer_options.get("enable_model_summary", True):
+        native_callbacks.append(ModelSummary())
     trainer = Trainer(max_epochs=config.epochs or 30, default_root_dir=result.output_dir, logger=False,
-                      callbacks=[bridge], use_distributed_sampler=False, reload_dataloaders_every_n_epochs=1,
+                      callbacks=native_callbacks, use_distributed_sampler=False, reload_dataloaders_every_n_epochs=1,
                       **trainer_options)
+    print("Starting Lightning fit: device setup, model summary, then validation sanity check", flush=True)
     trainer.fit(module, datamodule=data, ckpt_path=str(selection.resume) if selection.resume else None)

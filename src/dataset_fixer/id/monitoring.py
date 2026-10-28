@@ -35,6 +35,9 @@ def prepare_monitor(result):
             run.define_metric(namespace, step_metric="epoch")
         run.define_metric("val/loss", step_metric="epoch", summary="min")
         run.define_metric("val/monitor_rank1", step_metric="epoch", summary="max")
+        run.define_metric("progress/global_step")
+        run.define_metric("progress/*", step_metric="progress/global_step")
+        run.define_metric("train/batch_loss", step_metric="progress/global_step")
 
 
 def monitor_epoch(result, module, epoch):
