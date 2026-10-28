@@ -100,11 +100,33 @@ with df.TrainingSession(wandb=df.WandbConfig(project='wolf-id')) as session:
 
 `context_fraction=.1` adds 10% of box width on each horizontal side and 10% of height on each vertical side, clipped to the image boundary. Its default is zero. Already-cropped images cannot recover pixels outside their source. Context cropping happens before augmentation; it does not rotate or resize the image. Letterboxing in the display renderer is unrelated to crop context.
 
-Augmentation lists, Albumentations `Compose`, and serialized pipelines all use the existing serializer. `None` uses `id.default_augmentations()`: proportional affine scale 0.9–1.1, rotation ±5°, translation ±8% (p=.6), restrained brightness/contrast/saturation/hue (.2/.2/.15/.025, p=.65), grayscale (.1), blur (.15), and two small erasers (2–10% area at p=.25; 1–5% at p=.1). There are no flips or shear. This deliberately reduces the stronger zoom/color/occlusion settings in the supplied wolf recipe. The function returns a normal editable Albumentations list; `[]` disables random augmentation. Spatial crops and transforms are supported. They must return nonempty RGB `uint8` pixels: the model applies final resizing and normalization exactly once. Do not add `Normalize` or tensor conversion to the augmentation pipeline. Validation/prediction preprocessing is deterministic. A fixed body-part focus needed during prediction should be stored in the manifest's `crop` or an equivalent dataset crop view; stochastic training crops are not silently applied during inference.
+Augmentation lists, Albumentations `Compose`, and serialized pipelines all use the existing serializer. `None` uses `id.default_augmentations()`: border cropping up to 10% per side (p=.35), proportional affine scale 0.8–1.6, rotation ±5°, translation ±18% (p=.7), HSV changes (±18 hue, ±20 saturation, ±50 value; p=.4), explicit brightness and contrast (both ±.15; p=.5), mild 3–5 pixel blur (sigma .1–.6, p=.1), and two random-pixel noise erasers (2–12% area at p=.35; 2–6% at p=.2). Grayscale runs last (p=.25), so it also converts any noise patches. There are no flips or shear. More aggressive affine ranges can be supplied in a custom list; zoom and translation can cut off parts of a tightly cropped animal. The function returns a normal editable Albumentations list; `[]` disables random augmentation. Spatial crops and transforms are supported. They must return nonempty RGB `uint8` pixels: the model applies final resizing and normalization exactly once. Do not add `Normalize` or tensor conversion to the augmentation pipeline. Validation/prediction preprocessing is deterministic. A fixed body-part focus needed during prediction should be stored in the manifest's `crop` or an equivalent dataset crop view; stochastic training crops are not silently applied during inference.
 
-Startup grids use the same augmentation builder and preprocessing as training, with isolated randomness. They contain original/augmented pairs, identity/clip captions and source references. The existing renderer saves the local image, bundles it and logs that same file to W&B. Native detection trainers use their existing augmentation adapters for these grids too.
+Startup grids use the same augmentation builder and preprocessing as training, with isolated randomness. They contain original/augmented pairs, identity/clip captions, source references and the transforms actually applied to each image (brightness/contrast signs show the sampled direction). Transform probability decisions consume successive draws from shared Albumentations RNGs; they are not reset to identical child streams for every image. A small preview is a random sample, so it need not contain every transform. The existing renderer saves the local image, bundles it and logs that same file to W&B. Native detection trainers use their existing augmentation adapters for these grids too.
 
 Predefined backbones: `resnet18`, `efficientnet_v2_s`, `convnext_tiny`. Arbitrary timm names are accepted, for example `timm:vit_tiny_patch16_224`. For frozen-feature training set `freeze_backbone=True`; for the classification baseline set `loss='cross_entropy'`. The default is normalized embeddings with PyTorch Metric Learning's sub-center ArcFace loss. Advanced Lightning options, such as `precision`, go under `backend_options={'trainer': {...}}`. One device per run is currently supported to preserve the defined sampling distribution and batch caps.
+
+### Epoch workload and CUDA
+
+Without explicit batch caps, the progress bar reports the complete batch count: `samples_per_epoch=50_000` and `batch_size=64` produce 782 training batches. Explicit `max_per_batch` caps can produce smaller batches and keep the count unknown until sampled.
+
+By default every eligible validation image is evaluated every epoch. For a large dataset, set `backend_options={"validation_samples": 8192}` to select a fixed validation subset balanced across identities, clips and tracklets. It is selected once from the seed, is unchanged across epochs/resume, and is used for validation loss and checkpoint selection. The limit must cover every validation identity. Startup output and training metadata report selected/available counts. `None` retains full validation. Final `result.evaluate(split="test")` still uses the full test query cohort.
+
+On an NVIDIA L4, enable native Lightning mixed precision and PyTorch's faster float32 matmul policy explicitly:
+
+```python
+import torch
+if DEVICE.startswith("cuda"):
+    torch.set_float32_matmul_precision("high")
+
+# Merge these with your existing TrainingConfig.backend_options:
+backend_options = {
+    "validation_samples": 8192,
+    "trainer": {"precision": "bf16-mixed"} if DEVICE.startswith("cuda") else {},
+}
+```
+
+CUDA loaders pin host memory for transfers; CPU/MPS loaders do not. Keep extracted data on local scratch. Worker count should fit the available CPUs; increasing it beyond that may slow loading. These settings reduce work and enable native acceleration, but GPU throughput must be measured on the target machine.
 
 ### Custom models through the same API
 
@@ -128,7 +150,7 @@ result = id.train(new_data, weights=base, config=df.TrainingConfig(epochs=20))
 model = df.Model(result.bundle.path)  # local checkpoint, bundle or W&B reference
 ```
 
-`weights=` restores the encoder/projection and creates a new identity head and optimizer. The roster may change. Architecture and preprocessing are inferred; incompatible overrides fail. `resume=` restores full Lightning state and verifies identities, data fingerprint, sampling, batch size, seed, transforms and architecture. Preserve the previous best checkpoint alongside a standalone resume checkpoint, or use a full-state bundle. Native checkpoints remain local; `wandb_contents='full'` enables remote resume.
+`weights=` restores the encoder/projection and creates a new identity head and optimizer. The roster may change. Architecture and preprocessing are inferred; incompatible overrides fail. `resume=` restores full Lightning state and verifies identities, data fingerprint, sampling, batch size, seed, transforms and architecture. Changing the validation subset or augmentation RNG policy requires a new run. Checkpoints created before the independent augmentation RNG fix can still be loaded for inference or `weights=` initialization, but cannot strictly resume under the corrected policy. Preserve the previous best checkpoint alongside a standalone resume checkpoint, or use a full-state bundle. Native checkpoints remain local; `wandb_contents='full'` enables remote resume.
 
 With W&B enabled, ID defaults to `CheckpointConfig(wandb_upload='best', keep_wandb_versions=1, wandb_contents='best')`. The first best and every validation improvement upload immediately. A replacement must be confirmed before the previous managed version is pruned; protected artifacts are retained. Session completion republishes the selected best with reports and grids before finishing an owned run. Failed publication preserves local recovery files and reports incomplete finalization. Use a `TrainingSession` block when evaluation/calibration should be included in the final publication.
 

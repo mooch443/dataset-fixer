@@ -21,6 +21,7 @@ def test_diverse_batches_preserve_weighted_draws_and_full_batch_sizes():
     index = sample_index()
     sampler = _DiverseBatches(index, 8, 7)
     batches = list(sampler)
+    assert len(sampler) == len(batches) == 13
     assert [len(batch) for batch in batches] == [8]*12 + [5]
     draws = [key for batch in batches for key in batch]
     expected = list(torch.utils.data.WeightedRandomSampler(sampler.weights, 101, replacement=True,
@@ -52,6 +53,8 @@ def test_sparse_diversity_fills_batches_and_explicit_caps_remain_strict():
     ], sampling=dict(samples_per_epoch=17))
     assert [len(batch) for batch in _DiverseBatches(index, 8, 1)] == [8, 8, 1]
     index.sampling['max_per_batch'] = {'tracklet_id': 2}
+    with pytest.raises(TypeError, match='max_per_batch'):
+        len(_DiverseBatches(index, 8, 1))
     assert [len(batch) for batch in _DiverseBatches(index, 8, 1)] == [2]*8 + [1]
     index.frame['clip_id'] = None
     index.frame['tracklet_id'] = None

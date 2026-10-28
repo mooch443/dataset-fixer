@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 import hashlib
 import json
+import random
 import time
 
 import numpy as np
@@ -104,21 +105,23 @@ def build_backbone(name, *, pretrained=True, instance=None, resolution=None):
 
 
 def default_augmentations():
-    """Return a fresh conservative wolf/animal crop augmentation list.
+    """Return a fresh wolf/animal crop augmentation list.
 
-    Affine changes preserve aspect ratio and orientation (±5°, ±8% translation,
-    0.9–1.1 scale, no shear/flips). Two small erasers simulate partial occlusion.
+    Preserve orientation (±5°, no shear/flips), with proportional zoom, modest
+    cropping, bidirectional color/intensity changes and random-pixel occlusions.
     Customize this ordinary Albumentations list or pass [] to disable augmentation.
     """
     import albumentations as A
     return [
-        A.Affine(scale=(0.9, 1.1), translate_percent=(-0.08, 0.08), rotate=(-5, 5),
-                 shear=0, keep_ratio=True, balanced_scale=True, fill=0, p=0.6),
-        A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.15, hue=0.025, p=0.65),
-        A.ToGray(p=0.1),
-        A.GaussianBlur(blur_limit=0, sigma_limit=(0.1, 1.0), p=0.15),
-        A.Erasing(scale=(0.02, 0.10), ratio=(0.3, 3.3), fill=0, p=0.25),
-        A.Erasing(scale=(0.01, 0.05), ratio=(0.3, 3.3), fill=0, p=0.10),
+        A.RandomCropFromBorders(crop_left=0.1, crop_right=0.1, crop_top=0.1, crop_bottom=0.1, p=0.35),
+        A.Affine(scale=(0.8, 1.6), translate_percent=(-0.18, 0.18), rotate=(-5, 5),
+                 shear=0, keep_ratio=True, balanced_scale=True, fill=0, p=0.7),
+        A.HueSaturationValue(hue_shift_limit=18, sat_shift_limit=20, val_shift_limit=50, p=0.4),
+        A.RandomBrightnessContrast(brightness_limit=(-0.15, 0.15), contrast_limit=(-0.15, 0.15), p=0.5),
+        A.GaussianBlur(blur_limit=(3, 5), sigma_limit=(0.1, 0.6), p=0.1),
+        A.Erasing(scale=(0.02, 0.12), ratio=(0.3, 3.3), fill="random", p=0.35),
+        A.Erasing(scale=(0.02, 0.06), ratio=(0.3, 3.3), fill="random", p=0.2),
+        A.ToGray(p=0.25),
     ]
 
 
@@ -141,8 +144,19 @@ def augmentation_pipeline(value, *, seed=7):
                 inspect(child)
     inspect(serialized)
     pipeline = A.from_dict(serialized)
-    pipeline.set_random_seed(seed)
+    seed_augmentations(pipeline, seed)
     return pipeline, serialized
+
+
+def seed_augmentations(pipeline, seed):
+    """Seed one shared stream, so successive transforms consume distinct draws.
+
+    Compose.set_random_seed gives each child an identical *separate* stream.
+    Resetting those streams per image correlates their probability decisions.
+    Albumentations' set_random_state shares streams instead, without touching
+    Python/NumPy global state. Training and preview use this same policy.
+    """
+    pipeline.set_random_state(np.random.default_rng(int(seed)), random.Random(int(seed)))
 
 
 def preprocess(image, preprocessing):

@@ -415,8 +415,8 @@ def augmentation_preview(dataset, augmentations, config, split, options, *, weig
     from ..training.config import TrainingConfig
     from ..training.preview import _preview_seed
     from .data import index_of, balanced_rows
-    from .model import augmentation_pipeline, preprocess
-    from ..static_rendering import letterbox_image
+    from .model import augmentation_pipeline, preprocess, seed_augmentations
+    from ..static_rendering import letterbox_image, format_label
     from ..visualization import VisualizationItem, VisualizationPanel, visualize_records, finish_visualization
     index = index_of(dataset)
     if split is not None:
@@ -437,21 +437,35 @@ def augmentation_preview(dataset, augmentations, config, split, options, *, weig
         prep = dict(resolution=native.crop_size[0], mean=native.mean, std=native.std, interpolation=native.interpolation.value)
     prep = {**prep, "resolution": config.resolution or prep["resolution"]}
     pipeline, _ = augmentation_pipeline(augmentations, seed=options.seed)
+    pipeline.save_applied_params = True
 
     def prepare(position):
         sample = index[position]
         original = sample.image_ref.read()
-        pipeline.set_random_seed(int(options.seed+position))
-        transformed = pipeline(image=original.copy())["image"]
+        seed_augmentations(pipeline, options.seed+position)
+        applied = pipeline(image=original.copy())
+        transformed = applied["image"]
         tensor = preprocess(transformed, prep)
         # Undo normalization only for display; show exactly the training crop/resize.
         pixels = tensor.numpy().transpose(1, 2, 0) * np.asarray(prep["std"]) + np.asarray(prep["mean"])
         augmented = np.clip(pixels*255, 0, 255).astype(np.uint8)
         label = f"{sample.identity_id or 'unlabeled'} · {sample.clip_id or 'no clip'}"
         source = sample.image_path.name + (f" · row {sample.image_ref.row}" if sample.image_ref.row is not None else "")
+        names = {"RandomCropFromBorders": "crop", "Affine": "affine", "HueSaturationValue": "HSV",
+                 "GaussianBlur": "blur", "Erasing": "erase", "ToGray": "gray"}
+        effects = []
+        for name, params in applied["applied_transforms"]:
+            if name == "RandomBrightnessContrast":
+                effects.extend((f"bright{'+' if params['beta'] >= 0 else '−'}",
+                                f"contrast{'+' if params['alpha'] >= 1 else '−'}"))
+            else:
+                effects.append(names.get(name, name))
+        width = max(18, max(144, round(options.panel_size * 96)) // 7)
+        caption = "\n".join(format_label(", ".join(effects) or "No random transform",
+                                         mode="wrap", maximum=width, wrap_width=width))
         return VisualizationItem(sample.image_path, label,
             (VisualizationPanel("Original", np.asarray(letterbox_image(original, width=augmented.shape[1], height=augmented.shape[0])), footer=source),
-             VisualizationPanel("Augmented", augmented, footer=label)),
+             VisualizationPanel("Augmented", augmented, footer=caption)),
             np.ones(augmented.shape[:2], dtype=bool))
 
     with _preview_seed(options.seed):

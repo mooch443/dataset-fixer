@@ -111,7 +111,7 @@ def test_train_reload_transfer_resume(identity_data, tmp_path, monkeypatch):
     monkeypatch.setenv('DATASET_FIXER_CACHE', str(tmp_path/'cache'))
     id.register_backbone('test-tiny', tiny_model, feature_dim=4,
                          preprocessing=dict(resolution=16, mean=[0]*3, std=[1]*3))
-    options = dict(embedding_dim=8, loss='cross_entropy', pretrained=False,
+    options = dict(embedding_dim=8, loss='cross_entropy', pretrained=False, validation_samples=6,
                    trainer=dict(enable_progress_bar=False, enable_model_summary=False, num_sanity_val_steps=0))
     config = TrainingConfig(epochs=1, batch_size=4, workers=0, augmentation_samples=4,
                             output_dir=tmp_path/'run', backend_options=options)
@@ -119,6 +119,8 @@ def test_train_reload_transfer_resume(identity_data, tmp_path, monkeypatch):
     assert result.best_weights.is_file() and result.resumable_checkpoint.is_file()
     assert result.bundle.path.is_file()
     assert result.auxiliary_files['training/augmentations.png'].is_file()
+    assert result.metadata['training']['validation_samples'] == 6
+    assert result.metadata['training']['validation_total'] == 10
     from dataset_fixer import Model
     local, bundle = Model(result.best_weights), Model(result.bundle.path)
     assert local.kind == bundle.kind == 'id'
@@ -129,6 +131,19 @@ def test_train_reload_transfer_resume(identity_data, tmp_path, monkeypatch):
     assert all(r.identity_id in gallery.identities for r in a)
     report = result.evaluate(split='test', plots=0)
     assert 'rank1' in report.ranking
+    assert len(index_of(result._identity_protocol.queries['test'])) == 10
+    with pytest.raises(ValueError, match='same validation_samples'):
+        id.train(identity_data, resume=result.resumable_checkpoint, config=TrainingConfig(
+            epochs=2, batch_size=4, workers=0, augmentation_samples=0, output_dir=tmp_path/'changed-validation',
+            backend_options={**options, 'validation_samples': 4}))
+    legacy = torch.load(result.resumable_checkpoint, weights_only=False)
+    legacy['identity'].pop('augmentation_rng')
+    legacy_path = tmp_path/'legacy.ckpt'
+    torch.save(legacy, legacy_path)
+    with pytest.raises(ValueError, match='same augmentation_rng'):
+        id.train(identity_data, resume=legacy_path, config=TrainingConfig(
+            epochs=2, batch_size=4, workers=0, augmentation_samples=0, output_dir=tmp_path/'legacy-resume',
+            backend_options=options))
     resumed = id.train(identity_data, resume=result.resumable_checkpoint, augmentations=[],
         config=TrainingConfig(epochs=2, batch_size=4, workers=0, augmentation_samples=0, output_dir=tmp_path/'resumed', backend_options=options))
     assert torch.load(resumed.resumable_checkpoint, weights_only=False)['epoch'] == 1
@@ -446,18 +461,86 @@ def test_identity_stats_without_pixels_and_report(identity_data, tmp_path, monke
     assert identity_data.report(destination=tmp_path/'stats.png', show=False).is_file()
 
 
-def test_wolf_default_augmentations_are_serializable_and_conservative():
+def test_wolf_default_augmentations_are_serializable():
     import albumentations as A
     from dataset_fixer.id.model import augmentation_pipeline
     pipeline, serialized = augmentation_pipeline(None, seed=7)
     restored, again = augmentation_pipeline(serialized, seed=7)
     assert again==serialized
-    affine = pipeline.transforms[0]
+    affine = next(t for t in pipeline.transforms if isinstance(t, A.Affine))
     assert isinstance(affine, A.Affine) and affine.keep_ratio
-    assert affine.rotate==(-5.,5.) and affine.scale['x']==(.9,1.1)
+    assert affine.rotate==(-5.,5.) and affine.scale['x']==(.8,1.6)
     assert sum(isinstance(t,A.Erasing) for t in pipeline.transforms)==2
+    assert all(t.fill == 'random' for t in pipeline.transforms if isinstance(t, A.Erasing))
     image = np.full((128,128,3), 130, dtype=np.uint8)
     np.testing.assert_array_equal(pipeline(image=image)['image'], restored(image=image)['image'])
+
+
+def test_per_image_augmentation_decisions_are_independent_and_reproducible():
+    from collections import Counter
+    import random
+    import albumentations as A
+    from dataset_fixer.id.model import augmentation_pipeline, seed_augmentations
+    # Previously both flips always happened together because each got the same seed.
+    pipeline, _ = augmentation_pipeline([A.HorizontalFlip(p=.5), A.VerticalFlip(p=.5)])
+    pipeline.save_applied_params = True
+    image = np.random.default_rng(1).integers(0, 256, (16, 16, 3), dtype=np.uint8)
+    before = random.getstate(), np.random.get_state()
+    outcomes = Counter()
+    for seed in range(1000):
+        seed_augmentations(pipeline, seed)
+        result = pipeline(image=image)
+        outcomes[tuple(name for name, _ in result['applied_transforms'])] += 1
+        seed_augmentations(pipeline, seed)
+        np.testing.assert_array_equal(result['image'], pipeline(image=image)['image'])
+    assert len(outcomes) == 4 and all(180 < count < 320 for count in outcomes.values())
+    assert before[0] == random.getstate()
+    np.testing.assert_array_equal(before[1][1], np.random.get_state()[1])
+
+
+def test_validation_sample_is_fixed_balanced_and_does_not_change_dataset(identity_data):
+    from types import SimpleNamespace
+    from dataset_fixer.id.training import _IdentityDataModule
+    module = SimpleNamespace(identity=dict(identities=['wolf-a', 'wolf-b'], validation_samples=6,
+        preprocessing=dict(resolution=16, mean=[0]*3, std=[1]*3)))
+    config = TrainingConfig(batch_size=4, workers=0)
+    first = _IdentityDataModule(identity_data, module, config, [])
+    second = _IdentityDataModule(identity_data, module, config, [])
+    pd.testing.assert_frame_equal(first.val_data.index.frame, second.val_data.index.frame)
+    assert first.val_data.index.frame.identity_id.value_counts().tolist() == [3, 3]
+    assert len(index_of(identity_data).where(split='val')) == first.validation_total == 10
+    module.identity['validation_samples'] = None
+    assert len(_IdentityDataModule(identity_data, module, config, []).val_data) == 10
+    for invalid in (0, -1, 1, True, 1.5):
+        module.identity['validation_samples'] = invalid
+        with pytest.raises(ValueError, match='validation_samples'):
+            _IdentityDataModule(identity_data, module, config, [])
+
+
+def test_augmentation_preview_matches_training_pixels_and_reports_effects(identity_data, monkeypatch):
+    import albumentations as A
+    from dataset_fixer.id.evaluation import augmentation_preview
+    from dataset_fixer.id.training import _Pixels
+    from dataset_fixer.visualization import VisualizationOptions
+    prep = dict(resolution=16, mean=[0]*3, std=[1]*3)
+    pipeline = [A.RandomCropFromBorders(p=1), A.RandomBrightnessContrast(p=1),
+                A.Erasing(fill='random', p=1), A.ToGray(p=1)]
+    index = index_of(identity_data).where(split='train')
+    pixels = _Pixels(index, prep, {'wolf-a': 0, 'wolf-b': 1}, pipeline, training=True, seed=7)
+    seen = []
+    def capture(records, *, prepare, **kwargs):
+        for position in records:
+            item = prepare(position)
+            expected = np.clip(pixels[position][0].numpy().transpose(1, 2, 0)*255, 0, 255).astype(np.uint8)
+            np.testing.assert_array_equal(item.panels[1].image, expected)
+            caption = item.panels[1].footer
+            assert all(name in caption for name in ('crop', 'bright', 'contrast', 'erase', 'gray'))
+            seen.append(item)
+    monkeypatch.setattr('dataset_fixer.visualization.visualize_records', capture)
+    monkeypatch.setattr('dataset_fixer.visualization.finish_visualization', lambda chart, options: chart)
+    augmentation_preview(identity_data, pipeline, TrainingConfig(resolution=16, backend_options={'preprocessing': prep}),
+                         'train', VisualizationOptions(samples=6, seed=7, show=False))
+    assert len(seen) == 6
 
 
 def test_monitoring_keeps_rng_and_cohort_fixed(identity_data, tmp_path):

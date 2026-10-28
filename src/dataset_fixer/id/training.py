@@ -13,9 +13,9 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 
 from ..training.config import ModelTypes, Checkpoints, TrainingConfig
 from ..training.selection import Selection
-from .data import index_of
+from .data import index_of, balanced_rows
 from .model import (backbone_name, build_backbone, augmentation_pipeline, preprocess,
-                    load_checkpoint, validate_preprocessing)
+                    load_checkpoint, validate_preprocessing, seed_augmentations)
 
 
 class _IdentityModule(LightningModule):
@@ -103,7 +103,7 @@ class _Pixels(TorchDataset):
         sample = self.index[position]
         image = sample.image_ref.read()
         if self.transform is not None:
-            self.transform.set_random_seed((self.seed + epoch*1_000_003 + draw) % (2**32))
+            seed_augmentations(self.transform, (self.seed + epoch*1_000_003 + draw) % (2**32))
             image = self.transform(image=image)["image"]
         return preprocess(image, self.preprocessing), self.labels[sample.identity_id]
 
@@ -127,6 +127,11 @@ class _DiverseBatches(Sampler):
                 codes = pd.factorize(pd.MultiIndex.from_frame(index.frame[columns]))[0]
                 codes[~complete] = -1
                 self.keys[field] = codes
+
+    def __len__(self):
+        if self.caps:
+            raise TypeError("Batch count depends on sampled groups when max_per_batch is set")
+        return (self.workload + self.batch_size - 1) // self.batch_size
 
     def __iter__(self):
         epoch = self.epoch
@@ -189,6 +194,14 @@ class _IdentityDataModule(LightningDataModule):
         train = train.take(np.flatnonzero(train.frame.identity_id.notna()))
         validation = index.where(split="val")
         validation = validation.take(np.flatnonzero(validation.frame.identity_id.isin(labels)))
+        self.validation_total = len(validation)
+        limit = module.identity.get("validation_samples")
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+                raise ValueError("validation_samples must be a positive integer or None (all validation images)")
+            if limit < validation.frame.identity_id.nunique():
+                raise ValueError("validation_samples must cover every validation identity")
+            validation = validation.take(balanced_rows(validation, limit, config.seed))
         self.train_data = _Pixels(train, module.identity["preprocessing"], labels, augmentations, training=True, seed=config.seed)
         self.val_data = _Pixels(validation, module.identity["preprocessing"], labels)
         self.config = config
@@ -199,13 +212,15 @@ class _IdentityDataModule(LightningDataModule):
         # Stamp the sampler before creating the iterator (also after full resume).
         self.batch_sampler.epoch = self.trainer.current_epoch
         self.train_data.epoch = self.trainer.current_epoch
-        options = dict(num_workers=self.config.workers, persistent_workers=False)
+        options = dict(num_workers=self.config.workers, persistent_workers=False,
+                       pin_memory=self.trainer.strategy.root_device.type == "cuda")
         if self.config.workers:
             options["prefetch_factor"] = 2
         return DataLoader(self.train_data, batch_sampler=self.batch_sampler, **options)
 
     def val_dataloader(self):
-        return DataLoader(self.val_data, batch_size=self.config.batch_size or 64, num_workers=self.config.workers)
+        return DataLoader(self.val_data, batch_size=self.config.batch_size or 64, num_workers=self.config.workers,
+                          pin_memory=self.trainer.strategy.root_device.type == "cuda")
 
 
 class _TrainingBridge(ModelCheckpoint):
@@ -309,7 +324,7 @@ def train_identity(result, prepared, augmentations):
     config, selection = result.config, result.selection
     seed_everything(config.seed, workers=True)
     allowed = {"embedding_dim", "loss", "sub_centers", "freeze_backbone", "lr", "weight_decay", "pretrained", "preprocessing", "trainer",
-               "embedding_samples", "embedding_method"}
+               "embedding_samples", "embedding_method", "validation_samples"}
     unknown = set(config.backend_options)-allowed
     if unknown:
         raise ValueError(f"Unsupported ID backend options: {sorted(unknown)}; Lightning options belong under trainer")
@@ -319,6 +334,7 @@ def train_identity(result, prepared, augmentations):
     options = dict(config.backend_options)
     identity = {**saved_meta, **{k: v for k, v in options.items() if k not in {"trainer", "pretrained"}},
                 "framework": "id", "backbone": selection.name, "identities": labels,
+                "augmentation_rng": "shared_stream_v2",
                 "sampling": {**index.sampling, "batch_order": "diverse_v1"}, "seed": config.seed, "batch_size": config.batch_size or 64,
                 "training_fingerprint": index.fingerprint,
                 "training_clips": sorted(index.frame.loc[index.frame.split == "train", "clip_id"].dropna().unique().tolist())}
@@ -337,7 +353,7 @@ def train_identity(result, prepared, augmentations):
         if incompatible.unexpected_keys or any(not k.startswith("head.") for k in incompatible.missing_keys):
             raise ValueError("Initialization checkpoint is incompatible with encoder/projection")
     if selection.resume:
-        for key in ("backbone", "identities", "sampling", "seed", "batch_size", "training_fingerprint", "embedding_dim", "loss", "augmentations", "freeze_backbone", "lr", "weight_decay", "sub_centers"):
+        for key in ("backbone", "identities", "sampling", "seed", "batch_size", "training_fingerprint", "embedding_dim", "loss", "augmentations", "augmentation_rng", "validation_samples", "freeze_backbone", "lr", "weight_decay", "sub_centers"):
             if saved_meta.get(key) != module.identity.get(key):
                 raise ValueError(f"Resume requires the same {key}; use weights= for a new run")
     result.metadata.update(identity=module.identity, resolution=module.identity["preprocessing"]["resolution"],
@@ -346,6 +362,9 @@ def train_identity(result, prepared, augmentations):
     from ..training.preview import publish_augmentation_preview
     publish_augmentation_preview(result, serialized)
     data = _IdentityDataModule(result.dataset, module, config, serialized)
+    result.metadata["training"].update(validation_samples=len(data.val_data), validation_total=data.validation_total)
+    print(f"ID epoch: {data.batch_sampler.workload:,} training images; "
+          f"{len(data.val_data):,}/{data.validation_total:,} fixed validation images")
     from .monitoring import prepare_monitor
     prepare_monitor(result)
     trainer_options = dict(options.get("trainer", {}))
