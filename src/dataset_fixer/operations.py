@@ -18,7 +18,7 @@ from .models import Annotation, DatasetMetadata, Sample, Task
 from .planning import (
     callback_description as _callback_description,
     normalize_split_ratios,
-    reserve_class_coverage,
+    allocate_class_groups,
     project_move_images_with_classes,
     project_move_n_groups,
     resolve_class_selectors,
@@ -89,9 +89,9 @@ def split_dataset(
             locked[group] = target
 
     if classes_must_appear_in:
-        locked = reserve_class_coverage(
+        locked = allocate_class_groups(
             {group: len(values) for group, values in groups.items()}, normalized, locked, seed,
-            {group: {a.class_id for sample in values for a in sample.annotations}
+            {group: Counter(label for sample in values for label in {a.class_id for a in sample.annotations})
              for group, values in groups.items()}, classes_must_appear_in,
         )
 

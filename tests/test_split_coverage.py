@@ -89,6 +89,55 @@ def test_detection_coverage_survives_export(detect_dataset, tmp_path):
         for split in ('train', 'val', 'test'):
             assert {a.class_id for s in result._samples if s.split == split for a in s.annotations} == {0, 1}
     assert exported.manifest['history'][0]['settings']['classes_must_appear_in'] == ['train', 'val', 'test']
+    assert {s.image_path.name: s.split for s in planned._samples} == {s.image_path.name: s.split for s in exported._samples}
+
+
+@pytest.mark.parametrize('ratios', [{'train': .6, 'val': .2, 'test': .2}, {'train': .2, 'val': .6, 'test': .2}])
+def test_coverage_spreads_each_identity_to_requested_ratios(tmp_path, ratios):
+    data = identity_clips(tmp_path, {f'{label}-{i}': [label] for label in ('a', 'b') for i in range(10)})
+    result = data.split(ratios, group_by='clip_id', classes_must_appear_in=('train', 'val'))
+    counts = index_of(result).frame.groupby(['identity_id', 'split'], observed=True).size()
+    for label in ('a', 'b'):
+        for split, ratio in ratios.items():
+            assert counts[label, split] == round(10*ratio)
+
+
+def test_optional_splits_get_broad_coverage_when_target_fractions_allow(tmp_path):
+    data = identity_clips(tmp_path, {'forced': ['a', 'b', 'rare'], 'ab': ['a', 'b'], 'a': ['a'], 'b': ['b']})
+    result = data.split({'train': 3/7, 'val': 2/7, 'test': 2/7}, group_by='clip_id', classes_must_appear_in=('train',))
+    counts = index_of(result).frame.groupby('identity_id', observed=True).split.nunique()
+    assert counts.to_dict() == {'a': 3, 'b': 3, 'rare': 1}
+
+
+def test_positive_splits_cannot_be_emptied_to_fit_ratios(tmp_path):
+    data = identity_clips(tmp_path, {str(i): ['a', 'b'] for i in range(3)})
+    result = data.split({'train': .98, 'val': .01, 'test': .01}, group_by='clip_id', classes_must_appear_in=('train',))
+    assert set(index_of(result).frame.split) == {'train', 'val', 'test'}
+    with pytest.raises(DatasetValidationError, match='nonempty splits'):
+        data.split({'train': .98, 'val': .01, 'test': .01}, group_by='clip_id', classes_must_appear_in=('train',),
+                   assign=lambda p: 'train' if p.parent.name != '2' else None)
+
+
+def test_class_assignment_matches_exhaustive_coverage_and_ratio_objectives():
+    sizes = {0: 7, 1: 5, 2: 3, 3: 4}
+    labels = {0: {'a': 6, 'b': 1}, 1: {'a': 1, 'b': 4}, 2: {'b': 3}, 3: {'a': 4}}
+    ratios = {'train': .7, 'val': .2, 'test': .1}
+    def score(assignment):
+        total = sum(sizes.values())
+        counts = {(label, split): sum(labels[g].get(label, 0) for g in sizes if assignment[g] == split)
+                  for label in ('a', 'b') for split in ratios}
+        assigned_splits = set(assignment.values()) if isinstance(assignment, dict) else set(assignment)
+        if assigned_splits != set(ratios) or assignment[0] != 'train' or any(counts[label, 'train'] == 0 for label in ('a', 'b')):
+            return (-float('inf'), -1)
+        coverage = sum(value > 0 for value in counts.values())
+        error = sum(abs(sum(sizes[g] for g in sizes if assignment[g] == split)/total - ratio) for split, ratio in ratios.items())
+        for label in ('a', 'b'):
+            n = sum(counts[label, split] for split in ratios)
+            error += sum(abs(counts[label, split]/n-ratio) for split, ratio in ratios.items())/2
+        return -error, coverage
+    expected = max(score(assignment) for assignment in product(ratios, repeat=len(sizes)))
+    actual = allocate_groups(sizes, ratios, {0: 'train'}, 7, group_classes=labels, classes_must_appear_in=('train',))
+    assert score(actual) == pytest.approx(expected)
 
 
 def test_solver_feasibility_matches_exhaustive_small_group_partitions():

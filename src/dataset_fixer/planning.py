@@ -89,7 +89,7 @@ def plan_split(
             )
         locked[group] = target
 
-    group_classes = {key: {a.class_id for sample in values for a in sample.annotations}
+    group_classes = {key: Counter(label for sample in values for label in {a.class_id for a in sample.annotations})
                      for key, values in groups.items()} if classes_must_appear_in else None
     allocated = allocate_groups({key: len(value) for key, value in groups.items()}, normalized, locked, seed,
                                 group_classes=group_classes, classes_must_appear_in=classes_must_appear_in)
@@ -122,7 +122,7 @@ def plan_split(
 def allocate_groups(sizes, ratios, locked, seed, *, group_classes=None, classes_must_appear_in=()):
     """Assign indivisible groups using the shared weighted-deficit policy."""
     if classes_must_appear_in:
-        locked = reserve_class_coverage(sizes, ratios, locked, seed, group_classes, classes_must_appear_in)
+        return allocate_class_groups(sizes, ratios, locked, seed, group_classes, classes_must_appear_in)
     counts: Counter[str] = Counter()
     assigned = dict(locked)
     for group, target in locked.items():
@@ -138,88 +138,140 @@ def allocate_groups(sizes, ratios, locked, seed, *, group_classes=None, classes_
     return assigned
 
 
-def reserve_class_coverage(sizes, ratios, locked, seed, group_classes, required):
-    """Reserve whole groups with SciPy's integer solver, then leave ratios to the allocator.
+def allocate_class_groups(sizes, ratios, locked, seed, group_classes, required):
+    """Assign whole groups: mandatory coverage, sample ratios, then broader coverage.
 
-    Groups with identical class sets share one solver variable per required
-    split. A million individual crops therefore need only identity-count-sized
-    constraints, rather than a variable for every image.
+    SciPy solves two sparse integer programs with the same constraints. Groups
+    with identical sizes and per-class counts are interchangeable, so individual
+    crops compress to one group type per identity rather than millions of variables.
     """
     if isinstance(required, str):
         raise TypeError("classes_must_appear_in must be a sequence of split names, e.g. ('train',)")
     required = tuple(dict.fromkeys(normalize_split(split) for split in required))
     if any(ratios.get(split, 0) <= 0 for split in required):
         raise ValueError("classes_must_appear_in must name splits with positive ratios")
+    group_classes = {group: Counter(labels) for group, labels in group_classes.items()}
     classes = sorted({label for labels in group_classes.values() for label in labels}, key=repr)
     covered = {split: set() for split in required}
     for group, split in locked.items():
         if split in covered:
             covered[split].update(group_classes.get(group, ()))
-    missing = [(label, split) for label in classes for split in required if label not in covered[split]]
-    if not missing:
-        return dict(locked)
-
-    patterns = defaultdict(list)
-    for group in sizes:
-        labels = frozenset(group_classes.get(group, ()))
-        if group not in locked and labels:
-            patterns[labels].append(group)
-    availability = Counter()
-    for labels, groups in patterns.items():
-        for label in labels:
-            availability[label] += len(groups)
+    availability = Counter(label for group in sizes if group not in locked for label in group_classes.get(group, ()))
+    issues = []
     for label in classes:
         needed = [split for split in required if label not in covered[split]]
-        available = availability[label]
-        if len(needed) > available:
-            raise DatasetValidationError(
+        if len(needed) > availability[label]:
+            issues.append(ValidationIssue(
                 f"classes_must_appear_in cannot cover class {label!r} in {needed}: "
-                f"needs {len(needed)} distinct unassigned groups, but only {available} remain. "
+                f"needs {len(needed)} distinct unassigned groups, but only {availability[label]} remain. "
                 "Change group_by, explicit assignments, or the required splits; groups are never divided."
-            )
+            ))
+    if issues:
+        raise DatasetValidationError(issues)
+    splits = [split for split, ratio in ratios.items() if ratio > 0]
+    empty_splits = set(splits) - set(locked.values())
+    if len(sizes) - len(locked) < len(empty_splits):
+        raise DatasetValidationError(
+            f"Positive split ratios require nonempty splits {sorted(empty_splits)}, but only "
+            f"{len(sizes)-len(locked)} unassigned groups remain. Change ratios, group_by, or explicit assignments."
+        )
+    if len(locked) == len(sizes):
+        return dict(locked)
 
     import numpy as np
     from scipy.optimize import Bounds, LinearConstraint, milp
-    from scipy.sparse import coo_matrix
+    from scipy.sparse import coo_matrix, vstack
 
+    patterns = defaultdict(list)
+    for group, size in sizes.items():
+        if group not in locked:
+            signature = (size, tuple(sorted(group_classes.get(group, {}).items(), key=lambda item: repr(item[0]))))
+            patterns[signature].append(group)
     patterns = list(patterns.items())
-    rows_for_missing = {pair: len(patterns) + row for row, pair in enumerate(missing)}
-    rows, columns, variables = [], [], []
-    # One group of a given class-set suffices for that set in each split.
-    for pattern, (labels, groups) in enumerate(patterns):
-        for split in required:
-            covers = [rows_for_missing[(label, split)] for label in sorted(labels, key=repr)
-                      if (label, split) in rows_for_missing]
-            if covers:
-                rows.extend([pattern, *covers])
-                columns.extend([len(variables)] * (len(covers) + 1))
-                variables.append((pattern, split))
-    matrix = coo_matrix((np.ones(len(rows)), (rows, columns)),
-                        shape=(len(patterns) + len(missing), len(variables))).tocsc()
-    lower = [0] * len(patterns) + [1] * len(missing)
-    upper = [len(groups) for _, groups in patterns] + [np.inf] * len(missing)
+    ns = len(splits)
+    nx, nz = len(patterns) * ns, len(classes) * ns
+    # Allocation counts, binary class-presence flags, and absolute fraction errors.
+    nv = nx + nz + (len(classes) + 1) * ns
+    lower, upper = np.zeros(nv), np.full(nv, np.inf)
+    integrality = np.zeros(nv)
+    integrality[:nx+nz] = 1
+    upper[nx:nx+nz] = 1
+    rows, columns, values, lo, hi = [], [], [], [], []
+
+    def constraint(entries, minimum, maximum):
+        for column, value in entries:
+            if value:
+                rows.append(len(lo)); columns.append(column); values.append(value)
+        lo.append(minimum); hi.append(maximum)
+
+    by_class = defaultdict(list)
+    for pattern, ((size, counts), groups) in enumerate(patterns):
+        upper[pattern*ns:(pattern+1)*ns] = len(groups)
+        constraint([(pattern*ns+s, 1) for s in range(ns)], len(groups), len(groups))
+        for label, count in counts:
+            by_class[label].append((pattern, count))
+    for s, split in enumerate(splits):
+        constraint([(p*ns+s, 1) for p in range(len(patterns))], int(split in empty_splits), np.inf)
+    fixed = {split: Counter() for split in ratios}
+    for group, split in locked.items():
+        fixed[split].update(group_classes.get(group, ()))
+    for c, label in enumerate(classes):
+        for s, split in enumerate(splits):
+            z = nx + c*ns + s
+            lower[z] = int(split in required)
+            constraint([(p*ns+s, 1) for p, _ in by_class[label]] + [(z, -1)],
+                       -int(fixed[split][label] > 0), np.inf)
+
+    ratio_cost = np.zeros(nv)
+    # Equal weight to overall image fractions and the mean per-class fractions;
+    # large identities must not hide a badly distributed smaller identity.
+    totals = Counter()
+    for counts in group_classes.values():
+        totals.update(counts)
+    for metric, label in enumerate([None, *classes]):
+        total = sum(sizes.values()) if label is None else totals[label]
+        entries = [(p, signature[0]) for p, (signature, _) in enumerate(patterns)] if label is None else by_class[label]
+        for s, split in enumerate(splits):
+            d = nx + nz + metric*ns + s
+            fixed_count = sum(sizes[g] for g, target in locked.items() if target == split) if label is None else fixed[split][label]
+            target = ratios[split] - fixed_count / total
+            fractions = [(p*ns+s, count/total) for p, count in entries]
+            constraint(fractions + [(d, -1)], -np.inf, target)
+            constraint(fractions + [(d, 1)], target, np.inf)
+            ratio_cost[d] = 1 if label is None else 1/len(classes)
+    matrix = coo_matrix((values, (rows, columns)), shape=(len(lo), nv)).tocsc()
+    bounds = Bounds(lower, upper)
+
+    def solve(cost, matrix, lo, hi):
+        result = milp(cost, integrality=integrality, bounds=bounds,
+                      constraints=LinearConstraint(matrix, lo, hi), options={"mip_rel_gap": 0})
+        if result.status == 2:
+            raise DatasetValidationError(
+                f"classes_must_appear_in={required!r} is incompatible with whole-group membership "
+                "and explicit assignments. Class overlaps prevent simultaneous coverage "
+                "or leave a positive-ratio split empty; change group_by, assignments, or required splits."
+            )
+        if not result.success:
+            raise RuntimeError(f"Class-aware allocation failed: {result.message}")
+        return result.x
+
+    coverage_cost = np.zeros(nv)
+    coverage_cost[nx:nx+nz] = -1
+    first = solve(ratio_cost, matrix, lo, hi)
+    error = float(ratio_cost @ first)
+    # Prefer broader coverage among equally good proportional allocations.
+    # Coverage must not silently turn e.g. 70/15/15 into 48/21/31.
+    nonzero = np.flatnonzero(ratio_cost)
+    error_row = coo_matrix((ratio_cost[nonzero], (np.zeros(len(nonzero), dtype=int), nonzero)), shape=(1, nv)).tocsc()
+    solution = solve(coverage_cost, vstack([matrix, error_row], format="csc"), [*lo, -np.inf], [*hi, error+1e-8])
+    assigned = dict(locked)
     rng = random.Random(seed)
-    # Minimize reservations; seeded small costs only break ties between covers.
-    costs = [1 + rng.random() / (2 * len(variables)) for _ in variables]
-    solved = milp(costs, integrality=np.ones(len(variables)), bounds=Bounds(0, 1),
-                  constraints=LinearConstraint(matrix, lower, upper))
-    if solved.status == 2:
-        raise DatasetValidationError(
-            f"classes_must_appear_in={required!r} is incompatible with whole-group membership "
-            "and explicit assignments. Class overlaps prevent simultaneous coverage; "
-            "change group_by, assignments, or required splits."
-        )
-    if not solved.success:
-        raise RuntimeError(f"Class-coverage allocation failed: {solved.message}")
-    reservations = dict(locked)
-    for _, groups in patterns:
+    for p, (_, groups) in enumerate(patterns):
         rng.shuffle(groups)
-        groups.sort(key=lambda group: sizes[group])
-    selected = [variable for variable, value in zip(variables, solved.x) if value > .5]
-    # Larger required fractions receive the larger interchangeable groups first.
-    for pattern, split in sorted(selected, key=lambda entry: -ratios[entry[1]]):
-        reservations[patterns[pattern][1].pop()] = split
-    return reservations
+        for s, split in enumerate(splits):
+            for _ in range(round(solution[p*ns+s])):
+                assigned[groups.pop()] = split
+    return assigned
 
 
 def normalize_split_ratios(ratios: Mapping[str, float]) -> dict[str, float]:

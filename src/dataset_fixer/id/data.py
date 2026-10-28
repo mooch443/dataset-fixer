@@ -431,8 +431,10 @@ def split_dataset(dataset, ratios, *, group_by=None, assign=None, source_splits=
                 locked[group] = target
     group_classes = None
     if classes_must_appear_in:
-        pairs = pd.DataFrame({"group": groups, "identity_id": frame.identity_id}).dropna(subset=["identity_id"]).drop_duplicates()
-        group_classes = pairs.groupby("group", sort=False, observed=True).identity_id.agg(frozenset).to_dict()
+        pairs = pd.DataFrame({"group": groups, "identity_id": frame.identity_id}).dropna(subset=["identity_id"])
+        group_classes = {}
+        for (group, label), count in pairs.groupby(["group", "identity_id"], sort=False, observed=True).size().items():
+            group_classes.setdefault(group, {})[label] = int(count)
     allocated = allocate_groups(sizes, ratios, locked, seed, group_classes=group_classes,
                                 classes_must_appear_in=classes_must_appear_in)
     frame["split"] = groups.map(allocated)
@@ -467,10 +469,11 @@ def holdout(dataset, *, clip_id, identity_ids=None, to_split="test"):
 
 
 def with_sampling(dataset, *, balance_by=("identity_id", "clip_id"), samples_per_epoch=None, max_per_batch=None):
-    """Sampling policy; optional caps use clip_id or (clip_id, tracklet_id) keys.
+    """Balance weighted draws, then spread clips/tracklets within full batches.
 
-    Example max_per_batch={'tracklet_id': 2, 'clip_id': 8}. Caps produce smaller
-    batches when necessary; they never silently violate a diversity constraint.
+    Batch ordering is best effort with eight batches of metadata lookahead.
+    No draws are dropped or replaced. Optional max_per_batch caps remain strict
+    and can produce smaller batches; no caps are applied by default.
     """
     index = index_of(dataset)
     if samples_per_epoch is not None and (isinstance(samples_per_epoch, bool) or not isinstance(samples_per_epoch, int) or samples_per_epoch < 1):

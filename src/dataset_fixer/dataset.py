@@ -763,6 +763,9 @@ class Dataset:
                 count as a class. Only source_splits contribute classes. Whole
                 groups and explicit assignments are preserved; impossible
                 coverage raises an error. Empty by default (no constraint).
+                With this option, fit overall and per-class image proportions,
+                then prefer broader class coverage among equally good splits.
+                Every positive-ratio split must contain at least one group.
             seed: Deterministic shuffle seed for unpinned groups.
             visualize: Produce split previews and count reports at export.
             progress: Show export-time progress.
@@ -814,12 +817,14 @@ class Dataset:
 
     def with_sampling(self, *, balance_by: Sequence[str] = ("identity_id", "clip_id"),
                       samples_per_epoch: int | None = None, max_per_batch: Mapping[str, int] | None = None) -> "Dataset":
-        """Configure fresh hierarchical identity sampling and batch diversity caps.
+        """Configure weighted identity sampling and diverse, full training batches.
 
         Parameters:
             balance_by: Metadata fields in hierarchical sampling order.
             samples_per_epoch: Draw count per epoch; None uses the eligible row count.
-            max_per_batch: Optional clip_id/tracklet_id/identity_id caps; constrained batches may be smaller.
+            max_per_batch: Optional strict clip_id/tracklet_id/identity_id caps.
+                By default, prefer distinct clips/tracklets and reuse groups as
+                needed to fill batches. Explicit caps can make batches smaller.
         """
         from .id.data import with_sampling
         return with_sampling(self, balance_by=balance_by, samples_per_epoch=samples_per_epoch, max_per_batch=max_per_batch)

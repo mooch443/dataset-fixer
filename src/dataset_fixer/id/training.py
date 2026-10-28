@@ -5,6 +5,7 @@ from pathlib import Path
 import time
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset as TorchDataset, DataLoader, WeightedRandomSampler, Sampler
 from lightning.pytorch import LightningModule, LightningDataModule, Trainer, seed_everything
@@ -108,10 +109,10 @@ class _Pixels(TorchDataset):
 
 
 class _DiverseBatches(Sampler):
-    """Pack library-weighted draws while honoring optional metadata diversity caps.
+    """Spread library-weighted draws across clips and tracklets within each batch.
 
-    Oversubscribed groups end a smaller batch. No unbounded retry/buffer and no
-    discarded observations: the workload and weighted draw distribution are exact.
+    Reorder a bounded metadata-only lookahead; never discard or replace a draw.
+    Without explicit caps, repeated groups fill batches when diversity runs out.
     """
     def __init__(self, index, batch_size, seed):
         self.index, self.batch_size, self.seed, self.epoch = index, batch_size, seed, 0
@@ -119,24 +120,60 @@ class _DiverseBatches(Sampler):
         self.workload = index.sampling.get("samples_per_epoch") or len(index)
         self.caps = index.sampling.get("max_per_batch", {})
         self.keys = {}
-        for field in self.caps:
+        for field in dict.fromkeys(["clip_id", "tracklet_id", "identity_id", *self.caps]):
             columns = ["clip_id", "tracklet_id"] if field == "tracklet_id" else [field]
-            self.keys[field] = list(index.frame[columns].itertuples(index=False, name=None))
+            complete = index.frame[columns].notna().all(axis=1).to_numpy()
+            if complete.any():
+                codes = pd.factorize(pd.MultiIndex.from_frame(index.frame[columns]))[0]
+                codes[~complete] = -1
+                self.keys[field] = codes
 
     def __iter__(self):
         epoch = self.epoch
         generator = torch.Generator().manual_seed(self.seed+epoch)
         sampler = WeightedRandomSampler(self.weights, self.workload, replacement=True, generator=generator)
-        counts, batch = {}, []
-        for draw, row in enumerate(sampler):
-            keys = [(field, values[row]) for field, values in self.keys.items()]
-            if batch and (len(batch) == self.batch_size or any(counts.get(key, 0) >= self.caps[key[0]] for key in keys)):
-                yield batch
-                counts, batch = {}, []
-            batch.append((row, draw, epoch))
-            for key in keys:
-                counts[key] = counts.get(key, 0)+1
-        if batch:
+        from itertools import islice
+        draws = enumerate(sampler)
+        pending = []
+        while True:
+            pending.extend((row, draw, epoch) for draw, row in islice(draws, self.batch_size*8-len(pending)))
+            if not pending:
+                return
+            positions = np.array([key[0] for key in pending])
+            fields = {}
+            for field, values in self.keys.items():
+                unique, inverse = np.unique(values[positions], return_inverse=True)
+                fields[field] = inverse, np.zeros(len(unique), dtype=int), np.bincount(inverse), values[positions] >= 0
+            available = np.ones(len(pending), dtype=bool)
+            batch = []
+            for _ in range(self.batch_size):
+                eligible = available.copy()
+                novelty, reuse, remaining, identity_reuse = np.zeros((4, len(pending)), dtype=int)
+                for field, (inverse, counts, frequency, valid) in fields.items():
+                    used = counts[inverse]
+                    if field in ("clip_id", "tracklet_id"):
+                        novelty += valid & (used == 0)
+                        reuse += np.where(valid, used, 0)
+                        remaining += np.where(valid, frequency[inverse], 0)
+                    elif field == "identity_id":
+                        identity_reuse = np.where(valid, used, 0)
+                    if field in self.caps:
+                        eligible &= used < self.caps[field]
+                if not eligible.any():
+                    break
+                # Consume larger pending groups on ties so repeated draws are
+                # spread over batches instead of accumulating at epoch end.
+                candidates = np.flatnonzero(eligible)
+                order = np.lexsort((candidates, identity_reuse[candidates], -remaining[candidates],
+                                    reuse[candidates], -novelty[candidates]))
+                selected = int(candidates[order[0]])
+                batch.append(pending[selected])
+                available[selected] = False
+                for inverse, counts, frequency, valid in fields.values():
+                    if valid[selected]:
+                        counts[inverse[selected]] += 1
+                        frequency[inverse[selected]] -= 1
+            pending = [key for key, keep in zip(pending, available) if keep]
             yield batch
 
     # Exact length is deliberately unspecified with caps; iterating the sampler
@@ -282,7 +319,7 @@ def train_identity(result, prepared, augmentations):
     options = dict(config.backend_options)
     identity = {**saved_meta, **{k: v for k, v in options.items() if k not in {"trainer", "pretrained"}},
                 "framework": "id", "backbone": selection.name, "identities": labels,
-                "sampling": index.sampling, "seed": config.seed, "batch_size": config.batch_size or 64,
+                "sampling": {**index.sampling, "batch_order": "diverse_v1"}, "seed": config.seed, "batch_size": config.batch_size or 64,
                 "training_fingerprint": index.fingerprint,
                 "training_clips": sorted(index.frame.loc[index.frame.split == "train", "clip_id"].dropna().unique().tolist())}
     module = _IdentityModule(identity, pretrained=options.get("pretrained", True) and selection.weights is None and selection.resume is None,

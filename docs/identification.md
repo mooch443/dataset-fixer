@@ -24,7 +24,6 @@ data = data.holdout(clip_id='observation-17', identity_ids=['wolf-2'], to_split=
 data = data.with_sampling(
     balance_by=('identity_id', 'clip_id', 'tracklet_id'),
     samples_per_epoch=50_000,
-    max_per_batch={'clip_id': 16, 'tracklet_id': 2},
 )
 ```
 
@@ -36,14 +35,31 @@ Omit `identity_ids` to hold out the entire clip. `group_by=('identity_id', 'clip
 `source_splits` count. Whole groups and explicit assignments remain intact; a
 class appearing in one clip cannot satisfy a requirement for two splits. Invalid
 or impossible requirements raise an error, including conflicting class overlaps.
-SciPy's integer solver reserves a small set of groups for coverage, and the
-existing ratio allocator places the rest. Required splits must have positive
-ratios. Unrequired splits can lack individuals: ID dataset warnings report those
+SciPy's integer solver assigns all groups together: enforce required coverage,
+minimize deviation from the requested overall and per-class image fractions,
+then prefer broader class coverage among equally good proportional allocations.
+Overall fractions and the mean per-class fractions have equal weight. Extra
+coverage does not override the target proportions; only explicitly required
+coverage and indivisible groups can force that tradeoff. Required splits
+must have positive ratios, and positive-ratio splits must be nonempty; infeasible
+requests raise an error rather than silently omitting validation or test.
+Unrequired splits can lack individuals: ID dataset warnings report those
 gaps, and `id.stats(data, by=('identity_id', 'split'))` shows the actual counts.
 The same option applies to annotation classes in ordinary detection datasets and
 is retained when a planned split is exported.
 
-Sampling first balances individuals, then clips within each individual, then tracklets if requested. Images are sampled within the final group using PyTorch's weighted sampler. `samples_per_epoch` controls workload, not a fixed subset. Draws and augmentations change reproducibly each epoch, including after resume. Optional per-batch caps pack those draws into smaller batches when required; they never drop draws or silently exceed a cap. Very restrictive caps can produce batches of one, which may be unsuitable for a custom encoder containing batch normalization.
+Sampling first balances individuals, then clips within each individual, then tracklets if requested. Images are sampled within the final group using PyTorch's weighted sampler. `samples_per_epoch` controls workload, not a fixed subset. Draws and augmentations change reproducibly each epoch, including after resume.
+
+The batch builder prefers distinct clips and tracklets, then balances repeated
+groups when needed to fill the batch. It reorders up to eight batches of metadata
+at a time, without dropping or replacing any draw or changing the epoch's weighted
+selection. This is best effort within that bounded lookahead, not a global optimum
+over the entire epoch. Missing clip/tracklet metadata simply disables that preference.
+No hard limits apply by default. If explicitly supplied,
+`max_per_batch={'tracklet_id': 2}` remains a strict cap and can produce smaller
+batches. The sampler version is stored in checkpoints: old sequential-order runs
+can initialize a new run with `weights=`, but cannot silently resume with a different
+batch ordering algorithm.
 
 CSV/JSONL rows require `identity_id` (null is allowed) and either `image_path`/`path`, or `archive`, `array`, `row`. Optional fields include `split`, `clip_id`, `tracklet_id`, `local_id`, `frame_index`, `notes`, and `original_id`. Paths are relative to the manifest. Unsplit rows belong to `train`. A JSONL `crop: [left, top, right, bottom]` is an optional deterministic pixel crop. Use `data.export(destination=..., format='identity_manifest')` to save a view without copying pixels.
 
