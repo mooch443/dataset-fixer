@@ -18,6 +18,7 @@ from .models import Annotation, DatasetMetadata, Sample, Task
 from .planning import (
     callback_description as _callback_description,
     normalize_split_ratios,
+    reserve_class_coverage,
     project_move_images_with_classes,
     project_move_n_groups,
     resolve_class_selectors,
@@ -59,6 +60,7 @@ def split_dataset(
     progress: bool,
     dry_run: bool,
     validate_output: bool = True,
+    classes_must_appear_in: tuple[str, ...] = (),
 ) -> "Dataset":
     normalized = normalize_split_ratios(ratios)
     selected = {normalize_split(s) for s in source_splits} if source_splits else set(dataset.splits)
@@ -85,6 +87,13 @@ def split_dataset(
                     )
                 )
             locked[group] = target
+
+    if classes_must_appear_in:
+        locked = reserve_class_coverage(
+            {group: len(values) for group, values in groups.items()}, normalized, locked, seed,
+            {group: {a.class_id for sample in values for a in sample.annotations}
+             for group, values in groups.items()}, classes_must_appear_in,
+        )
 
     # Ratios apply to the annotated images as well as to the total, because a
     # split that is correct overall can still starve one side of labels when
@@ -166,6 +175,8 @@ def split_dataset(
         },
         "visualize": visualize,
     }
+    if classes_must_appear_in:
+        settings["classes_must_appear_in"] = classes_must_appear_in
     builder = _builder(dataset, destination, name, "split", settings)
     try:
         if visualize:

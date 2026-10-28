@@ -735,6 +735,7 @@ class Dataset:
         source_splits: Iterable[Literal["train", "val", "test"]] | None = None,
         group_by: Callable[[Path], Hashable] | str | tuple[str, ...] | None = None,
         assign: Callable[[Path], Literal["train", "val", "test"] | None] | None = None,
+        classes_must_appear_in: Iterable[Literal["train", "val", "test"]] = (),
         seed: int = 42,
         visualize: bool = True,
         progress: bool = True,
@@ -756,6 +757,12 @@ class Dataset:
                 Images with the same key remain in one output split.
             assign: Optional callback that pins an image to a split. Return
                 ``None`` to let ratio-based assignment decide.
+            classes_must_appear_in: Require every observed class in each named
+                split, e.g. ("train",) or ("train", "val", "test"). Classes are
+                individual identities for ID datasets; unlabeled images do not
+                count as a class. Only source_splits contribute classes. Whole
+                groups and explicit assignments are preserved; impossible
+                coverage raises an error. Empty by default (no constraint).
             seed: Deterministic shuffle seed for unpinned groups.
             visualize: Produce split previews and count reports at export.
             progress: Show export-time progress.
@@ -764,14 +771,19 @@ class Dataset:
             A virtual dataset with projected split membership.
         """
 
+        if isinstance(classes_must_appear_in, str):
+            raise TypeError("classes_must_appear_in must be a sequence, e.g. ('train',)")
+        required = tuple(dict.fromkeys(normalize_split(split) for split in classes_must_appear_in))
         if self.task == Task.ID:
             from .id.data import split_dataset
             return split_dataset(self, ratios, group_by=group_by, assign=assign,
-                                 source_splits=source_splits, seed=seed, name=name)
+                                 source_splits=source_splits, seed=seed, name=name,
+                                 classes_must_appear_in=required)
         self._require_vector_annotations("Dataset.split")
         source_split_values = tuple(source_splits) if source_splits is not None else None
         projected, settings, _ = plan_split(
-            self._samples, ratios, source_splits=source_split_values, group_by=group_by, assign=assign, seed=seed
+            self._samples, ratios, source_splits=source_split_values, group_by=group_by, assign=assign, seed=seed,
+            classes_must_appear_in=required,
         )
         settings["visualize"] = visualize
         operation = PlannedOperation(
@@ -779,6 +791,7 @@ class Dataset:
             {
                 "ratios": dict(ratios), "source_splits": source_split_values,
                 "group_by": group_by, "assign": assign, "seed": seed, "visualize": visualize,
+                "classes_must_appear_in": required,
             },
             settings,
         )

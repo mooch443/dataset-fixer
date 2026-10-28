@@ -402,7 +402,8 @@ def from_dataset(dataset, *, identity, context_fraction=0.0):
     return as_dataset(SampleIndex(records), location=dataset.location, name=dataset.name)
 
 
-def split_dataset(dataset, ratios, *, group_by=None, assign=None, source_splits=None, seed=42, name=None):
+def split_dataset(dataset, ratios, *, group_by=None, assign=None, source_splits=None, seed=42, name=None,
+                  classes_must_appear_in=()):
     from ..planning import allocate_groups, normalize_split_ratios
     index = index_of(dataset)
     if source_splits:
@@ -428,10 +429,25 @@ def split_dataset(dataset, ratios, *, group_by=None, assign=None, source_splits=
                 if target not in ratios or (group in locked and locked[group] != target):
                     raise ValueError("Conflicting/invalid explicit group assignment")
                 locked[group] = target
-    allocated = allocate_groups(sizes, ratios, locked, seed)
+    group_classes = None
+    if classes_must_appear_in:
+        pairs = pd.DataFrame({"group": groups, "identity_id": frame.identity_id}).dropna(subset=["identity_id"]).drop_duplicates()
+        group_classes = pairs.groupby("group", sort=False, observed=True).identity_id.agg(frozenset).to_dict()
+    allocated = allocate_groups(sizes, ratios, locked, seed, group_classes=group_classes,
+                                classes_must_appear_in=classes_must_appear_in)
     frame["split"] = groups.map(allocated)
-    result = as_dataset(SampleIndex(frame, names=index.names, sampling=index.sampling), parent=dataset, name=name)
+    warnings = []
+    if classes_must_appear_in:
+        observed = set(frame.identity_id.dropna())
+        for split, ratio in ratios.items():
+            absent = sorted(observed - set(frame.loc[frame.split == split, "identity_id"].dropna()))
+            if ratio > 0 and absent:
+                warnings.append(f"Split {split!r} lacks coverage for {len(absent)} identities: {', '.join(absent[:20])}" +
+                                (" …" if len(absent) > 20 else "") + "; group boundaries preserved")
+    result = as_dataset(SampleIndex(frame, names=index.names, sampling=index.sampling), parent=dataset, name=name, warnings=warnings)
     result._manifest["split_policy"] = dict(group_by=str(group_by), seed=seed, ratios=ratios)
+    if classes_must_appear_in:
+        result._manifest["split_policy"]["classes_must_appear_in"] = list(classes_must_appear_in)
     return result
 
 

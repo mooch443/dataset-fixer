@@ -18,7 +18,8 @@ data = df.Dataset.open('/data/tracklet_npzs', format='trex_npz',
     identities='/data/global_id_summary.xlsx')
 
 # Immutable metadata views; pixels stay at their original locations.
-data = data.split({'train': .7, 'val': .15, 'test': .15}, group_by='clip_id')
+data = data.split({'train': .7, 'val': .15, 'test': .15}, group_by='clip_id',
+                  classes_must_appear_in=('train',))
 data = data.holdout(clip_id='observation-17', identity_ids=['wolf-2'], to_split='test')
 data = data.with_sampling(
     balance_by=('identity_id', 'clip_id', 'tracklet_id'),
@@ -28,6 +29,19 @@ data = data.with_sampling(
 ```
 
 Omit `identity_ids` to hold out the entire clip. `group_by=('identity_id', 'clip_id')` groups each individual/clip combination; path callbacks still work. Individual holdouts warn when the clip remains in training for other animals. Group boundaries take precedence over exact split ratios.
+
+`classes_must_appear_in=('train',)` requires every observed identity in training;
+`('train', 'val', 'test')` requires every identity in all three splits. The default
+`()` adds no coverage constraint. Only labeled identities in the selected
+`source_splits` count. Whole groups and explicit assignments remain intact; a
+class appearing in one clip cannot satisfy a requirement for two splits. Invalid
+or impossible requirements raise an error, including conflicting class overlaps.
+SciPy's integer solver reserves a small set of groups for coverage, and the
+existing ratio allocator places the rest. Required splits must have positive
+ratios. Unrequired splits can lack individuals: ID dataset warnings report those
+gaps, and `id.stats(data, by=('identity_id', 'split'))` shows the actual counts.
+The same option applies to annotation classes in ordinary detection datasets and
+is retained when a planned split is exported.
 
 Sampling first balances individuals, then clips within each individual, then tracklets if requested. Images are sampled within the final group using PyTorch's weighted sampler. `samples_per_epoch` controls workload, not a fixed subset. Draws and augmentations change reproducibly each epoch, including after resume. Optional per-batch caps pack those draws into smaller batches when required; they never drop draws or silently exceed a cap. Very restrictive caps can produce batches of one, which may be unsuitable for a custom encoder containing batch normalization.
 
