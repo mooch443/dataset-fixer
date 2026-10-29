@@ -60,7 +60,7 @@ class _IdentityModule(LightningModule):
         return self
 
     def _step(self, batch, stage):
-        images, labels = batch
+        images, labels = batch[:2]
         embeddings = self(images)
         loss = self.criterion(self.head(embeddings), labels) if self.criterion is not None else self.head(embeddings, labels)
         self.log(f"{stage}_loss", loss, on_step=False, on_epoch=True, batch_size=len(labels))
@@ -87,9 +87,10 @@ class _IdentityModule(LightningModule):
 
 
 class _Pixels(TorchDataset):
-    def __init__(self, index, preprocessing, labels, augmentations=None, *, training=False, seed=7):
+    def __init__(self, index, preprocessing, labels, augmentations=None, *, training=False, seed=7, source_ids=None):
         self.index, self.preprocessing, self.labels = index, preprocessing, labels
         self.training, self.seed, self.epoch = training, seed, 0
+        self.source_ids = source_ids
         self.transform, self.serialized = augmentation_pipeline(augmentations, seed=seed) if training else (None, None)
 
     def __len__(self):
@@ -106,7 +107,8 @@ class _Pixels(TorchDataset):
         if self.transform is not None:
             seed_augmentations(self.transform, (self.seed + epoch*1_000_003 + draw) % (2**32))
             image = self.transform(image=image)["image"]
-        return preprocess(image, self.preprocessing), self.labels[sample.identity_id]
+        source_id = position if self.source_ids is None else int(self.source_ids[position])
+        return preprocess(image, self.preprocessing), self.labels[sample.identity_id], source_id
 
 
 class _DiverseBatches(Sampler):
@@ -118,7 +120,8 @@ class _DiverseBatches(Sampler):
     def __init__(self, index, batch_size, seed):
         self.index, self.batch_size, self.seed, self.epoch = index, batch_size, seed, 0
         self.weights = torch.as_tensor(index.weights(), dtype=torch.double)
-        self.workload = index.sampling.get("samples_per_epoch") or len(index)
+        self.requested_workload = index.sampling.get("samples_per_epoch") or len(index)
+        self.workload = ((self.requested_workload + batch_size - 1) // batch_size) * batch_size
         self.caps = index.sampling.get("max_per_batch", {})
         self.keys = {}
         for field in dict.fromkeys(["clip_id", "tracklet_id", "identity_id", *self.caps]):
@@ -200,17 +203,51 @@ class _IdentityDataModule(LightningDataModule):
         validation = index.where(split="val")
         validation = validation.take(np.flatnonzero(validation.frame.identity_id.isin(labels)))
         self.validation_total = len(validation)
+        # Count underlying files/NPZ rows, not repeated metadata records or crops.
+        self.coverage = {}
+        source_ids = {}
+        for split, records in (("train", train), ("val", validation)):
+            codes, sources = pd.factorize(pd.MultiIndex.from_frame(records.frame[["path", "array", "row"]]))
+            source_ids[split] = codes
+            self.coverage[split] = np.zeros(len(sources), dtype=bool)
         limit = module.identity.get("validation_samples")
         if limit is not None:
             if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
                 raise ValueError("validation_samples must be a positive integer or None (all validation images)")
             if limit < validation.frame.identity_id.nunique():
                 raise ValueError("validation_samples must cover every validation identity")
-            validation = validation.take(balanced_rows(validation, limit, config.seed))
-        self.train_data = _Pixels(train, module.identity["preprocessing"], labels, augmentations, training=True, seed=config.seed)
-        self.val_data = _Pixels(validation, module.identity["preprocessing"], labels)
+            selected = balanced_rows(validation, limit, config.seed)
+            validation = validation.take(selected)
+            source_ids["val"] = source_ids["val"][selected]
+        self.train_data = _Pixels(train, module.identity["preprocessing"], labels, augmentations,
+                                  training=True, seed=config.seed, source_ids=source_ids["train"])
+        self.val_data = _Pixels(validation, module.identity["preprocessing"], labels, source_ids=source_ids["val"])
         self.config = config
         self.batch_sampler = _DiverseBatches(train, config.batch_size or 64, config.seed)
+        if self.batch_sampler.workload != self.batch_sampler.requested_workload:
+            print(f"⚠ ID epoch workload rounded from {self.batch_sampler.requested_workload:,} "
+                  f"to {self.batch_sampler.workload:,} samples for batch size {self.batch_sampler.batch_size}. "
+                  "Extra samples use the same weighted sampler; explicit batch caps still apply.", flush=True)
+
+    def transfer_batch_to_device(self, batch, device, dataloader_idx):
+        if isinstance(batch, torch.Tensor):  # Lightning's model-summary example
+            return super().transfer_batch_to_device(batch, device, dataloader_idx)
+        # Keep coverage metadata on the CPU; do not synchronize the GPU per batch.
+        return (*super().transfer_batch_to_device(batch[:2], device, dataloader_idx), batch[2])
+
+    def mark_seen(self, split, source_ids):
+        self.coverage[split][source_ids.numpy()] = True
+
+    def state_dict(self):
+        return {split: {"total": len(seen), "seen": torch.from_numpy(np.packbits(seen))}
+                for split, seen in self.coverage.items()}
+
+    def load_state_dict(self, state_dict):
+        for split, seen in self.coverage.items():
+            saved = state_dict[split]
+            if saved["total"] != len(seen):
+                raise ValueError(f"Coverage resume requires the same {split} source pool")
+            seen[:] = np.unpackbits(saved["seen"].cpu().numpy(), count=len(seen)).astype(bool)
 
     def train_dataloader(self):
         # Lightning starts prefetch during setup_data, before on_train_epoch_start.
@@ -270,6 +307,7 @@ class _TrainingBridge(ModelCheckpoint):
         super().on_train_batch_end(trainer, pl_module, outputs, batch, batch_idx)
         if not trainer.is_global_zero:
             return
+        trainer.datamodule.mark_seen("train", batch[2])
         now = time.monotonic()
         interval = trainer.log_every_n_steps
         report = (batch_idx == 0 or batch_idx + 1 == trainer.num_training_batches or
@@ -291,16 +329,21 @@ class _TrainingBridge(ModelCheckpoint):
     def on_train_epoch_start(self, trainer, pl_module):
         self.epoch_started = self.last_progress = time.monotonic()
 
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        if trainer.is_global_zero and not trainer.sanity_checking:
+            trainer.datamodule.mark_seen("val", batch[2])
+
     def on_train_epoch_end(self, trainer, pl_module):
         super().on_train_epoch_end(trainer, pl_module)
         if not trainer.is_global_zero:
             return
-        from .monitoring import monitor_epoch
+        from .monitoring import monitor_epoch, coverage_epoch
         metrics = {key.replace("train_", "train/").replace("val_", "val/"): float(value)
                    for key, value in trainer.callback_metrics.items()}
         metrics["optim/lr"] = trainer.optimizers[0].param_groups[0]["lr"]
         metrics["time/epoch_seconds"] = time.monotonic()-self.epoch_started
         started = time.monotonic()
+        metrics.update(coverage_epoch(self.result, trainer.datamodule, trainer.current_epoch))
         metrics.update(monitor_epoch(self.result, pl_module, trainer.current_epoch))
         metrics["time/monitor_seconds"] = time.monotonic()-started
         self.result._capture(trainer, Checkpoints(Path(self.best_model_path) if self.best_model_path else None,
@@ -370,7 +413,7 @@ def train_identity(result, prepared, augmentations):
     identity = {**saved_meta, **{k: v for k, v in options.items() if k not in {"trainer", "pretrained"}},
                 "framework": "id", "backbone": selection.name, "identities": labels,
                 "augmentation_rng": "shared_stream_v2",
-                "sampling": {**index.sampling, "batch_order": "diverse_v2"}, "seed": config.seed, "batch_size": config.batch_size or 64,
+                "sampling": {**index.sampling, "batch_order": "diverse_v3"}, "seed": config.seed, "batch_size": config.batch_size or 64,
                 "training_fingerprint": index.fingerprint,
                 "training_clips": sorted(index.frame.loc[index.frame.split == "train", "clip_id"].dropna().unique().tolist())}
     module = _IdentityModule(identity, pretrained=options.get("pretrained", True) and selection.weights is None and selection.resume is None,
@@ -406,7 +449,9 @@ def train_identity(result, prepared, augmentations):
     started = time.monotonic()
     print("Preparing ID sampling and fixed validation subset", flush=True)
     data = _IdentityDataModule(result.dataset, module, config, serialized)
-    result.metadata["training"].update(validation_samples=len(data.val_data), validation_total=data.validation_total)
+    result.metadata["training"].update(validation_samples=len(data.val_data), validation_total=data.validation_total,
+        requested_samples_per_epoch=data.batch_sampler.requested_workload,
+        effective_samples_per_epoch=data.batch_sampler.workload)
     print(f"ID epoch: {data.batch_sampler.workload:,} training images; "
           f"{len(data.val_data):,}/{data.validation_total:,} fixed validation images "
           f"(prepared in {time.monotonic() - started:.1f}s)", flush=True)

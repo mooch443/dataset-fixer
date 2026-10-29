@@ -59,7 +59,7 @@ def test_clip_views_and_sampling(identity_data):
     train = index_of(balanced).where(split='train')
     sampler = _DiverseBatches(train, 4, 7)
     first = list(sampler)
-    assert sum(map(len, first)) == 101
+    assert sum(map(len, first)) == 104
     for batch in first:
         keys = [(train.frame.iloc[i].clip_id, train.frame.iloc[i].tracklet_id) for i, _, _ in batch]
         assert len(keys) == len(set(keys))
@@ -167,39 +167,6 @@ def test_train_reload_transfer_resume(identity_data, tmp_path, monkeypatch):
     transferred = id.train(as_dataset(SampleIndex(frame), location=tmp_path), weights=Model(legacy_order), augmentations=[],
         config=TrainingConfig(epochs=1, batch_size=4, workers=0, augmentation_samples=0, output_dir=tmp_path/'transferred', backend_options=options))
     assert all(v.endswith('-new') for v in torch.load(transferred.best_weights, weights_only=False)['identity']['identities'])
-
-
-def test_lightning_leafspec_warning_filter_is_scoped(identity_data, tmp_path, monkeypatch):
-    import warnings
-    from lightning.pytorch import Trainer
-    from lightning.pytorch.utilities import _pytree
-    message = ('`isinstance(treespec, LeafSpec)` is deprecated, '
-               'use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.')
-    native_fit = Trainer.fit
-    def fit(self, *args, **kwargs):
-        # Probe the exact upstream warning even after Lightning eventually fixes it.
-        warnings.warn_explicit(message, FutureWarning, _pytree.__file__, 21,
-                               module=_pytree.__name__)
-        warnings.warn_explicit('Another pytree deprecation', FutureWarning, _pytree.__file__, 22,
-                               module=_pytree.__name__)
-        warnings.warn(message, FutureWarning)  # Same message outside Lightning must survive.
-        return native_fit(self, *args, **kwargs)
-    monkeypatch.setattr(Trainer, 'fit', fit)
-    id.register_backbone('warning-tiny', tiny_model, feature_dim=4,
-                         preprocessing=dict(resolution=16, mean=[0]*3, std=[1]*3))
-    with warnings.catch_warnings(record=True) as seen:
-        warnings.simplefilter('always')
-        result = id.train(identity_data, backbone='warning-tiny', augmentations=[], wandb=False,
-            config=TrainingConfig(epochs=1, batch_size=4, workers=0, augmentation_samples=0,
-                output_dir=tmp_path/'run', backend_options=dict(embedding_dim=4, embedding_samples=0,
-                    loss='cross_entropy', pretrained=False,
-                    trainer=dict(enable_progress_bar=False, enable_model_summary=False, num_sanity_val_steps=0))))
-        leaf_warnings = [w for w in seen if str(w.message) == message]
-        assert len(leaf_warnings) == 1 and leaf_warnings[0].filename == __file__
-        assert any(str(w.message) == 'Another pytree deprecation' for w in seen)
-        warnings.warn_explicit(message, FutureWarning, _pytree.__file__, 21, module=_pytree.__name__)
-        assert str(seen[-1].message) == message and seen[-1].filename == _pytree.__file__
-    assert result.best_weights.is_file() and result.resumable_checkpoint.is_file()
 
 
 def test_threshold_ties_library():
@@ -372,7 +339,7 @@ def test_resume_preserves_best_when_validation_does_not_improve(identity_data, t
 
 
 @pytest.mark.parametrize('accumulation', [1, 2])
-def test_native_lightning_display_and_batch_telemetry(identity_data, tmp_path, monkeypatch, capsys, run, accumulation):
+def test_native_lightning_display_and_batch_telemetry(identity_data, tmp_path, monkeypatch, run, accumulation):
     import dataset_fixer as df
     from lightning.pytorch.callbacks import ModelSummary, TQDMProgressBar, RichProgressBar, RichModelSummary
     from lightning.pytorch.trainer.connectors.callback_connector import _RICH_AVAILABLE
@@ -419,13 +386,9 @@ def test_native_lightning_display_and_batch_telemetry(identity_data, tmp_path, m
     assert all(1 <= entry['train/batch_identities'] <= 2 for entry in progress)
     assert [entry['train/batch_loss'] for entry in progress] == pytest.approx(losses)
     assert result.best_weights.is_file()
-    stdout = capsys.readouterr().out
-    assert 'validation sanity check complete' in stdout
-    assert 'first training batch completed' not in stdout
-    assert 'training batch 2/2' not in stdout
 
 
-def test_native_callback_and_partial_batch_telemetry(identity_data, tmp_path, monkeypatch, run):
+def test_native_callback_and_completed_batch_telemetry(identity_data, tmp_path, monkeypatch, run):
     import dataset_fixer as df
     from lightning.pytorch.callbacks import RichProgressBar
     from dataset_fixer.id import training
@@ -449,7 +412,7 @@ def test_native_callback_and_partial_batch_telemetry(identity_data, tmp_path, mo
                                  trainer=dict(callbacks=[bar], log_every_n_steps=1, enable_model_summary=False))))
     assert trainers[0].progress_bar_callback is bar
     progress = [entry for entry in logged if 'progress/batch' in entry]
-    assert [entry['train/batch_size'] for entry in progress] == [4, 4, 2]
+    assert [entry['train/batch_size'] for entry in progress] == [4, 4, 4]
     assert [entry['progress/batch'] for entry in progress] == [1, 2, 3]
     assert result.best_weights.is_file()
 

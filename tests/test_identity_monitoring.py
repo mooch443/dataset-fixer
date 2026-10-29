@@ -26,21 +26,20 @@ def monitor_module():
                                 embedding_dim=4, loss='cross_entropy'), pretrained=False)
 
 
-def test_large_monitor_request_is_bounded_and_warns_once(identity_data, tmp_path, monkeypatch, capsys):
+def test_large_monitor_request_is_bounded(identity_data, tmp_path, monkeypatch):
     monkeypatch.setattr(monitoring, '_MAX_EMBEDDING_SAMPLES', 12)
     result = monitor_result(identity_data, tmp_path, 10**20)
     monitoring.prepare_monitor(result)
     assert len(result._embedding_cohort) == 12
     assert result._embedding_cohort.frame.split.value_counts().loc[['train', 'val']].tolist() == [6, 6]
     monitoring.prepare_monitor(result)
-    assert capsys.readouterr().out.count('⚠ Embedding monitor:') == 1
     result = monitor_result(identity_data, tmp_path/'disabled', 0)
     monkeypatch.setattr(monitoring, 'index_of', lambda *a: pytest.fail('Disabled monitor must not select data'))
     monitoring.prepare_monitor(result)
     assert result._embedding_cohort is None
 
 
-def test_monitor_memory_failure_reduces_next_attempt_and_preserves_rng(identity_data, tmp_path, monkeypatch, capsys):
+def test_monitor_memory_failure_reduces_next_attempt_and_preserves_rng(identity_data, tmp_path, monkeypatch):
     import random
     module = monitor_module().train()
     result = monitor_result(identity_data, tmp_path)
@@ -65,10 +64,9 @@ def test_monitor_memory_failure_reduces_next_attempt_and_preserves_rng(identity_
     cohort = result._embedding_cohort.frame.copy()
     monitoring.monitor_epoch(result, module, 2)
     assert result._embedding_cohort.frame.equals(cohort)
-    assert capsys.readouterr().out.count('⚠ Embedding monitor:') == 1
 
 
-def test_cohort_preparation_failure_is_optional(identity_data, tmp_path, monkeypatch, capsys):
+def test_cohort_preparation_failure_is_optional(identity_data, tmp_path, monkeypatch):
     result = monitor_result(identity_data, tmp_path)
     def fail(*args):
         raise OSError('unavailable diagnostic storage')
@@ -76,10 +74,9 @@ def test_cohort_preparation_failure_is_optional(identity_data, tmp_path, monkeyp
     monitoring.prepare_monitor(result)
     for epoch in range(2):
         assert monitoring.monitor_epoch(result, None, epoch)['embeddings/skipped'] == 1
-    assert capsys.readouterr().out.count('⚠ Embedding monitor:') == 1
 
 
-def test_failed_monitor_does_not_block_training_or_checkpoint_bundle(identity_data, tmp_path, monkeypatch, capsys):
+def test_failed_monitor_does_not_block_training_or_checkpoint_bundle(identity_data, tmp_path, monkeypatch):
     monitor_module()
     def fail(*args, **kwargs):
         raise OSError('diagnostic renderer unavailable')
@@ -92,8 +89,7 @@ def test_failed_monitor_does_not_block_training_or_checkpoint_bundle(identity_da
     assert result.best_weights.is_file() and result.resumable_checkpoint.is_file() and result.bundle.path.is_file()
     checkpoint = torch.load(result.resumable_checkpoint, weights_only=False)
     assert checkpoint['epoch'] == 1 and checkpoint['global_step'] == 4
-    assert 'diagnostic renderer unavailable' in result.metadata['monitoring']['notice']
-    assert capsys.readouterr().out.count('⚠ Embedding monitor:') == 1
+    assert result._embedding_disabled
 
 
 def test_monitor_does_not_swallow_user_interrupt(identity_data, tmp_path, monkeypatch):

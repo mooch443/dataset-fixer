@@ -68,9 +68,10 @@ No hard limits apply by default. If explicitly supplied,
 `max_per_batch={'tracklet_id': 2}` remains a strict cap and can produce smaller
 batches. The sampler version is stored in checkpoints: old sequential-order runs
 can initialize a new run with `weights=`, but cannot silently resume with a different
-batch ordering algorithm. This proportional ordering is recorded as
-`diverse_v2`; `diverse_v1` checkpoints remain valid for prediction and `weights=`
-initialization, but require a new training run to use the corrected ordering.
+batch ordering algorithm. Proportional ordering with complete-batch workloads is
+recorded as `diverse_v3`; older checkpoints remain valid for prediction and
+`weights=` initialization, but require a new run for the new workload policy and
+cumulative source-coverage tracking.
 
 CSV/JSONL rows require `identity_id` (null is allowed) and either `image_path`/`path`, or `archive`, `array`, `row`. Optional fields include `split`, `clip_id`, `tracklet_id`, `local_id`, `frame_index`, `notes`, and `original_id`. Paths are relative to the manifest. Unsplit rows belong to `train`. A JSONL `crop: [left, top, right, bottom]` is an optional deterministic pixel crop. Use `data.export(destination=..., format='identity_manifest')` to save a view without copying pixels.
 
@@ -119,7 +120,19 @@ Predefined backbones: `resnet18`, `efficientnet_v2_s`, `convnext_tiny`. Arbitrar
 
 ### Epoch workload and CUDA
 
-Without explicit batch caps, the progress bar reports the complete batch count: `samples_per_epoch=50_000` and `batch_size=64` produce 782 training batches. Explicit `max_per_batch` caps can produce smaller batches and keep the count unknown until sampled.
+Training rounds `samples_per_epoch` up to the nearest batch-size multiple and
+prints one startup notice if it changes. For example, 5,000 becomes 5,056 at
+batch size 64, or 5,120 at batch size 256. Without an explicit workload, the
+eligible training row count is rounded in the same way. Extra draws use the
+same weighted sampler and receive fresh augmentations. The immutable dataset
+and requested configuration stay intact; run metadata records both
+`requested_samples_per_epoch` and `effective_samples_per_epoch`.
+
+Without explicit batch caps, the progress bar reports the complete batch count:
+50,000 requested samples at batch size 64 become 50,048 samples in 782 full
+batches. Explicit `max_per_batch` caps still take precedence, can produce smaller
+batches, and keep their count unknown until sampled. Validation is never padded
+or repeated to fill a batch.
 
 ID training uses Lightning's native Rich display when available, otherwise tqdm. Native `trainer.enable_progress_bar` and `trainer.enable_model_summary` switches still apply; native callback instances can be passed in `backend_options['trainer']['callbacks']`. Flushed startup messages identify W&B initialization, the backup-directory check, augmentation rendering, sampler preparation, monitor-cohort selection and validation sanity checks. Timings separate dataset preparation from actual training. There are no additional per-batch printouts.
 
@@ -128,12 +141,6 @@ FLOPs summary. This measures one image's encoder/projection forward pass, not a
 training batch or GPU utilization. The identity head/loss are outside that
 forward pass and may show zero. Lightning's `bf16-mixed` model-summary warning
 concerns its parameter-memory estimate; it does not disable mixed precision.
-
-Without explicit batch caps, a non-divisible workload ends with a smaller batch:
-5,000 images at batch size 64 gives 78 full batches and one batch of 8. That tail
-can have different normalization statistics and less identity/clip diversity.
-For a controlled comparison use 5,120 images (80 full batches); this still samples
-fresh images from the whole eligible dataset. No samples are silently discarded.
 
 By default every eligible validation image is evaluated every epoch. For a large dataset, set `backend_options={"validation_samples": 8192}` to select a fixed validation subset balanced across identities, clips and tracklets. It is selected once from the seed, is unchanged across epochs/resume, and is used for validation loss and checkpoint selection. The limit must cover every validation identity. Startup output and training metadata report selected/available counts. `None` retains full validation. Final `result.evaluate(split="test")` still uses the full test query cohort.
 
@@ -279,6 +286,30 @@ Only three public classes are added: `id.Protocol`, `id.Gallery`, and `id.Reject
 No parallel plotting engine, identity-specific model/result hierarchy, or custom optimization loop is introduced.
 
 ## Monitoring and inspection
+
+Every epoch logs exact cumulative physical-source coverage under
+`dataset_coverage/train_percent` and `dataset_coverage/val_percent`, with
+`train_seen`, `train_total`, `val_seen`, and `val_total` counts in the same namespace.
+The denominator is each split's eligible source pool in the dataset passed to
+training, after identity/unlabeled filtering and before epoch/validation limits.
+Validation includes identities supported by the training head. These are
+per-split percentages, not fractions of train+val+test combined.
+
+A physical source is a file path, or an NPZ path/array/row. Repeated draws,
+augmentations, and derived crops of that source count once; copied files at
+different paths are distinct (no expensive pixel-hash deduplication). Counters
+advance only after completed batches. Prefetch, sanity checks, augmentation and
+embedding previews do not count. A fixed validation subset therefore produces
+flat validation coverage after the first epoch. Full resume restores compact
+coverage bitmaps through Lightning's DataModule checkpoint state; `weights=`
+starts coverage for the new run.
+
+`dataset_coverage/chart` is a two-bar image per epoch, rendered with the existing
+chart machinery and browsable through W&B's media history. Both scalar series
+remain available for custom history plots. The latest image and `coverage.csv`
+enter the bundle. Chart failures disable only the coverage image; counts and
+training continue. Coverage metadata stays on the CPU and requires no per-batch
+GPU synchronization. Disabling embedding plots does not disable these counters.
 
 Every epoch renders a scikit-learn t-SNE projection of a fixed, balanced cohort of up to 512 training/validation crops, using the **current** encoder and deterministic preprocessing. Selection and monitoring preserve training RNGs and model mode. Identity colors and cohort membership remain fixed; refitted 2D coordinates are not a longitudinal distance metric. Set `backend_options={"embedding_samples": 512, "embedding_method": "tsne"}` (`"pca"` is also supported; samples `0` disables it).
 

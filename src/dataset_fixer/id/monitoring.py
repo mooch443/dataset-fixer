@@ -11,19 +11,21 @@ from .data import balanced_rows, index_of
 _MAX_EMBEDDING_SAMPLES = 2048
 
 
-def _monitor_notice(result, key, message):
+def _monitor_notice(result, key, message, *, namespace='embeddings'):
     """Report a diagnostic fallback once per reason, including in run metadata."""
     if not hasattr(result, 'metadata'):
         result.metadata = {}
-    result.metadata.setdefault('monitoring', {})['notice'] = message
+    result.metadata.setdefault('monitoring', {})['notice' if namespace == 'embeddings' else 'coverage_notice'] = message
+    key = (namespace, key)
     notices = getattr(result, '_embedding_notices', set())
     if key not in notices:
         notices.add(key)
         result._embedding_notices = notices
-        print(f"⚠ Embedding monitor: {message}", flush=True)
+        label = 'Embedding monitor' if namespace == 'embeddings' else 'Dataset coverage'
+        print(f"⚠ {label}: {message}", flush=True)
     if result.wandb_run is not None:
         try:
-            result.wandb_run.summary['embeddings/notice'] = message
+            result.wandb_run.summary[f'{namespace}/notice'] = message
         except Exception:
             pass  # Diagnostics must also survive a broken media/logging sink.
 
@@ -99,7 +101,7 @@ def prepare_monitor(result):
     run = result.wandb_run
     if run is not None:
         run.define_metric("epoch")
-        for namespace in ("train/*", "val/*", "optim/*", "time/*", "embeddings/*"):
+        for namespace in ("train/*", "val/*", "optim/*", "time/*", "embeddings/*", "dataset_coverage/*"):
             run.define_metric(namespace, step_metric="epoch")
         run.define_metric("val/loss", step_metric="epoch", summary="min")
         run.define_metric("val/monitor_rank1", step_metric="epoch", summary="max")
@@ -107,6 +109,39 @@ def prepare_monitor(result):
         run.define_metric("progress/*", step_metric="progress/global_step")
         for name in ('loss', 'size', 'identities'):
             run.define_metric(f"train/batch_{name}", step_metric="progress/global_step")
+
+
+def coverage_epoch(result, data, epoch):
+    """Report exact cumulative source coverage, independently of embedding previews."""
+    rows, metrics = [], {}
+    for split, seen in data.coverage.items():
+        total, used = len(seen), int(np.count_nonzero(seen))
+        percent = 100 * used / total if total else 0.
+        rows.append(dict(epoch=epoch, split=split, seen=used, total=total, percent=percent))
+        metrics.update({f'dataset_coverage/{split}_{name}': value
+                        for name, value in dict(seen=used, total=total, percent=percent).items()})
+    result.metadata['dataset_coverage'] = rows
+    if getattr(result, '_coverage_plot_failed', False):
+        return metrics
+    try:
+        from .inspection import coverage_chart
+        from ..static_rendering import save_chart
+        folder = result.output_dir / 'monitoring'
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f'coverage-{epoch:04d}.png'
+        save_chart(coverage_chart(rows, epoch=epoch), path)
+        table = folder / 'coverage.csv'
+        pd.DataFrame(rows).to_csv(table, mode='a', header=not table.exists(), index=False)
+        result.auxiliary_files.update({'monitoring/coverage.png': path, 'monitoring/coverage.csv': table})
+        if result.wandb_run is not None:
+            import wandb
+            result.wandb_run.log({'epoch': epoch, 'dataset_coverage/chart': wandb.Image(str(path),
+                caption=f'Epoch {epoch+1}: cumulative distinct source images used')})
+    except Exception as error:
+        result._coverage_plot_failed = True
+        _monitor_notice(result, 'chart', f'chart disabled ({type(error).__name__}: {error}); '
+                        'coverage metrics and training continue.', namespace='dataset_coverage')
+    return metrics
 
 
 def monitor_epoch(result, module, epoch):

@@ -48,6 +48,24 @@ def embedding_chart(table, *, identities, method, epoch):
     ))
 
 
+def coverage_chart(rows, *, epoch):
+    import altair as alt
+    from ..tabular import chart_data
+    base = alt.Chart(chart_data(rows)).encode(
+        x=alt.X('split:N', sort=['train', 'val'], title=None, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y('percent:Q', title='Unique source images used (%)', scale=alt.Scale(domain=[0, 100])),
+        tooltip=['split:N', 'seen:Q', 'total:Q', alt.Tooltip('percent:Q', format='.2f')],
+    )
+    bars = base.mark_bar(size=90).encode(color=alt.Color('split:N', legend=None,
+        scale=alt.Scale(domain=['train', 'val'], range=['#4c78a8', '#f58518'])))
+    labels = base.mark_text(dy=-10, fontSize=14).encode(text=alt.Text('percent:Q', format='.2f'))
+    return (bars + labels).properties(width=360, height=230, padding=16, title=alt.TitleParams(
+        text=f'Dataset coverage · epoch {epoch+1}', offset=25, subtitle=[
+            'Cumulative completed batches; repeats count once',
+            ' · '.join(f"{r['split']}: {r['seen']:,} / {r['total']:,}" for r in rows),
+        ]))
+
+
 def visualize_attention(model, source, *, gallery, identity_id=None, contrast=True,
                         samples=4, patch_fraction=0.15, device=None, destination=None, show=True):
     """Visualize Captum occlusion attribution for identity similarity.

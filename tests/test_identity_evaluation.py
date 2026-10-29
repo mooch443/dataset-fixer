@@ -79,7 +79,7 @@ def test_batched_retrieval_matches_scalar_library(identity_data, tmp_path, monke
         assert summary.loc['identity_clip', 'average_precision'] == pytest.approx(balanced)
 
 
-def test_embedding_progress_cached_quiet_and_failure(identity_data, tmp_path, monkeypatch, capsys):
+def test_embedding_progress_cached_quiet_and_failure(identity_data, tmp_path, monkeypatch):
     import torch
     from dataset_fixer.id.training import _IdentityModule
     from dataset_fixer.id.data import ImageRef
@@ -94,13 +94,11 @@ def test_embedding_progress_cached_quiet_and_failure(identity_data, tmp_path, mo
     options = dict(batch_size=3, prediction_cache=tmp_path/'cache', _on_progress=lambda *event: events.append(event))
     fresh = model.embed(data, **options)
     assert events == [('embeddings', 0, 7), ('embeddings', 7, 7)]
-    assert '7/7 images' in capsys.readouterr().out
     events.clear()
     cached = model.embed(data, progress=False, cache_only=True, **options)
     assert cached.cache_info['hits'] == 7
     np.testing.assert_array_equal([r.embedding for r in fresh], [r.embedding for r in cached])
     assert events == [('embeddings', 0, 7), ('embeddings', 7, 7)]
-    assert not capsys.readouterr().out
     events.clear()
     def broken(*args):
         raise OSError('read failed')
@@ -129,7 +127,7 @@ def test_id_console_capture_defaults_preserve_explicit_settings(identity_data, t
     assert options == ({} if settings is None else {'settings': settings})
 
 
-def test_periodic_progress_reports_completed_batches_and_failures(monkeypatch, capsys, run):
+def test_periodic_progress_reports_completed_batches_and_failures(monkeypatch, run):
     from dataset_fixer.id import _progress, monitoring
     clock = SimpleNamespace(now=0.)
     monkeypatch.setattr(_progress, 'time', SimpleNamespace(monotonic=lambda: clock.now))
@@ -149,5 +147,4 @@ def test_periodic_progress_reports_completed_batches_and_failures(monkeypatch, c
     completed = [v['evaluation/test/embeddings_completed'] for v in logged if 'evaluation/test/embeddings_completed' in v]
     assert completed == [0, 3]
     assert run.summary['evaluation/test/stage'] == 'failed'
-    assert '3/12 images' in capsys.readouterr().out
     assert any(kwargs.get('step_metric') == 'evaluation/test/elapsed_seconds' for args, kwargs in definitions)

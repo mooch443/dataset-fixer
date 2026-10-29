@@ -22,9 +22,9 @@ def test_diverse_batches_preserve_weighted_draws_and_full_batch_sizes():
     sampler = _DiverseBatches(index, 8, 7)
     batches = list(sampler)
     assert len(sampler) == len(batches) == 13
-    assert [len(batch) for batch in batches] == [8]*12 + [5]
+    assert [len(batch) for batch in batches] == [8]*13
     draws = [key for batch in batches for key in batch]
-    expected = list(torch.utils.data.WeightedRandomSampler(sampler.weights, 101, replacement=True,
+    expected = list(torch.utils.data.WeightedRandomSampler(sampler.weights, 104, replacement=True,
                                                          generator=torch.Generator().manual_seed(7)))
     assert [row for row, _, _ in sorted(draws, key=lambda item: item[1])] == expected
     assert Counter(row for row, _, _ in draws) == Counter(expected)
@@ -51,15 +51,15 @@ def test_sparse_diversity_fills_batches_and_explicit_caps_remain_strict():
         dict(path=f'/unused/{i}.png', width=16, height=16, identity_id='a', clip_id='one', tracklet_id='one')
         for i in range(3)
     ], sampling=dict(samples_per_epoch=17))
-    assert [len(batch) for batch in _DiverseBatches(index, 8, 1)] == [8, 8, 1]
+    assert [len(batch) for batch in _DiverseBatches(index, 8, 1)] == [8, 8, 8]
     index.sampling['max_per_batch'] = {'tracklet_id': 2}
     with pytest.raises(TypeError, match='max_per_batch'):
         len(_DiverseBatches(index, 8, 1))
-    assert [len(batch) for batch in _DiverseBatches(index, 8, 1)] == [2]*8 + [1]
+    assert [len(batch) for batch in _DiverseBatches(index, 8, 1)] == [2]*12
     index.frame['clip_id'] = None
     index.frame['tracklet_id'] = None
     index.sampling.pop('max_per_batch')
-    assert [len(batch) for batch in _DiverseBatches(index, 8, 1)] == [8, 8, 1]
+    assert [len(batch) for batch in _DiverseBatches(index, 8, 1)] == [8, 8, 8]
 
 
 def test_clip_coverage_cannot_defer_an_identity_to_epoch_tail(monkeypatch):
@@ -77,3 +77,14 @@ def test_clip_coverage_cannot_defer_an_identity_to_epoch_tail(monkeypatch):
         assert frame.identity_id.value_counts().to_dict() == {'a': 4, 'b': 4}
         assert frame.clip_id.nunique() == 5  # maximum under those identity shares
         assert len(frame[['clip_id', 'tracklet_id']].drop_duplicates()) == 8
+
+
+@pytest.mark.parametrize('requested,batch_size,effective', [(5000,64,5056), (5000,256,5120), (5120,64,5120), (1,64,64)])
+def test_epoch_workload_rounds_up_to_full_batches(requested, batch_size, effective):
+    index = sample_index()
+    index.sampling['samples_per_epoch'] = requested
+    sampler = _DiverseBatches(index, batch_size, 7)
+    assert sampler.workload == effective
+    assert sampler.requested_workload == requested
+    assert index.sampling['samples_per_epoch'] == requested
+    assert len(sampler) == effective // batch_size
