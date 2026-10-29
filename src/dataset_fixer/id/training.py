@@ -25,7 +25,7 @@ class _IdentityModule(LightningModule):
         super().__init__()
         self.identity = dict(identity)
         for key, value in dict(loss="subcenter_arcface", sub_centers=3, freeze_backbone=False,
-                               lr=1e-3, weight_decay=1e-4).items():
+                               lr=1e-3, weight_decay=1e-4, validation_sampling="fixed").items():
             self.identity.setdefault(key, value)
         self.encoder, features, prep = build_backbone(identity["backbone"], pretrained=pretrained, instance=instance,
             resolution=resolution or identity.get("preprocessing", {}).get("resolution"))
@@ -229,22 +229,41 @@ class _IdentityDataModule(LightningDataModule):
         # Count underlying files/NPZ rows, not repeated metadata records or crops.
         self.coverage = {}
         source_ids = {}
+        source_pools = []
         for split, records in (("train", train), ("val", validation)):
             codes, sources = pd.factorize(pd.MultiIndex.from_frame(records.frame[["path", "array", "row"]]))
             source_ids[split] = codes
             self.coverage[split] = np.zeros(len(sources), dtype=bool)
+            source_pools.append(sources)
+        # The combined percentage counts a source once even if both splits
+        # reference it. Split bars retain their own eligible denominators.
+        combined, sources = pd.factorize(source_pools[0].append(source_pools[1]))
+        self.coverage_total = len(sources)
+        self.coverage_source_ids = dict(zip(self.coverage,
+            np.split(combined, [len(source_pools[0])])))
         limit = module.identity.get("validation_samples")
+        self.validation_sampling = module.identity.get("validation_sampling", "fixed")
+        if self.validation_sampling not in {"fixed", "cycle"}:
+            raise ValueError("validation_sampling must be fixed or cycle")
+        self._validation_order = None
         if limit is not None:
             if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
                 raise ValueError("validation_samples must be a positive integer or None (all validation images)")
             if limit < validation.frame.identity_id.nunique():
                 raise ValueError("validation_samples must cover every validation identity")
+            if self.validation_sampling == "cycle" and limit < len(validation):
+                self._validation_index, self._validation_source_ids = validation, source_ids["val"]
+                # Cycle each identity independently: short identities repeat while
+                # long ones advance, keeping every epoch's identity shares balanced.
+                self._validation_order = [rows[np.asarray(balanced_rows(validation.take(rows), len(rows), config.seed))]
+                    for rows in validation.frame.groupby("identity_id", observed=True, sort=True).indices.values()]
             selected = balanced_rows(validation, limit, config.seed)
             validation = validation.take(selected)
             source_ids["val"] = source_ids["val"][selected]
         self.train_data = _Pixels(train, module.identity["preprocessing"], labels, augmentations,
                                   training=True, seed=config.seed, source_ids=source_ids["train"], profile=profile)
         self.val_data = _Pixels(validation, module.identity["preprocessing"], labels, source_ids=source_ids["val"], profile=profile)
+        self._cycle_validation(0)
         self.config = config
         self.batch_sampler = _DiverseBatches(train, config.batch_size or 64, config.seed, profile=profile)
         if self.batch_sampler.workload != self.batch_sampler.requested_workload:
@@ -284,9 +303,22 @@ class _IdentityDataModule(LightningDataModule):
         return DataLoader(self.train_data, batch_sampler=self.batch_sampler, **options)
 
     def val_dataloader(self):
+        self._cycle_validation(self.trainer.current_epoch)
         return DataLoader(self.val_data, batch_size=self.config.batch_size or 64, num_workers=self.config.workers,
                           worker_init_fn=_initialize_worker,
                           pin_memory=self.trainer.strategy.root_device.type == "cuda")
+
+    def _cycle_validation(self, epoch):
+        if self._validation_order is None:
+            return
+        positions = np.arange(epoch * len(self.val_data), (epoch + 1) * len(self.val_data))
+        selected = np.empty(len(positions), dtype=int)
+        groups = len(self._validation_order)
+        for group, rows in enumerate(self._validation_order):
+            mask = positions % groups == group
+            selected[mask] = rows[(positions[mask] // groups) % len(rows)]
+        self.val_data.index = self._validation_index.take(selected)
+        self.val_data.source_ids = self._validation_source_ids[selected]
 
 
 class _TrainingBridge(ModelCheckpoint):
@@ -425,13 +457,13 @@ def train_identity(result, prepared, augmentations):
     config, selection = result.config, result.selection
     seed_everything(config.seed, workers=True)
     allowed = {"embedding_dim", "loss", "sub_centers", "freeze_backbone", "lr", "weight_decay", "pretrained", "preprocessing", "trainer",
-               "embedding_samples", "embedding_method", "validation_samples"}
+               "embedding_samples", "embedding_method", "validation_samples", "validation_sampling"}
     unknown = set(config.backend_options)-allowed
     if unknown:
         raise ValueError(f"Unsupported ID backend options: {sorted(unknown)}; Lightning options belong under trainer")
     index = index_of(result.dataset)
     labels = sorted(index.frame.loc[(index.frame.split == "train") & index.frame.identity_id.notna(), "identity_id"].unique())
-    saved_meta = selection.metadata.get("identity", {})
+    saved_meta = {"validation_sampling": "fixed", **selection.metadata.get("identity", {})}
     options = dict(config.backend_options)
     print("Initializing ID encoder and dataset fingerprint", flush=True)
     identity = {**saved_meta, **{k: v for k, v in options.items() if k not in {"trainer", "pretrained"}},
@@ -457,7 +489,7 @@ def train_identity(result, prepared, augmentations):
         if incompatible.unexpected_keys or any(not k.startswith("head.") for k in incompatible.missing_keys):
             raise ValueError("Initialization checkpoint is incompatible with encoder/projection")
     if selection.resume:
-        for key in ("backbone", "identities", "sampling", "seed", "batch_size", "training_fingerprint", "embedding_dim", "loss", "augmentations", "augmentation_rng", "validation_samples", "freeze_backbone", "lr", "weight_decay", "sub_centers"):
+        for key in ("backbone", "identities", "sampling", "seed", "batch_size", "training_fingerprint", "embedding_dim", "loss", "augmentations", "augmentation_rng", "validation_samples", "validation_sampling", "freeze_backbone", "lr", "weight_decay", "sub_centers"):
             if saved_meta.get(key) != module.identity.get(key):
                 raise ValueError(f"Resume requires the same {key}; use weights= for a new run")
     result.metadata.update(identity=module.identity, resolution=module.identity["preprocessing"]["resolution"],
@@ -471,13 +503,14 @@ def train_identity(result, prepared, augmentations):
     if config.augmentation_samples:
         print(f"Augmentation grid ready ({time.monotonic() - started:.1f}s)", flush=True)
     started = time.monotonic()
-    print("Preparing ID sampling and fixed validation subset", flush=True)
+    print("Preparing ID sampling and validation subset", flush=True)
     data = _IdentityDataModule(result.dataset, module, config, serialized)
     result.metadata["training"].update(validation_samples=len(data.val_data), validation_total=data.validation_total,
+        validation_sampling=data.validation_sampling,
         requested_samples_per_epoch=data.batch_sampler.requested_workload,
         effective_samples_per_epoch=data.batch_sampler.workload)
     print(f"ID epoch: {data.batch_sampler.workload:,} training images; "
-          f"{len(data.val_data):,}/{data.validation_total:,} fixed validation images "
+          f"{len(data.val_data):,}/{data.validation_total:,} validation images ({data.validation_sampling}) "
           f"(prepared in {time.monotonic() - started:.1f}s)", flush=True)
     from .monitoring import prepare_monitor
     started = time.monotonic()

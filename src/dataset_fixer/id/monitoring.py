@@ -113,13 +113,15 @@ def prepare_monitor(result):
 
 def coverage_epoch(result, data, epoch):
     """Report exact cumulative source coverage, independently of embedding previews."""
-    rows, metrics = [], {}
+    rows = []
+    combined_seen = np.zeros(data.coverage_total, dtype=bool)
     for split, seen in data.coverage.items():
         total, used = len(seen), int(np.count_nonzero(seen))
         percent = 100 * used / total if total else 0.
         rows.append(dict(epoch=epoch, split=split, seen=used, total=total, percent=percent))
-        metrics.update({f'dataset_coverage/{split}_{name}': value
-                        for name, value in dict(seen=used, total=total, percent=percent).items()})
+        combined_seen[data.coverage_source_ids[split][seen]] = True
+    metrics = {'dataset_coverage/percent':
+        100 * np.count_nonzero(combined_seen) / len(combined_seen) if len(combined_seen) else 0.}
     result.metadata['dataset_coverage'] = rows
     if getattr(result, '_coverage_plot_failed', False):
         return metrics

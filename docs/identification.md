@@ -169,6 +169,18 @@ concerns its parameter-memory estimate; it does not disable mixed precision.
 
 By default every eligible validation image is evaluated every epoch. For a large dataset, set `backend_options={"validation_samples": 8192}` to select a fixed validation subset balanced across identities, clips and tracklets. It is selected once from the seed, is unchanged across epochs/resume, and is used for validation loss and checkpoint selection. The limit must cover every validation identity. Startup output and training metadata report selected/available counts. `None` retains full validation. Final `result.evaluate(split="test")` still uses the full test query cohort.
 
+To visit the rest of validation over successive epochs, also set
+`validation_sampling="cycle"` in `backend_options`. Each identity advances through
+a seeded order of its observations, interleaved across clips and tracklets;
+smaller identities wrap independently so identity shares stay balanced. The
+epoch number determines the selection, including after resume. This eventually
+covers all eligible validation sources when complete validation passes run.
+Only metadata is indexed; pixels remain lazy. The default `"fixed"` keeps the
+original behavior, and `validation_samples=None` still evaluates all images.
+Cycling changes the images underlying validation loss and checkpoint selection,
+so adjacent losses are not measured on identical observations. The embedding
+monitor remains fixed. Use fixed or full validation for controlled model comparisons.
+
 On an NVIDIA L4, enable native Lightning mixed precision and PyTorch's faster float32 matmul policy explicitly:
 
 ```python
@@ -364,26 +376,31 @@ No parallel plotting engine, identity-specific model/result hierarchy, or custom
 
 ## Monitoring and inspection
 
-Every epoch logs exact cumulative physical-source coverage under
-`dataset_coverage/train_percent` and `dataset_coverage/val_percent`, with
-`train_seen`, `train_total`, `val_seen`, and `val_total` counts in the same namespace.
-The denominator is each split's eligible source pool in the dataset passed to
-training, after identity/unlabeled filtering and before epoch/validation limits.
-Validation includes identities supported by the training head. These are
-per-split percentages, not fractions of train+val+test combined.
+Every epoch logs one scalar, `dataset_coverage/percent`: the percentage of
+distinct eligible train-or-validation source images consumed so far. Plot it
+against `epoch` in one W&B line panel. Sources shared between those splits count
+once in this combined percentage. Test images are excluded. Eligibility is
+determined after identity/unlabeled filtering and before epoch/validation limits;
+validation includes identities supported by the training head. Raw split counts
+remain in local metadata/CSV rather than additional W&B scalar streams.
 
 A physical source is a file path, or an NPZ path/array/row. Repeated draws,
 augmentations, and derived crops of that source count once; copied files at
 different paths are distinct (no expensive pixel-hash deduplication). Counters
 advance only after completed batches. Prefetch, sanity checks, augmentation and
 embedding previews do not count. A fixed validation subset therefore produces
-flat validation coverage after the first epoch. Full resume restores compact
+flat validation coverage after the first epoch; use `validation_sampling="cycle"`
+to advance through validation, or `validation_samples=None` to reach 100% in one
+complete pass. Training draws are weighted with replacement: coverage is
+nondecreasing, but rare images can take many epochs to appear and no finite
+epoch count guarantees 100%. Full resume restores compact
 coverage bitmaps through Lightning's DataModule checkpoint state; `weights=`
 starts coverage for the new run.
 
 `dataset_coverage/chart` is a two-bar image per epoch, rendered with the existing
-chart machinery and browsable through W&B's media history. Both scalar series
-remain available for custom history plots. The latest image and `coverage.csv`
+chart machinery and browsable through W&B's media history. Each bar uses its
+own split's eligible source pool as the denominator. The chart and combined
+percentage are the only two W&B coverage fields. The latest image and `coverage.csv`
 enter the bundle. Chart failures disable only the coverage image; counts and
 training continue. Coverage metadata stays on the CPU and requires no per-batch
 GPU synchronization. Disabling embedding plots does not disable these counters.
