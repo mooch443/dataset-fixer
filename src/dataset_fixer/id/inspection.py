@@ -267,9 +267,12 @@ def _render_attention(observations, options, *, color_scale, contrast, reference
         prepare=lambda item: _attention_item(*item, item[3]["color_bound"], options))
     title = ("Reference evidence difference" if contrast else "Mean reference evidence") if reference_maps is not None else "Identity evidence"
     scale = f"shared ±{bound:.4g}" if color_scale == "shared" else "per-image scale"
+    subtitle = (["difference = focal_mean - mean(other_identity_means)",
+                 f"red: difference > 0 · blue: difference < 0 · {scale}"]
+                if reference_maps is not None and contrast else [f"Red + · blue − · {scale}"])
     chart = chart.properties(title=alt.TitleParams(text=title,
         anchor="middle", fontSize=12, offset=8,
-        subtitle=[f"Red + · blue − · {scale}"]))
+        subtitle=subtitle))
     finish_visualization(chart, options)
     if options.destination:
         path = Path(options.destination)
