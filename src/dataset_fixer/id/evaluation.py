@@ -393,23 +393,38 @@ def evaluate(model, data, *, gallery, rejection=None, novel_identities=(), unkno
                             {}, "identity", settings, tuple(notes))
 
 
-def visualize_identity(source, *, options, split=None):
+def _prediction_context(record):
+    """Describe a saved decision without recomputing embeddings or gallery scores."""
+    ranking = record.metadata.get("ranking") or []
+    truth = record.metadata.get("reference_identity")
+    margin = float(ranking[0][1] - ranking[1][1]) if len(ranking) > 1 else None
+    correct = None
+    if truth is not None and record.similarity is not None:
+        if record.rejected:
+            correct = truth not in {label for label, _ in ranking} if ranking else None
+        elif record.identity_id is not None:
+            correct = truth == record.identity_id and (margin is None or margin > 0)
+    return dict(ground_truth=truth, correct=correct, rejected=record.rejected,
+                prediction="unknown (rejected)" if record.rejected else record.identity_id or "not identified",
+                identity_id=ranking[0][0] if ranking else record.identity_id,
+                competitor=ranking[1][0] if len(ranking) > 1 else None,
+                margin=margin, similarity=record.similarity)
+
+
+def visualize_identity(source, *, options, split=None, show_model_slugs=True):
     """Prepare identity captions/pixels for the existing generic grid renderer."""
     from ..visualization import VisualizationItem, VisualizationPanel, visualize_records, finish_visualization
     from ..model import PredictionResult
     from .data import ImageRef
     if isinstance(source, PredictionResult):
-        from ..comparison.plot_labels import model_identity_card
-        heading = model_identity_card(source.model_metadata or {"name": source.model_name}, width=max(144, round(options.panel_size*96)))
+        from .inspection import _identity_panel
         records = source.records
         def prepare(record):
             ref = ImageRef(*json.loads(record.metadata["source_ref"]))
             pixels = ref.read()
-            label = f"{record.identity_id or 'unknown'} · cosine {record.similarity:.3f}" if record.similarity is not None else "Embedding"
-            truth = record.metadata.get("reference_identity") or "unlabeled"
-            caption = f"Reference: {truth} · {record.metadata.get('clip_id') or 'no clip'}"
+            caption = record.metadata.get("clip_id") or record.image_path.name
             return VisualizationItem(record.image_path, caption,
-                (VisualizationPanel(source.model_name, pixels, footer=label, heading=heading),), np.ones(pixels.shape[:2], bool))
+                (_identity_panel(pixels, _prediction_context(record), options),), np.ones(pixels.shape[:2], bool))
     else:
         index = index_of(source)
         if split is not None:
@@ -421,6 +436,14 @@ def visualize_identity(source, *, options, split=None):
             return VisualizationItem(sample.image_path, sample.identity_id or "unlabeled",
                 (VisualizationPanel(sample.clip_id or "no clip", pixels, footer=sample.image_path.name),), np.ones(pixels.shape[:2], bool))
     chart = visualize_records(records, options=options, prepare=prepare, title="Individual identification")
+    if isinstance(source, PredictionResult):
+        import altair as alt
+        from ..comparison.plot_labels import model_full_label
+        from .inspection import _PREDICTION_LEGEND
+        model = {"name": source.model_name, **(source.model_metadata or {})}
+        subtitles = [model_full_label(model)] if show_model_slugs else []
+        chart = chart.properties(title=alt.TitleParams(text="Individual identification", anchor="middle",
+            fontSize=16, offset=14, subtitle=[*subtitles, *_PREDICTION_LEGEND]))
     finish_visualization(chart, options)
     return chart
 

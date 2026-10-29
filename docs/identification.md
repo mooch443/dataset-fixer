@@ -321,6 +321,16 @@ opened = model.predict(query_crops, gallery=gallery, mode='open', rejection=reje
 
 Enrollment selects references across clips/tracklets. New individuals can be added by enrolling a new reference dataset without retraining the encoder. Maximum cosine similarity over each identity's references determines its score. Scores are not probabilities. `model.embed(...)` returns the same `PredictionResult`, with `record.embedding`; identified records additionally expose `identity_id`, `similarity` and `rejected`. `predict(..., track_by=('clip_id','tracklet_id'))` optionally averages features within supplied tracking groups. Ground-truth global identity labels cannot be used to form prediction groups.
 
+`predictions.visualize(samples=12, columns=4)` shows one query image per card,
+with ground truth and a prediction colored green for correct, red for incorrect
+(including tied top scores), or gray when correctness is unavailable. The footer
+shows the strongest competitor, the top-two similarity margin, and cosine
+similarity. A rejected query is labeled `unknown (rejected)` and retains its best
+gallery match in the footer; rejection is correct only when the labeled identity
+is absent from the gallery. Unlabeled queries and embedding-only outputs stay
+neutral. Margins require saved rankings; no inference is rerun for visualization.
+Model details appear once above the grid; `show_model_slugs=False` hides them.
+
 Gallery and calibration fingerprints bind to the exact model. A changed model or gallery requires recalibration. `Gallery.load(...)` and `RejectionCalibration.load(...)` restore saved artifacts. Embeddings use the existing verified prediction cache; gallery/rejection changes reuse the encoder output.
 
 Reference selection defaults to the existing seeded, clip/tracklet-balanced random

@@ -91,3 +91,74 @@ def test_attention_overlay_strength_uses_shared_scale():
     assert len(weak.panels) == len(strong.panels) == 1
     assert np.abs(weak.panels[0].image.astype(float) - rgb*255).max() < 2
     assert np.abs(strong.panels[0].image.astype(float) - rgb*255).max() > 50
+
+
+@pytest.fixture
+def prediction_case(tmp_path):
+    from dataset_fixer import ImagePrediction, PredictionResult
+    from dataset_fixer.id.data import ImageRef
+    cases = [
+        ("correct", "wolf-a", "wolf-a", False, [("wolf-a", .98), ("wolf-b", .4)]),
+        ("incorrect", "wolf-b", "wolf-a", False, [("wolf-a", .986), ("wolf-b", .985)]),
+        ("tied", "wolf-a", "wolf-a", False, [("wolf-a", .9), ("wolf-b", .9)]),
+        ("unlabeled", None, "wolf-a", False, [("wolf-a", .8), ("wolf-b", .3)]),
+        ("unknown", "new-wolf", None, True, [("wolf-a", .2), ("wolf-b", .1)]),
+        ("rejected_known", "wolf-a", None, True, [("wolf-a", .2), ("wolf-b", .1)]),
+        ("single", "wolf-a", "wolf-a", False, [("wolf-a", .8)]),
+        ("embedding", "wolf-a", None, None, []),
+    ]
+    records = []
+    for number, (name, truth, prediction, rejected, ranking) in enumerate(cases):
+        path = tmp_path / f"{name}.png"
+        Image.new("RGB", (20, 16), (50, 80 + number*15, 100)).save(path)
+        records.append(ImagePrediction(name, path, path.name, 20, 16, metadata=dict(
+            source_ref=ImageRef(str(path)).key, reference_identity=truth, identity_id=prediction,
+            rejected=rejected, similarity=ranking[0][1] if ranking else None, ranking=ranking,
+            clip_id="0909_126_PM3_Zz_SH")))
+    return PredictionResult("test-model", "id", "id", "torch", tuple(records), 0.,
+        model_metadata=dict(name="test-model", model_type="resnet18", resolution=128,
+                            hash="1fbe0718", source_created_at="2026-10-29T15:08:17"))
+
+
+def test_prediction_context_distinguishes_errors_rejections_and_missing_labels(prediction_case):
+    from dataset_fixer.id.evaluation import _prediction_context
+    contexts = {record.image_id: _prediction_context(record) for record in prediction_case}
+    assert {key: value["correct"] for key, value in contexts.items()} == dict(
+        correct=True, incorrect=False, tied=False, unlabeled=None, unknown=True,
+        rejected_known=False, single=True, embedding=None)
+    assert contexts["incorrect"]["margin"] == pytest.approx(.001)
+    assert contexts["tied"]["margin"] == 0
+    assert contexts["single"]["margin"] is None
+    assert contexts["embedding"]["similarity"] is None
+    assert contexts["unknown"]["prediction"] == "unknown (rejected)"
+    assert contexts["unknown"]["identity_id"] == "wolf-a"
+    assert contexts["unknown"]["competitor"] == "wolf-b"
+    assert contexts["unknown"]["margin"] == pytest.approx(.1)
+
+
+def test_prediction_grid_shares_identity_cards_and_model_heading(prediction_case, tmp_path, monkeypatch):
+    from dataset_fixer.id import inspection
+    panels, native = [], inspection._identity_panel
+
+    def capture(*args):
+        panel = native(*args)
+        panels.append(panel)
+        return panel
+
+    monkeypatch.setattr(inspection, "_identity_panel", capture)
+    chart = prediction_case.visualize(samples=8, columns=3, destination=tmp_path / "predictions.png", show=False)
+    spec = chart.to_dict()
+    assert [len(row["hconcat"]) for row in spec["vconcat"]] == [3, 3, 2]
+    assert len(panels) == 8
+    assert {panel.heading.vconcat[1].mark.color for panel in panels} == {"#218739", "#C53030", "#6B7280"}
+    assert any("Margin: +0.0010" in panel.footer for panel in panels)
+    assert any(panel.footer.startswith("Best: wolf-a") for panel in panels)
+    assert any(panel.footer == "Embedding only" for panel in panels)
+    text = json.dumps(spec)
+    assert text.count("1fbe0718") == text.count("resnet18") == text.count("128px") == 1
+    assert "Reference:" not in text
+    assert len([row for rows in spec["datasets"].values() for row in rows if "url" in row]) == 8
+    hidden = prediction_case.visualize(samples=1, columns=1, show_model_slugs=False, show=False).to_dict()
+    assert "1fbe0718" not in json.dumps(hidden)
+    with pytest.raises(TypeError, match="show_model_slugs must be a boolean"):
+        prediction_case.visualize(show_model_slugs="yes", show=False)

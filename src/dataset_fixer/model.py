@@ -632,7 +632,8 @@ class PredictionResult:
             show: Display in an active notebook or interactive backend.
             show_model_slugs: Show the canonical model identifier/hash with
                 coloured architecture, upscale, and resolution slugs above
-                every prediction panel.
+                every prediction panel. Identity grids show these details once
+                as a shared heading.
 
         """
 
@@ -653,13 +654,13 @@ class PredictionResult:
             destination=destination,
             show=show,
         )
-        if self.task == "id":
-            from .id.evaluation import visualize_identity
-            return visualize_identity(self, options=options)
-        if not self.records:
-            raise ValueError("PredictionResult contains no images")
         if not isinstance(show_model_slugs, bool):
             raise TypeError("show_model_slugs must be a boolean")
+        if self.task == "id":
+            from .id.evaluation import visualize_identity
+            return visualize_identity(self, options=options, show_model_slugs=show_model_slugs)
+        if not self.records:
+            raise ValueError("PredictionResult contains no images")
         from .comparison.plot_labels import model_identity_card
 
         model_metadata = {

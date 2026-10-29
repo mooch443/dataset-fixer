@@ -66,32 +66,46 @@ def coverage_chart(rows, *, epoch):
         ]))
 
 
-def _attention_item(sample, rgb, heat, metadata, bound, options):
-    import altair as alt
-    from matplotlib import colormaps
-    from ..static_rendering import format_label, text_region
-    from ..visualization import VisualizationItem, VisualizationPanel
+_PREDICTION_LEGEND = ("Prediction: green correct · red incorrect", "Gray prediction: correctness unavailable")
 
-    scaled = heat / max(bound, 1e-12)
-    colors = colormaps["RdBu_r"]((scaled + 1) / 2)[..., :3]
-    alpha = np.abs(scaled)[..., None] * .65
-    overlay = ((rgb * (1 - alpha) + colors * alpha) * 255).astype(np.uint8)
-    width = round(options.panel_size * 96)
+
+def _identity_panel(pixels, metadata, options):
+    """Shared ground truth, decision colors and score captions for ID images."""
+    import altair as alt
+    from ..static_rendering import format_label, text_region
+    from ..visualization import VisualizationPanel
+
+    width = max(144, round(options.panel_size * 96))
 
     def caption(text, **style):
-        return text_region(format_label(text, mode="middle", maximum=width // 7), width=width, **style)
+        return text_region(format_label(text, mode=options.label_mode, maximum=max(18, width // 7)), width=width, **style)
 
     color = "#6B7280" if metadata["correct"] is None else "#218739" if metadata["correct"] else "#C53030"
     headings = [caption(f"GT: {metadata['ground_truth'] or 'unlabeled'}"),
                 caption(f"Pred: {metadata['prediction']}", color=color, font_weight="bold")]
     if metadata.get("target_override", False):
         headings.append(caption(f"Target: {metadata['identity_id']}"))
-    if metadata["competitor"] is None:
-        footer = f"Similarity: {metadata['similarity']:.4f}\nNo competing identity"
+    if metadata["similarity"] is None:
+        footer = "Embedding only"
+    elif metadata["competitor"] is None:
+        footer = f"Similarity: {metadata['similarity']:.4f}"
     else:
         footer = (f"vs: {metadata['competitor']}\n"
                   f"Margin: {metadata['margin']:+.4f} · sim: {metadata['similarity']:.4f}")
-    panel = VisualizationPanel("", overlay, footer=footer, heading=alt.vconcat(*headings, spacing=0))
+    if metadata.get("rejected") and metadata.get("identity_id"):
+        footer = f"Best: {metadata['identity_id']} · {footer}"
+    return VisualizationPanel("", pixels, footer=footer, heading=alt.vconcat(*headings, spacing=0))
+
+
+def _attention_item(sample, rgb, heat, metadata, bound, options):
+    from matplotlib import colormaps
+    from ..visualization import VisualizationItem
+
+    scaled = heat / max(bound, 1e-12)
+    colors = colormaps["RdBu_r"]((scaled + 1) / 2)[..., :3]
+    alpha = np.abs(scaled)[..., None] * .65
+    overlay = ((rgb * (1 - alpha) + colors * alpha) * 255).astype(np.uint8)
+    panel = _identity_panel(overlay, metadata, options)
     return VisualizationItem(sample.image_path, sample.clip_id or sample.image_path.name,
                              (panel,), np.ones(heat.shape, bool))
 
@@ -193,8 +207,7 @@ def visualize_attention(model, source, *, gallery, identity_id=None, contrast=Tr
         anchor="middle", fontSize=16, offset=14, subtitle=[
             f"Overlay: red supports · blue opposes {'margin' if contrast else 'similarity'}",
             f"Shared effect scale: ±{bound:.4g}",
-            "Prediction: green correct · red incorrect",
-            "Gray prediction: no ground truth",
+            *_PREDICTION_LEGEND,
         ]))
     finish_visualization(chart, options)
     if destination:
