@@ -125,6 +125,7 @@ def visualize_attention(model, source, *, gallery, identity_id=None, contrast=Tr
     import torch
     from captum.attr import Occlusion
     from .model import input_index, runtime, preprocess
+    from .gallery import identity_scores
     from ..visualization import visualization_options, visualize_records, finish_visualization
     options = visualization_options(samples=samples, columns=columns, destination=destination, show=show)
     if samples is None or not 0 < patch_fraction <= 1:
@@ -143,10 +144,8 @@ def visualize_attention(model, source, *, gallery, identity_id=None, contrast=Tr
     try:
         module.to(target_device).eval()
         references = torch.as_tensor(gallery.embeddings.copy(), device=target_device)
-        masks = [torch.tensor(np.asarray(gallery.labels) == label, device=target_device) for label in gallery.identities]
         def scores(images):
-            similarity = module(images) @ references.T
-            return torch.stack([similarity[:, mask].max(dim=1).values for mask in masks], dim=1)
+            return identity_scores(module(images), references, gallery.labels)
         with torch.no_grad():
             for number, row in enumerate(selected):
                 sample = index[row]

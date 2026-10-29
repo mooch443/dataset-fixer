@@ -1,14 +1,14 @@
 """Enrollment references independent of the encoder's training roster."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path
 
 import numpy as np
 
-from .data import balanced_rows
+from .data import balanced_rows, SampleIndex, ImageRef, as_dataset
 from .model import input_index, embed, fingerprint
 
 
@@ -26,6 +26,7 @@ class Gallery:
     labels: tuple[str, ...]
     references: tuple[dict, ...]
     model_fingerprint: str
+    metadata: dict = field(default_factory=dict)
 
     def __post_init__(self):
         vectors = np.array(self.embeddings, dtype=np.float32, copy=True)
@@ -66,12 +67,21 @@ class Gallery:
         Parameters:
             embeddings: Normalized query features in N×D form.
         """
-        rows = []
-        labels = np.asarray(self.labels)
-        for start in range(0, len(embeddings), 256):
-            similarities = np.asarray(embeddings[start:start+256]) @ self.embeddings.T
-            rows.append(np.stack([similarities[:, labels == label].max(axis=1) for label in self.identities], axis=1))
-        return np.concatenate(rows) if rows else np.empty((0, len(self.identities)))
+        return identity_scores(np.asarray(embeddings), self.embeddings, self.labels)
+
+    @property
+    def summary(self):
+        """Local enrollment counts per identity; no additional W&B metrics."""
+        import pandas as pd
+        return pd.DataFrame(self.metadata.get("identities", []))
+
+    def visualize(self, **kwargs):
+        """Show the selected source images using Dataset.visualize options."""
+        index = input_index([ImageRef(*json.loads(r["source_ref"])) for r in self.references])
+        frame = index.frame.assign(identity_id=list(self.labels))
+        for key in ("clip_id", "tracklet_id", "original_id"):
+            frame[key] = [r.get(key) for r in self.references]
+        return as_dataset(SampleIndex(frame), location=Path.cwd()).visualize(**kwargs)
 
     def save(self, path):
         """Save an enrollment gallery without Python pickle objects.
@@ -81,7 +91,8 @@ class Gallery:
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        metadata = dict(labels=self.labels, references=self.references, model=self.model_fingerprint)
+        metadata = dict(labels=self.labels, references=self.references, model=self.model_fingerprint,
+                        enrollment=self.metadata)
         with path.open("wb") as handle:
             np.savez(handle, embeddings=self.embeddings, metadata=json.dumps(metadata))
         return path
@@ -95,28 +106,117 @@ class Gallery:
         """
         with np.load(path, allow_pickle=False) as data:
             meta = json.loads(str(data["metadata"]))
-            return cls(data["embeddings"], tuple(meta["labels"]), tuple(meta["references"]), meta["model"])
+            return cls(data["embeddings"], tuple(meta["labels"]), tuple(meta["references"]), meta["model"],
+                       meta.get("enrollment", {}))
 
 
-def enroll(model, source, *, samples_per_identity=20, split=None, seed=7, **kwargs):
-    if not isinstance(samples_per_identity, int) or samples_per_identity < 1:
-        raise ValueError("samples_per_identity must be positive")
-    index = input_index(source, split)
-    if index.frame.identity_id.isna().any():
-        raise ValueError("Every enrollment reference requires an explicit identity_id")
+def identity_scores(embeddings, references, labels):
+    """Canonical maximum-cosine identity scores, including differentiable tensors."""
+    labels = np.asarray(labels)
+    identities = sorted(set(labels))
+    numpy = isinstance(embeddings, np.ndarray)
+    if not numpy:
+        import torch
+    masks = [labels == label for label in identities]
+    if not numpy:
+        masks = [torch.as_tensor(mask, device=embeddings.device) for mask in masks]
+    rows = []
+    for start in range(0, len(embeddings), 256):
+        similarities = embeddings[start:start+256] @ references.T
+        values = [similarities[:, mask].max(axis=1) if numpy else similarities[:, mask].max(dim=1).values
+                  for mask in masks]
+        rows.append(np.stack(values, axis=1) if numpy else torch.stack(values, dim=1))
+    if rows:
+        return np.concatenate(rows) if numpy else torch.cat(rows)
+    return np.empty((0, len(identities))) if numpy else embeddings.new_empty((0, len(identities)))
+
+
+def _validate_selection(selection, count, candidates):
+    if selection not in {"balanced", "medoids"}:
+        raise ValueError("gallery selection must be 'balanced' or 'medoids'")
+    for name, value in (("samples_per_identity", count), ("candidates_per_identity", candidates)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if selection == "medoids" and candidates < count:
+        raise ValueError("candidates_per_identity must be at least samples_per_identity")
+
+
+def _candidate_rows(index, count, seed):
     selected = []
     for label in sorted(index.frame.identity_id.unique()):
-        candidates = np.flatnonzero(index.frame.identity_id == label)
-        selected.extend(candidates[balanced_rows(index.take(candidates), samples_per_identity, seed)])
+        rows = np.flatnonzero(index.frame.identity_id == label)
+        selected.extend(rows[balanced_rows(index.take(rows), count, seed)])
+    return selected
+
+
+def _medoid_rows(index, embeddings, count, seed):
+    """Keep hierarchical clip/tracklet quotas; choose representatives within them."""
+    from kmedoids import fasterpam
+    from sklearn.metrics.pairwise import cosine_distances
+    chosen = _candidate_rows(index, count, seed)
+    fields = [key for key in ("identity_id", "clip_id", "tracklet_id") if index.frame[key].notna().all()]
+    groups = index.frame.groupby(fields, observed=True, sort=True).ngroup().to_numpy()
+    selected = []
+    for group, quota in zip(*np.unique(groups[chosen], return_counts=True)):
+        rows = np.flatnonzero(groups == group)
+        if len(rows) > quota:
+            distances = cosine_distances(embeddings[rows]).astype(np.float32)
+            rows = rows[fasterpam(distances, int(quota), random_state=seed, n_cpu=1).medoids]
+        selected.extend(rows)
+    return selected
+
+
+def enroll(model, source, *, samples_per_identity=None, selection=None, candidates_per_identity=None,
+           split=None, seed=None, **kwargs):
+    from .evaluation import Protocol
+    protocol = source if isinstance(source, Protocol) else None
+    if protocol is not None and split is not None:
+        raise ValueError("A Protocol already defines enrollment roles; omit split")
+    selection = selection if selection is not None else (protocol.gallery_selection if protocol else "balanced")
+    count = samples_per_identity if samples_per_identity is not None else (protocol.gallery_samples if protocol else 20)
+    candidates = candidates_per_identity if candidates_per_identity is not None else (protocol.gallery_candidates if protocol else 256)
+    # Balanced Protocol enrollment historically reselected its frozen references
+    # with seed 7, independently of the seed that created those references.
+    seed = seed if seed is not None else (protocol.seed if protocol and selection == "medoids" else 7)
+    _validate_selection(selection, count, candidates)
+    if protocol is not None:
+        if selection == "medoids" and protocol.gallery_selection != "medoids":
+            raise ValueError("Set gallery_selection='medoids' on the Protocol to reserve candidate observations")
+        source = protocol.reference_candidates if selection == "medoids" else protocol.references
+    index = input_index(source, split)
+    if not len(index) or index.frame.identity_id.isna().any():
+        raise ValueError("Every enrollment reference requires an explicit identity_id")
+    selected = _candidate_rows(index, count if selection == "balanced" else candidates, seed)
     result = embed(model, index.take(selected), **kwargs)
     # Identical references do not count as independent gallery observations.
     unique = {}
-    for record in result:
+    unique_rows = []
+    for row, record in zip(selected, result):
         digest = record.metadata["pixel_sha256"]
         label = record.metadata["reference_identity"]
         if digest in unique and unique[digest].metadata["reference_identity"] != label:
             raise ValueError("Identical reference pixels carry conflicting identity labels")
-        unique.setdefault(digest, record)
+        if digest not in unique:
+            unique[digest] = record
+            unique_rows.append(row)
     records = list(unique.values())
+    candidate_refs = [r.metadata["source_ref"] for r in result]
+    candidate_index = index.take(unique_rows)
+    if selection == "medoids":
+        keep = _medoid_rows(candidate_index, np.asarray([r.embedding for r in records]), count, seed)
+        records = [records[i] for i in keep]
+    summaries = []
+    for label in sorted(index.frame.identity_id.unique()):
+        refs = [r.metadata for r in records if r.metadata["reference_identity"] == label]
+        summaries.append(dict(identity_id=label, eligible=int((index.frame.identity_id == label).sum()),
+            candidates=sum(r.metadata["reference_identity"] == label for r in result),
+            unique_candidates=int((candidate_index.frame.identity_id == label).sum()), references=len(refs),
+            clips=len({r["clip_id"] for r in refs if r.get("clip_id") is not None}),
+            tracklets=len({(r.get("clip_id"), r["tracklet_id"]) for r in refs if r.get("tracklet_id") is not None}),
+            shortfall=max(0, count-len(refs))))
+    metadata = dict(selection=selection, seed=seed, samples_per_identity=count,
+                    candidates_per_identity=candidates if selection == "medoids" else count,
+                    candidates=candidate_refs, identities=summaries)
     return Gallery(np.asarray([r.embedding for r in records]), tuple(r.metadata["reference_identity"] for r in records),
-                   tuple({key: r.metadata.get(key) for key in ("source_ref", "original_id", "pixel_sha256", "clip_id", "frame_index", "local_id")} for r in records), fingerprint(model))
+                   tuple({key: r.metadata.get(key) for key in ("source_ref", "original_id", "pixel_sha256", "clip_id", "frame_index", "local_id", "tracklet_id")} for r in records),
+                   fingerprint(model), metadata)

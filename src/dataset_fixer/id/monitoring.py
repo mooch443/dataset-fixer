@@ -238,9 +238,15 @@ def _monitor_epoch(result, module, epoch):
     val = (table.split == "val").to_numpy()
     labels = table.identity_id.to_numpy()
     if train.any() and val.any():
-        enrolled = sorted(set(labels[train]))
-        similarities = features[val] @ features[train].T
-        scores = np.stack([similarities[:, labels[train] == label].max(axis=1) for label in enrolled], axis=1)
+        from .gallery import identity_scores, _candidate_rows, _medoid_rows
+        references = np.flatnonzero(train)
+        protocol = getattr(result, '_identity_protocol', None)
+        if protocol is not None and protocol.gallery_selection == 'medoids':
+            references = references[_candidate_rows(index.take(references), protocol.gallery_candidates, protocol.seed)]
+            references = references[_medoid_rows(index.take(references), features[references],
+                                                 protocol.gallery_samples, protocol.seed)]
+        enrolled = sorted(set(labels[references]))
+        scores = identity_scores(features[val], features[references], labels[references])
         truth = labels[val]
         correct = [label in enrolled and np.sum(row >= row[enrolled.index(label)]) == 1 for row, label in zip(scores, truth)]
         metrics["val/monitor_rank1"] = float(np.mean(correct))

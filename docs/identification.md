@@ -323,6 +323,58 @@ Enrollment selects references across clips/tracklets. New individuals can be add
 
 Gallery and calibration fingerprints bind to the exact model. A changed model or gallery requires recalibration. `Gallery.load(...)` and `RejectionCalibration.load(...)` restore saved artifacts. Embeddings use the existing verified prediction cache; gallery/rejection changes reuse the encoder output.
 
+Reference selection defaults to the existing seeded, clip/tracklet-balanced random
+selection. Opt into representative images with `kmedoids` (included in the `id`
+extra); this changes enrollment, not model training:
+
+```python
+protocol = id.Protocol(
+    train_data,
+    gallery_samples=20,
+    gallery_selection="medoids",
+    gallery_candidates=256,  # Maximum decoded candidates PER identity.
+)
+result = id.train(protocol, config=config, session=session)
+report = result.evaluate(split="val")  # Uses the protocol's enrollment policy.
+gallery = result.model.enroll(protocol)
+
+# Also works with a loaded model and an independent labeled reference dataset:
+gallery = model.enroll(reference_crops, samples_per_identity=20,
+                       selection="medoids", candidates_per_identity=256)
+display(gallery.summary)
+gallery.visualize(samples=12, columns=3)
+```
+
+For medoids, the protocol preserves eligible enrollment candidates separately in
+`reference_candidates`, and excludes their source observations from queries before
+model-dependent selection. `references` retains the historical balanced subset;
+pass the **protocol** to `enroll()` to use the configured selector and candidate pool.
+Changing a balanced protocol to medoids requires constructing a new protocol with
+that policy so its query exclusions are established first.
+
+Candidates are balanced across clips and tracklets, embedded with deterministic
+preprocessing, and deduplicated by pixels before final selection. The existing
+hierarchical sampler determines reference quotas across clips and tracklets;
+FasterPAM chooses cosine-distance medoids **within those groups**, rather than
+letting a large clip dominate a global clustering. Distance matrices are bounded
+by the candidate count, and clustering uses one CPU thread. If the pool contains
+too few unique images, the gallery is smaller and `gallery.summary.shortfall`
+reports the deficit. Balanced selection keeps its previous selection and
+post-selection deduplication behavior for comparability.
+
+The gallery NPZ stores the seed, settings, candidate source references, selected
+tracklet metadata, and per-identity counts. Training-result evaluation also puts
+`identity/enrollment.csv` into the bundle. `gallery.visualize()` delegates to the
+existing dataset renderer and requires the original reference images to remain
+accessible. These reports add **no W&B metrics or automatic gallery plots**.
+
+The epoch embedding monitor keeps its existing cohort, scoring, and W&B keys by
+default. With medoids enabled it applies the same selector to the training half
+of its fixed, bounded cohort; it does not decode an extra candidate pool each
+epoch. Its rank metric remains a small-cohort diagnostic, not the full protocol
+evaluation. Prediction, evaluation, monitoring, and Captum share maximum-cosine
+identity scoring. No top-k voting, prototypes, or reranking are enabled.
+
 ## Evaluation roles
 
 ```python

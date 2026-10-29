@@ -26,19 +26,25 @@ class Protocol:
         novel_identities: Validation/test identities enrolled after encoder training.
         gallery_samples: Maximum references per enrolled identity.
         seed: Deterministic enrollment selection seed.
+        gallery_selection: "balanced" (existing random selection) or "medoids".
+        gallery_candidates: Maximum candidates per identity for medoid selection.
     """
     data: object
     unknown_identities: dict = field(default_factory=dict)
     novel_identities: dict = field(default_factory=dict)
     gallery_samples: int = 20
     seed: int = 7
+    gallery_selection: str = "balanced"
+    gallery_candidates: int = 256
     training: object = field(init=False, repr=False)
     references: object = field(init=False, repr=False)
+    reference_candidates: object = field(init=False, repr=False)
     queries: dict = field(init=False, repr=False)
     limitations: tuple = field(init=False, default=())
 
     @classmethod
-    def open_set(cls, data, *, unknown_identities, novel_identities=None, gallery_samples=20, seed=7):
+    def open_set(cls, data, *, unknown_identities, novel_identities=None, gallery_samples=20, seed=7,
+                 gallery_selection="balanced", gallery_candidates=256):
         """Construct the same protocol with explicit unknown-identity roles.
 
         Parameters:
@@ -47,12 +53,15 @@ class Protocol:
             novel_identities: Optional disjoint newly enrolled labels.
             gallery_samples: Maximum references per enrolled individual.
             seed: Enrollment selection seed.
+            gallery_selection: "balanced" or "medoids" reference selection.
+            gallery_candidates: Maximum medoid candidates per identity.
         """
-        return cls(data, unknown_identities, novel_identities or {}, gallery_samples, seed)
+        return cls(data, unknown_identities, novel_identities or {}, gallery_samples, seed,
+                   gallery_selection, gallery_candidates)
 
     def __post_init__(self):
-        if not isinstance(self.gallery_samples, int) or self.gallery_samples < 1:
-            raise ValueError("gallery_samples must be positive")
+        from .gallery import _validate_selection
+        _validate_selection(self.gallery_selection, self.gallery_samples, self.gallery_candidates)
         index = index_of(self.data)
         frame = index.frame
         unknown = {s: frozenset(map(str, self.unknown_identities.get(s, ()))) for s in ("val", "test")}
@@ -89,7 +98,7 @@ class Protocol:
         training_index.labels = {v: k for k, v in training_index.names.items()}
         training = as_dataset(training_index, parent=self.data)
         training._metadata.names = training_index.names
-        selected, excluded_clips, limitations = [], {}, []
+        selected, eligible, excluded_clips, limitations = [], [], {}, []
         enrolled = set(labels) | novel["val"] | novel["test"]
         for label in sorted(enrolled):
             rows = np.flatnonzero(frame.identity_id == label)
@@ -117,14 +126,19 @@ class Protocol:
             if frame.iloc[candidates].clip_id.isna().any():
                 limitations.append(f"Identity {label}: clip coverage unavailable; only observation/pixel disjointness can be checked")
             selected.extend(candidates[balanced_rows(index.take(candidates), self.gallery_samples, self.seed)])
+            if self.gallery_selection == "medoids":
+                eligible.extend(candidates)
+        # The default keeps its historical fixed query cohort. Model-dependent
+        # selection reserves the entire eligible pool before any model is used.
+        reserved_rows = selected if self.gallery_selection == "balanced" else eligible
         duplicate = np.zeros(len(frame), dtype=bool)
-        duplicate[selected] = True
-        original_ids = set(frame.iloc[selected].original_id.dropna())
+        duplicate[reserved_rows] = True
+        original_ids = set(frame.iloc[reserved_rows].original_id.dropna())
         if original_ids:
             duplicate |= frame.original_id.isin(original_ids).to_numpy()
         fields = ["clip_id", "local_id", "frame_index"]
         complete = frame[fields].notna().all(axis=1)
-        references = frame.iloc[selected].dropna(subset=fields)
+        references = frame.iloc[reserved_rows].dropna(subset=fields)
         if len(references):
             keys = pd.MultiIndex.from_frame(frame.loc[complete, fields])
             duplicate[np.flatnonzero(complete)] |= keys.isin(pd.MultiIndex.from_frame(references[fields]))
@@ -143,7 +157,10 @@ class Protocol:
         object.__setattr__(self, "unknown_identities", unknown)
         object.__setattr__(self, "novel_identities", novel)
         object.__setattr__(self, "training", training)
-        object.__setattr__(self, "references", as_dataset(index.take(selected), parent=self.data))
+        references = as_dataset(index.take(selected), parent=self.data)
+        object.__setattr__(self, "references", references)
+        object.__setattr__(self, "reference_candidates", as_dataset(index.take(eligible), parent=self.data)
+                           if self.gallery_selection == "medoids" else references)
         object.__setattr__(self, "queries", query_sets)
         object.__setattr__(self, "limitations", tuple(limitations))
 

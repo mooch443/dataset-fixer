@@ -1512,12 +1512,15 @@ class Model:
         )
         self._slug = slugify(self._name)
 
-    def enroll(self, source, *, samples_per_identity=20, **kwargs):
+    def enroll(self, source, *, samples_per_identity=None, **kwargs):
         """Enroll reference images without changing model weights.
 
         Parameters:
-            source: Labeled identity dataset or lazy sample references.
-            samples_per_identity: Maximum clip-balanced references per individual.
+            source: Labeled identity dataset, lazy references, or id.Protocol.
+            samples_per_identity: Maximum references per individual; defaults to
+                the Protocol's gallery_samples, or 20 for an ordinary dataset.
+            **kwargs: selection="balanced" or "medoids", candidates_per_identity
+                (default 256), seed, and embedding options such as device.
         """
         if self.kind != "id":
             raise ValueError("Enrollment requires an identity model")
@@ -2196,7 +2199,7 @@ class Model:
             from .id.evaluation import Protocol, evaluate
             from .id.data import index_of, as_dataset
             if isinstance(source, Protocol):
-                gallery = gallery or self.enroll(source.references, samples_per_identity=source.gallery_samples)
+                gallery = gallery or self.enroll(source)
                 unknown_identities, novel_identities = source.unknown_identities[split], source.novel_identities[split]
                 source = source.queries[split]
             else:

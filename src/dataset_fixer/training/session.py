@@ -240,10 +240,12 @@ class TrainingResult:
         if gallery is None or gallery.model_fingerprint != fingerprint(self.model):
             protocol = self._identity_protocol
             callback = (lambda stage, completed, total: on_progress("enrollment", completed, total)) if on_progress else None
-            gallery = self.model.enroll(protocol.references, samples_per_identity=protocol.gallery_samples,
-                                       _on_progress=callback)
+            gallery = self.model.enroll(protocol, _on_progress=callback)
             self._identity_gallery = gallery
             self.auxiliary_files["identity/gallery.npz"] = gallery.save(self.output_dir / "gallery.npz")
+            path = self.output_dir / "enrollment.csv"
+            gallery.summary.to_csv(path, index=False)
+            self.auxiliary_files["identity/enrollment.csv"] = path
         return gallery
 
     def calibrate(self, *, target_fpir=0.01):
