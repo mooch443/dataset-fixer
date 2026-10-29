@@ -160,6 +160,58 @@ backend_options = {
 
 CUDA loaders pin host memory for transfers; CPU/MPS loaders do not. Keep extracted data on local scratch. Worker count should fit the available CPUs; increasing it beyond that may slow loading. These settings reduce work and enable native acceleration, but GPU throughput must be measured on the target machine.
 
+### Locating an input bottleneck
+
+Use Lightning's native `PyTorchProfiler` under `backend_options['trainer']['profiler']`.
+It records CPU activity and, on CUDA, GPU kernels/transfers. Named input ranges
+are enabled only when a profiler is configured: `id/sampling`,
+`id/source_lookup`, `id/read_image`, `id/augment`, and `id/preprocess`.
+No separate profiling implementation or GPU synchronization is added to normal training.
+
+First profile a short run with the actual worker count. Look for GPU idle gaps
+aligned with Lightning's `train_dataloader_next` range; this includes sampling,
+worker/IPC waiting, and collation. Sampling runs in the main process. Worker
+image/augmentation ranges are not collected by the parent profiler: repeat with
+`workers=0` to break down those CPU stages. That serial run diagnoses component
+costs, not production throughput. `id/read_image` includes source cropping and
+black-border trimming; `id/preprocess` includes final resize and normalization.
+CPU and GPU work overlap, so their durations must not be added as if sequential.
+
+```python
+from lightning.pytorch.profilers import PyTorchProfiler
+import torch
+
+profiler = PyTorchProfiler(
+    dirpath='/tmp/id-profile', filename='input', record_module_names=False,
+    schedule=torch.profiler.schedule(wait=1, warmup=1, active=4, repeat=1),
+    record_shapes=False, profile_memory=False, with_stack=False,
+    acc_events=True, row_limit=40,
+)
+# Merge into config.backend_options['trainer'] for a disposable, one-epoch run:
+trainer_options = {
+    'profiler': profiler, 'limit_train_batches': 12, 'limit_val_batches': 1,
+    'num_sanity_val_steps': 0, 'enable_model_summary': False,
+}
+# Use a fresh output directory, augmentation_samples=0, embedding_samples=0,
+# and wandb=False for the profiling run. Keep its model separate from real runs.
+# After fitting: print(profiler.summary()); Chrome trace JSONs are in dirpath.
+```
+
+Sampler selection uses successive minima/maxima instead of sorting the entire
+lookahead for every image, preserving the exact draws, ordering and resume policy.
+The process-local NPZ LRU retains at most 32 memory mappings to avoid repeatedly
+reopening diverse clips. Archives remain lazy; mapping more files can increase
+resident pages and file handles, but does not eagerly decode whole image arrays.
+Loader workers use single-threaded OpenCV while retaining Lightning worker
+seeding, preventing nested OpenCV thread pools from competing for the same CPUs.
+
+Tune from the measured bottleneck: local storage/caching for read time, worker
+count and crop-first pipelines for augmentation time, and batch size/precision
+when GPU kernels dominate. The default augmentation pipeline already crops
+early, combines geometry in one affine transform and retains uint8 pixels.
+Custom pipelines keep their ordering and original crop coordinates; resizing
+before a custom body-part crop must be an explicit pipeline choice.
+
 ### Custom models through the same API
 
 ```python

@@ -60,7 +60,9 @@ class ImageRef:
         return np.ascontiguousarray(pixels)
 
 
-# Process-local LRU: at most two archive mappings, and never a decoded image cache.
+# Process-local LRU: bounded archive mappings, never a decoded image cache.
+# Diverse batches revisit many clips; two entries repeatedly reopen the archives.
+_READER_LIMIT = 32
 _READERS = OrderedDict()
 _READER_PID = None
 
@@ -87,7 +89,7 @@ def _reader(path):
         except ImportError as error:
             raise ImportError("NPZ identity sources require pip install 'dataset-fixer[id]'") from error
         _READERS[path] = NpzReader(path)
-        while len(_READERS) > 2:
+        while len(_READERS) > _READER_LIMIT:
             _, reader = _READERS.popitem(last=False)
             reader.close()
     _READERS.move_to_end(path)

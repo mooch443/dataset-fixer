@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import nullcontext
 import time
 import warnings
 
@@ -87,10 +88,11 @@ class _IdentityModule(LightningModule):
 
 
 class _Pixels(TorchDataset):
-    def __init__(self, index, preprocessing, labels, augmentations=None, *, training=False, seed=7, source_ids=None):
+    def __init__(self, index, preprocessing, labels, augmentations=None, *, training=False, seed=7, source_ids=None, profile=False):
         self.index, self.preprocessing, self.labels = index, preprocessing, labels
         self.training, self.seed, self.epoch = training, seed, 0
         self.source_ids = source_ids
+        self.profile = torch.profiler.record_function if profile else nullcontext
         self.transform, self.serialized = augmentation_pipeline(augmentations, seed=seed) if training else (None, None)
 
     def __len__(self):
@@ -102,13 +104,18 @@ class _Pixels(TorchDataset):
             position, draw, epoch = key
         else:
             position, draw, epoch = key, key, self.epoch
-        sample = self.index[position]
-        image = sample.image_ref.read()
+        with self.profile("id/source_lookup"):
+            sample = self.index[position]
+        with self.profile("id/read_image"):
+            image = sample.image_ref.read()
         if self.transform is not None:
-            seed_augmentations(self.transform, (self.seed + epoch*1_000_003 + draw) % (2**32))
-            image = self.transform(image=image)["image"]
+            with self.profile("id/augment"):
+                seed_augmentations(self.transform, (self.seed + epoch*1_000_003 + draw) % (2**32))
+                image = self.transform(image=image)["image"]
+        with self.profile("id/preprocess"):
+            tensor = preprocess(image, self.preprocessing)
         source_id = position if self.source_ids is None else int(self.source_ids[position])
-        return preprocess(image, self.preprocessing), self.labels[sample.identity_id], source_id
+        return tensor, self.labels[sample.identity_id], source_id
 
 
 class _DiverseBatches(Sampler):
@@ -117,8 +124,9 @@ class _DiverseBatches(Sampler):
     Reorder a bounded metadata-only lookahead; never discard or replace a draw.
     Without explicit caps, repeated groups fill batches when diversity runs out.
     """
-    def __init__(self, index, batch_size, seed):
+    def __init__(self, index, batch_size, seed, *, profile=False):
         self.index, self.batch_size, self.seed, self.epoch = index, batch_size, seed, 0
+        self.profile = torch.profiler.record_function if profile else nullcontext
         self.weights = torch.as_tensor(index.weights(), dtype=torch.double)
         self.requested_workload = index.sampling.get("samples_per_epoch") or len(index)
         self.workload = ((self.requested_workload + batch_size - 1) // batch_size) * batch_size
@@ -145,52 +153,66 @@ class _DiverseBatches(Sampler):
         draws = enumerate(sampler)
         pending = []
         while True:
-            pending.extend((row, draw, epoch) for draw, row in islice(draws, self.batch_size*8-len(pending)))
-            if not pending:
-                return
-            positions = np.array([key[0] for key in pending])
-            fields = {}
-            for field, values in self.keys.items():
-                unique, inverse = np.unique(values[positions], return_inverse=True)
-                fields[field] = inverse, np.zeros(len(unique), dtype=int), np.bincount(inverse), values[positions] >= 0
-            available = np.ones(len(pending), dtype=bool)
-            batch = []
-            for _ in range(self.batch_size):
-                eligible = available.copy()
-                novelty, reuse, remaining = np.zeros((3, len(pending)), dtype=int)
-                identity_share = np.zeros(len(pending))
-                for field, (inverse, counts, frequency, valid) in fields.items():
-                    used = counts[inverse]
-                    if field in ("clip_id", "tracklet_id"):
-                        novelty += valid & (used == 0)
-                        reuse += np.where(valid, used, 0)
-                        remaining += np.where(valid, frequency[inverse], 0)
-                    elif field == "identity_id":
-                        # Spread each identity's pending draws proportionally.
-                        # Clip novelty alone can exhaust identities with many
-                        # clips, leaving low-coverage identities at the tail.
-                        identity_share = (used + 1) / (used + frequency[inverse])
-                    if field in self.caps:
-                        eligible &= used < self.caps[field]
-                if not eligible.any():
-                    break
-                # Consume larger pending groups on ties so repeated draws are
-                # spread over batches instead of accumulating at epoch end.
-                candidates = np.flatnonzero(eligible)
-                order = np.lexsort((candidates, -remaining[candidates], reuse[candidates],
-                                    -novelty[candidates], identity_share[candidates]))
-                selected = int(candidates[order[0]])
-                batch.append(pending[selected])
-                available[selected] = False
-                for inverse, counts, frequency, valid in fields.values():
-                    if valid[selected]:
-                        counts[inverse[selected]] += 1
-                        frequency[inverse[selected]] -= 1
-            pending = [key for key, keep in zip(pending, available) if keep]
+            with self.profile("id/sampling"):
+                pending.extend((row, draw, epoch) for draw, row in islice(draws, self.batch_size*8-len(pending)))
+                if not pending:
+                    return
+                positions = np.array([key[0] for key in pending])
+                fields = {}
+                for field, values in self.keys.items():
+                    unique, inverse = np.unique(values[positions], return_inverse=True)
+                    fields[field] = inverse, np.zeros(len(unique), dtype=int), np.bincount(inverse), values[positions] >= 0
+                available = np.ones(len(pending), dtype=bool)
+                batch = []
+                for _ in range(self.batch_size):
+                    eligible = available.copy()
+                    novelty, reuse, remaining = np.zeros((3, len(pending)), dtype=int)
+                    identity_share = np.zeros(len(pending))
+                    for field, (inverse, counts, frequency, valid) in fields.items():
+                        used = counts[inverse]
+                        if field in ("clip_id", "tracklet_id"):
+                            novelty += valid & (used == 0)
+                            reuse += np.where(valid, used, 0)
+                            remaining += np.where(valid, frequency[inverse], 0)
+                        elif field == "identity_id":
+                            # Spread each identity's pending draws proportionally.
+                            # Clip novelty alone can exhaust identities with many
+                            # clips, leaving low-coverage identities at the tail.
+                            identity_share = (used + 1) / (used + frequency[inverse])
+                        if field in self.caps:
+                            eligible &= used < self.caps[field]
+                    if not eligible.any():
+                        break
+                    # Consume larger pending groups on ties so repeated draws are
+                    # spread over batches instead of accumulating at epoch end.
+                    candidates = np.flatnonzero(eligible)
+                    # Select the lexicographic minimum without sorting the entire
+                    # lookahead. Stable candidate order preserves the final tie-break.
+                    for scores, reduce in ((identity_share, np.min), (novelty, np.max),
+                                           (reuse, np.min), (remaining, np.max)):
+                        values = scores[candidates]
+                        candidates = candidates[values == reduce(values)]
+                        if len(candidates) == 1:
+                            break
+                    selected = int(candidates[0])
+                    batch.append(pending[selected])
+                    available[selected] = False
+                    for inverse, counts, frequency, valid in fields.values():
+                        if valid[selected]:
+                            counts[inverse[selected]] += 1
+                            frequency[inverse[selected]] -= 1
+                pending = [key for key, keep in zip(pending, available) if keep]
             yield batch
 
     # Exact length is deliberately unspecified with caps; iterating the sampler
     # solely to count batches would duplicate a potentially huge epoch draw.
+
+
+def _initialize_worker(worker_id):
+    from lightning.fabric.utilities.seed import pl_worker_init_function
+    import cv2
+    pl_worker_init_function(worker_id)
+    cv2.setNumThreads(0)  # DataLoader processes own CPU parallelism, not OpenCV.
 
 
 class _IdentityDataModule(LightningDataModule):
@@ -203,6 +225,7 @@ class _IdentityDataModule(LightningDataModule):
         validation = index.where(split="val")
         validation = validation.take(np.flatnonzero(validation.frame.identity_id.isin(labels)))
         self.validation_total = len(validation)
+        profile = bool(config.backend_options.get("trainer", {}).get("profiler"))
         # Count underlying files/NPZ rows, not repeated metadata records or crops.
         self.coverage = {}
         source_ids = {}
@@ -220,10 +243,10 @@ class _IdentityDataModule(LightningDataModule):
             validation = validation.take(selected)
             source_ids["val"] = source_ids["val"][selected]
         self.train_data = _Pixels(train, module.identity["preprocessing"], labels, augmentations,
-                                  training=True, seed=config.seed, source_ids=source_ids["train"])
-        self.val_data = _Pixels(validation, module.identity["preprocessing"], labels, source_ids=source_ids["val"])
+                                  training=True, seed=config.seed, source_ids=source_ids["train"], profile=profile)
+        self.val_data = _Pixels(validation, module.identity["preprocessing"], labels, source_ids=source_ids["val"], profile=profile)
         self.config = config
-        self.batch_sampler = _DiverseBatches(train, config.batch_size or 64, config.seed)
+        self.batch_sampler = _DiverseBatches(train, config.batch_size or 64, config.seed, profile=profile)
         if self.batch_sampler.workload != self.batch_sampler.requested_workload:
             print(f"⚠ ID epoch workload rounded from {self.batch_sampler.requested_workload:,} "
                   f"to {self.batch_sampler.workload:,} samples for batch size {self.batch_sampler.batch_size}. "
@@ -254,7 +277,7 @@ class _IdentityDataModule(LightningDataModule):
         # Stamp the sampler before creating the iterator (also after full resume).
         self.batch_sampler.epoch = self.trainer.current_epoch
         self.train_data.epoch = self.trainer.current_epoch
-        options = dict(num_workers=self.config.workers, persistent_workers=False,
+        options = dict(num_workers=self.config.workers, persistent_workers=False, worker_init_fn=_initialize_worker,
                        pin_memory=self.trainer.strategy.root_device.type == "cuda")
         if self.config.workers:
             options["prefetch_factor"] = 2
@@ -262,6 +285,7 @@ class _IdentityDataModule(LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(self.val_data, batch_size=self.config.batch_size or 64, num_workers=self.config.workers,
+                          worker_init_fn=_initialize_worker,
                           pin_memory=self.trainer.strategy.root_device.type == "cuda")
 
 

@@ -84,6 +84,29 @@ def test_npz_parity_lazy(tmp_path, monkeypatch):
         np.testing.assert_array_equal(data._samples[row].image_ref.read(), pixels[row])
 
 
+def test_npz_mapping_cache_reuses_and_evicts_readers(tmp_path, monkeypatch):
+    from collections import OrderedDict
+    from dataset_fixer.id import data as source
+    monkeypatch.setattr(source, '_READERS', OrderedDict())
+    try:
+        first = None
+        for i in range(source._READER_LIMIT + 1):
+            path = tmp_path / f'{i}.npz'
+            pixels = np.full((1, 4, 4, 3), i, dtype=np.uint8)
+            np.savez(path, images=pixels)
+            np.testing.assert_array_equal(ImageRef(str(path), 'images', 0).read(), pixels[0])
+            reader = source._reader(str(path))
+            assert reader is source._reader(str(path))
+            if first is None:
+                first = reader
+            assert len(source._READERS) <= source._READER_LIMIT
+        assert str(tmp_path/'0.npz') not in source._READERS
+        assert not hasattr(first, 'mmap')
+    finally:
+        for reader in source._READERS.values():
+            reader.close()
+
+
 def test_crop_context_and_custom_pipeline(tmp_path):
     from dataset_fixer.models import Sample, Annotation, Task, DatasetMetadata
     image = tmp_path / 'animal.png'
