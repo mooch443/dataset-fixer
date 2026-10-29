@@ -401,7 +401,25 @@ with df.TrainingSession(wandb=df.WandbConfig(project='wolf-id')) as session:
     report = result.evaluate(split='test', rejection=rejection)
 ```
 
-All novel/unknown identities are excluded from encoder training. Their validation and test roles must be disjoint. The protocol fixes reference/query membership and separates enrollment clips from query clips where metadata exists. Novel identities need enough clips for this separation; the API reports infeasibility rather than substituting adjacent frames. Shared source observations/derived crops across training and evaluation are rejected. Identical reference/query pixels are excluded during evaluation.
+All novel/unknown identities are excluded from encoder training. Their validation and test roles must be disjoint. The protocol fixes reference/query membership and follows the supplied dataset split: enrollment uses training observations, including shared clips when the dataset was split by tracklet or image. No additional switch is needed. Shared clips are recorded in protocol limitations. Novel identities without explicit training-partition enrollment observations still reserve a separate gallery clip from their query partition and need at least two clips. Shared source observations/derived crops across training and evaluation are rejected. Identical reference/query pixels are excluded during evaluation.
+
+For a within-clip diagnostic, hold out whole tracklets from only the existing
+training partition; the original validation/test datasets remain untouched:
+
+```python
+diagnostic_data = train_data.split(
+    {"train": .8, "val": .2},
+    source_splits=("train",),
+    group_by=("clip_id", "tracklet_id"),
+    classes_must_appear_in=("train", "val"),
+    seed=7,
+)
+protocol = id.Protocol(diagnostic_data, gallery_samples=20)
+```
+
+The sampling configuration is preserved. Use fixed validation and a fresh run
+with the same training settings to isolate the effect of the split. High scores
+on this diagnostic measure within-clip recognition, not performance on new clips.
 
 Reports distinguish known individuals, newly enrolled individuals unseen during training, and explicit unknowns absent from the gallery. They include Rank 1/5, macro identity recall, image-retrieval mAP, correct identification at the rejection threshold, and achieved test FPIR, both per crop and balanced over identity/clip groups. Missing labels are excluded. Tied identity similarities count conservatively against ranking. PyTorch Metric Learning computes image-retrieval mAP.
 

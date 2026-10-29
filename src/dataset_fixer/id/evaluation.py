@@ -19,6 +19,8 @@ class Protocol:
 
     The encoder/loss/gallery machinery is identical for open and closed queries.
     Roles only control which identities may train/enroll and which queries evaluate.
+    Explicit dataset splits determine clip/tracklet independence. Enrollment uses
+    training observations without imposing a second, stricter clip split.
 
     Parameters:
         data: Identity Dataset containing fixed train/val/test observations.
@@ -105,15 +107,10 @@ class Protocol:
             per_identity = frame.iloc[rows]
             if label in labels:
                 candidates = rows[(per_identity.split == "train").to_numpy()]
-                query_clips = set(per_identity.loc[per_identity.split.isin(["val", "test"]), "clip_id"].dropna())
-                if query_clips:
-                    candidates = candidates[~frame.iloc[candidates].clip_id.isin(query_clips).to_numpy()]
             else:
                 role_split = "val" if label in novel["val"] else "test"
                 candidates = rows[(per_identity.split == "train").to_numpy()]
                 queries = per_identity[per_identity.split == role_split]
-                query_clips = set(queries.clip_id.dropna())
-                candidates = candidates[~frame.iloc[candidates].clip_id.isin(query_clips).to_numpy()]
                 if not len(candidates):
                     clips = sorted(queries.clip_id.dropna().unique())
                     if len(clips) < 2:
@@ -122,7 +119,10 @@ class Protocol:
                     candidates = rows[((per_identity.split == role_split) & (per_identity.clip_id == gallery_clip)).to_numpy()]
                     excluded_clips[label] = gallery_clip
             if not len(candidates):
-                raise ValueError(f"Identity {label} has no enrollment clip separate from queries; revise the split")
+                raise ValueError(f"Identity {label} has no enrollment observations; revise the split")
+            query_clips = set(per_identity.loc[per_identity.split.isin(["val", "test"]), "clip_id"].dropna())
+            if set(frame.iloc[candidates].clip_id.dropna()) & query_clips and label not in excluded_clips:
+                limitations.append(f"Identity {label}: enrollment and queries share clips under the supplied dataset split")
             if frame.iloc[candidates].clip_id.isna().any():
                 limitations.append(f"Identity {label}: clip coverage unavailable; only observation/pixel disjointness can be checked")
             selected.extend(candidates[balanced_rows(index.take(candidates), self.gallery_samples, self.seed)])
