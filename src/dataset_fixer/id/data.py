@@ -104,7 +104,9 @@ _DEFAULTS = dict(array=None, row=None, crop=None, identity_id=None, clip_id=None
 class SampleIndex(Sequence):
     """Immutable-view column index; Samples and ImageRefs are created on access."""
     def __init__(self, records, *, names=None, sampling=None):
-        frame = records.copy() if isinstance(records, pd.DataFrame) else pd.DataFrame(records)
+        # Import-wide attrs (tracklet tables/notes) belong to Dataset metadata.
+        # DataFrame.copy preserves them, making pandas deepcopy them per row.
+        frame = pd.DataFrame(records, copy=True)
         for key, value in _DEFAULTS.items():
             if key not in frame:
                 frame[key] = value

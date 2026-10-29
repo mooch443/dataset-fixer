@@ -84,6 +84,30 @@ def test_npz_parity_lazy(tmp_path, monkeypatch):
         np.testing.assert_array_equal(data._samples[row].image_ref.read(), pixels[row])
 
 
+def test_sample_index_does_not_copy_import_wide_metadata():
+    class TrackletTables(dict):
+        def __deepcopy__(self, memo):
+            pytest.fail('Sample lookup/views must not copy all imported tracklet tables')
+
+    tables = TrackletTables({'crops.npz': [[0, 9], [10, 19]]})
+    frame = pd.DataFrame([
+        dict(path='crops.npz', array='images', row=i, width=8, height=8,
+             identity_id='wolf-a', clip_id='clip', tracklet_id=str(i),
+             notes='qualified', synthetic='{"visible_fraction": 1.0}')
+        for i in range(2)
+    ])
+    frame.attrs.update(tracklets=tables, warnings=['import note'])
+    index = SampleIndex(frame)
+    samples = [index[0], index[1]]
+    assert list(index.take([1, 0])) == samples[::-1]
+    assert frame.attrs['tracklets'] is tables
+    assert frame.attrs['warnings'] == ['import note']
+    assert samples[1].image_ref == ImageRef('crops.npz', 'images', 1)
+    assert samples[1].identity_id == 'wolf-a'
+    assert samples[1].provenance['identity_notes'] == 'qualified'
+    assert samples[1].provenance['synthetic'] == {'visible_fraction': 1.0}
+
+
 def test_npz_mapping_cache_reuses_and_evicts_readers(tmp_path, monkeypatch):
     from collections import OrderedDict
     from dataset_fixer.id import data as source
