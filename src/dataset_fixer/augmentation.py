@@ -632,6 +632,15 @@ def _boxes_after(sample: Sample, result: dict[str, Any], width: int, height: int
     return output
 
 
+def _keypoints_by_id(result: dict[str, Any]) -> dict[int, tuple[float, float]]:
+    """Recover surviving landmarks by stable ID; transforms may drop points."""
+    return {
+        int(tag): (float(point[0]), float(point[1]))
+        for point, tag in zip(result["keypoints"], result["keypoint_ids"], strict=True)
+        if np.isfinite(point[:2]).all()
+    }
+
+
 def _pose_after(
     sample: Sample,
     result: dict[str, Any],
@@ -641,10 +650,7 @@ def _pose_after(
     flip_idx: list[int] | None,
     horizontal_flip: bool,
 ) -> list[Annotation]:
-    transformed_points = {
-        int(tag): (float(point[0]), float(point[1]))
-        for point, tag in zip(result["keypoints"], result["keypoint_ids"])
-    }
+    transformed_points = _keypoints_by_id(result)
     output: list[Annotation] = []
     for bbox, annotation_index_value in zip(result["bboxes"], result["bbox_ids"]):
         annotation_index = int(annotation_index_value)
@@ -652,7 +658,7 @@ def _pose_after(
         points: list[tuple[float, float, float | None]] = []
         visible = 0
         for keypoint_index, (_, _, visibility) in enumerate(annotation.keypoints or []):
-            x, y = transformed_points.get(_keypoint_tag(annotation_index, keypoint_index), (0.0, 0.0))
+            x, y = transformed_points.get(_keypoint_tag(annotation_index, keypoint_index), (-1.0, -1.0))
             if visibility != 0 and 0 <= x < width and 0 <= y < height:
                 points.append((x, y, visibility))
                 visible += 1
@@ -729,10 +735,7 @@ def _polo_after(
 ) -> tuple[list[Annotation], list[str]]:
     import cv2
 
-    centers = {
-        int(tag): (float(point[0]), float(point[1]))
-        for point, tag in zip(result["keypoints"], result["keypoint_ids"])
-    }
+    centers = _keypoints_by_id(result)
     output: list[Annotation] = []
     warnings: list[str] = []
     for index, (annotation, transformed_mask) in enumerate(zip(sample.annotations, result.get("masks", []))):

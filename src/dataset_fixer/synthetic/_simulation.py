@@ -10,7 +10,7 @@ import numpy as np
 
 
 VERSION = 3
-SIMULATION_VERSION = 4
+SIMULATION_VERSION = 5
 SLOTS = 8
 LIMB_END = 14 + SLOTS * 6
 PATTERNS = ("stripes", "dots", "stars")

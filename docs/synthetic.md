@@ -16,9 +16,15 @@ from dataset_fixer import synthetic
 scenes = synthetic.generate(individuals=12, clips=3, frames_per_clip=100)
 scenes.visualize(samples=6, columns=3)
 
-data = synthetic.identity(scenes, normalization="posture", bbox_jitter=0.05)
+data = synthetic.identity(scenes, normalization="posture", bbox_jitter=0.05, workers=4)
 data.visualize(samples=12, columns=4)
 ```
+
+`identity(..., workers=4)` extracts crops from up to four clips concurrently.
+The default is `1`. Each clip retains sequential frames and correlated detection
+jitter; crop pixels, tracklet IDs, sample ordering, and cache reuse are identical
+across worker counts. This uses the same standard thread pool as scene generation
+and works directly in macOS notebooks. A single clip uses one worker.
 
 `frames_per_clip` counts scene frames. With 12 individuals and 100 frames there
 are at most 1,200 identity crops per clip. Overlaps, truncation, and exits lose
@@ -189,6 +195,10 @@ the body deformation and geometric camera augmentations. Visibility is `2`
 when visible, `1` when occluded, and `0` outside the frame. The animated leg
 joints and the neck band are not additional pose targets. Identity extraction
 and posture normalization work with pose scenes just as with segment scenes.
+Landmarks dropped by a geometric transform keep their original slots with
+visibility `0`; they are never connected to another individual's landmarks.
+An observation with an unavailable head or tail does not produce an identity
+crop, and its next usable observation starts a new tracklet.
 
 ## DNA
 

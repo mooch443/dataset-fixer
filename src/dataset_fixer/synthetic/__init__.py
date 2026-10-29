@@ -8,8 +8,10 @@ from __future__ import annotations
 import json
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import asdict
 from collections.abc import Mapping, Sequence
+from itertools import groupby
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Literal
@@ -45,6 +47,19 @@ def _default_effects():
     return [A.ChromaticAberration(primary_distortion_limit=0.01, secondary_distortion_limit=0.02, p=0.8),
             A.OpticalDistortion(distort_limit=0.03, p=0.8),
             A.GaussianBlur(sigma_limit=(0.2, 0.6), p=0.3)]
+
+
+@contextmanager
+def _clip_batches(function, clips, workers, stop):
+    workers = min(workers, max(1, len(clips)))
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="synthetic") if workers > 1 else None
+    try:
+        yield executor.map(function, clips) if executor else map(function, clips)
+    finally:
+        stop.set()
+        if executor:
+            # Finish active image writes before staged-directory cleanup.
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 def generate(*, individuals: int | Mapping[str, Sequence[float]] = 12,
@@ -175,6 +190,8 @@ def generate(*, individuals: int | Mapping[str, Sequence[float]] = 12,
                 images.append(dict(id=image_id, file_name=path.as_posix(), width=width, height=height))
                 frame_annotations = []
                 for local_id, (label, observation, shape, points) in enumerate(zip(dna, observations, visible, landmarks)):
+                    points_in_frame = (points >= 0).all(axis=1) & (points < [width, height]).all(axis=1)
+                    observation["usable"] = observation["usable"] and bool(points_in_frame.all())
                     observation.update(identity_id=label, local_id=local_id, head_tail=points.tolist(),
                                        tracklet_id=tracks.observe(clip, label, frame, observation["usable"]))
                     area = int(shape.sum())
@@ -189,10 +206,10 @@ def generate(*, individuals: int | Mapping[str, Sequence[float]] = 12,
                     if task is Task.SEGMENT:
                         annotation["segmentation"] = segmentation(shape)
                     elif task is Task.POSE:
-                        points_in_frame = (points >= 0).all(axis=1) & (points < [width, height]).all(axis=1)
                         points = points.copy()
                         points[:, 0] = np.clip(points[:, 0], 0, width - 1)
                         points[:, 1] = np.clip(points[:, 1], 0, height - 1)
+                        points[~points_in_frame] = 0
                         visible_points = points_in_frame & shape[np.round(points[:, 1]).astype(int), np.round(points[:, 0]).astype(int)]
                         annotation["keypoints"] = np.column_stack((points, np.where(visible_points, 2, np.where(points_in_frame, 1, 0)))).reshape(-1).tolist()
                         annotation["num_keypoints"] = int(points_in_frame.sum())
@@ -214,9 +231,7 @@ def generate(*, individuals: int | Mapping[str, Sequence[float]] = 12,
             return images, annotations, records
 
         images, annotations, records = [], [], []
-        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="synthetic") if workers > 1 else None
-        try:
-            batches = executor.map(render_clip, range(clips)) if executor else map(render_clip, range(clips))
+        with _clip_batches(render_clip, range(clips), workers, stop) as batches:
             # Merge in clip order regardless of completion order, keeping COCO
             # IDs and provenance identical to the sequential renderer.
             for clip_images, clip_annotations, clip_records in batches:
@@ -232,11 +247,6 @@ def generate(*, individuals: int | Mapping[str, Sequence[float]] = 12,
                 images.extend(clip_images)
                 annotations.extend(clip_annotations)
                 records.extend(clip_records)
-        finally:
-            stop.set()
-            if executor:
-                # Finish active frame writes before staged-directory cleanup.
-                executor.shutdown(wait=True, cancel_futures=True)
         category = dict(id=0, name="individual")
         if task is Task.POSE:
             category.update(keypoints=["head", "tail"], skeleton=[[1, 2]])
@@ -253,6 +263,7 @@ def generate(*, individuals: int | Mapping[str, Sequence[float]] = 12,
 def identity(scenes: Dataset, *, normalization: Literal["posture", "none"] = "posture",
              bbox_jitter: float = 0.05, context_fraction: float = 0.15,
              orientation_jitter: float = 5.0, size: int = 128,
+             workers: int = 1,
              destination: str | Path | None = None, seed: int | None = None) -> Dataset:
     """Extract valid identity tracklets from generated scenes, with detection error.
 
@@ -265,6 +276,9 @@ def identity(scenes: Dataset, *, normalization: Literal["posture", "none"] = "po
         context_fraction: Nonnegative additional box fraction on each side.
         orientation_jitter: Maximum posture error in degrees, default 5.
         size: Square output resolution, default 128, preserving aspect ratio.
+        workers: Positive number of extraction threads, default 1. Independent
+            clips run concurrently; frames within each clip stay sequential.
+            Crop pixels, jitter, tracklets, ordering, and cache identity are unchanged.
         destination: New repository directory, or None for a reusable managed cache.
         seed: Override randomness; None inherits the scene seed.
 
@@ -285,6 +299,7 @@ def identity(scenes: Dataset, *, normalization: Literal["posture", "none"] = "po
         raise ValueError("context_fraction must be finite and nonnegative")
     orientation_jitter = fraction(orientation_jitter, "orientation_jitter", maximum=180)
     size = positive_int(size, "size")
+    workers = positive_int(workers, "workers")
     if size < 2:
         raise ValueError("Crop size must be at least 2")
     seed = synthetic["seed"] if seed is None else seed
@@ -298,12 +313,15 @@ def identity(scenes: Dataset, *, normalization: Literal["posture", "none"] = "po
     destination, cached = _destination(destination, "identities", settings)
     if cached and destination.exists():
         return open_dataset(destination / "samples.jsonl", format="identity_manifest")
-    tracks = Tracklets()
-    jitter_states = {}
-    count = 0
+    clips = [list(group) for _, group in groupby(samples, key=lambda s: s.clip_id)]
     with staged_directory(destination, source=scenes.location) as staging:
-        with (staging / "samples.jsonl").open("w") as handle:
-            for sample in samples:
+        stop = Event()
+
+        def extract_clip(clip_samples):
+            tracks, jitter_states, records = Tracklets(), {}, []
+            for sample in clip_samples:
+                if stop.is_set():
+                    break
                 info = sample.provenance.get("synthetic")
                 if not info or sha256_file(sample.image_path) != info["scene_sha256"]:
                     raise ValueError("Scene pixels changed since simulation; generate with augmentations= instead of transforming before identity()")
@@ -340,8 +358,15 @@ def identity(scenes: Dataset, *, normalization: Literal["posture", "none"] = "po
                                   clip_id=sample.clip_id, frame_index=sample.frame_index,
                                   local_id=observation["local_id"], tracklet_id=track, split=sample.split,
                                   original_id=info["scene_id"], synthetic=json.dumps(details, sort_keys=True))
+                    records.append(record)
+            return records
+
+        count = 0
+        with (staging / "samples.jsonl").open("w") as handle, _clip_batches(extract_clip, clips, workers, stop) as batches:
+            for records in batches:
+                for record in records:
                     handle.write(json.dumps(record) + "\n")
-                    count += 1
+                count += len(records)
         if not count:
             raise ValueError("No usable identity crops: increase scene size/frames or reduce the population")
         write_json(dataset_info_path(staging), dict(name=destination.name, task="id", format="identity_manifest",

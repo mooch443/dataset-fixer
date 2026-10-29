@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 from shapely.geometry import Polygon
 
-from ..augmentation import _albumentations, _target_replay_pipeline
+from ..augmentation import _albumentations, _target_replay_pipeline, _keypoints_by_id
 from ._simulation import rng_for, random_seed
 from ._appearance import body_colors
 
@@ -138,8 +138,10 @@ class SceneEffects:
         image = result["image"]
         if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
             raise ValueError("Scene augmentations must produce HWC RGB uint8 pixels; remove Normalize/ToTensor")
-        points = np.empty((len(landmarks) * 2, 2))
-        points[np.asarray(result["keypoint_ids"], dtype=int)] = result["keypoints"]
+        transformed = _keypoints_by_id(result)
+        # Nonlinear remapping can drop landmarks even with remove_invisible=False.
+        # Missing slots must stay outside the image, never inherit scratch memory.
+        points = np.asarray([transformed.get(i, (-1., -1.)) for i in range(len(landmarks) * 2)])
         return image, np.asarray(result["masks"], dtype=bool), points.reshape(-1, 2, 2)
 
 
