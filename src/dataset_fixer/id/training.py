@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import time
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -429,4 +430,10 @@ def train_identity(result, prepared, augmentations):
                       callbacks=[bridge], use_distributed_sampler=False, reload_dataloaders_every_n_epochs=1,
                       **trainer_options)
     print("Starting Lightning fit: device setup, model summary, then validation sanity check", flush=True)
-    trainer.fit(module, datamodule=data, ckpt_path=str(selection.resume) if selection.resume else None)
+    # Lightning still constructs PyTorch's deprecated LeafSpec (upstream #21326).
+    # Scope this compatibility filter to fit; keep other FutureWarnings visible.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FutureWarning,
+            message=r"`isinstance\(treespec, LeafSpec\)` is deprecated,.*",
+            module=r"lightning\.pytorch\.utilities\._pytree$")
+        trainer.fit(module, datamodule=data, ckpt_path=str(selection.resume) if selection.resume else None)

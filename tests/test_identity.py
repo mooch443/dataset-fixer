@@ -161,6 +161,39 @@ def test_train_reload_transfer_resume(identity_data, tmp_path, monkeypatch):
     assert all(v.endswith('-new') for v in torch.load(transferred.best_weights, weights_only=False)['identity']['identities'])
 
 
+def test_lightning_leafspec_warning_filter_is_scoped(identity_data, tmp_path, monkeypatch):
+    import warnings
+    from lightning.pytorch import Trainer
+    from lightning.pytorch.utilities import _pytree
+    message = ('`isinstance(treespec, LeafSpec)` is deprecated, '
+               'use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.')
+    native_fit = Trainer.fit
+    def fit(self, *args, **kwargs):
+        # Probe the exact upstream warning even after Lightning eventually fixes it.
+        warnings.warn_explicit(message, FutureWarning, _pytree.__file__, 21,
+                               module=_pytree.__name__)
+        warnings.warn_explicit('Another pytree deprecation', FutureWarning, _pytree.__file__, 22,
+                               module=_pytree.__name__)
+        warnings.warn(message, FutureWarning)  # Same message outside Lightning must survive.
+        return native_fit(self, *args, **kwargs)
+    monkeypatch.setattr(Trainer, 'fit', fit)
+    id.register_backbone('warning-tiny', tiny_model, feature_dim=4,
+                         preprocessing=dict(resolution=16, mean=[0]*3, std=[1]*3))
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter('always')
+        result = id.train(identity_data, backbone='warning-tiny', augmentations=[], wandb=False,
+            config=TrainingConfig(epochs=1, batch_size=4, workers=0, augmentation_samples=0,
+                output_dir=tmp_path/'run', backend_options=dict(embedding_dim=4, embedding_samples=0,
+                    loss='cross_entropy', pretrained=False,
+                    trainer=dict(enable_progress_bar=False, enable_model_summary=False, num_sanity_val_steps=0))))
+        leaf_warnings = [w for w in seen if str(w.message) == message]
+        assert len(leaf_warnings) == 1 and leaf_warnings[0].filename == __file__
+        assert any(str(w.message) == 'Another pytree deprecation' for w in seen)
+        warnings.warn_explicit(message, FutureWarning, _pytree.__file__, 21, module=_pytree.__name__)
+        assert str(seen[-1].message) == message and seen[-1].filename == _pytree.__file__
+    assert result.best_weights.is_file() and result.resumable_checkpoint.is_file()
+
+
 def test_threshold_ties_library():
     from dataset_fixer.id.evaluation import threshold_at_fpir
     scores = np.array([.2, .3, .5, .5, .8])

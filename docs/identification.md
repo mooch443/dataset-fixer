@@ -170,6 +170,11 @@ Explicit `WandbConfig(init={'settings': ...})` settings and caller-owned runs ar
 preserved. If a notebook previously set `console='off'`, change that to `'wrap'`
 to restore console capture; structured metrics are logged in either case.
 
+During ID training, a scoped compatibility filter suppresses only Lightning's
+internal `LeafSpec` constructor `FutureWarning` from its pytree module. Other
+warnings remain visible, and the filter is removed when fitting exits. This is
+an upstream PyTorch/Lightning deprecation, independent of W&B uploads.
+
 ## Enrollment and query mode
 
 ```python
@@ -240,6 +245,16 @@ No parallel plotting engine, identity-specific model/result hierarchy, or custom
 ## Monitoring and inspection
 
 Every epoch renders a scikit-learn t-SNE projection of a fixed, balanced cohort of up to 512 training/validation crops, using the **current** encoder and deterministic preprocessing. Selection and monitoring preserve training RNGs and model mode. Identity colors and cohort membership remain fixed; refitted 2D coordinates are not a longitudinal distance metric. Set `backend_options={"embedding_samples": 512, "embedding_method": "tsne"}` (`"pca"` is also supported; samples `0` disables it).
+
+`embedding_samples` is the total plot budget, independent of training batch size
+and `validation_samples`. Half is allocated to train and half to validation
+(an odd extra sample goes to train), balancing identities, clips and tracklets
+within each split. For example, 600 requests up to 300 train and 300 validation
+images. A split with fewer available images contributes fewer; unused capacity
+is not transferred to the other split. The selected images stay fixed across
+epochs. Monitor inference processes them in chunks of `min(batch_size, 64)`;
+this chunk size does not change the number of plotted points. W&B's
+`embeddings/samples` records the actual cohort size.
 
 W&B receives one image per epoch under `embeddings/tsne`, giving a single media panel with step history/slider. `epoch` is the shared zero-based axis; captions display one-based epoch numbers. Monitor `train/loss`, `val/loss`, `val/monitor_rank1`, `optim/lr`, `time/epoch_seconds`, and `time/monitor_seconds`. The diagnostic Rank-1 uses only the small fixed cohort and is separate from final evaluation. Selection remains validation loss. The cohort manifest, latest coordinates and image enter the checkpoint bundle; local epoch images and W&B history retain earlier views.
 
