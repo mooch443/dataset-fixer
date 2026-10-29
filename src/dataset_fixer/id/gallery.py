@@ -10,6 +10,7 @@ import numpy as np
 
 from .data import balanced_rows, SampleIndex, ImageRef, as_dataset
 from .model import input_index, embed, fingerprint
+from ..utils import qualified_tracklet_id
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,9 @@ class Gallery:
         vectors.flags.writeable = False
         object.__setattr__(self, "embeddings", vectors)
         object.__setattr__(self, "labels", tuple(str(label) for label in self.labels))
-        object.__setattr__(self, "references", tuple(dict(r) for r in self.references))
+        object.__setattr__(self, "references", tuple(
+            {**r, "tracklet_id": qualified_tracklet_id(r.get("clip_id"), r["tracklet_id"])}
+            if "tracklet_id" in r else dict(r) for r in self.references))
 
     @property
     def identities(self):
@@ -212,7 +215,7 @@ def enroll(model, source, *, samples_per_identity=None, selection=None, candidat
             candidates=sum(r.metadata["reference_identity"] == label for r in result),
             unique_candidates=int((candidate_index.frame.identity_id == label).sum()), references=len(refs),
             clips=len({r["clip_id"] for r in refs if r.get("clip_id") is not None}),
-            tracklets=len({(r.get("clip_id"), r["tracklet_id"]) for r in refs if r.get("tracklet_id") is not None}),
+            tracklets=len({r["tracklet_id"] for r in refs if r.get("tracklet_id") is not None}),
             shortfall=max(0, count-len(refs))))
     metadata = dict(selection=selection, seed=seed, samples_per_identity=count,
                     candidates_per_identity=candidates if selection == "medoids" else count,

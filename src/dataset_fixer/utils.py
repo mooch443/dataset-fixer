@@ -21,6 +21,24 @@ STANDARD_SPLITS = ("train", "val", "test")
 SPLIT_ALIASES = {"validation": "val", "valid": "val"}
 
 
+def qualified_tracklet_id(clip_id, source_id):
+    """Stable source identity, qualified once and retained by every derived view."""
+    if source_id is None or pd.isna(source_id):
+        return None
+    value = str(source_id)
+    prefix = "tracklet:"
+    if value.startswith(prefix):
+        try:
+            parts = json.loads(value[len(prefix):])
+        except json.JSONDecodeError:
+            parts = None
+        if (isinstance(parts, list) and len(parts) == 2 and
+                (parts[0] is None or isinstance(parts[0], str)) and isinstance(parts[1], str)):
+            return value  # Already global: do not renumber after cropping/relabeling.
+    clip = None if clip_id is None or pd.isna(clip_id) else str(clip_id)
+    return prefix + json.dumps([clip, value], separators=(",", ":"))
+
+
 def normalize_split(value: str) -> str:
     split = SPLIT_ALIASES.get(value.lower(), value.lower())
     if split not in STANDARD_SPLITS:

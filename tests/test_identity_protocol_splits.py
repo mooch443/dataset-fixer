@@ -11,7 +11,7 @@ from test_identity import identity_data
 def test_protocol_accepts_tracklet_split_with_shared_clips(identity_data, selection):
     diagnostic = identity_data.split(
         {'train': .8, 'val': .2}, source_splits=('train',),
-        group_by=('clip_id', 'tracklet_id'), classes_must_appear_in=('train', 'val'), seed=7,
+        group_by='tracklet_id', classes_must_appear_in=('train', 'val'), seed=7,
     )
     protocol = id.Protocol(diagnostic, gallery_samples=2, gallery_selection=selection)
     training = index_of(protocol.training).where(split='train').frame
@@ -20,7 +20,7 @@ def test_protocol_accepts_tracklet_split_with_shared_clips(identity_data, select
     assert set(references.path) <= set(training.path)
     assert set(references.clip_id) == set(queries.clip_id) == {'train-clip'}
     assert set(references.identity_id) == set(queries.identity_id) == {'wolf-a', 'wolf-b'}
-    assert set(zip(references.clip_id, references.tracklet_id)).isdisjoint(zip(queries.clip_id, queries.tracklet_id))
+    assert set(references.tracklet_id).isdisjoint(queries.tracklet_id)
     assert set(references.path).isdisjoint(queries.path)
     assert len(index_of(protocol.queries['test'])) == 0
     # The source's independent val/test partitions are untouched.

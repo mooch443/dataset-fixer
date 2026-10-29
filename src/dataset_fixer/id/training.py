@@ -133,7 +133,7 @@ class _DiverseBatches(Sampler):
         self.caps = index.sampling.get("max_per_batch", {})
         self.keys = {}
         for field in dict.fromkeys(["clip_id", "tracklet_id", "identity_id", *self.caps]):
-            columns = ["clip_id", "tracklet_id"] if field == "tracklet_id" else [field]
+            columns = [field]
             complete = index.frame[columns].notna().all(axis=1).to_numpy()
             if complete.any():
                 codes = pd.factorize(pd.MultiIndex.from_frame(index.frame[columns]))[0]

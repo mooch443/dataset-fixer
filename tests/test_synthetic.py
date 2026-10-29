@@ -120,6 +120,14 @@ def test_overlap_discards_both_crops_and_restarts_tracklets(tmp_path, monkeypatc
     assert [o["overlap"] for o in observations] == [True, True, False]
     assert len(scenes._samples) == 3
     assert scenes._samples[1].annotations  # Scene annotations survive.
+    source_ids = {(s.clip_id, s.frame_index, o['identity_id']): o['tracklet_id']
+                  for s in scenes._samples for o in s.provenance['synthetic']['observations']}
+    subset = scenes.sample(1, split='train', seed=5)
+    assert subset._samples[0].frame_index == 2  # Earlier tracklets are absent.
+    subset_crops = synthetic.identity(subset, destination=tmp_path / 'subset-id')
+    for data in (crops, subset_crops):
+        for sample in data._samples:
+            assert sample.provenance['tracklet_id'] == source_ids[sample.clip_id, sample.frame_index, sample.identity_id]
 
 
 def test_mask_overlap_not_box_overlap_and_border_loss():
@@ -207,7 +215,7 @@ def test_portable_export_materializes_lazy_crops(tmp_path):
     exported = data.export(destination=tmp_path / "copy", format="identity_manifest", copy_images=True)
     shutil.rmtree(source)
     np.testing.assert_array_equal(exported._samples[0].image_ref.read(), image[5:15, 10:30])
-    assert exported._samples[0].provenance["tracklet_id"] == "t"
+    assert exported._samples[0].provenance["tracklet_id"] == data._samples[0].provenance["tracklet_id"]
 
 
 def test_portable_export_materializes_npz_rows(tmp_path):

@@ -26,7 +26,7 @@ from ..augmentation import _albumentations, serialize_pipeline
 from ..dataset import Dataset
 from ..models import Task
 from ..sources import cache_root
-from ..utils import settings_fingerprint, sha256_file
+from ..utils import settings_fingerprint, sha256_file, qualified_tracklet_id
 from ..writer import staged_directory
 from ._simulation import (GENES, DNA_LENGTHS, SIMULATION_VERSION, SceneSettings, WeatherSettings, Tracklets, Trajectory,
                           fraction, population, positive_int, rng_for)
@@ -193,7 +193,7 @@ def generate(*, individuals: int | Mapping[str, Sequence[float]] = 12,
                     points_in_frame = (points >= 0).all(axis=1) & (points < [width, height]).all(axis=1)
                     observation["usable"] = observation["usable"] and bool(points_in_frame.all())
                     observation.update(identity_id=label, local_id=local_id, head_tail=points.tolist(),
-                                       tracklet_id=tracks.observe(clip, label, frame, observation["usable"]))
+                                       tracklet_id=qualified_tracklet_id(clip, tracks.observe(clip, label, frame, observation["usable"])))
                     area = int(shape.sum())
                     observation["visible_fraction"] = area / max(1, int(masks[local_id].sum()))
                     if area < 3:
@@ -307,7 +307,7 @@ def identity(scenes: Dataset, *, normalization: Literal["posture", "none"] = "po
         raise ValueError("seed must be a nonnegative integer")
     scenes._ensure_provenance(progress=False)
     samples = sorted(scenes._samples, key=lambda s: (s.clip_id or "", s.frame_index if s.frame_index is not None else -1))
-    settings = dict(normalization=normalization, bbox_jitter=bbox_jitter, context_fraction=context_fraction,
+    settings = dict(tracklet_id_version=1, normalization=normalization, bbox_jitter=bbox_jitter, context_fraction=context_fraction,
                     orientation_jitter=orientation_jitter, size=size, seed=seed,
                     source=[(s.provenance.get("synthetic", {}).get("scene_id"), s.split) for s in samples])
     destination, cached = _destination(destination, "identities", settings)
@@ -356,7 +356,8 @@ def identity(scenes: Dataset, *, normalization: Literal["posture", "none"] = "po
                                    visible_fraction=observation["visible_fraction"], normalization=normalization)
                     record = dict(path=relative.as_posix(), width=size, height=size, identity_id=label,
                                   clip_id=sample.clip_id, frame_index=sample.frame_index,
-                                  local_id=observation["local_id"], tracklet_id=track, split=sample.split,
+                                  local_id=observation["local_id"],
+                                  tracklet_id=qualified_tracklet_id(sample.clip_id, observation.get("tracklet_id", track)), split=sample.split,
                                   original_id=info["scene_id"], synthetic=json.dumps(details, sort_keys=True))
                     records.append(record)
             return records

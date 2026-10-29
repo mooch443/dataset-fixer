@@ -52,7 +52,7 @@ from .segmentation import PolygonRepairConfig
 from .tabular import frame
 from .tiling import tile_dataset
 from .tracing import DatasetTrace, trace_dataset
-from .utils import IMAGE_SUFFIXES, ensure_safe_destination, normalize_split, settings_fingerprint, slugify
+from .utils import IMAGE_SUFFIXES, ensure_safe_destination, normalize_split, settings_fingerprint, slugify, qualified_tracklet_id
 from .validation import validate_dataset, _duplicate_split_order
 from .validation_audit import ValidationFailureExample, build_load_validation_audit
 from .visualization import (
@@ -704,6 +704,11 @@ class Dataset:
                 for field in ("identity_id", "clip_id", "frame_index", "local_id"):
                     if field in sample.provenance.get("sample_metadata", {}):
                         setattr(sample, field, sample.provenance["sample_metadata"][field])
+                # Upgrade saved native IDs once, before any derived view uses them.
+                tracking = [sample.provenance, *sample.provenance.get("synthetic", {}).get("observations", [])]
+                for record in tracking:
+                    if "tracklet_id" in record:
+                        record["tracklet_id"] = qualified_tracklet_id(sample.clip_id, record["tracklet_id"])
                 annotations = sample.provenance.get("annotation_metadata", [])
                 if len(annotations) == len(sample.annotations):
                     for annotation, metadata in zip(sample.annotations, annotations):

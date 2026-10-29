@@ -100,6 +100,15 @@ cumulative source-coverage tracking.
 
 CSV/JSONL rows require `identity_id` (null is allowed) and either `image_path`/`path`, or `archive`, `array`, `row`. Optional fields include `split`, `clip_id`, `tracklet_id`, `local_id`, `frame_index`, `notes`, and `original_id`. Paths are relative to the manifest. Unsplit rows belong to `train`. A JSONL `crop: [left, top, right, bottom]` is an optional deterministic pixel crop. Use `data.export(destination=..., format='identity_manifest')` to save a view without copying pixels.
 
+`tracklet_id` always identifies the same source tracklet across dataset views.
+Import qualifies native tracklet IDs with their clip ID, so repeated native
+numbers in different clips cannot collide. Filtering, splitting, cropping,
+sampling, and export/reload preserve that qualified ID exactly; it does not
+depend on row order, identity labels, or destination paths. Keep it intact when
+writing a derived manifest. With no clip metadata, supplied tracklet IDs must
+already distinguish tracks across the input. Missing IDs remain missing.
+Reopen older saved datasets to upgrade their IDs without rewriting image files.
+
 TRex imports use uncompressed NPZ memory maps and the full observation directory name as `clip_id`. Workbook mappings come from the `Global ID Summary` sheet; confidence-qualified assignments are accepted and their original notes retained. Unmapped rows remain unlabeled, are excluded from supervised training, and are never considered unknown by inference or evaluation.
 
 `Dataset.open(..., trim_black_borders=True)` applies to **all identity sources**: folder PNGs, manifests, and NPZs. Purely black outer rows/columns are trimmed lazily after any explicit source crop and before augmentation. Non-black background and interior black pixels remain; all-black images keep their original dimensions. New identity inputs enable trimming by default. With the default `None`, saved manifest settings are preserved; explicit `True`/`False` overrides them. The flag is part of source references/cache identities and is saved in manifests, without rewriting images. Stored width/height describe the original source crop; the actual trimmed dimensions are determined on pixel access. Disable trimming if a custom augmentation relies on fixed coordinates in the original padded image.
@@ -319,7 +328,7 @@ rejection = model.calibrate(validation_queries, gallery=gallery,
 opened = model.predict(query_crops, gallery=gallery, mode='open', rejection=rejection)
 ```
 
-Enrollment selects references across clips/tracklets. New individuals can be added by enrolling a new reference dataset without retraining the encoder. Maximum cosine similarity over each identity's references determines its score. Scores are not probabilities. `model.embed(...)` returns the same `PredictionResult`, with `record.embedding`; identified records additionally expose `identity_id`, `similarity` and `rejected`. `predict(..., track_by=('clip_id','tracklet_id'))` optionally averages features within supplied tracking groups. Ground-truth global identity labels cannot be used to form prediction groups.
+Enrollment selects references across clips/tracklets. New individuals can be added by enrolling a new reference dataset without retraining the encoder. Maximum cosine similarity over each identity's references determines its score. Scores are not probabilities. `model.embed(...)` returns the same `PredictionResult`, with `record.embedding`; identified records additionally expose `identity_id`, `similarity` and `rejected`. `predict(..., track_by='tracklet_id')` optionally averages features within supplied tracking groups. Ground-truth global identity labels cannot be used to form prediction groups.
 
 `predictions.visualize(samples=12, columns=4)` shows one query image per card,
 with ground truth and a prediction colored green for correct, red for incorrect
@@ -403,23 +412,28 @@ with df.TrainingSession(wandb=df.WandbConfig(project='wolf-id')) as session:
 
 All novel/unknown identities are excluded from encoder training. Their validation and test roles must be disjoint. The protocol fixes reference/query membership and follows the supplied dataset split: enrollment uses training observations, including shared clips when the dataset was split by tracklet or image. No additional switch is needed. Shared clips are recorded in protocol limitations. Novel identities without explicit training-partition enrollment observations still reserve a separate gallery clip from their query partition and need at least two clips. Shared source observations/derived crops across training and evaluation are rejected. Identical reference/query pixels are excluded during evaluation.
 
-For a within-clip diagnostic, hold out whole tracklets from only the existing
-training partition; the original validation/test datasets remain untouched:
+To compare clip separation with tracklet separation, split the same selected
+data by tracklet instead of clip. Complete tracklets stay together, while
+different tracklets from a clip may appear in different splits:
 
 ```python
-diagnostic_data = train_data.split(
-    {"train": .8, "val": .2},
-    source_splits=("train",),
-    group_by=("clip_id", "tracklet_id"),
-    classes_must_appear_in=("train", "val"),
+train_data = labeled.filter(identity_ids=keep_ids).split(
+    {"train": .7, "val": .15, "test": .15},
+    group_by="tracklet_id",
+    classes_must_appear_in=("train", "val", "test"),
     seed=7,
+).with_sampling(
+    balance_by=("identity_id", "tracklet_id"),
+    samples_per_epoch=SAMPLES_PER_EPOCH,
 )
-protocol = id.Protocol(diagnostic_data, gallery_samples=20)
+protocol = id.Protocol(train_data, gallery_samples=20)
 ```
 
-The sampling configuration is preserved. Use fixed validation and a fresh run
-with the same training settings to isolate the effect of the split. High scores
-on this diagnostic measure within-clip recognition, not performance on new clips.
+All three splits remain present. This sampling balances identities, then their
+tracklets; include `clip_id` between them only to additionally equalize clips.
+Keep your existing sampling configuration if you want to isolate just the split
+change. Use a fresh training run with the same model settings. High scores with
+shared clips measure recognition in familiar clips, not performance on new clips.
 
 Reports distinguish known individuals, newly enrolled individuals unseen during training, and explicit unknowns absent from the gallery. They include Rank 1/5, macro identity recall, image-retrieval mAP, correct identification at the rejection threshold, and achieved test FPIR, both per crop and balanced over identity/clip groups. Missing labels are excluded. Tied identity similarities count conservatively against ranking. PyTorch Metric Learning computes image-retrieval mAP.
 

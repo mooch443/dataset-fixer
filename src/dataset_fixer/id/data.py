@@ -20,7 +20,7 @@ import pandas as pd
 from PIL import Image
 
 from ..models import Annotation, DatasetMetadata, Sample, Task
-from ..utils import normalize_split, settings_fingerprint
+from ..utils import normalize_split, settings_fingerprint, qualified_tracklet_id
 
 
 @dataclass(frozen=True)
@@ -103,7 +103,7 @@ _DEFAULTS = dict(array=None, row=None, crop=None, identity_id=None, clip_id=None
 
 class SampleIndex(Sequence):
     """Immutable-view column index; Samples and ImageRefs are created on access."""
-    def __init__(self, records, *, names=None, sampling=None):
+    def __init__(self, records, *, names=None, sampling=None, _qualified=False):
         # Import-wide attrs (tracklet tables/notes) belong to Dataset metadata.
         # DataFrame.copy preserves them, making pandas deepcopy them per row.
         frame = pd.DataFrame(records, copy=True)
@@ -113,6 +113,14 @@ class SampleIndex(Sequence):
         if "path" not in frame or not {"width", "height"} <= set(frame):
             raise ValueError("Identity records need path, width and height")
         frame = frame.reset_index(drop=True)
+        if not _qualified and frame.tracklet_id.notna().any():
+            # Qualify distinct source groups, not millions of individual rows.
+            present = frame.tracklet_id.notna().to_numpy()
+            codes, groups = pd.factorize(pd.MultiIndex.from_frame(frame.loc[present, ["clip_id", "tracklet_id"]]))
+            identifiers = np.asarray([qualified_tracklet_id(clip, track) for clip, track in groups], dtype=object)
+            values = np.full(len(frame), None, dtype=object)
+            values[present] = identifiers[codes]
+            frame["tracklet_id"] = values
         for key in ("path", "array", "identity_id", "clip_id", "tracklet_id", "split", "notes"):
             frame[key] = frame[key].astype("category")
         self.frame = frame
@@ -144,7 +152,7 @@ class SampleIndex(Sequence):
                       frame_index=clean(row.frame_index), local_id=clean(row.local_id), image_ref=ref)
 
     def take(self, rows):
-        return SampleIndex(self.frame.iloc[rows], names=self.names, sampling=self.sampling)
+        return SampleIndex(self.frame.iloc[rows], names=self.names, sampling=self.sampling, _qualified=True)
 
     def where(self, **conditions):
         mask = np.ones(len(self), dtype=bool)
@@ -241,7 +249,7 @@ def open_dataset(location, *, format, layout=None, identities=None, name=None, t
         frame = pd.DataFrame(records)
     elif format == "identity_manifest":
         if path.suffix.lower() == ".csv":
-            records = pd.read_csv(path, dtype={"identity_id": "string", "clip_id": "string"}).to_dict("records")
+            records = pd.read_csv(path, dtype={"identity_id": "string", "clip_id": "string", "tracklet_id": "string"}).to_dict("records")
         elif path.suffix.lower() == ".jsonl":
             records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
         else:
@@ -661,7 +669,7 @@ def stats(data, *, by="identity_id"):
         by: Metadata field or tuple of fields to group by; () returns one total row.
 
     Missing identities remain an explicit unlabeled group. Tracklets are counted
-    by (clip_id, tracklet_id), never by the number of archive parts.
+    by their global tracklet_id, never by the number of archive parts.
     """
     index = index_of(data)
     fields = (by,) if isinstance(by, str) else tuple(by)
@@ -669,8 +677,7 @@ def stats(data, *, by="identity_id"):
     if len(set(fields)) != len(fields) or set(fields)-allowed:
         raise ValueError(f"by must contain distinct metadata fields from {sorted(allowed)}")
     table = index.frame[list(allowed)].astype(object).copy()
-    table["_tracklet"] = pd.factorize(pd.MultiIndex.from_frame(table[["clip_id", "tracklet_id"]]))[0]
-    table.loc[table.tracklet_id.isna(), "_tracklet"] = np.nan
+    table["_tracklet"] = table.tracklet_id
     table["_labeled"] = table.identity_id.notna().astype(int)
     if not fields:
         table["_total"] = "all"
