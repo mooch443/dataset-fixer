@@ -222,8 +222,8 @@ def threshold_at_fpir(scores, target):
     return float(thresholds[selected]), float(fpr[selected])
 
 
-def _query_embeddings(model, data, gallery):
-    prediction = embed(model, data)
+def _query_embeddings(model, data, gallery, **kwargs):
+    prediction = embed(model, data, **kwargs)
     original = {r.get("original_id") for r in gallery.references if r.get("original_id")}
     hashes = {r.get("pixel_sha256") for r in gallery.references}
     records = tuple(r for r in prediction if r.metadata.get("original_id") not in original
@@ -257,48 +257,61 @@ def calibrate(model, data, *, gallery, unknown_identities, target_fpir=0.01):
 
 
 def evaluate(model, data, *, gallery, rejection=None, novel_identities=(), unknown_identities=(),
-             destination=None, split="test", limitations=(), plots=0):
+             destination=None, split="test", limitations=(), plots=0, progress=True, _on_progress=None):
     import torch
     from ..comparison.types import ComparisonResult
     from ..sources import cache_root
     from pytorch_metric_learning.utils.accuracy_calculator import AccuracyCalculator
     from pytorch_metric_learning.utils.inference import CustomKNN
     from pytorch_metric_learning.distances import CosineSimilarity
+    from ._progress import batches
     gallery.validate(model)
     if rejection is not None:
         rejection.validate(model, gallery)
-    records, vectors, duplicates = _query_embeddings(model, data, gallery)
-    scores = gallery.scores(vectors)
+    records, vectors, duplicates = _query_embeddings(model, data, gallery, progress=progress, _on_progress=_on_progress)
     identities = np.asarray(gallery.identities)
     known = set(identities)
     explicit_unknown = set(map(str, unknown_identities))
     novel = set(map(str, novel_identities))
     label_codes = {v: i for i, v in enumerate(gallery.identities)}
-    reference_labels = np.asarray([label_codes[v] for v in gallery.labels])
+    references = torch.tensor(gallery.embeddings.copy())
+    # PML returns per-class means. Tag each query with its batch-local row ID
+    # so each result is one query's AP, while relevance still compares only
+    # identity (the second column). This uses PML's documented 2D-label API.
+    reference_labels = np.column_stack((np.full(len(gallery.labels), -1),
+                                       [label_codes[v] for v in gallery.labels]))
     calculator = AccuracyCalculator(include=("mean_average_precision",), k=len(gallery.labels),
+        return_per_class=True, label_comparison_fn=lambda a, b: a[..., 1] == b[..., 1],
         device=torch.device("cpu"), knn_func=CustomKNN(CosineSimilarity(), batch_size=128))
     rows = []
-    for record, vector, score in zip(records, vectors, scores):
-        label = record.metadata.get("reference_identity")
-        if label is None:
-            continue  # Unlabeled never means unknown.
-        if label not in known and label not in explicit_unknown:
-            raise ValueError(f"Query identity {label} is absent from the gallery but not explicitly declared unknown")
-        enrolled = label in known
-        target = score[label_codes[label]] if enrolled else None
-        # Pessimistic tie handling: indistinguishable impostors count ahead.
-        rank = 1 + int(np.sum(np.delete(score, label_codes[label]) >= target)) if enrolled else None
-        accepted = rejection is None or float(score.max()) >= rejection.threshold
-        ap = None
-        if enrolled:
-            ap = calculator.get_accuracy(vector[None, :], np.asarray([label_codes[label]]), gallery.embeddings.copy(),
-                                         reference_labels, ref_includes_query=False)["mean_average_precision"]
-        rows.append(dict(identity_id=label, clip_id=record.metadata.get("clip_id"),
-            role="novel" if label in novel else "known" if enrolled else "unknown",
-            rank1=float(rank == 1) if enrolled else None, rank5=float(rank <= 5) if enrolled else None,
-            average_precision=ap, correct_identification=float(rank == 1 and accepted) if enrolled else None,
-            false_positive=float(accepted) if not enrolled and rejection is not None else None,
-            similarity=float(score.max()), accepted=bool(accepted)))
+    for start, end in batches(len(records), 128, stage="metrics", description="ID retrieval metrics",
+                              progress=progress, on_progress=_on_progress):
+        labels = [r.metadata.get("reference_identity") for r in records[start:end]]
+        invalid = set(labels) - known - explicit_unknown - {None}
+        if invalid:
+            raise ValueError(f"Query identities {sorted(invalid)} are absent from the gallery but not explicitly declared unknown")
+        enrolled_rows = np.array([i for i, label in enumerate(labels) if label in known], dtype=int)
+        average_precision = dict()
+        if len(enrolled_rows):
+            query_labels = np.column_stack((enrolled_rows, [label_codes[labels[i]] for i in enrolled_rows]))
+            values = calculator.get_accuracy(vectors[start:end][enrolled_rows], query_labels, references,
+                reference_labels, ref_includes_query=False)["mean_average_precision"]
+            average_precision = dict(zip(enrolled_rows, values))
+        scores = gallery.scores(vectors[start:end])
+        for i, (record, label, score) in enumerate(zip(records[start:end], labels, scores)):
+            if label is None:
+                continue  # Unlabeled never means unknown.
+            enrolled = label in known
+            target = score[label_codes[label]] if enrolled else None
+            # Pessimistic tie handling: indistinguishable impostors count ahead.
+            rank = 1 + int(np.sum(np.delete(score, label_codes[label]) >= target)) if enrolled else None
+            accepted = rejection is None or float(score.max()) >= rejection.threshold
+            rows.append(dict(identity_id=label, clip_id=record.metadata.get("clip_id"),
+                role="novel" if label in novel else "known" if enrolled else "unknown",
+                rank1=float(rank == 1) if enrolled else None, rank5=float(rank <= 5) if enrolled else None,
+                average_precision=average_precision.get(i), correct_identification=float(rank == 1 and accepted) if enrolled else None,
+                false_positive=float(accepted) if not enrolled and rejection is not None else None,
+                similarity=float(score.max()), accepted=bool(accepted)))
     table = pd.DataFrame(rows)
     if table.empty:
         raise ValueError("Identity evaluation requires labeled independent queries; unlabeled images are not unknown identities")
@@ -312,12 +325,16 @@ def evaluate(model, data, *, gallery, rejection=None, novel_identities=(), unkno
                 macro_identity_recall=float(metric.rank1.mean() if balance == "identity_clip" else group.groupby("identity_id").rank1.mean().mean()) if role != "unknown" else None)
             summaries.append(summary)
     location = Path(destination) if destination else cache_root() / "identity-evaluation" / hashlib.sha256((fingerprint(model)+index_of(data).fingerprint+gallery.fingerprint).encode()).hexdigest()[:16]
+    if progress:
+        print(f"Saving ID {split} evaluation report: {location}", flush=True)
+    if _on_progress is not None:
+        _on_progress("report", 0, 1)
     location.mkdir(parents=True, exist_ok=True)
     table.to_csv(location / "queries.csv", index=False)
     ranking = pd.DataFrame(summaries)
     ranking.to_json(location / "metrics.json", orient="records", indent=2)
     from ..comparison.cohort import freeze_cohort, write_cohort
-    cohort = freeze_cohort(data, split)
+    cohort = freeze_cohort(data, split, progress=progress)
     write_cohort(cohort, location / "cohort.jsonl")
     from .model import runtime
     training_clips = set(runtime(model).identity.get("training_clips", ()))
@@ -348,9 +365,13 @@ def evaluate(model, data, *, gallery, rejection=None, novel_identities=(), unkno
             json.loads(record.metadata["source_ref"])+[False]), identity_id=record.metadata["reference_identity"],
             clip_id=record.metadata.get("clip_id")), Path.cwd()) for record in chosen])
         prediction = predict(model, selected, gallery=gallery, rejection=rejection,
-                             mode="open" if rejection is not None else "closed")
+                             mode="open" if rejection is not None else "closed", progress=progress)
         prediction.visualize(samples=plots, columns=min(3, plots),
                              destination=location / "predictions.png", show=False)
+    if progress:
+        print(f"ID {split} evaluation complete: {len(table):,} labeled queries", flush=True)
+    if _on_progress is not None:
+        _on_progress("report", 1, 1)
     return ComparisonResult(location, ranking, cohort.fingerprint, True, bool(shared_clips), False, True,
                             {}, "identity", settings, tuple(notes))
 

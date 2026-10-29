@@ -239,10 +239,12 @@ def input_index(source, split=None):
     return SampleIndex([_file_record({"path": str(Path(p).resolve())}, Path.cwd()) for p in paths])
 
 
-def embed(model, source, *, split=None, batch_size=None, device=None, prediction_cache=True, cache_only=False):
+def embed(model, source, *, split=None, batch_size=None, device=None, prediction_cache=True, cache_only=False,
+          progress=True, _on_progress=None):
     import torch
     from ..model import ImagePrediction, ModelInput, PredictionResult
     from ..prediction_cache import PredictionCache, prediction_cache_key
+    from ._progress import batches
     index = input_index(source, split)
     module = runtime(model)
     device = device or model._device or "cpu"
@@ -258,8 +260,9 @@ def embed(model, source, *, split=None, batch_size=None, device=None, prediction
         PredictionCache(prediction_cache) if isinstance(prediction_cache, (str, Path)) else PredictionCache.package_default())
     records, hits = [], 0
     started = time.monotonic()
-    for start in range(0, len(index), size):
-        samples = [index[i] for i in range(start, min(start+size, len(index)))]
+    for start, end in batches(len(index), size, stage="embeddings", description=f"ID embeddings ({device})",
+                              progress=progress, on_progress=_on_progress):
+        samples = [index[i] for i in range(start, end)]
         pixels = [s.image_ref.read() for s in samples]
         hashes = [hashlib.sha256(str(p.shape).encode()+p.tobytes()).hexdigest() for p in pixels]
         inputs = [ModelInput(hashlib.sha256(s.image_ref.key.encode()).hexdigest(), s.image_path, p.shape[1], p.shape[0],
@@ -290,7 +293,7 @@ def embed(model, source, *, split=None, batch_size=None, device=None, prediction
 
 
 def predict(model, source, *, gallery, mode="closed", rejection=None, split=None, batch_size=None,
-            device=None, prediction_cache=True, cache_only=False, track_by=None):
+            device=None, prediction_cache=True, cache_only=False, track_by=None, progress=True):
     if mode not in {"closed", "open"}:
         raise ValueError("mode must be 'closed' or 'open'")
     if gallery is None:
@@ -301,7 +304,7 @@ def predict(model, source, *, gallery, mode="closed", rejection=None, split=None
     if rejection is not None:
         rejection.validate(model, gallery)
     result = embed(model, source, split=split, batch_size=batch_size, device=device,
-                   prediction_cache=prediction_cache, cache_only=cache_only)
+                   prediction_cache=prediction_cache, cache_only=cache_only, progress=progress)
     if not result.records:
         return result
     vectors = np.asarray([r.embedding for r in result])

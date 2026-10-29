@@ -200,11 +200,14 @@ class TrainingResult:
         """
         if self.selection.family == ModelTypes.ID:
             from ..id.evaluation import evaluate
+            from ..id.monitoring import evaluation_progress
             protocol = self._identity_protocol
-            report = evaluate(self.model, protocol.queries[split], gallery=self._enrollment(),
-                              rejection=rejection, split=split, novel_identities=protocol.novel_identities[split],
-                              unknown_identities=protocol.unknown_identities[split],
-                              destination=self.output_dir / "evaluation" / split, limitations=protocol.limitations, plots=plots)
+            with evaluation_progress(self, split) as on_progress:
+                report = evaluate(self.model, protocol.queries[split], gallery=self._enrollment(on_progress=on_progress),
+                                  rejection=rejection, split=split, novel_identities=protocol.novel_identities[split],
+                                  unknown_identities=protocol.unknown_identities[split],
+                                  destination=self.output_dir / "evaluation" / split, limitations=protocol.limitations,
+                                  plots=plots, _on_progress=on_progress)
             self.metrics[f"evaluation/{split}"] = to_jsonable(report.ranking.to_dict(orient="records"))
             for path in report.location.rglob("*"):
                 if path.is_file():
@@ -231,12 +234,14 @@ class TrainingResult:
             self._record_error(exc)
             raise
 
-    def _enrollment(self):
+    def _enrollment(self, *, on_progress=None):
         from ..id.model import fingerprint
         gallery = getattr(self, "_identity_gallery", None)
         if gallery is None or gallery.model_fingerprint != fingerprint(self.model):
             protocol = self._identity_protocol
-            gallery = self.model.enroll(protocol.references, samples_per_identity=protocol.gallery_samples)
+            callback = (lambda stage, completed, total: on_progress("enrollment", completed, total)) if on_progress else None
+            gallery = self.model.enroll(protocol.references, samples_per_identity=protocol.gallery_samples,
+                                       _on_progress=callback)
             self._identity_gallery = gallery
             self.auxiliary_files["identity/gallery.npz"] = gallery.save(self.output_dir / "gallery.npz")
         return gallery
@@ -470,6 +475,10 @@ class TrainingSession:
                 options.update(project=selected_wandb.project, entity=selected_wandb.entity,
                                name=selected_wandb.name or output.name, dir=str(output))
                 options.setdefault("mode", "online")
+                if selection.family == ModelTypes.ID:
+                    # Capture Python output while preserving the notebook's
+                    # stdout/stderr streams. Explicit SDK settings still win.
+                    options.setdefault("settings", {"console": "wrap"})
                 print("Initializing W&B run", flush=True)
                 run, owns = sdk.init(**options), True
                 print("W&B run ready", flush=True)

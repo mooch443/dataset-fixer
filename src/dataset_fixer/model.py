@@ -1672,7 +1672,8 @@ class Model:
             from .id.model import predict
             result = predict(self, source, gallery=gallery, mode=mode, rejection=rejection,
                            split=split, batch_size=batch_size, device=device,
-                           prediction_cache=prediction_cache, cache_only=cache_only, track_by=track_by)
+                           prediction_cache=prediction_cache, cache_only=cache_only, track_by=track_by,
+                           progress=progress)
             if destination is not None:
                 result.save(destination)
             return result

@@ -276,8 +276,9 @@ def test_identity_wandb_lifecycle(identity_data, tmp_path, monkeypatch, run):
         result.evaluate(split='test',plots=0)
     assert any('training/augmentations' in entry for entry in logged)
     batches = [entry for entry in logged if 'progress/batch' in entry]
-    assert [entry['progress/epoch'] for entry in batches] == [0, 1, 2, 3]
-    assert all(entry['progress/batch'] == 1 and np.isfinite(entry['train/batch_loss']) for entry in batches)
+    assert [entry['progress/epoch'] for entry in batches] == [0, 0, 1, 1, 2, 2, 3, 3]
+    assert [entry['progress/batch'] for entry in batches] == [1, 3]*4
+    assert all(np.isfinite(entry['train/batch_loss']) for entry in batches)
     assert all(a['progress/global_step'] < b['progress/global_step'] for a, b in zip(batches, batches[1:]))
     assert any(args == ('train/batch_loss',) and kwargs['step_metric'] == 'progress/global_step' for args, kwargs in definitions)
     projections = [entry for entry in logged if 'embeddings/tsne' in entry]
@@ -285,6 +286,10 @@ def test_identity_wandb_lifecycle(identity_data, tmp_path, monkeypatch, run):
     assert any(args == ('val/loss',) and kwargs['summary']=='min' for args,kwargs in definitions)
     assert any('optim/lr' in entry and 'train/loss' in entry and 'val/loss' in entry for entry in logged)
     assert not any('train_loss' in entry or 'val_loss' in entry for entry in logged)
+    evaluation = [entry for entry in logged if 'evaluation/test/elapsed_seconds' in entry]
+    assert evaluation and run.summary['evaluation/test/stage'] == 'complete'
+    assert evaluation[-1]['evaluation/test/report_completed'] == 1
+    assert any(entry.get('evaluation/test/metrics_completed') == 10 for entry in evaluation)
     assert len(list(run.logged_artifacts())) == 1
     assert all(artifact.waited for artifact in run.artifacts)
     assert not run.closed  # caller-owned run
@@ -326,9 +331,10 @@ def test_resume_preserves_best_when_validation_does_not_improve(identity_data, t
 
 
 @pytest.mark.parametrize('accumulation', [1, 2])
-def test_native_plain_display_and_batch_telemetry(identity_data, tmp_path, monkeypatch, capsys, run, accumulation):
+def test_native_lightning_display_and_batch_telemetry(identity_data, tmp_path, monkeypatch, capsys, run, accumulation):
     import dataset_fixer as df
-    from lightning.pytorch.callbacks import ModelSummary, TQDMProgressBar
+    from lightning.pytorch.callbacks import ModelSummary, TQDMProgressBar, RichProgressBar, RichModelSummary
+    from lightning.pytorch.trainer.connectors.callback_connector import _RICH_AVAILABLE
     from dataset_fixer.id import training
     id.register_backbone('display-tiny', tiny_model, feature_dim=4,
                          preprocessing=dict(resolution=16, mean=[0]*3, std=[1]*3))
@@ -354,9 +360,10 @@ def test_native_plain_display_and_batch_telemetry(identity_data, tmp_path, monke
             backend_options=dict(pretrained=False, embedding_dim=4, embedding_samples=0,
                                  trainer=dict(precision='bf16-mixed', log_every_n_steps=2,
                                               accumulate_grad_batches=accumulation))))
-    assert any(type(cb) is TQDMProgressBar for cb in trainers[0].callbacks)
-    assert any(type(cb) is ModelSummary for cb in trainers[0].callbacks)
-    assert all('Rich' not in type(cb).__name__ for cb in trainers[0].callbacks)
+    bar_type = RichProgressBar if _RICH_AVAILABLE else TQDMProgressBar
+    summary_type = RichModelSummary if _RICH_AVAILABLE else ModelSummary
+    assert any(type(cb) is bar_type for cb in trainers[0].callbacks)
+    assert any(type(cb) is summary_type for cb in trainers[0].callbacks)
     progress = [entry for entry in logged if 'progress/batch' in entry]
     assert [entry['progress/global_step'] for entry in progress] == ([1, 2] if accumulation == 1 else [0, 1])
     assert all(np.isfinite(entry['train/batch_loss']) for entry in progress)
@@ -365,6 +372,7 @@ def test_native_plain_display_and_batch_telemetry(identity_data, tmp_path, monke
     stdout = capsys.readouterr().out
     assert 'validation sanity check complete' in stdout
     assert 'first training batch completed' in stdout
+    assert 'training batch 2/2' in stdout
 
 
 def test_custom_instance_freeze_and_cache(identity_data,tmp_path):

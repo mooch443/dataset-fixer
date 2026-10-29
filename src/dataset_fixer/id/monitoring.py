@@ -1,11 +1,42 @@
 """Bounded epoch monitoring without a second logger or training loop."""
 import json
-from contextlib import nullcontext
+import time
+import warnings
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import pandas as pd
 
 from .data import balanced_rows, index_of
+
+
+@contextmanager
+def evaluation_progress(result, split):
+    """Mirror post-training stages to the session-owned run, independently of stdout."""
+    run = result.wandb_run
+    if run is None:
+        yield None
+        return
+    prefix = f"evaluation/{split}"
+    run.define_metric(f"{prefix}/elapsed_seconds")
+    run.define_metric(f"{prefix}/*", step_metric=f"{prefix}/elapsed_seconds")
+    started = time.monotonic()
+
+    def report(stage, completed, total):
+        status = "complete" if stage == "report" and completed == total else stage
+        try:
+            run.summary[f"{prefix}/stage"] = status
+            run.log({f"{prefix}/elapsed_seconds": time.monotonic() - started,
+                     f"{prefix}/{stage}_completed": completed, f"{prefix}/{stage}_total": total})
+        except Exception as exc:
+            warnings.warn(f"W&B evaluation progress logging failed: {exc}")
+
+    report("starting", 0, 1)
+    try:
+        yield report
+    except BaseException:
+        report("failed", 0, 1)
+        raise
 
 
 def prepare_monitor(result):

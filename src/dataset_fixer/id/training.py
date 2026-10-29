@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset as TorchDataset, DataLoader, WeightedRandomSampler, Sampler
 from lightning.pytorch import LightningModule, LightningDataModule, Trainer, seed_everything
-from lightning.pytorch.callbacks import ModelCheckpoint, ModelSummary, TQDMProgressBar
+from lightning.pytorch.callbacks import ModelCheckpoint
 
 from ..training.config import ModelTypes, Checkpoints, TrainingConfig
 from ..training.selection import Selection
@@ -265,20 +265,30 @@ class _TrainingBridge(ModelCheckpoint):
         super().on_train_batch_end(trainer, pl_module, outputs, batch, batch_idx)
         if not trainer.is_global_zero:
             return
+        now = time.monotonic()
         if batch_idx == 0:
             print(f"ID epoch {trainer.current_epoch + 1}: first training batch completed", flush=True)
         interval = trainer.log_every_n_steps
-        if self.result.wandb_run is not None and (batch_idx == 0 or (interval > 0 and (batch_idx + 1) % interval == 0)):
+        report = (batch_idx == 0 or batch_idx + 1 == trainer.num_training_batches or
+                  (interval > 0 and ((batch_idx + 1) % interval == 0 or now - self.last_progress >= 15)))
+        if not report:
+            return
+        self.last_progress = now
+        loss = float(outputs["loss"].detach()) * trainer.accumulate_grad_batches
+        total = str(int(trainer.num_training_batches)) if np.isfinite(trainer.num_training_batches) else "?"
+        print(f"ID epoch {trainer.current_epoch + 1}/{trainer.max_epochs}: "
+              f"training batch {batch_idx + 1}/{total}, loss={loss:.4f}", flush=True)
+        if self.result.wandb_run is not None:
             self.result.wandb_run.log({
                 "progress/global_step": trainer.global_step,
                 "progress/epoch": trainer.current_epoch,
                 "progress/batch": batch_idx + 1,
                 # Lightning divides callback loss by the accumulation factor.
-                "train/batch_loss": float(outputs["loss"].detach()) * trainer.accumulate_grad_batches,
+                "train/batch_loss": loss,
             })
 
     def on_train_epoch_start(self, trainer, pl_module):
-        self.epoch_started = time.monotonic()
+        self.epoch_started = self.last_progress = time.monotonic()
 
     def on_train_epoch_end(self, trainer, pl_module):
         super().on_train_epoch_end(trainer, pl_module)
@@ -414,16 +424,9 @@ def train_identity(result, prepared, augmentations):
     if trainer_options["devices"] != 1 and trainer_options["devices"] != devices:
         raise ValueError("Identity sampling currently supports one device per run")
     bridge = _TrainingBridge(result)
-    # Use Lightning's standard callbacks explicitly. Recent Lightning versions
-    # otherwise select Rich when installed, introducing another console/live
-    # rendering layer alongside Colab and W&B's output capture.
-    native_callbacks = [bridge]
-    if trainer_options.get("enable_progress_bar", True):
-        native_callbacks.append(TQDMProgressBar())
-    if trainer_options.get("enable_model_summary", True):
-        native_callbacks.append(ModelSummary())
+    # Let Lightning select its native Rich/tqdm display and model summary.
     trainer = Trainer(max_epochs=config.epochs or 30, default_root_dir=result.output_dir, logger=False,
-                      callbacks=native_callbacks, use_distributed_sampler=False, reload_dataloaders_every_n_epochs=1,
+                      callbacks=[bridge], use_distributed_sampler=False, reload_dataloaders_every_n_epochs=1,
                       **trainer_options)
     print("Starting Lightning fit: device setup, model summary, then validation sanity check", flush=True)
     trainer.fit(module, datamodule=data, ckpt_path=str(selection.resume) if selection.resume else None)

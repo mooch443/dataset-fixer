@@ -156,6 +156,14 @@ model = df.Model(result.bundle.path)  # local checkpoint, bundle or W&B referenc
 
 With W&B enabled, ID defaults to `CheckpointConfig(wandb_upload='best', keep_wandb_versions=1, wandb_contents='best')`. The first best and every validation improvement upload immediately. A replacement must be confirmed before the previous managed version is pruned; protected artifacts are retained. Session completion republishes the selected best with reports and grids before finishing an owned run. Failed publication preserves local recovery files and reports incomplete finalization. Use a `TrainingSession` block when evaluation/calibration should be included in the final publication.
 
+Lightning selects its native progress display (Rich when available, otherwise
+tqdm). Training also emits periodic plain-text batch summaries, which remain
+readable in W&B console logs. New managed ID runs default to W&B's `console='wrap'`
+capture so Python output stays visible in Colab while being copied to W&B.
+Explicit `WandbConfig(init={'settings': ...})` settings and caller-owned runs are
+preserved. If a notebook previously set `console='off'`, change that to `'wrap'`
+to restore console capture; structured metrics are logged in either case.
+
 ## Enrollment and query mode
 
 ```python
@@ -195,6 +203,18 @@ Reports distinguish known individuals, newly enrolled individuals unseen during 
 Calibration uses scikit-learn's complete ROC thresholds over maximum gallery scores from unknown validation queries, choosing the most permissive attainable point that does not exceed the target FPIR. Ties remain together. Reports distinguish requested and attained FPIR and flag limited independent clip coverage; correlated frames are not independent calibration evidence. Bob was intentionally replaced because its NumPy 1.x requirements conflict with this framework's NumPy 2/OpenCV requirements.
 
 `TrainingResult.evaluate()` evaluates the complete fixed ID query cohort; the detection-only `samples` limit does not subsample it. `plots` controls the number of prediction examples (`0` disables the grid). Evaluation writes the shared `ComparisonResult`, frozen cohort, query CSV, metrics and protocol JSON, and figures through the existing report renderer. Training provenance currently checks clip membership and source-reference overlap; it does not certify pixel-level duplicate exclusion against the entire training corpus under renamed/copied files.
+
+Embedding extraction and retrieval scoring show completed-image counts, elapsed
+time and progress bars. Retrieval metrics use bounded batches of 128 queries;
+PyTorch Metric Learning still computes each image's AP before the existing crop
+and identity/clip summaries. Gallery tensors are reused across batches.
+Session evaluation also logs enrollment, embedding, metric and report progress
+under `evaluation/<split>/`, using elapsed seconds as its own step axis. The run
+summary's `evaluation/<split>/stage` becomes `complete` only after report writing.
+These metrics remain available when console capture is off. Direct
+`model.embed(..., progress=False)` and `model.predict(..., progress=False)` silence
+their local progress output. Training's `samples_per_epoch` and
+`validation_samples` do not reduce this final evaluation cohort.
 
 ## Implementation map
 
