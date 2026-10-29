@@ -13,6 +13,23 @@ from .model import input_index, embed, fingerprint
 from ..utils import qualified_tracklet_id
 
 
+def _reference_hashes(gallery):
+    """Pixel identities for leave-one-observation-out inspection of a gallery."""
+    hashes = []
+    for reference in gallery.references:
+        digest = reference.get("pixel_sha256")
+        if digest is None:
+            pixels = ImageRef(*json.loads(reference["source_ref"])).read()
+            digest = hashlib.sha256(str(pixels.shape).encode() + pixels.tobytes()).hexdigest()
+        hashes.append(digest)
+    return hashes
+
+
+def _reference_mask(gallery, hashes, source_ref, pixel_sha256):
+    return np.array([digest != pixel_sha256 and ref["source_ref"] != source_ref
+                     for digest, ref in zip(hashes, gallery.references)])
+
+
 @dataclass(frozen=True)
 class Gallery:
     """Reference embeddings independent of the encoder's training roster.

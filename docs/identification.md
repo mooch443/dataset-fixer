@@ -587,7 +587,94 @@ The difference subtitle states `difference = focal_mean - mean(other_identity_me
 
 The NPZ includes the displayed `attribution_*` maps, the `mean_*` identity maps and individual `reference_*` maps. JSON identifies all contributing sources, other-identity map keys, scores, self-exclusions, the medoid source and effect magnitudes. To improve the enrolled reference set itself, the existing `model.enroll(..., selection="medoids")` option still applies.
 
-ID training automatically generates both figures from the selected best checkpoint, displays them locally, includes their PNG/NPZ/JSON files in the final bundle and backup, and logs the two images to `inspection/reference_attention` and `inspection/reference_contrast` in the session-owned W&B run. This adds no scalar training metrics. The default averages up to four references per identity with per-image display scaling. Customize it without changing enrollment:
+For localized, repeatable texture evidence, use a separate call:
+
+```python
+effects = id.explain_markings(
+    model,
+    gallery=gallery,
+    identity_id="MUDH00_02",
+    samples_per_identity=8,
+    patches=2,
+    destination="wolf-markings.png",
+)
+display(effects[["patch", "identity_id", "clip_id", "role", "effect", "control_effect"]])
+display(effects.attrs["clip_summary"])
+```
+
+The default source is the gallery's reference images. Pass a labeled Dataset as
+the second argument to inspect different images, for example
+`id.explain_markings(model, validation_data, gallery=gallery, identity_id="MUDH00_02")`.
+Images need identity and clip metadata; at least two focal clips are required.
+Selection uses the existing clip/tracklet-balanced sampler, with at most
+`samples_per_identity` images per enrolled individual (default 20). The gallery
+and the model remain unchanged. This call does not add W&B metrics or run during
+training automatically.
+
+[OpenCV SIFT](https://docs.opencv.org/4.x/dc/dc3/tutorial_py_matcher.html) proposes
+local correspondences using mutual nearest neighbors and a distance-ratio test
+below 0.75. Exact duplicate pixels and same-clip pairs cannot supply independent
+matches. Each candidate uses at most one observation per clip. Nearby duplicate
+proposals are suppressed. Up to `min(12, 4 * patches)` candidates (at least
+`patches`) are measured, then ranked by their mean signed effect across focal
+clips. The nearest texture on another identity is also shown, explicitly labeled
+as an unverified lookalike rather than an accepted correspondence. The algorithm
+does not force matches when no candidates pass; it returns an empty table and a
+warning. Increasing the sample budget can expose additional clips and poses.
+
+[Captum FeatureAblation](https://captum.ai/api/feature_ablation.html) replaces each
+patch with a blurred version of that patch **inside the full model input**. Pixels
+outside it stay unchanged. It measures:
+
+```text
+margin(image) = similarity(image, focal) - max(similarity(image, other identities))
+effect = margin(original image) - margin(image with patch blurred)
+```
+
+Positive effect means the original local texture supports the focal identity's
+margin; negative means it opposes that margin. The same focal identity is used
+on every image, including other wolves' images. Scores are maximum cosine
+similarities to remaining gallery references. Self references and exact pixel
+duplicates are excluded; other images from the same clip may remain. The
+strongest competing identity can change after ablation. These are score changes,
+not probabilities. A non-overlapping nearby patch of equal area provides a
+control effect when space permits; the table includes `effect_minus_control`.
+It is a spatial control, not an anatomically matched control.
+
+Each call makes one figure for the requested identity, with a separate grid
+for each marking. Every matched clip and the nearest other-identity lookalike
+appear in that grid. Each observation pairs its full image (orange patch, cyan
+control) with a wider detail view, with the actual measured patch outlined in
+orange. Captions give before/after margins and measured effects. The default
+`context_fraction=1` includes one patch width of context on each side, giving
+a detail view three times the patch width, subject to image boundaries. Increase
+it to zoom in less. `columns=2` sets image pairs per row. Neither display option
+changes ablation regions, matching, or reported effects.
+`patch_fraction` (default 0.15) controls anchor width relative to the model input;
+SIFT scale changes adjust the matching region's size. Enlargement uses nearest
+neighbor display and adds no detail. `device` and `show` behave as in the attention
+visualizer. No particular backbone layers or hooks are required.
+
+The returned DataFrame has source references, model-input boxes, corresponding
+decoded-source boxes, descriptor distances, margins, effects, controls, and
+excluded gallery rows. `attrs["clip_summary"]` gives equally weighted focal-clip
+effects, their range, and the fraction with positive effects. The CSV/JSON
+sidecars preserve all observations, settings and fingerprints; NPZ stores each
+original and altered display image plus the exact normalized float inputs
+(`observation_N_input`, `observation_N_ablated_input`) used for scoring.
+Coordinates refer to the decoded
+`ImageRef`, after any dataset cropping or border trimming.
+
+This is an exploratory model-sensitivity diagnostic. SIFT can match background,
+and apparent correspondences are not verified anatomy. Blur can affect coarse
+structure as well as fur texture; the nearby control does not remove that
+ambiguity. Ranking and inspection use the same images, so clip consistency is
+not a significance test or an independent validation result. Use fresh clips
+and visual confirmation before calling a proposed patch a reliable human
+identification cue. A 128-pixel model input cannot establish individual hairs
+that were lost during resizing.
+
+ID training automatically generates the mean-reference and reference-difference attention figures from the selected best checkpoint, displays them locally, includes their PNG/NPZ/JSON files in the final bundle and backup, and logs the two images to `inspection/reference_attention` and `inspection/reference_contrast` in the session-owned W&B run. This adds no scalar training metrics. The default averages up to four references per identity with per-image display scaling. Customize it without changing enrollment:
 
 ```python
 backend_options={

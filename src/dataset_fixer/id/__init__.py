@@ -7,6 +7,7 @@ from .evaluation import Protocol, RejectionCalibration
 from .gallery import Gallery
 from .model import register_backbone, default_augmentations
 from .inspection import visualize_attention
+from .markings import explain_markings
 
 
 def train(data, *, backbone=None, **kwargs):
@@ -22,5 +23,5 @@ def train(data, *, backbone=None, **kwargs):
     return shared_train(data, type="id", backbone=backbone, **kwargs)
 
 
-__all__ = ["train", "from_dataset", "register_backbone", "default_augmentations", "stats", "visualize_attention",
+__all__ = ["train", "from_dataset", "register_backbone", "default_augmentations", "stats", "visualize_attention", "explain_markings",
            "Protocol", "Gallery", "RejectionCalibration"]

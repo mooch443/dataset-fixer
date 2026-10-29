@@ -177,7 +177,7 @@ def _attention_observations(model, index, selected, gallery, *, identity_id=None
     import torch
     from captum.attr import Occlusion
     from .model import runtime, preprocess
-    from .gallery import identity_scores
+    from .gallery import identity_scores, _reference_hashes, _reference_mask
     gallery.validate(model)
     if contrast and len(gallery.identities) < 2:
         raise ValueError("Contrast attribution needs at least two enrolled individuals")
@@ -187,15 +187,7 @@ def _attention_observations(model, index, selected, gallery, *, identity_id=None
     previous_device, was_training = next(module.parameters()).device, module.training
     target_device = device or model._device or str(previous_device)
     observations = []
-    hashes = []
-    if reference_mode:
-        import hashlib
-        for row, ref in enumerate(gallery.references):
-            digest = ref.get("pixel_sha256")
-            if digest is None:
-                pixels = index[row].image_ref.read()
-                digest = hashlib.sha256(str(pixels.shape).encode() + pixels.tobytes()).hexdigest()
-            hashes.append(digest)
+    hashes = _reference_hashes(gallery) if reference_mode else []
     try:
         module.to(target_device).eval()
         references = torch.as_tensor(gallery.embeddings.copy(), device=target_device)
@@ -204,8 +196,7 @@ def _attention_observations(model, index, selected, gallery, *, identity_id=None
                 sample = index[row]
                 keep = np.ones(len(gallery.labels), dtype=bool)
                 if reference_mode:
-                    keep = np.array([digest != hashes[row] and ref["source_ref"] != sample.image_ref.key
-                                     for digest, ref in zip(hashes, gallery.references)])
+                    keep = _reference_mask(gallery, hashes, sample.image_ref.key, hashes[row])
                     if not any(keep[i] and label == sample.identity_id for i, label in enumerate(gallery.labels)):
                         raise ValueError(f"Reference attention needs at least two distinct images for {sample.identity_id!r}")
                 labels = tuple(label for label, use in zip(gallery.labels, keep) if use)
@@ -321,3 +312,54 @@ def _visualize_reference_attention(model, gallery, *, samples_per_identity=20, s
         combined.append((sample, rgb, heat, metadata))
     return _render_attention(combined, options, color_scale=color_scale, contrast=contrast,
                              reference_maps=maps)
+
+
+def _render_markings(records, arrays, metadata, *, options):
+    """Prepare marking evidence for the canonical context/patch image grid."""
+    import cv2
+    import altair as alt
+    from ..static_rendering import concat_grid
+    from ..visualization import (VisualizationItem, VisualizationPanel, foreground_crop_bounds,
+                                 visualize_records, finish_visualization, draw_mask_outline)
+
+    def prepare(record):
+        original = arrays[f"{record['array_key']}_original"]
+        x0, y0, x1, y1 = record["box"]
+        mask = np.zeros(original.shape[:2], bool)
+        mask[y0:y1, x0:x1] = True
+        context = original
+        if record["control_box"] is not None:
+            a, b, c, d = record["control_box"]
+            control_mask = np.zeros(mask.shape, bool)
+            control_mask[b:d, a:c] = True
+            context = draw_mask_outline(original, control_mask, color="#00A6B2", line_width=options.line_width,
+                                        outline_width=options.outline_width, alpha=options.outline_alpha)
+        a, b, c, d = foreground_crop_bounds(mask, context_fraction=options.context_fraction, minimum_context=0)
+        def enlarge(pixels):
+            return cv2.resize(pixels[b:d, a:c], (original.shape[1], original.shape[0]), interpolation=cv2.INTER_NEAREST)
+        control = "n/a" if record["control_effect"] is None else f"{record['control_effect']:+.4f}"
+        panels = (
+            VisualizationPanel("Location", context, mask=mask, color="#E98224",
+                footer=f"Pred: {record['prediction']}\nMargin: {record['margin_before']:+.4f} → {record['margin_after']:+.4f}"),
+            VisualizationPanel("Detail with context", enlarge(original), mask=enlarge(mask.astype(np.uint8)).astype(bool),
+                color="#E98224", footer=f"Effect Δ: {record['effect']:+.4f}\nNearby control Δ: {control}"),
+        )
+        role = {"anchor": "anchor", "cross_clip": "cross-clip match", "other_identity": "nearest other-wolf texture (unverified)"}[record["role"]]
+        return VisualizationItem(Path(record["array_key"]),
+            f"{record['identity_id']} · {record['clip_id']}\n{role}", panels, np.ones(mask.shape, bool))
+
+    groups = []
+    for summary in metadata["clip_summary"]:
+        group = [record for record in records if record["patch"] == summary["patch"]]
+        grid = visualize_records(group, options=options, prepare=prepare).properties(
+            title=alt.TitleParams(fontSize=12, anchor="middle",
+            text=f"Marking {summary['patch']} · {summary['clips']} focal clips · mean Δ {summary['mean_effect']:+.4f}"))
+        # Vega-Lite permits configuration only on the outermost chart.
+        grid.config = alt.Undefined
+        groups.append(grid)
+    chart = concat_grid(groups, columns=1, spacing=24).properties(title=alt.TitleParams(
+        text=f"Marking evidence · {metadata['identity_id']}", fontSize=12, anchor="middle", offset=8,
+        subtitle=["margin = focal similarity - strongest rival similarity; effect = original margin - blurred margin",
+                  "Orange: measured patch · cyan: nearby control · candidate matches, not anatomical proof"]))
+    finish_visualization(chart, options)
+    return chart
