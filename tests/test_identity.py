@@ -469,6 +469,26 @@ def test_metadata_views_and_prediction_filter_keep_npz_rows_lazy(tmp_path, monke
     negative = data.filter(predictions=predictions, has_prediction=False)
     assert index_of(positive).frame.row.tolist()==[2]
     assert index_of(negative).frame.row.tolist()==[1]
+    assert index_of(data.filter(identity_ids=['wolf-a'], predictions=predictions,
+                                has_prediction=True)).frame.row.tolist() == [2]
+
+
+def test_identity_selection_is_lazy_and_combines_filters(identity_data, monkeypatch):
+    before = index_of(identity_data).frame.copy()
+    monkeypatch.setattr(SampleIndex, '__getitem__', lambda *args: pytest.fail('Filtering must read metadata only'))
+    selected = identity_data.filter(identity_ids=['wolf-b'], gt_annotated=True, split='val')
+    assert id.stats(selected).identity_id.tolist() == ['wolf-b']
+    assert len(index_of(selected)) == 5
+    assert selected.splits == ('val',)
+    assert len(index_of(identity_data.filter(identity_ids=['wolf-a']))) == 15
+    assert len(index_of(identity_data.filter(identity_ids=[]))) == 0
+    pd.testing.assert_frame_equal(index_of(identity_data).frame, before)
+    with pytest.raises(ValueError, match='Unknown identity_ids'):
+        identity_data.filter(identity_ids=['typo'])
+    with pytest.raises(TypeError, match='sequence'):
+        identity_data.filter(identity_ids='wolf-a')
+    with pytest.raises(TypeError, match='string labels'):
+        identity_data.filter(identity_ids=[1])
 
 
 def test_arcface_custom_training_advances_prefetched_sampling(identity_data, tmp_path, monkeypatch):

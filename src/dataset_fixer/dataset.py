@@ -2367,13 +2367,14 @@ class Dataset:
         self,
         *,
         gt_annotated: bool | None = None,
+        identity_ids: Iterable[str] | None = None,
         predictions: "PredictionResult | None" = None,
         model: "Model | None" = None,
         has_prediction: bool | None = None,
         split: Literal["train", "val", "test"] | None = None,
         progress: bool = True,
     ) -> "Dataset":
-        """Return a materialized view selected by GT and prediction presence.
+        """Return a materialized view selected by labels and prediction presence.
 
         Ground-truth presence is read from vector annotations or semantic
         masks. Prediction presence can use an explicit
@@ -2384,6 +2385,9 @@ class Dataset:
         Parameters:
             gt_annotated: Retain images with non-empty ground truth when
                 ``True``, or confirmed-empty ground truth when ``False``.
+            identity_ids: For identity datasets, retain these individual labels.
+                Combines with other filters. Unknown labels raise an error;
+                an empty sequence selects no images. Only metadata is read.
             predictions: Prediction result used to evaluate
                 ``has_prediction`` without inference. Mutually exclusive with
                 ``model``.
@@ -2408,8 +2412,10 @@ class Dataset:
         ):
             if value is not None and not isinstance(value, bool):
                 raise TypeError(f"{name} must be a boolean or None")
-        if gt_annotated is None and has_prediction is None:
+        if gt_annotated is None and has_prediction is None and identity_ids is None:
             raise ValueError("Dataset.filter requires at least one filter")
+        if identity_ids is not None and self.task != Task.ID:
+            raise ValueError("identity_ids filtering requires an identity dataset")
         if not isinstance(progress, bool):
             raise TypeError("progress must be a boolean")
         if predictions is not None and model is not None:
@@ -2433,17 +2439,28 @@ class Dataset:
             raise ValueError(
                 f"Unknown split {split!r}; available splits are {self.splits}"
             )
-        if self.task == Task.ID and has_prediction is not None:
-            from .id.data import filter_predictions
-            return filter_predictions(self, predictions, has_prediction=has_prediction,
-                                      gt_annotated=gt_annotated, split=normalized_split)
-        if self.task == Task.ID and has_prediction is None:
-            from .id.data import index_of, as_dataset
+        if self.task == Task.ID:
+            from .id.data import index_of, as_dataset, filter_predictions
             index = index_of(self)
+            if identity_ids is not None:
+                if isinstance(identity_ids, str):
+                    raise TypeError("identity_ids must be a sequence of labels, e.g. ['wolf-1']")
+                labels = tuple(identity_ids)
+                if not all(isinstance(label, str) for label in labels):
+                    raise TypeError("identity_ids must contain string labels")
+                unknown = set(labels) - set(index.frame.identity_id.dropna().unique())
+                if unknown:
+                    raise ValueError(f"Unknown identity_ids: {sorted(unknown)}")
+                index = index.where(identity_id=labels)
             if normalized_split is not None:
                 index = index.where(split=normalized_split)
-            matches = index.frame.identity_id.notna() == gt_annotated
-            return as_dataset(index.take(matches.to_numpy().nonzero()[0]), parent=self)
+            if gt_annotated is not None:
+                matches = index.frame.identity_id.notna() == gt_annotated
+                index = index.take(matches.to_numpy().nonzero()[0])
+            selected = as_dataset(index, parent=self)
+            if has_prediction is not None:
+                return filter_predictions(selected, predictions, has_prediction=has_prediction)
+            return selected
         if model is not None:
             from .model import Model
 

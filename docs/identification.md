@@ -18,6 +18,7 @@ data = df.Dataset.open('/data/tracklet_npzs', format='trex_npz',
     identities='/data/global_id_summary.xlsx')
 
 # Immutable metadata views; pixels stay at their original locations.
+data = data.filter(gt_annotated=True, identity_ids=['wolf-1', 'wolf-2'])
 data = data.split({'train': .7, 'val': .15, 'test': .15}, group_by='clip_id',
                   classes_must_appear_in=('train',))
 data = data.holdout(clip_id='observation-17', identity_ids=['wolf-2'], to_split='test')
@@ -28,6 +29,11 @@ data = data.with_sampling(
 ```
 
 Omit `identity_ids` to hold out the entire clip. `group_by=('identity_id', 'clip_id')` groups each individual/clip combination; path callbacks still work. Individual holdouts warn when the clip remains in training for other animals. Group boundaries take precedence over exact split ratios.
+
+`filter(identity_ids=[...])` selects individuals using metadata without opening
+images or rewriting archives. It combines with `gt_annotated`, `split`, and
+prediction filters. Unknown labels raise an error; an empty list selects no
+images. Omit the option to retain all identities.
 
 `classes_must_appear_in=('train',)` requires every observed identity in training;
 `('train', 'val', 'test')` requires every identity in all three splits. The default
@@ -110,7 +116,7 @@ Predefined backbones: `resnet18`, `efficientnet_v2_s`, `convnext_tiny`. Arbitrar
 
 Without explicit batch caps, the progress bar reports the complete batch count: `samples_per_epoch=50_000` and `batch_size=64` produce 782 training batches. Explicit `max_per_batch` caps can produce smaller batches and keep the count unknown until sampled.
 
-ID training explicitly uses Lightning's tqdm progress bar and plain model summary, avoiding an additional Rich live-rendering layer in notebooks with W&B console capture. Native `trainer.enable_progress_bar` and `trainer.enable_model_summary` switches still apply. Flushed startup messages identify W&B initialization, the backup-directory check, augmentation rendering, sampler preparation, monitor-cohort selection, validation sanity checks and the first completed training batch. Timings separate dataset preparation from actual training.
+ID training uses Lightning's native Rich display when available, otherwise tqdm. Native `trainer.enable_progress_bar` and `trainer.enable_model_summary` switches still apply. Flushed startup messages identify W&B initialization, the backup-directory check, augmentation rendering, sampler preparation, monitor-cohort selection, validation sanity checks and the first completed training batch. Timings separate dataset preparation from actual training.
 
 By default every eligible validation image is evaluated every epoch. For a large dataset, set `backend_options={"validation_samples": 8192}` to select a fixed validation subset balanced across identities, clips and tracklets. It is selected once from the seed, is unchanged across epochs/resume, and is used for validation loss and checkpoint selection. The limit must cover every validation identity. Startup output and training metadata report selected/available counts. `None` retains full validation. Final `result.evaluate(split="test")` still uses the full test query cohort.
 
