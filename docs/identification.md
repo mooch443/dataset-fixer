@@ -56,8 +56,11 @@ is retained when a planned split is exported.
 
 Sampling first balances individuals, then clips within each individual, then tracklets if requested. Images are sampled within the final group using PyTorch's weighted sampler. `samples_per_epoch` controls workload, not a fixed subset. Draws and augmentations change reproducibly each epoch, including after resume.
 
-The batch builder prefers distinct clips and tracklets, then balances repeated
-groups when needed to fill the batch. It reorders up to eight batches of metadata
+The batch builder first spreads each identity's pending draws proportionally
+across batches, then prefers distinct clips and tracklets within those shares.
+This prevents identities with many clips from being consumed early and leaving
+identities with fewer clips concentrated at epoch end. It balances repeated
+groups when needed to fill the batch and reorders up to eight batches of metadata
 at a time, without dropping or replacing any draw or changing the epoch's weighted
 selection. This is best effort within that bounded lookahead, not a global optimum
 over the entire epoch. Missing clip/tracklet metadata simply disables that preference.
@@ -65,7 +68,9 @@ No hard limits apply by default. If explicitly supplied,
 `max_per_batch={'tracklet_id': 2}` remains a strict cap and can produce smaller
 batches. The sampler version is stored in checkpoints: old sequential-order runs
 can initialize a new run with `weights=`, but cannot silently resume with a different
-batch ordering algorithm.
+batch ordering algorithm. This proportional ordering is recorded as
+`diverse_v2`; `diverse_v1` checkpoints remain valid for prediction and `weights=`
+initialization, but require a new training run to use the corrected ordering.
 
 CSV/JSONL rows require `identity_id` (null is allowed) and either `image_path`/`path`, or `archive`, `array`, `row`. Optional fields include `split`, `clip_id`, `tracklet_id`, `local_id`, `frame_index`, `notes`, and `original_id`. Paths are relative to the manifest. Unsplit rows belong to `train`. A JSONL `crop: [left, top, right, bottom]` is an optional deterministic pixel crop. Use `data.export(destination=..., format='identity_manifest')` to save a view without copying pixels.
 
@@ -116,7 +121,19 @@ Predefined backbones: `resnet18`, `efficientnet_v2_s`, `convnext_tiny`. Arbitrar
 
 Without explicit batch caps, the progress bar reports the complete batch count: `samples_per_epoch=50_000` and `batch_size=64` produce 782 training batches. Explicit `max_per_batch` caps can produce smaller batches and keep the count unknown until sampled.
 
-ID training uses Lightning's native Rich display when available, otherwise tqdm. Native `trainer.enable_progress_bar` and `trainer.enable_model_summary` switches still apply. Flushed startup messages identify W&B initialization, the backup-directory check, augmentation rendering, sampler preparation, monitor-cohort selection, validation sanity checks and the first completed training batch. Timings separate dataset preparation from actual training.
+ID training uses Lightning's native Rich display when available, otherwise tqdm. Native `trainer.enable_progress_bar` and `trainer.enable_model_summary` switches still apply; native callback instances can be passed in `backend_options['trainer']['callbacks']`. Flushed startup messages identify W&B initialization, the backup-directory check, augmentation rendering, sampler preparation, monitor-cohort selection and validation sanity checks. Timings separate dataset preparation from actual training. There are no additional per-batch printouts.
+
+Lightning receives an example input at the effective resolution for its native
+FLOPs summary. This measures one image's encoder/projection forward pass, not a
+training batch or GPU utilization. The identity head/loss are outside that
+forward pass and may show zero. Lightning's `bf16-mixed` model-summary warning
+concerns its parameter-memory estimate; it does not disable mixed precision.
+
+Without explicit batch caps, a non-divisible workload ends with a smaller batch:
+5,000 images at batch size 64 gives 78 full batches and one batch of 8. That tail
+can have different normalization statistics and less identity/clip diversity.
+For a controlled comparison use 5,120 images (80 full batches); this still samples
+fresh images from the whole eligible dataset. No samples are silently discarded.
 
 By default every eligible validation image is evaluated every epoch. For a large dataset, set `backend_options={"validation_samples": 8192}` to select a fixed validation subset balanced across identities, clips and tracklets. It is selected once from the seed, is unchanged across epochs/resume, and is used for validation loss and checkpoint selection. The limit must cover every validation identity. Startup output and training metadata report selected/available counts. `None` retains full validation. Final `result.evaluate(split="test")` still uses the full test query cohort.
 
@@ -162,13 +179,32 @@ model = df.Model(result.bundle.path)  # local checkpoint, bundle or W&B referenc
 
 With W&B enabled, ID defaults to `CheckpointConfig(wandb_upload='best', keep_wandb_versions=1, wandb_contents='best')`. The first best and every validation improvement upload immediately. A replacement must be confirmed before the previous managed version is pruned; protected artifacts are retained. Session completion republishes the selected best with reports and grids before finishing an owned run. Failed publication preserves local recovery files and reports incomplete finalization. Use a `TrainingSession` block when evaluation/calibration should be included in the final publication.
 
-Lightning selects its native progress display (Rich when available, otherwise
-tqdm). Training also emits periodic plain-text batch summaries, which remain
-readable in W&B console logs. New managed ID runs default to W&B's `console='wrap'`
-capture so Python output stays visible in Colab while being copied to W&B.
-Explicit `WandbConfig(init={'settings': ...})` settings and caller-owned runs are
-preserved. If a notebook previously set `console='off'`, change that to `'wrap'`
-to restore console capture; structured metrics are logged in either case.
+W&B uses the SDK defaults for mode and console capture. Explicit
+`WandbConfig(init={'settings': ...})` settings, environment settings and
+caller-owned runs are preserved. Ordinary stdout/stderr can be captured by W&B;
+Rich's notebook HTML display bypasses those streams, including prints redirected
+through an active Rich live display. To keep native Rich bars while making their
+output available to both the notebook and W&B, select Rich's terminal rendering
+through the native controls before training:
+
+```python
+import rich
+from lightning.pytorch.callbacks import RichProgressBar
+
+console = {'force_jupyter': False, 'force_terminal': True}
+rich.reconfigure(**console)  # also applies to the startup Rich model summary
+# Include this in config.backend_options['trainer']:
+trainer_options = {
+    'callbacks': [RichProgressBar(console_kwargs=console, leave=True)],
+    'enable_progress_bar': True,
+}
+# W&B needs no custom console setting:
+wandb_config = df.WandbConfig(project='wolf-id')
+```
+
+These remain Lightning callbacks; its enable/disable, refresh and summary
+controls still apply. Structured training metrics do not depend on console
+capture. Notebook HTML widgets themselves are not copied into W&B console logs.
 
 During ID training, a scoped compatibility filter suppresses only Lightning's
 internal `LeafSpec` constructor `FutureWarning` from its pytree module. Other
@@ -252,13 +288,30 @@ and `validation_samples`. Half is allocated to train and half to validation
 within each split. For example, 600 requests up to 300 train and 300 validation
 images. A split with fewer available images contributes fewer; unused capacity
 is not transferred to the other split. The selected images stay fixed across
-epochs. Monitor inference processes them in chunks of `min(batch_size, 64)`;
+epochs. Requests above 2,048 are capped with a single `⚠` notice, bounding the
+projection and pairwise-score work. Monitor inference starts in chunks of `min(batch_size, 64)`;
 this chunk size does not change the number of plotted points. W&B's
 `embeddings/samples` records the actual cohort size.
 
+Monitoring is optional: a recoverable memory failure skips that epoch's image
+and halves the cohort and inference chunk for the next attempt. The reduced
+cohort stays fixed after recovery; its metrics are not directly comparable with
+the earlier cohort. Other diagnostic failures disable further monitoring while
+training, checkpointing and publication continue. Each fallback reason prints
+one `⚠` notice and is recorded in bundle metadata and W&B's `embeddings/notice`
+summary. `embeddings/skipped=1` marks a failed/disabled diagnostic epoch. User
+interrupts still propagate. Setting samples to zero avoids cohort selection.
+
 W&B receives one image per epoch under `embeddings/tsne`, giving a single media panel with step history/slider. `epoch` is the shared zero-based axis; captions display one-based epoch numbers. Monitor `train/loss`, `val/loss`, `val/monitor_rank1`, `optim/lr`, `time/epoch_seconds`, and `time/monitor_seconds`. The diagnostic Rank-1 uses only the small fixed cohort and is separate from final evaluation. Selection remains validation loss. The cohort manifest, latest coordinates and image enter the checkpoint bundle; local epoch images and W&B history retain earlier views.
 
-Before an epoch finishes, `progress/batch`, `progress/epoch` (zero-based) and `train/batch_loss` report completed batches against `progress/global_step` (optimizer steps). They update after the first batch of each epoch and every `backend_options['trainer']['log_every_n_steps']` batches (default 50; zero retains just the first-batch update). Batch loss is the loss for that batch before gradient-accumulation scaling; `train/loss` remains the epoch aggregate. These metrics help distinguish an inactive loader/process from a long epoch without changing checkpoint selection.
+Before an epoch finishes, `progress/batch`, `progress/epoch` (zero-based),
+`train/batch_loss`, `train/batch_size` and `train/batch_identities` report completed
+batches against `progress/global_step` (optimizer steps). They update on the
+first and last batches, and every `backend_options['trainer']['log_every_n_steps']`
+batches (default 50), or after 15 seconds between updates. Zero retains only
+first/last updates. Batch loss is the loss for that batch before
+gradient-accumulation scaling; `train/loss` remains the sample-weighted epoch
+aggregate. Size/identity counts help investigate tail-batch loss spikes.
 
 ```python
 display(id.stats(data))  # samples, labeled/unlabeled, individuals, clips, tracklets

@@ -97,7 +97,7 @@ class CheckpointConfig:
 
 @dataclass(frozen=True)
 class WandbConfig:
-    """Use an existing run or create an online run; login stays with the caller.
+    """Use an existing run or create one with SDK defaults; login stays with the caller.
 
     Parameters:
         project: Project for a new run.

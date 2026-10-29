@@ -144,6 +144,14 @@ def test_train_reload_transfer_resume(identity_data, tmp_path, monkeypatch):
         id.train(identity_data, resume=legacy_path, config=TrainingConfig(
             epochs=2, batch_size=4, workers=0, augmentation_samples=0, output_dir=tmp_path/'legacy-resume',
             backend_options=options))
+    legacy = torch.load(result.resumable_checkpoint, weights_only=False)
+    legacy['identity']['sampling']['batch_order'] = 'diverse_v1'
+    legacy_order = tmp_path/'legacy-order.ckpt'
+    torch.save(legacy, legacy_order)
+    with pytest.raises(ValueError, match='same sampling'):
+        id.train(identity_data, resume=legacy_order, config=TrainingConfig(
+            epochs=2, batch_size=4, workers=0, augmentation_samples=0, output_dir=tmp_path/'legacy-order-resume',
+            backend_options=options))
     resumed = id.train(identity_data, resume=result.resumable_checkpoint, augmentations=[],
         config=TrainingConfig(epochs=2, batch_size=4, workers=0, augmentation_samples=0, output_dir=tmp_path/'resumed', backend_options=options))
     assert torch.load(resumed.resumable_checkpoint, weights_only=False)['epoch'] == 1
@@ -156,7 +164,7 @@ def test_train_reload_transfer_resume(identity_data, tmp_path, monkeypatch):
         torch.testing.assert_close(full_state[key], continued_state[key], rtol=0, atol=0)
     frame = index_of(identity_data).frame.copy()
     frame['identity_id'] = frame.identity_id.astype(str) + '-new'
-    transferred = id.train(as_dataset(SampleIndex(frame), location=tmp_path), weights=local, augmentations=[],
+    transferred = id.train(as_dataset(SampleIndex(frame), location=tmp_path), weights=Model(legacy_order), augmentations=[],
         config=TrainingConfig(epochs=1, batch_size=4, workers=0, augmentation_samples=0, output_dir=tmp_path/'transferred', backend_options=options))
     assert all(v.endswith('-new') for v in torch.load(transferred.best_weights, weights_only=False)['identity']['identities'])
 
@@ -371,7 +379,13 @@ def test_native_lightning_display_and_batch_telemetry(identity_data, tmp_path, m
     from dataset_fixer.id import training
     id.register_backbone('display-tiny', tiny_model, feature_dim=4,
                          preprocessing=dict(resolution=16, mean=[0]*3, std=[1]*3))
-    logged, trainers, losses = [], [], []
+    logged, trainers, losses, flops = [], [], [], []
+    summary_type = RichModelSummary if _RICH_AVAILABLE else ModelSummary
+    native_summary = summary_type.summarize
+    def summarize(*args, **kwargs):
+        flops.append(kwargs['total_flops'])
+        return native_summary(*args, **kwargs)
+    monkeypatch.setattr(summary_type, 'summarize', staticmethod(summarize))
     monkeypatch.setattr(run, 'log', lambda value, **kw: logged.append(value))
     monkeypatch.setattr(run, 'define_metric', lambda *args, **kwargs: None, raising=False)
     original_step = training._IdentityModule._step
@@ -394,18 +408,50 @@ def test_native_lightning_display_and_batch_telemetry(identity_data, tmp_path, m
                                  trainer=dict(precision='bf16-mixed', log_every_n_steps=2,
                                               accumulate_grad_batches=accumulation))))
     bar_type = RichProgressBar if _RICH_AVAILABLE else TQDMProgressBar
-    summary_type = RichModelSummary if _RICH_AVAILABLE else ModelSummary
     assert any(type(cb) is bar_type for cb in trainers[0].callbacks)
     assert any(type(cb) is summary_type for cb in trainers[0].callbacks)
+    assert trainers[0].lightning_module.example_input_array.shape == (1, 3, 16, 16)
+    assert flops and flops[0] > 0
     progress = [entry for entry in logged if 'progress/batch' in entry]
     assert [entry['progress/global_step'] for entry in progress] == ([1, 2] if accumulation == 1 else [0, 1])
     assert all(np.isfinite(entry['train/batch_loss']) for entry in progress)
+    assert all(entry['train/batch_size'] == 4 for entry in progress)
+    assert all(1 <= entry['train/batch_identities'] <= 2 for entry in progress)
     assert [entry['train/batch_loss'] for entry in progress] == pytest.approx(losses)
     assert result.best_weights.is_file()
     stdout = capsys.readouterr().out
     assert 'validation sanity check complete' in stdout
-    assert 'first training batch completed' in stdout
-    assert 'training batch 2/2' in stdout
+    assert 'first training batch completed' not in stdout
+    assert 'training batch 2/2' not in stdout
+
+
+def test_native_callback_and_partial_batch_telemetry(identity_data, tmp_path, monkeypatch, run):
+    import dataset_fixer as df
+    from lightning.pytorch.callbacks import RichProgressBar
+    from dataset_fixer.id import training
+    id.register_backbone('partial-tiny', tiny_model, feature_dim=4,
+                         preprocessing=dict(resolution=16, mean=[0]*3, std=[1]*3))
+    logged = []
+    monkeypatch.setattr(run, 'log', lambda value, **kw: logged.append(value))
+    monkeypatch.setattr(run, 'define_metric', lambda *a, **kw: None, raising=False)
+    bar = RichProgressBar(console_kwargs={'force_jupyter': False, 'force_terminal': True}, leave=True)
+    trainers = []
+    native = training.Trainer
+    def build(**kwargs):
+        trainer = native(**kwargs)
+        trainers.append(trainer)
+        return trainer
+    monkeypatch.setattr(training, 'Trainer', build)
+    result = id.train(identity_data.with_sampling(samples_per_epoch=10), backbone='partial-tiny',
+        augmentations=[], wandb=df.WandbConfig(run=run), config=TrainingConfig(
+            epochs=1, batch_size=4, workers=0, augmentation_samples=0, output_dir=tmp_path/'partial',
+            backend_options=dict(pretrained=False, embedding_dim=4, embedding_samples=0,
+                                 trainer=dict(callbacks=[bar], log_every_n_steps=1, enable_model_summary=False))))
+    assert trainers[0].progress_bar_callback is bar
+    progress = [entry for entry in logged if 'progress/batch' in entry]
+    assert [entry['train/batch_size'] for entry in progress] == [4, 4, 2]
+    assert [entry['progress/batch'] for entry in progress] == [1, 2, 3]
+    assert result.best_weights.is_file()
 
 
 def test_custom_instance_freeze_and_cache(identity_data,tmp_path):

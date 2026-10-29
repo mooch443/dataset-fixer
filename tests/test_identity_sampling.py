@@ -60,3 +60,20 @@ def test_sparse_diversity_fills_batches_and_explicit_caps_remain_strict():
     index.frame['tracklet_id'] = None
     index.sampling.pop('max_per_batch')
     assert [len(batch) for batch in _DiverseBatches(index, 8, 1)] == [8, 8, 1]
+
+
+def test_clip_coverage_cannot_defer_an_identity_to_epoch_tail(monkeypatch):
+    index = SampleIndex([
+        dict(path=f'/unused/{label}-{i}.png', width=16, height=16, identity_id=label,
+             clip_id='one-clip' if label == 'a' else f'clip-{i}', tracklet_id=str(i))
+        for label in ('a', 'b') for i in range(8)
+    ], sampling=dict(balance_by=('identity_id', 'clip_id', 'tracklet_id'), samples_per_epoch=64))
+    draws = list(range(16))*4
+    monkeypatch.setattr('dataset_fixer.id.training.WeightedRandomSampler', lambda *a, **k: iter(draws))
+    batches = list(_DiverseBatches(index, 8, 7))
+    assert Counter(row for batch in batches for row, _, _ in batch) == Counter(draws)
+    for batch in batches:
+        frame = index.frame.iloc[[row for row, _, _ in batch]]
+        assert frame.identity_id.value_counts().to_dict() == {'a': 4, 'b': 4}
+        assert frame.clip_id.nunique() == 5  # maximum under those identity shares
+        assert len(frame[['clip_id', 'tracklet_id']].drop_duplicates()) == 8

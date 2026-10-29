@@ -474,11 +474,6 @@ class TrainingSession:
                 options = dict(selected_wandb.init)
                 options.update(project=selected_wandb.project, entity=selected_wandb.entity,
                                name=selected_wandb.name or output.name, dir=str(output))
-                options.setdefault("mode", "online")
-                if selection.family == ModelTypes.ID:
-                    # Capture Python output while preserving the notebook's
-                    # stdout/stderr streams. Explicit SDK settings still win.
-                    options.setdefault("settings", {"console": "wrap"})
                 print("Initializing W&B run", flush=True)
                 run, owns = sdk.init(**options), True
                 print("W&B run ready", flush=True)

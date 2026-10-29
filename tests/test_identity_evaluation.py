@@ -121,7 +121,11 @@ def test_id_console_capture_defaults_preserve_explicit_settings(identity_data, t
     config = TrainingConfig(output_dir=tmp_path/'run')
     selection = select_identity(identity_data, backbone='resnet18', config=config)
     TrainingSession()._register(identity_data, selection, config, wandb=WandbConfig(project='wolves', init=options))
-    assert captured[0]['settings'] == (settings if settings is not None else {'console': 'wrap'})
+    if settings is None:
+        assert 'settings' not in captured[0]
+    else:
+        assert captured[0]['settings'] == settings
+    assert 'mode' not in captured[0]
     assert options == ({} if settings is None else {'settings': settings})
 
 

@@ -1,5 +1,4 @@
 """Bounded epoch monitoring without a second logger or training loop."""
-import json
 import time
 import warnings
 from contextlib import contextmanager, nullcontext
@@ -8,6 +7,42 @@ import numpy as np
 import pandas as pd
 
 from .data import balanced_rows, index_of
+
+_MAX_EMBEDDING_SAMPLES = 2048
+
+
+def _monitor_notice(result, key, message):
+    """Report a diagnostic fallback once per reason, including in run metadata."""
+    if not hasattr(result, 'metadata'):
+        result.metadata = {}
+    result.metadata.setdefault('monitoring', {})['notice'] = message
+    notices = getattr(result, '_embedding_notices', set())
+    if key not in notices:
+        notices.add(key)
+        result._embedding_notices = notices
+        print(f"⚠ Embedding monitor: {message}", flush=True)
+    if result.wandb_run is not None:
+        try:
+            result.wandb_run.summary['embeddings/notice'] = message
+        except Exception:
+            pass  # Diagnostics must also survive a broken media/logging sink.
+
+
+def _monitor_cohort(index, count, seed):
+    chosen = []
+    for split in ('train', 'val'):
+        rows = np.flatnonzero((index.frame.split == split) & index.frame.identity_id.notna())
+        budget = count//2 + (count % 2 if split == 'train' else 0)
+        chosen.extend(rows[balanced_rows(index.take(rows), budget, seed)])
+    return index.take(chosen)
+
+
+def _save_monitor_cohort(result):
+    from ..sources import _atomic_json
+    path = result.output_dir / 'monitoring' / 'cohort.json'
+    _atomic_json(path, [dict(source_ref=s.image_ref.key, identity_id=s.identity_id,
+        clip_id=s.clip_id, split=s.split) for s in result._embedding_cohort])
+    result.auxiliary_files['monitoring/cohort.json'] = path
 
 
 @contextmanager
@@ -46,19 +81,21 @@ def prepare_monitor(result):
         raise ValueError("embedding_samples must be a non-negative integer (0 disables monitoring)")
     if method not in {"tsne", "pca"}:
         raise ValueError("embedding_method must be tsne or pca")
-    index = index_of(result.dataset)
-    chosen = []
-    for split in ("train", "val"):
-        rows = np.flatnonzero((index.frame.split == split) & index.frame.identity_id.notna())
-        budget = count//2 + (count % 2 if split == "train" else 0)
-        chosen.extend(rows[balanced_rows(index.take(rows), budget, result.config.seed)])
-    result._embedding_cohort = index.take(chosen)
-    if count:
-        path = result.output_dir / "monitoring" / "cohort.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps([dict(source_ref=s.image_ref.key, identity_id=s.identity_id,
-            clip_id=s.clip_id, split=s.split) for s in result._embedding_cohort], indent=2))
-        result.auxiliary_files["monitoring/cohort.json"] = path
+    result._embedding_cohort = None
+    result._embedding_disabled = False
+    result._embedding_batch_size = min(result.config.batch_size or 64, 64)
+    if count > _MAX_EMBEDDING_SAMPLES:
+        _monitor_notice(result, 'limit', f"requested {count:,} samples; using at most "
+                        f"{_MAX_EMBEDDING_SAMPLES:,} to bound diagnostic memory and plotting work.")
+    try:
+        if count:
+            result._embedding_cohort = _monitor_cohort(index_of(result.dataset),
+                min(count, _MAX_EMBEDDING_SAMPLES), result.config.seed)
+            _save_monitor_cohort(result)
+    except Exception as error:
+        result._embedding_disabled = True
+        _monitor_notice(result, 'disabled', f"disabled after cohort preparation failed "
+                        f"({type(error).__name__}: {error}). Training will continue.")
     run = result.wandb_run
     if run is not None:
         run.define_metric("epoch")
@@ -68,10 +105,49 @@ def prepare_monitor(result):
         run.define_metric("val/monitor_rank1", step_metric="epoch", summary="max")
         run.define_metric("progress/global_step")
         run.define_metric("progress/*", step_metric="progress/global_step")
-        run.define_metric("train/batch_loss", step_metric="progress/global_step")
+        for name in ('loss', 'size', 'identities'):
+            run.define_metric(f"train/batch_{name}", step_metric="progress/global_step")
 
 
 def monitor_epoch(result, module, epoch):
+    """Best-effort diagnostics; resource failures shrink the next epoch's cohort."""
+    index = result._embedding_cohort
+    if getattr(result, '_embedding_disabled', False):
+        return {'embeddings/samples': 0, 'embeddings/skipped': 1}
+    if index is None or len(index) < 3:
+        return {'embeddings/samples': 0 if index is None else len(index)}
+    try:
+        return _monitor_epoch(result, module, epoch)
+    except Exception as error:
+        problem = f"{type(error).__name__}: {error}"
+        resource_failure = isinstance(error, MemoryError) or 'out of memory' in str(error).lower()
+    # Outside the except block so the traceback no longer retains failed tensors.
+    try:
+        if resource_failure:
+            size = result._embedding_batch_size
+            count = max(3, len(index)//2)
+            smaller_batch = max(1, min(count, size//2))
+            if count < len(index) or smaller_batch < size:
+                result._embedding_cohort = _monitor_cohort(index, count, result.config.seed)
+                result._embedding_batch_size = smaller_batch
+                import torch
+                device = next(module.parameters()).device.type
+                if device == 'cuda':
+                    torch.cuda.empty_cache()
+                elif device == 'mps':
+                    torch.mps.empty_cache()
+                _monitor_notice(result, 'resource', f"skipped epoch {epoch+1} ({problem}); "
+                    f"next attempt uses {len(result._embedding_cohort)} samples and batches of {smaller_batch}. "
+                    "The reduced cohort stays fixed after recovery; its metrics use a different cohort.")
+                return {'embeddings/samples': 0, 'embeddings/skipped': 1}
+    except Exception as error:
+        problem = f"{problem}; recovery failed: {type(error).__name__}: {error}"
+    result._embedding_disabled = True
+    _monitor_notice(result, 'disabled', f"disabled after epoch {epoch+1} ({problem}). Training will continue.")
+    return {'embeddings/samples': 0, 'embeddings/skipped': 1}
+
+
+def _monitor_epoch(result, module, epoch):
     import torch
     from sklearn.manifold import TSNE
     from sklearn.decomposition import PCA
@@ -83,7 +159,7 @@ def monitor_epoch(result, module, epoch):
     if len(index) < 3:
         return {"embeddings/samples": len(index)}
     method = result.config.backend_options.get("embedding_method", "tsne")
-    size = min(result.config.batch_size or 64, 64)
+    size = result._embedding_batch_size
     was_training, vectors = module.training, []
     device = next(module.parameters()).device
     mps_rng = torch.mps.get_rng_state() if device.type == "mps" else None
@@ -119,7 +195,8 @@ def monitor_epoch(result, module, epoch):
     save_chart(embedding_chart(table, identities=sorted(index.names.values()), method=method.upper(), epoch=epoch), path)
     table.to_csv(folder / "embeddings.csv", index=False)
     result.auxiliary_files.update({"monitoring/embeddings.png": path, "monitoring/embeddings.csv": folder / "embeddings.csv"})
-    metrics = {"embeddings/samples": len(index)}
+    _save_monitor_cohort(result)
+    metrics = {"embeddings/samples": len(index), "embeddings/skipped": 0}
     train = (table.split == "train").to_numpy()
     val = (table.split == "val").to_numpy()
     labels = table.identity_id.to_numpy()

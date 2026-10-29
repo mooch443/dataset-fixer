@@ -110,7 +110,7 @@ class _Pixels(TorchDataset):
 
 
 class _DiverseBatches(Sampler):
-    """Spread library-weighted draws across clips and tracklets within each batch.
+    """Spread weighted identity shares, then diversify their clips and tracklets.
 
     Reorder a bounded metadata-only lookahead; never discard or replace a draw.
     Without explicit caps, repeated groups fill batches when diversity runs out.
@@ -154,7 +154,8 @@ class _DiverseBatches(Sampler):
             batch = []
             for _ in range(self.batch_size):
                 eligible = available.copy()
-                novelty, reuse, remaining, identity_reuse = np.zeros((4, len(pending)), dtype=int)
+                novelty, reuse, remaining = np.zeros((3, len(pending)), dtype=int)
+                identity_share = np.zeros(len(pending))
                 for field, (inverse, counts, frequency, valid) in fields.items():
                     used = counts[inverse]
                     if field in ("clip_id", "tracklet_id"):
@@ -162,7 +163,10 @@ class _DiverseBatches(Sampler):
                         reuse += np.where(valid, used, 0)
                         remaining += np.where(valid, frequency[inverse], 0)
                     elif field == "identity_id":
-                        identity_reuse = np.where(valid, used, 0)
+                        # Spread each identity's pending draws proportionally.
+                        # Clip novelty alone can exhaust identities with many
+                        # clips, leaving low-coverage identities at the tail.
+                        identity_share = (used + 1) / (used + frequency[inverse])
                     if field in self.caps:
                         eligible &= used < self.caps[field]
                 if not eligible.any():
@@ -170,8 +174,8 @@ class _DiverseBatches(Sampler):
                 # Consume larger pending groups on ties so repeated draws are
                 # spread over batches instead of accumulating at epoch end.
                 candidates = np.flatnonzero(eligible)
-                order = np.lexsort((candidates, identity_reuse[candidates], -remaining[candidates],
-                                    reuse[candidates], -novelty[candidates]))
+                order = np.lexsort((candidates, -remaining[candidates], reuse[candidates],
+                                    -novelty[candidates], identity_share[candidates]))
                 selected = int(candidates[order[0]])
                 batch.append(pending[selected])
                 available[selected] = False
@@ -267,25 +271,21 @@ class _TrainingBridge(ModelCheckpoint):
         if not trainer.is_global_zero:
             return
         now = time.monotonic()
-        if batch_idx == 0:
-            print(f"ID epoch {trainer.current_epoch + 1}: first training batch completed", flush=True)
         interval = trainer.log_every_n_steps
         report = (batch_idx == 0 or batch_idx + 1 == trainer.num_training_batches or
                   (interval > 0 and ((batch_idx + 1) % interval == 0 or now - self.last_progress >= 15)))
         if not report:
             return
         self.last_progress = now
-        loss = float(outputs["loss"].detach()) * trainer.accumulate_grad_batches
-        total = str(int(trainer.num_training_batches)) if np.isfinite(trainer.num_training_batches) else "?"
-        print(f"ID epoch {trainer.current_epoch + 1}/{trainer.max_epochs}: "
-              f"training batch {batch_idx + 1}/{total}, loss={loss:.4f}", flush=True)
         if self.result.wandb_run is not None:
             self.result.wandb_run.log({
                 "progress/global_step": trainer.global_step,
                 "progress/epoch": trainer.current_epoch,
                 "progress/batch": batch_idx + 1,
                 # Lightning divides callback loss by the accumulation factor.
-                "train/batch_loss": loss,
+                "train/batch_loss": float(outputs["loss"].detach()) * trainer.accumulate_grad_batches,
+                "train/batch_size": len(batch[1]),
+                "train/batch_identities": int(batch[1].unique().numel()),
             })
 
     def on_train_epoch_start(self, trainer, pl_module):
@@ -370,13 +370,15 @@ def train_identity(result, prepared, augmentations):
     identity = {**saved_meta, **{k: v for k, v in options.items() if k not in {"trainer", "pretrained"}},
                 "framework": "id", "backbone": selection.name, "identities": labels,
                 "augmentation_rng": "shared_stream_v2",
-                "sampling": {**index.sampling, "batch_order": "diverse_v1"}, "seed": config.seed, "batch_size": config.batch_size or 64,
+                "sampling": {**index.sampling, "batch_order": "diverse_v2"}, "seed": config.seed, "batch_size": config.batch_size or 64,
                 "training_fingerprint": index.fingerprint,
                 "training_clips": sorted(index.frame.loc[index.frame.split == "train", "clip_id"].dropna().unique().tolist())}
     module = _IdentityModule(identity, pretrained=options.get("pretrained", True) and selection.weights is None and selection.resume is None,
                              instance=selection.metadata.get("instance"), resolution=config.resolution)
     if config.resolution is not None:
         module.identity["preprocessing"]["resolution"] = config.resolution
+    size = module.identity["preprocessing"]["resolution"]
+    module.example_input_array = torch.zeros(1, 3, size, size)
     if augmentations is None and selection.resume:
         augmentations = saved_meta.get("augmentations")
     _, serialized = augmentation_pipeline(augmentations, seed=config.seed)
@@ -414,7 +416,7 @@ def train_identity(result, prepared, augmentations):
     prepare_monitor(result)
     print(f"Embedding-monitor cohort ready ({time.monotonic() - started:.1f}s)", flush=True)
     trainer_options = dict(options.get("trainer", {}))
-    managed = {"callbacks", "logger", "enable_checkpointing", "default_root_dir", "max_epochs", "use_distributed_sampler", "reload_dataloaders_every_n_epochs"}
+    managed = {"logger", "enable_checkpointing", "default_root_dir", "max_epochs", "use_distributed_sampler", "reload_dataloaders_every_n_epochs"}
     if managed & trainer_options.keys():
         raise ValueError(f"Lightning options managed by dataset-fixer: {sorted(managed & trainer_options.keys())}")
     device = config.device or "cpu"
@@ -425,9 +427,10 @@ def train_identity(result, prepared, augmentations):
     if trainer_options["devices"] != 1 and trainer_options["devices"] != devices:
         raise ValueError("Identity sampling currently supports one device per run")
     bridge = _TrainingBridge(result)
+    native_callbacks = list(trainer_options.pop("callbacks", None) or [])
     # Let Lightning select its native Rich/tqdm display and model summary.
     trainer = Trainer(max_epochs=config.epochs or 30, default_root_dir=result.output_dir, logger=False,
-                      callbacks=[bridge], use_distributed_sampler=False, reload_dataloaders_every_n_epochs=1,
+                      callbacks=[bridge, *native_callbacks], use_distributed_sampler=False, reload_dataloaders_every_n_epochs=1,
                       **trainer_options)
     print("Starting Lightning fit: device setup, model summary, then validation sanity check", flush=True)
     # Lightning still constructs PyTorch's deprecated LeafSpec (upstream #21326).
