@@ -69,6 +69,12 @@ or impossible requirements raise an error, including conflicting class overlaps.
 SciPy's integer solver assigns all groups together: enforce required coverage,
 minimize deviation from the requested overall and per-class image fractions,
 then prefer broader class coverage among equally good proportional allocations.
+Each solver call is bounded to five seconds. If proving
+optimal ratios takes longer, the best feasible allocation is retained and one
+warning is emitted; required coverage and group boundaries are never relaxed.
+The broader-coverage pass is skipped when every class is already required in
+every split. Export the resulting dataset to reuse exact assignments: a timed
+optimization can return different feasible assignments on different machines.
 Overall fractions and the mean per-class fractions have equal weight. Extra
 coverage does not override the target proportions; only explicitly required
 coverage and indivisible groups can force that tradeoff. Required splits

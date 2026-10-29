@@ -163,3 +163,37 @@ def test_solver_feasibility_matches_exhaustive_small_group_partitions():
                 assert all(actual[g] == split for g, split in locked.items())
                 assert all(any(actual[g] == split and label in labels[g] for g in range(3))
                            for label in classes for split in ('train', 'val'))
+
+
+@pytest.mark.parametrize('limit', ['ratio_incumbent', 'coverage_no_incumbent', 'ratio_no_incumbent'])
+def test_solver_limits_keep_feasible_whole_group_assignments(monkeypatch, limit):
+    import scipy.optimize
+    from scipy.optimize import OptimizeResult
+
+    original = scipy.optimize.milp
+    calls = []
+    def solve(cost, **kwargs):
+        calls.append(cost.copy())
+        no_incumbent = (limit == 'coverage_no_incumbent' and len(calls) == 2 or
+                        limit == 'ratio_no_incumbent' and len(calls) == 1)
+        if no_incumbent:
+            return OptimizeResult(status=1, success=False, x=None, message='Time limit reached')
+        result = original(cost, **kwargs)
+        assert result.success
+        if limit == 'ratio_incumbent' and len(calls) == 1:
+            result.status, result.success = 1, False
+        return result
+    monkeypatch.setattr(scipy.optimize, 'milp', solve)
+    sizes = dict(enumerate([11, 5, 3, 13, 7, 2]))
+    classes = {g: {'a' if g < 3 else 'b': size} for g, size in sizes.items()}
+    required = ('train',) if limit == 'coverage_no_incumbent' else ('train', 'val', 'test')
+    assigned = allocate_groups(sizes, {'train': .7, 'val': .15, 'test': .15}, {0: 'train'}, 7,
+                               group_classes=classes, classes_must_appear_in=required)
+    assert set(assigned) == set(sizes)
+    assert assigned[0] == 'train'
+    assert set(assigned.values()) == {'train', 'val', 'test'}
+    for label in ('a', 'b'):
+        assert set(required) <= {assigned[g] for g in sizes if label in classes[g]}
+    assert len(calls) == (1 if limit == 'ratio_incumbent' else 2)
+    if limit == 'ratio_no_incumbent':
+        assert not calls[-1].any()  # Only the soft ratio objective was removed.

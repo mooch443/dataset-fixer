@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import math
 import random
+import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -141,7 +142,7 @@ def allocate_groups(sizes, ratios, locked, seed, *, group_classes=None, classes_
 def allocate_class_groups(sizes, ratios, locked, seed, group_classes, required):
     """Assign whole groups: mandatory coverage, sample ratios, then broader coverage.
 
-    SciPy solves two sparse integer programs with the same constraints. Groups
+    SciPy solves bounded sparse integer programs with the same constraints. Groups
     with identical sizes and per-class counts are interchangeable, so individual
     crops compress to one group type per identity rather than millions of variables.
     """
@@ -242,16 +243,29 @@ def allocate_class_groups(sizes, ratios, locked, seed, group_classes, required):
     matrix = coo_matrix((values, (rows, columns)), shape=(len(lo), nv)).tocsc()
     bounds = Bounds(lower, upper)
 
-    def solve(cost, matrix, lo, hi):
-        result = milp(cost, integrality=integrality, bounds=bounds,
-                      constraints=LinearConstraint(matrix, lo, hi), options={"mip_rel_gap": 0})
+    limited = False
+
+    def solve(cost, matrix, lo, hi, fallback=None):
+        nonlocal limited
+        kwargs = dict(integrality=integrality, bounds=bounds,
+                      constraints=LinearConstraint(matrix, lo, hi),
+                      options={"mip_rel_gap": 0, "time_limit": 5.0})
+        result = milp(cost, **kwargs)
+        if result.status == 1:
+            limited = True
+            if result.x is None:
+                if fallback is not None:
+                    return fallback
+                # Ratio optimization found no incumbent: ask only for feasibility.
+                # Required coverage, locked assignments and whole groups stay hard.
+                result = milp(np.zeros(nv), **kwargs)
         if result.status == 2:
             raise DatasetValidationError(
                 f"classes_must_appear_in={required!r} is incompatible with whole-group membership "
                 "and explicit assignments. Class overlaps prevent simultaneous coverage "
                 "or leave a positive-ratio split empty; change group_by, assignments, or required splits."
             )
-        if not result.success:
+        if result.status not in (0, 1) or result.x is None:
             raise RuntimeError(f"Class-aware allocation failed: {result.message}")
         return result.x
 
@@ -261,9 +275,16 @@ def allocate_class_groups(sizes, ratios, locked, seed, group_classes, required):
     error = float(ratio_cost @ first)
     # Prefer broader coverage among equally good proportional allocations.
     # Coverage must not silently turn e.g. 70/15/15 into 48/21/31.
-    nonzero = np.flatnonzero(ratio_cost)
-    error_row = coo_matrix((ratio_cost[nonzero], (np.zeros(len(nonzero), dtype=int), nonzero)), shape=(1, nv)).tocsc()
-    solution = solve(coverage_cost, vstack([matrix, error_row], format="csc"), [*lo, -np.inf], [*hi, error+1e-8])
+    solution = first
+    if set(required) != set(splits):
+        nonzero = np.flatnonzero(ratio_cost)
+        error_row = coo_matrix((ratio_cost[nonzero], (np.zeros(len(nonzero), dtype=int), nonzero)), shape=(1, nv)).tocsc()
+        solution = solve(coverage_cost, vstack([matrix, error_row], format="csc"),
+                         [*lo, -np.inf], [*hi, error+1e-8], fallback=first)
+    if limited:
+        warnings.warn("Split optimization reached its work limit; using a feasible allocation. "
+                      "Whole groups, required class coverage and explicit assignments are preserved; "
+                      "ratios are approximate. Save/export this split to reuse its exact assignments.", stacklevel=3)
     assigned = dict(locked)
     rng = random.Random(seed)
     for p, (_, groups) in enumerate(patterns):
