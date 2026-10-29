@@ -748,6 +748,14 @@ def _make_representable(
         if not valid:
             raise DatasetValidationError(f"RLE annotation {annotation.source_id} produced no valid polygon")
         polygon = [tuple(map(float, point)) for point in max(valid, key=cv2.contourArea)]
+    geometry = Polygon(polygon)
+    if not geometry.is_valid:
+        from shapely import make_valid
+        from .segmentation import _polygonal_components
+        parts = [part for part in _polygonal_components(make_valid(geometry)) if part.area > 0]
+        if not parts:
+            raise DatasetValidationError(f"Annotation {annotation.source_id} produced no valid polygon")
+        polygon = list(max(parts, key=lambda part: part.area).exterior.coords)[:-1]
     builder.warnings.append(f"Lossy segmentation conversion for annotation {annotation.source_id}")
     return annotation.clone(polygon=polygon, rle=None)
 

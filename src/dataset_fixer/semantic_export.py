@@ -298,6 +298,8 @@ def export_semantic_masks(
         write_json(source_info_path(staging), source_info)
         manifest = {
             "schema": "dataset-fixer-dataset-info",
+            **({"synthetic": dataset.manifest["synthetic"]}
+               if "synthetic" in dataset.manifest else {}),
             "schema_version": DATASET_INFO_SCHEMA,
             "dataset_id": dataset_id,
             "name": final_name,
@@ -427,6 +429,9 @@ def _provenance_record(
             "lossy_clipping",
             "split_group",
             "display_label",
+            "synthetic",
+            "sample_metadata",
+            "annotation_metadata",
         )
         if key in parent
     }

@@ -1367,6 +1367,9 @@ Operation-specific previews and audits are controlled with each method's
 
 ## Development
 
+Synthetic multi-individual scenes and identity crops are available through
+`dataset_fixer.synthetic`. See the [API guide and notebook examples](docs/synthetic.md).
+
 The GitHub Actions pipeline tests supported Python versions and the complete
 runtime dependency set, builds the wheel and source distribution,
 checks package metadata, and smoke-tests installation from the wheel.

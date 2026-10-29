@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import tempfile
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
@@ -16,11 +17,142 @@ import numpy as np
 from PIL import Image
 
 from .models import DatasetMetadata, Sample, Task
-from .utils import IMAGE_SUFFIXES, VIDEO_SUFFIXES, slugify, to_jsonable
+from .utils import IMAGE_SUFFIXES, VIDEO_SUFFIXES, sha256_file, slugify, to_jsonable
 from .visualization import MarkerStyle, VisualizationOptions, annotation_item, annotations_from_values
 
 if TYPE_CHECKING:
+    from .dataset import Dataset
     from .model import Model
+
+
+def _h264_stream(writer, *, width, height, rate, time_base):
+    """Shared encoder settings for scene and prediction videos."""
+    stream = writer.add_stream("libx264", rate=rate)
+    stream.width, stream.height = width, height
+    stream.pix_fmt = "yuv420p" if width % 2 == height % 2 == 0 else "yuv444p"
+    stream.time_base = stream.codec_context.time_base = time_base
+    stream.codec_context.max_b_frames = 0
+    stream.options = {"crf": "18", "preset": "fast"}
+    return stream
+
+
+def _display_video(path):
+    from IPython import get_ipython
+    from IPython.display import Video, display
+
+    if get_ipython() is not None:
+        display(Video(filename=str(path), embed=True, html_attributes="controls loop", width=800))
+    else:
+        print(f"Video: {path}")
+
+
+def export_video(dataset: Dataset, *, clip_id, fps, destination, annotations, markers, show, overwrite):
+    """Stream one indexed scene clip to an atomic, notebook-playable MP4."""
+    import av
+    from .sources import cache_root
+
+    if not isinstance(overwrite, bool):
+        raise TypeError("overwrite must be a boolean")
+    if dataset.task is Task.ID:
+        raise ValueError("Export the scene Dataset as video, not its individual identity crops")
+    if dataset._plan:
+        raise ValueError("Export pending dataset operations before exporting video")
+    if isinstance(fps, bool) or not isinstance(fps, (int, float)) or not math.isfinite(fps) or fps <= 0:
+        raise ValueError("fps must be finite and positive")
+    dataset._ensure_provenance(progress=False)
+    if any(s.clip_id is None or s.frame_index is None for s in dataset._samples):
+        raise ValueError("Video export requires clip_id and frame_index metadata on every scene")
+    clips = sorted({s.clip_id for s in dataset._samples})
+    if clip_id is None:
+        if len(clips) != 1:
+            raise ValueError(f"Select clip_id from the available clips: {clips}")
+        clip_id = clips[0]
+    samples = [s for s in dataset._samples if s.clip_id == clip_id]
+    if not samples:
+        raise ValueError(f"Unknown clip_id {clip_id!r}; available clips: {clips}")
+    if any(isinstance(s.frame_index, bool) or not isinstance(s.frame_index, (int, np.integer)) or s.frame_index < 0 for s in samples):
+        raise ValueError("frame_index values must be nonnegative integers")
+    samples.sort(key=lambda s: s.frame_index)
+    indexes = [s.frame_index for s in samples]
+    if len(set(indexes)) != len(indexes):
+        raise ValueError("A scene clip must have exactly one image per frame_index")
+    width, height = samples[0].width, samples[0].height
+    if any((s.width, s.height) != (width, height) for s in samples):
+        raise ValueError("All frames in a clip must have identical dimensions")
+    rate = Fraction(str(fps)).limit_denominator(1_000_000)
+    if rate <= 0:
+        raise ValueError("fps is too small to represent as a video frame rate")
+    time_base = 1 / rate
+    cached = destination is None
+    if cached:
+        # Annotation renderer revision; retain reusable raw-video cache entries.
+        content = dict(version=2 if annotations else 1, fps=str(rate), annotations=annotations, markers=asdict(markers) if markers else None,
+                       task=dataset.task.value, metadata=asdict(dataset._metadata),
+                       frames=[(int(s.frame_index), sha256_file(s.image_path),
+                                [asdict(a) for a in s.annotations] if annotations else None,
+                                sha256_file(dataset._mask_paths[s.image_path])
+                                if annotations and dataset.format == "semantic_masks" else None) for s in samples])
+        digest = hashlib.sha256(json.dumps(to_jsonable(content), sort_keys=True).encode()).hexdigest()[:24]
+        destination = cache_root() / "videos" / f"{slugify(clip_id)}-{digest}.mp4"
+    destination = Path(destination).expanduser().resolve()
+    if destination.suffix.lower() != ".mp4":
+        raise ValueError("Video destination must be an .mp4 file")
+    if destination.exists() and not cached and not overwrite:
+        raise FileExistsError(f"Destination already exists: {destination}")
+    if overwrite or not destination.exists():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        options = VisualizationOptions(markers=markers or MarkerStyle(show_labels=False))
+        # H.264 4:2:0 is widely playable in macOS browsers. Pad odd dimensions by
+        # one pixel at the right/bottom rather than changing scene coordinates.
+        encoded_size = (width + width % 2, height + height % 2)
+        with tempfile.TemporaryDirectory(prefix=".video-", dir=destination.parent) as temporary:
+            staged = Path(temporary) / "clip.mp4"
+            with av.open(str(staged), "w", options={"movflags": "+faststart"}) as writer:
+                stream = _h264_stream(writer, width=encoded_size[0], height=encoded_size[1], rate=rate, time_base=time_base)
+                durations = {}
+
+                def mux(packet):
+                    duration = durations.pop(packet.pts * packet.time_base)
+                    packet.duration = max(1, round(duration / packet.time_base))
+                    writer.mux(packet)
+
+                for number, sample in enumerate(samples):
+                    with Image.open(sample.image_path) as source:
+                        image = source.convert("RGB")
+                    if image.size != (width, height):
+                        raise ValueError(f"Frame dimensions changed: {sample.image_path}")
+                    if annotations:
+                        mask = None
+                        if dataset.format == "semantic_masks":
+                            with Image.open(dataset._mask_paths[sample.image_path]) as opened:
+                                mask = np.asarray(opened.convert("L")) > 0
+                        panel = annotation_item(sample, dataset.task, dataset._metadata, options, image=image, mask=mask)
+                        image = panel.panels[0].render((0, 0, width, height), (width, height))
+                    if image.size != encoded_size:
+                        canvas = Image.new("RGB", encoded_size)
+                        canvas.paste(image, (0, 0))
+                        image = canvas
+                    frame = av.VideoFrame.from_image(image)
+                    frame.pts, frame.time_base = int(sample.frame_index - indexes[0]), time_base
+                    frame.duration = int(indexes[number + 1] - indexes[number]) if number + 1 < len(samples) else 1
+                    durations[frame.pts * time_base] = frame.duration * time_base
+                    for packet in stream.encode(frame):
+                        mux(packet)
+                for packet in stream.encode():
+                    mux(packet)
+            # Confirm the published file decodes completely, streaming one frame
+            # at a time, before making it visible to a notebook or video player.
+            with av.open(str(staged)) as probe:
+                count = sum(1 for _ in probe.decode(video=0))
+            if count != len(samples):
+                raise ValueError(f"Video encoded {count} of {len(samples)} frames")
+            if overwrite:
+                os.replace(staged, destination)  # Old output survives any encoding failure.
+            else:
+                os.link(staged, destination)  # Atomic publication; refuses replacement.
+    if show:
+        _display_video(destination)
+    return destination
 
 
 @dataclass(frozen=True)
@@ -228,13 +360,7 @@ def _predict_video(model, source, output, metadata, markers, predict_kwargs):
             width, height = first.to_image().rotate(rotation, expand=True).size
         spool = Path(temporary) / "rows.jsonl"
         with av.open(str(video_path), "w", options={"movflags": "+faststart"}) as writer, spool.open("w", encoding="utf-8") as rows:
-            outgoing = writer.add_stream("libx264", rate=rate)
-            outgoing.width, outgoing.height = width, height
-            outgoing.pix_fmt = "yuv420p" if width % 2 == height % 2 == 0 else "yuv444p"
-            outgoing.time_base = incoming.time_base
-            outgoing.codec_context.time_base = incoming.time_base
-            outgoing.codec_context.max_b_frames = 0
-            outgoing.options = {"crf": "18", "preset": "fast"}
+            outgoing = _h264_stream(writer, width=width, height=height, rate=rate, time_base=incoming.time_base)
             durations = {}
 
             def mux_video(packet):

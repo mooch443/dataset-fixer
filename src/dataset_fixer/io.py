@@ -578,7 +578,8 @@ def _load_coco(
     if not valid:
         raise DatasetValidationError("JSON files do not contain COCO images, annotations, and categories arrays")
     inferred = _infer_coco_task([d for _, d in valid])
-    resolved_task = task or inferred
+    declared_task = (valid[0][1].get("info") or {}).get("task")
+    resolved_task = task or (Task.parse(declared_task) if declared_task else inferred)
     if resolved_task is None:
         raise DatasetValidationError("COCO contains multiple annotation geometries; pass task explicitly")
 
@@ -724,6 +725,9 @@ def _load_coco(
         raise DatasetValidationError("COCO contains no valid images after skipping recoverable errors")
 
     metadata = DatasetMetadata(names=category_names)
+    if resolved_task is Task.POLO:
+        metadata.radii = {category_map[int(c["id"])]: float(c["radius"])
+                          for c in categories if "radius" in c}
     if resolved_task is Task.POSE:
         keypoint_lengths = {len(c.get("keypoints", [])) for c in categories if c.get("keypoints")}
         if len(keypoint_lengths) > 1:
@@ -828,7 +832,7 @@ def _load_coco(
                     if bbox_raw:
                         x, y, w, h = map(float, bbox_raw)
                         bbox = (x, y, x + w, y + h)
-                    annotation = Annotation(class_id, bbox=bbox, source_id=ann.get("id"))
+                    annotation = Annotation(class_id, bbox=bbox, source_id=ann.get("id"), identity_id=ann.get("identity_id"))
                     if resolved_task is Task.SEGMENT:
                         segmentation = ann.get("segmentation")
                         if isinstance(segmentation, dict):
@@ -847,6 +851,9 @@ def _load_coco(
                             (float(flat[i]), float(flat[i + 1]), float(flat[i + 2]))
                             for i in range(0, len(flat), 3)
                         ]
+                    elif resolved_task is Task.POLO:
+                        annotation.point = tuple(map(float, ann["point"]))
+                        annotation.radius = float(ann["radius"])
                 except (IndexError, TypeError, ValueError) as exc:
                     source_id = ann.get("id")
                     source = f"{json_path} [annotation {source_id}]" if source_id is not None else str(json_path)

@@ -109,6 +109,33 @@ def test_letterbox_preserves_aspect_and_mask_outline_handles_empty_masks() -> No
     assert tuple(outlined_hole[14, 120]) == (255, 0, 0)
 
 
+def test_raster_outlines_do_not_force_white_halos(tmp_path: Path) -> None:
+    from pycocotools import mask as mask_utils
+    from dataset_fixer.models import Annotation, DatasetMetadata, Sample, Task
+    from dataset_fixer.visualization import MarkerStyle, annotation_item
+
+    image = Image.new("RGB", (100, 80), "#335577")
+    mask = np.zeros((80, 100), np.uint8)
+    mask[12:65, 16:82] = 1
+    mask[30:46, 34:60] = 0  # Interior contour as well as outer boundary.
+    rle = mask_utils.encode(np.asfortranarray(mask))
+    polygon = Annotation(0, polygon=[(16, 12), (81, 25), (60, 64), (25, 50)])
+    raster = Annotation(0, rle=rle)
+    for annotation in (polygon, raster):
+        sample = Sample(tmp_path / "unused.png", Path("unused.png"), "train", 100, 80, [annotation])
+        for alpha in (1., .5):
+            options = VisualizationOptions(line_width=2, outline_width=1, outline_alpha=alpha,
+                                           markers=MarkerStyle(show_labels=False))
+            panel = annotation_item(sample, Task.SEGMENT, DatasetMetadata({0: "individual"}), options, image=image).panels[0]
+            rendered = np.asarray(panel.render((8, 4, 92, 76), (168, 144)))
+            # With no white under-stroke requested, every pixel is either the
+            # background or the magenta annotation blended over it.
+            assert rendered[..., 1].max() <= 85
+            assert np.any(rendered[..., 0] > 51)
+    outlined = draw_mask_outline(image, mask, color="magenta", line_width=2, outline_width=5, alpha=1)
+    assert np.any(np.all(outlined == 255, axis=2))  # Explicit halos remain supported.
+
+
 def test_visualization_grid_is_deterministic_and_keeps_incomplete_rows() -> None:
     records = list(range(5))
 

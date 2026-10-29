@@ -6,7 +6,7 @@ The index stores columns, not one Python Sample/ImageRef object per observation.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 import hashlib
@@ -20,7 +20,7 @@ import pandas as pd
 from PIL import Image
 
 from ..models import Annotation, DatasetMetadata, Sample, Task
-from ..utils import normalize_split
+from ..utils import normalize_split, settings_fingerprint
 
 
 @dataclass(frozen=True)
@@ -133,6 +133,8 @@ class SampleIndex(Sequence):
                        bool(clean(row.trim_black_borders)))
         identity = clean(row.identity_id)
         provenance = {"original_id": clean(row.original_id) or ref.key, "identity_notes": clean(row.notes), "tracklet_id": clean(row.tracklet_id), "clip_id": clean(row.clip_id), "identity_id": identity, "image_ref": ref.key}
+        if "synthetic" in row and clean(row.synthetic) is not None:
+            provenance["synthetic"] = json.loads(row.synthetic)
         return Sample(Path(ref.path), Path(f"{hashlib.sha256(ref.key.encode()).hexdigest()[:20]}-{Path(ref.path).name}"), str(row.split),
                       int(row.width), int(row.height),
                       [Annotation(self.labels[identity], identity_id=identity)] if identity is not None else [],
@@ -257,6 +259,11 @@ def open_dataset(location, *, format, layout=None, identities=None, name=None, t
     warnings.extend(frame.attrs.get("warnings", ()))
     result = as_dataset(index, location=path if path.is_dir() else path.parent, name=name or path.stem, source_format=format, warnings=warnings)
     result._metadata.extra["tracklets"] = frame.attrs.get("tracklets", {})
+    if format == "identity_manifest":
+        from ..artifacts import dataset_info_path
+        metadata_path = dataset_info_path(path.parent)
+        if metadata_path.is_file():
+            result._manifest = json.loads(metadata_path.read_text())
     return result
 
 
@@ -493,6 +500,60 @@ def with_sampling(dataset, *, balance_by=("identity_id", "clip_id"), samples_per
     return as_dataset(SampleIndex(index.frame, names=index.names, sampling=sampling), parent=dataset)
 
 
+def limit_coverage(dataset, limits, *, split="train", seed=42):
+    """Select complete identity groups using stable, independently seeded ranks."""
+    index = index_of(dataset)
+    if not isinstance(limits, Mapping):
+        raise TypeError("limits must map identity IDs to clips/tracklets_per_clip caps")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("seed must be a nonnegative integer")
+    split = normalize_split(split) if split is not None else None
+    if split is not None and split not in index.splits:
+        raise ValueError(f"Unknown split {split!r}; available splits are {index.splits}")
+    policies = {}
+    for label, caps in limits.items():
+        if not isinstance(label, str) or not label or not isinstance(caps, Mapping):
+            raise TypeError("limits must map nonempty identity strings to cap mappings")
+        if set(caps) - {"clips", "tracklets_per_clip"}:
+            raise ValueError("Coverage caps support only clips and tracklets_per_clip")
+        if any(isinstance(n, bool) or not isinstance(n, int) or n < 1 for n in caps.values()):
+            raise ValueError("Coverage caps must be positive integers")
+        policies[label] = dict(caps)
+    frame = index.frame
+    scoped = frame if split is None else frame.loc[frame.split == split]
+    missing = set(policies) - set(scoped.identity_id.dropna())
+    if missing:
+        raise ValueError(f"No observations for identities in the selected scope: {sorted(missing)}")
+
+    def choose(values, cap, *parents):
+        # Group ranks do not depend on row counts or neighboring identities.
+        # Smaller caps retain a subset of larger caps, including on repeat calls.
+        return sorted(values, key=lambda value: (
+            settings_fingerprint(dict(seed=seed, group=[*parents, value])), str(value),
+        ))[:cap]
+
+    keep = np.ones(len(index), dtype=bool)
+    for label, caps in policies.items():
+        if not caps:
+            continue
+        rows = scoped.loc[scoped.identity_id == label]
+        fields = ["clip_id", *(["tracklet_id"] if "tracklets_per_clip" in caps else [])]
+        if rows[fields].isna().any().any():
+            raise ValueError(f"Coverage limits for {label!r} require non-missing {fields}")
+        clips = choose(rows.clip_id.unique().tolist(), caps.get("clips"), label)
+        keep[rows.index] = False
+        for clip in clips:
+            selected = rows.loc[rows.clip_id == clip]
+            if "tracklets_per_clip" in caps:
+                tracks = choose(selected.tracklet_id.unique().tolist(), caps["tracklets_per_clip"], label, clip)
+                selected = selected.loc[selected.tracklet_id.isin(tracks)]
+            keep[selected.index] = True
+    result = as_dataset(index.take(np.flatnonzero(keep)), parent=dataset)
+    result._manifest["coverage_limits"] = [*dataset.manifest.get("coverage_limits", []),
+                                           dict(limits=policies, split=split, seed=seed)]
+    return result
+
+
 def balanced_rows(index, n, seed=7):
     """Bounded deterministic preview/gallery selection, round-robin across groups."""
     rng = np.random.default_rng(seed)
@@ -519,21 +580,56 @@ def balanced_rows(index, n, seed=7):
 
 
 
-def export_manifest(dataset, destination):
-    """Persist an immutable view as references; image/NPZ pixels are never copied."""
-    destination = Path(destination)
-    if destination.suffix != ".jsonl":
-        destination = destination / "samples.jsonl"
-    destination.parent.mkdir(parents=True, exist_ok=True)
+def export_manifest(dataset, destination, *, copy_images=False):
+    """Persist references, or publish a portable directory of decoded crops.
+
+    Portable exports resolve file/NPZ/crop references through ImageRef, clear
+    their source selectors, and use relative PNG paths. Metadata stays intact.
+    """
+    import os
+    import tempfile
+    from ..artifacts import dataset_info_path, write_json
+    from ..writer import staged_directory
+
+    destination = Path(destination).expanduser().resolve()
     index = index_of(dataset)
-    if destination.exists():
-        raise FileExistsError(f"Refusing to overwrite {destination}")
-    with destination.open("x") as handle:
-        for values in index.frame.itertuples(index=False, name=None):
-            record = dict(zip(index.frame.columns, values))
-            record = {k: (None if v is None or (np.isscalar(v) and pd.isna(v)) else v) for k, v in record.items()}
-            handle.write(json.dumps(record) + "\n")
-    return open_dataset(destination, format="identity_manifest", name=dataset.name)
+
+    def write(path, *, portable):
+        with path.open("x") as handle:
+            for number, values in enumerate(index.frame.itertuples(index=False, name=None)):
+                record = dict(zip(index.frame.columns, values))
+                record = {k: (None if v is None or (np.isscalar(v) and pd.isna(v)) else v) for k, v in record.items()}
+                if portable:
+                    sample = index[number]
+                    relative = Path("images") / f"{number:08d}.png"
+                    target = path.parent / relative
+                    target.parent.mkdir(exist_ok=True)
+                    pixels = sample.image_ref.read()
+                    Image.fromarray(pixels).save(target)
+                    record.update(path=relative.as_posix(), array=None, row=None, crop=None, trim_black_borders=False,
+                                  width=pixels.shape[1], height=pixels.shape[0],
+                                  original_id=sample.provenance["original_id"])
+                handle.write(json.dumps(record) + "\n")
+
+    if destination.suffix == ".jsonl":
+        if copy_images:
+            raise ValueError("copy_images=True requires a new repository directory")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        # Hard-link publication is atomic and refuses an existing destination.
+        with tempfile.TemporaryDirectory(prefix=".identity-", dir=destination.parent) as folder:
+            temporary = Path(folder) / destination.name
+            write(temporary, portable=False)
+            open_dataset(temporary, format="identity_manifest", name=dataset.name)
+            os.link(temporary, destination)
+        return open_dataset(destination, format="identity_manifest", name=dataset.name)
+
+    with staged_directory(destination, source=dataset.location if copy_images else None) as staging:
+        manifest = staging / "samples.jsonl"
+        write(manifest, portable=copy_images)
+        write_json(dataset_info_path(staging), {**dataset.manifest, "name": dataset.name,
+                   "format": "identity_manifest", "task": "id", "copy_images": copy_images})
+        open_dataset(manifest, format="identity_manifest", name=dataset.name)
+    return open_dataset(destination / "samples.jsonl", format="identity_manifest", name=dataset.name)
 
 
 def summary_counts(dataset):

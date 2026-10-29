@@ -701,6 +701,14 @@ class Dataset:
                 key = str(Path("images") / sample.split / sample.relative_path)
             if key in self._provenance:
                 sample.provenance = self._provenance[key]
+                for field in ("identity_id", "clip_id", "frame_index", "local_id"):
+                    if field in sample.provenance.get("sample_metadata", {}):
+                        setattr(sample, field, sample.provenance["sample_metadata"][field])
+                annotations = sample.provenance.get("annotation_metadata", [])
+                if len(annotations) == len(sample.annotations):
+                    for annotation, metadata in zip(sample.annotations, annotations):
+                        annotation.identity_id = metadata.get("identity_id")
+                        annotation.source_id = metadata.get("source_id")
 
     @property
     def training_ready(self) -> bool:
@@ -828,6 +836,30 @@ class Dataset:
         """
         from .id.data import with_sampling
         return with_sampling(self, balance_by=balance_by, samples_per_epoch=samples_per_epoch, max_per_batch=max_per_batch)
+
+    def limit_coverage(self, limits: Mapping[str, Mapping[str, int]], *,
+                       split: Literal["train", "val", "test"] | None = "train",
+                       seed: int = 42) -> "Dataset":
+        """Return an identity view with fewer clips/tracklets for selected individuals.
+
+        Selection reads metadata only and retains every observation in each
+        selected group, in source order. Unspecified individuals and other splits
+        are unchanged. Limits are upper bounds; no observations are synthesized.
+
+        Parameters:
+            limits: Identity IDs mapped to positive integer ``clips`` and/or
+                ``tracklets_per_clip`` caps. Omitted caps are unlimited.
+            split: Restrict this split, default train; None applies caps across
+                all splits together. Split first to preserve held-out coverage.
+            seed: Nonnegative seed for reproducible group selection. Selection
+                is independent of row/mapping order and other individuals.
+
+        Target individuals must occur in the selected scope and have clip IDs;
+        tracklet caps additionally require tracklet IDs. Existing IDs, source
+        references and sampling settings are preserved. The source is unchanged.
+        """
+        from .id.data import limit_coverage
+        return limit_coverage(self, limits, split=split, seed=seed)
 
     def move_images_with_classes(
         self,
@@ -1881,6 +1913,7 @@ class Dataset:
         destination: str | Path | None = None,
         name: str | None = None,
         format: Literal["yolo", "semantic_masks", "identity_manifest"] = "yolo",
+        copy_images: bool = False,
         splits: Iterable[Literal["train", "val", "test"]] | None = None,
         allow_lossy: bool | Literal["bridge-holes"] = False,
         visualize: bool = True,
@@ -1905,6 +1938,8 @@ class Dataset:
                 foreground-union masks and also returns a :class:`Dataset`.
             splits: Splits included in the published output; ``None`` publishes
                 every available split. Unselected splits are omitted.
+            copy_images: For identity manifests, materialize referenced pixels
+                into a portable repository with relative image paths.
             allow_lossy: ``True`` permits explicit lossy conversion of COCO
                 RLE/multipart masks and fills polygon holes.
                 ``"bridge-holes"`` instead opens each polygon hole to the
@@ -1932,7 +1967,9 @@ class Dataset:
             if dry_run:
                 return self
             selected = as_dataset(index_of(self).where(split=list(splits)), parent=self) if splits else self
-            return export_manifest(selected, destination)
+            return export_manifest(selected, destination, copy_images=copy_images)
+        if copy_images:
+            raise ValueError("copy_images applies only to identity_manifest export")
         self._require_vector_annotations("Dataset.export")
         format = format.lower()
         if format not in {"yolo", "semantic_masks"}:
@@ -2172,6 +2209,42 @@ class Dataset:
             show=show,
             width=width,
         )
+
+    def export_video(
+        self,
+        *,
+        clip_id: str | None = None,
+        fps: float = 20,
+        destination: str | Path | None = None,
+        annotations: bool = False,
+        markers: MarkerStyle | None = None,
+        show: bool = True,
+        overwrite: bool = False,
+    ) -> Path:
+        """Export an indexed scene clip as an MP4 and optionally play it inline.
+
+        Parameters:
+            clip_id: Clip to export; may be omitted when the dataset has one clip.
+            fps: Positive playback rate, default 20. Frames follow frame_index;
+                gaps hold the preceding frame, retaining the clip's timeline.
+            destination: Output .mp4 file, or None for a reusable managed cache file.
+            annotations: Render the existing annotation overlays, default False.
+            markers: Shared MarkerStyle used when annotations=True.
+            show: Display an embedded video player in IPython/Jupyter, or print
+                the video path in a terminal. Disable to only export the file.
+            overwrite: Replace an existing output after successfully encoding and
+                validating the new MP4. Also refreshes cached videos; default False.
+
+        Returns:
+            The saved MP4 path. Uses H.264/yuv420p with fast-start metadata for
+            macOS/browser playback. Odd dimensions get one pixel of padding on
+            the right/bottom. Scene clip/frame metadata is required; identity
+            crops and pending pixel transformations must be handled separately.
+        """
+        from .video import export_video
+
+        return export_video(self, clip_id=clip_id, fps=fps, destination=destination,
+                            annotations=annotations, markers=markers, show=show, overwrite=overwrite)
 
     def visualize(
         self,

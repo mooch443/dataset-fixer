@@ -5,6 +5,7 @@ import os
 import shutil
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,28 @@ from .utils import environment_snapshot, settings_fingerprint, sha256_file, slug
 # operation preview images are pruned before publication. Operations check this
 # before rendering one: a preview that cannot be published must not cost time.
 PUBLISHES_OPERATION_VISUALS = False
+
+
+@contextmanager
+def staged_directory(destination: Path, *, source: Path | None = None):
+    """Publish a new directory only after its caller has written and validated it."""
+    from .utils import ensure_safe_destination
+
+    destination = destination.expanduser().resolve()
+    if source is not None:
+        ensure_safe_destination(source, destination)
+    elif destination.exists():
+        raise FileExistsError(f"Destination already exists: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.tmp-", dir=destination.parent))
+    try:
+        yield staging
+        if destination.exists():
+            raise FileExistsError(f"Destination already exists: {destination}")
+        os.rename(staging, destination)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
 
 
 class OutputBuilder:
@@ -192,6 +215,7 @@ class OutputBuilder:
                 "letterbox_padding_output_px",
                 "letterbox_scale_xy",
                 "display_label",
+                "synthetic",
             )
             if key in parent
         }
@@ -211,6 +235,12 @@ class OutputBuilder:
             "output_annotation_count": len(annotations),
             "output_has_labels": bool(annotations),
             "source_annotation_ids": [a.source_id for a in annotations if a.source_id is not None],
+            "sample_metadata": {key: getattr(sample, key) for key in
+                                ("identity_id", "clip_id", "frame_index", "local_id")
+                                if getattr(sample, key) is not None},
+            **({"annotation_metadata": [{"identity_id": a.identity_id, "source_id": a.source_id}
+                                        for a in annotations]}
+               if any(a.identity_id is not None for a in annotations) else {}),
             "operation": self.operation,
             "transformation_chain": [
                 *(parent.get("transformation_chain") or []),
@@ -391,6 +421,8 @@ class OutputBuilder:
         write_json(source_info_path(self.staging), source_info)
         manifest = {
             "schema": "dataset-fixer-dataset-info",
+            **({"synthetic": self.parent_manifest["synthetic"]}
+               if "synthetic" in self.parent_manifest else {}),
             "schema_version": DATASET_INFO_SCHEMA,
             "dataset_id": dataset_id,
             "name": self.name,

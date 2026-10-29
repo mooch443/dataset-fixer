@@ -35,6 +35,31 @@ images or rewriting archives. It combines with `gt_annotated`, `split`, and
 prediction filters. Unknown labels raise an error; an empty list selects no
 images. Omit the option to retain all identities.
 
+To test uneven clip/tracklet diversity, restrict selected individuals with a
+metadata-only view:
+
+```python
+limited = data.limit_coverage({
+    "wolf-1": {"clips": 1, "tracklets_per_clip": 1},
+    "wolf-2": {"clips": 2},
+}, split="train", seed=42)
+display(id.stats(limited, by=("identity_id", "split")))
+```
+
+Split first to reduce training diversity while preserving validation/test data.
+`split="train"` is the default; `split=None` applies one set of caps across all
+splits together. Each cap is a positive integer upper bound; omitted caps are
+unlimited. Unspecified individuals and other splits remain unchanged. Complete
+clips are selected first, then complete tracklets within each selected clip;
+all observations in retained groups keep their original order and identifiers.
+There is no per-frame thinning or replacement when fewer groups are available.
+The seed fixes group selection independently of row order and other identities;
+smaller caps select nested subsets. Target identities must have observations in
+the chosen scope and non-missing clip IDs; tracklet caps also need tracklet IDs.
+The source and pixels are unchanged. The view works with training, `with_sampling`,
+and normal identity exports; directory exports also retain the `coverage_limits`
+history in their manifest. This works for synthetic and imported identity data.
+
 `classes_must_appear_in=('train',)` requires every observed identity in training;
 `('train', 'val', 'test')` requires every identity in all three splits. The default
 `()` adds no coverage constraint. Only labeled identities in the selected

@@ -450,9 +450,12 @@ def draw_mask_outline(
     if not contours:
         return base
     resolved_line_width = max(1, round(outline_width if line_width is None else line_width))
-    halo_width = max(resolved_line_width + 2, round(outline_width))
+    # Match vector annotations: a halo appears only when the requested white
+    # stroke is wider than the colour stroke. Do not force one for raster masks.
+    halo_width = round(outline_width)
     overlay = base.copy()
-    cv2.drawContours(overlay, contours, -1, (255, 255, 255), halo_width)
+    if halo_width > resolved_line_width:
+        cv2.drawContours(overlay, contours, -1, (255, 255, 255), halo_width)
     cv2.drawContours(
         overlay,
         contours,
@@ -1197,7 +1200,8 @@ def render_annotated_sample(
         if markers.show_boxes and annotation.bbox is not None and task in {None, Task.DETECT, Task.POSE}:
             bx1, by1, bx2, by2 = annotation.bbox
             box = (*point(bx1, by1), *point(bx2, by2))
-            draw.rectangle(box, outline="white", width=resolved_outline_width)
+            if resolved_outline_width > colour_width:
+                draw.rectangle(box, outline="white", width=resolved_outline_width)
             draw.rectangle(box, outline=color, width=colour_width)
             if show_names:
                 label((box[0] + 2, box[1] - markers.label_size - 4), name, color)
@@ -1208,18 +1212,29 @@ def render_annotated_sample(
                 if len(points) < 2:
                     continue
                 closed = [*points, points[0]]
-                draw.line(
-                    closed,
-                    fill="white",
-                    width=resolved_outline_width,
-                    joint="curve",
-                )
+                if resolved_outline_width > colour_width:
+                    draw.line(
+                        closed,
+                        fill="white",
+                        width=resolved_outline_width,
+                        joint="curve",
+                    )
                 draw.line(
                     closed,
                     fill=color,
                     width=colour_width,
                     joint="curve",
                 )
+        elif annotation.rle is not None:
+            from .segmentation import rasterize_annotation
+
+            mask = rasterize_annotation(annotation, width=sample.width, height=sample.height)
+            view = Image.fromarray(mask).crop((x0, y0, x1, y1)).resize(image.size, Image.Resampling.NEAREST)
+            image = Image.fromarray(draw_mask_outline(
+                image, np.asarray(view), color=color, line_width=colour_width,
+                outline_width=resolved_outline_width, alpha=1.0,
+            ))
+            draw = ImageDraw.Draw(image)
         if annotation.keypoints:
             names = metadata.kpt_names.get(annotation.class_id, [])
             skeleton_value = metadata.extra.get("skeleton", [])
