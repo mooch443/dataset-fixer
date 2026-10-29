@@ -447,6 +447,8 @@ Calibration uses scikit-learn's complete ROC thresholds over maximum gallery sco
 
 `TrainingResult.evaluate()` evaluates the complete fixed ID query cohort; the detection-only `samples` limit does not subsample it. `plots` controls the number of prediction examples (`0` disables the grid). Evaluation writes the shared `ComparisonResult`, frozen cohort, query CSV, metrics and protocol JSON, and figures through the existing report renderer. Training provenance currently checks clip membership and source-reference overlap; it does not certify pixel-level duplicate exclusion against the entire training corpus under renamed/copied files.
 
+Evaluation also works after leaving `TrainingSession`, when its W&B run has finished, or without W&B. The report and metrics remain local; a finished run is not reopened. Missing or unavailable W&B logging does not prevent training or evaluation. Calling `session.finish()` again packages new reports and refreshes a configured filesystem backup. Automatic Colab disconnect requires confirmed persistent storage of the updated results; a previous model upload alone does not cover new local reports.
+
 Embedding extraction and retrieval scoring show completed-image counts, elapsed
 time and progress bars. Retrieval metrics use bounded batches of 128 queries;
 PyTorch Metric Learning still computes each image's AP before the existing crop
@@ -548,8 +550,26 @@ id.visualize_attention(model, queries, gallery=gallery,
                        contrast=True, samples=12, columns=4, destination="attention.png")
 ```
 
-The attention visualizer calls [Captum Occlusion](https://captum.ai/api/occlusion.html) directly. It explains maximum cosine similarity to the selected identity; by default, it subtracts the maximum over all competing identities. Each occluded patch uses the preprocessing channel mean. Red supports the target score/margin and blue opposes it. Each sample has one overlay card; `columns` controls the grid width (default 2). All cards share one symmetric effect scale, so equally strong colors represent equally strong effects within the grid.
+The attention visualizer calls [Captum Occlusion](https://captum.ai/api/occlusion.html) directly. It explains maximum cosine similarity to the selected identity; by default, it subtracts the maximum over all competing identities. Each occluded patch uses the preprocessing channel mean. Red supports the target score/margin and blue opposes it. Each sample has one overlay card; `columns` controls the grid width (default 2). By default, all cards share one symmetric effect scale, so equally strong colors represent equally strong effects within the grid. Pass `color_scale="per_image"` to reveal weak patterns independently. Each card shows `Max |Δ|`, the actual maximum absolute effect before display scaling. An entirely zero map remains transparent. Equal colors under per-image scaling do not imply equal effect magnitudes.
 
-Cards show ground truth and prediction. Prediction text alone indicates correctness: green for a correct unique top prediction, red for an incorrect prediction or tied top scores, and gray without ground truth. The footer names the original input's strongest competing identity and shows the target's signed similarity margin and cosine similarity; these are not probabilities. `identity_id=` explains a specified enrolled individual and can produce a negative margin; otherwise the target is the model's own top prediction. The competitor may change during occlusion. With a single enrolled identity and `contrast=False`, only similarity is shown. Raw attribution arrays and metadata (including ground truth, prediction, correctness, competitor, margin, and shared scale) are saved alongside the grid. This measures sensitivity to masking, not anatomical ground truth or internal transformer attention. The method supports custom encoders without layer-specific hooks.
+Cards show ground truth and prediction. Prediction text alone indicates correctness: green for a correct unique top prediction, red for an incorrect prediction or tied top scores, and gray without ground truth. The footer names the original input's strongest competing identity and shows the target's signed similarity margin and cosine similarity; these are not probabilities. `identity_id=` explains a specified enrolled individual and can produce a negative margin; otherwise the target is the model's own top prediction. The competitor may change during occlusion. With a single enrolled identity and `contrast=False`, only similarity is shown. Raw attribution arrays and metadata (including ground truth, prediction, correctness, competitor, margin, actual effect magnitude, and chosen color scale) are saved alongside the grid. This measures sensitivity to masking, not anatomical ground truth or internal transformer attention. The method supports custom encoders without layer-specific hooks.
+
+To summarize the enrolled references, average their evidence maps over a real representative image:
+
+```python
+gallery.visualize_attention(
+    model,
+    samples_per_identity=20,
+    color_scale="per_image",
+    columns=3,
+    destination="reference_attention.png",
+)
+```
+
+This inspects up to 20 references per identity, balanced across clips and tracklets, and shows one card per identity (`samples=` optionally limits identities). Each reference explains its enrolled identity against the strongest score among all other identities. Its own source and any exact pixel duplicates are excluded from the gallery for that calculation; at least two distinct reference images per identity are required.
+
+The raw signed maps are averaged in model-input coordinates before color scaling. The backdrop is a real embedding medoid chosen by the existing `kmedoids` implementation from the inspected images, rather than an artificial pixel-median wolf. The prediction and margin on the card belong to that representative; the overlay and `Max |mean Δ|` summarize all inspected references. Their count is printed on the card. Orientation-normalized, similarly cropped images are appropriate for this view: pose or position differences can blur the average, and positive/negative effects can cancel. It does not align body parts automatically.
+
+The NPZ includes both the displayed `attribution_*` averages and individual `reference_*` maps. JSON records the contributing sources, their scores, the excluded reference rows, the medoid source and effect magnitudes. To improve the enrolled reference set itself, the existing `model.enroll(..., selection="medoids")` option still applies; enrollment defaults and W&B metrics are unchanged.
 
 The [wolf Colab notebook](../notebooks/wolves_identity_colab.ipynb) installs the optional dependencies, extracts Drive NPZs into `/mnt/local-scratch`, reports identity/clip coverage, enrolls all labeled wolves, and trains on CUDA (or local MPS). `DATASET_FIXER_CACHE_DIR` directs the shared cache into scratch. Drive backups retain resumable state and final reports. Install from a published revision containing these changes; staging alone does not update GitHub.

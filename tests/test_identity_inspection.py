@@ -42,11 +42,12 @@ def attention_case(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("target", [None, "wolf-b"])
-def test_attention_reports_ground_truth_prediction_and_signed_target_margin(attention_case, tmp_path, target):
+@pytest.mark.parametrize("color_scale", ["shared", "per_image"])
+def test_attention_reports_ground_truth_prediction_and_signed_target_margin(attention_case, tmp_path, target, color_scale):
     model, module, data, gallery = attention_case
     destination = tmp_path / "attention.png"
     id.visualize_attention(model, data, gallery=gallery, identity_id=target,
-                           samples=4, columns=3, patch_fraction=1, destination=destination, show=False)
+                           samples=4, columns=3, patch_fraction=1, color_scale=color_scale, destination=destination, show=False)
     records = {json.loads(r["source_ref"])[0].split("/")[-1]: r
                for r in json.loads(destination.with_suffix(".json").read_text())}
     assert records["correct.png"]["correct"] is True
@@ -59,6 +60,9 @@ def test_attention_reports_ground_truth_prediction_and_signed_target_margin(atte
     assert records["correct.png"]["margin"] == (-1 if target else 1)
     assert records["incorrect.png"]["margin"] == 1
     assert records["correct.png"]["competitor"] == ("wolf-a" if target else "wolf-b")
+    bound = max(r['max_abs_effect'] for r in records.values())
+    assert all(r['color_scale'] == color_scale and r['color_bound'] ==
+               (r['max_abs_effect'] if color_scale == 'per_image' else bound) for r in records.values())
     assert module.training and next(module.parameters()).device.type == "cpu"
 
 
@@ -91,6 +95,70 @@ def test_attention_overlay_strength_uses_shared_scale():
     assert len(weak.panels) == len(strong.panels) == 1
     assert np.abs(weak.panels[0].image.astype(float) - rgb*255).max() < 2
     assert np.abs(strong.panels[0].image.astype(float) - rgb*255).max() > 50
+
+
+def test_reference_attention_averages_raw_maps_and_excludes_self_matches(attention_case, tmp_path, monkeypatch):
+    from dataset_fixer.id import model as identity_model
+    from dataset_fixer.id.data import ImageRef
+    model, module, _, _ = attention_case
+    monkeypatch.setattr(identity_model, 'fingerprint', lambda model: 'test-model')
+    monkeypatch.setattr('dataset_fixer.id.gallery.fingerprint', lambda model: 'test-model')
+    labels, vectors, refs = [], [], []
+    colors = [(220, 20, 0), (190, 45, 0), (150, 65, 0),
+              (20, 220, 0), (45, 190, 0), (65, 150, 0), (220, 20, 0)]
+    for i, color in enumerate(colors):
+        path = tmp_path / f'ref-{i}.png'
+        pixels = np.full((16, 16, 3), 40, dtype=np.uint8)
+        pixels[2:14, 3 + i % 3:11 + i % 3] = color
+        Image.fromarray(pixels).save(path)
+        labels.append('wolf-a' if i < 3 or i == 6 else 'wolf-b')
+        vector = pixels[:, :, :2].mean(axis=(0, 1)).astype(np.float32)
+        vectors.append(vector / np.linalg.norm(vector))
+        refs.append(dict(source_ref=ImageRef(str(path)).key, clip_id=f'clip-{i % 2}'))
+    gallery = id.Gallery(np.asarray(vectors), tuple(labels), tuple(refs), 'test-model')
+    path = tmp_path / 'reference-attention.png'
+    gallery.visualize_attention(model, samples_per_identity=4, patch_fraction=.5,
+                                color_scale='per_image', destination=path, show=False)
+    records = json.loads(path.with_suffix('.json').read_text())
+    assert [r['identity_id'] for r in records] == ['wolf-a', 'wolf-b']
+    with np.load(path.with_suffix('.npz')) as maps:
+        for i, record in enumerate(records):
+            expected = np.mean([maps[s['map_key']] for s in record['sources']], axis=0)
+            assert np.abs(expected).max() > .001
+            np.testing.assert_allclose(maps[f'attribution_{i}'], expected)
+            assert record['color_bound'] == pytest.approx(np.abs(expected).max())
+            assert record['representative'] == 'embedding_medoid'
+            assert record['source_ref'] in [s['source_ref'] for s in record['sources']]
+            for source in record['sources']:
+                assert source['reference_row'] in source['excluded_reference_rows']
+                if source['reference_row'] in (0, 6):
+                    assert set(source['excluded_reference_rows']) == {0, 6}
+    assert module.training
+    singleton = id.Gallery(np.asarray(vectors)[[0, 3]], ('wolf-a', 'wolf-b'), (refs[0], refs[3]), 'test-model')
+    with pytest.raises(ValueError, match='at least two distinct'):
+        singleton.visualize_attention(model, show=False)
+    assert module.training
+
+
+def test_per_image_scale_preserves_zero_maps_and_displays_actual_effect(tmp_path):
+    from dataset_fixer.id.inspection import _attention_options, _render_attention
+    from pathlib import Path
+    observations = []
+    for effect in (1., .002, 0.):
+        heat = np.zeros((32, 32), dtype=np.float32)
+        heat[8:24, 8:24] = effect
+        heat[4:8, 8:24] = -effect / 2
+        metadata = dict(correct=True, ground_truth='wolf', prediction='wolf', identity_id='wolf',
+                        competitor='other', margin=.8, similarity=.95, max_abs_effect=float(effect))
+        sample = SimpleNamespace(image_path=Path('wolf.png'), clip_id=f'effect {effect}')
+        observations.append((sample, np.full((32, 32, 3), .5), heat, metadata))
+    for scale in ('shared', 'per_image'):
+        path = tmp_path / f'{scale}.png'
+        options = _attention_options(3, 3, .15, scale, path, False)
+        _render_attention(observations, options, color_scale=scale, contrast=True)
+        records = json.loads(path.with_suffix('.json').read_text())
+        assert [r['max_abs_effect'] for r in records] == [1., .002, 0.]
+        assert [r['color_bound'] for r in records] == ([1., 1., 1.] if scale == 'shared' else [1., .002, 0.])
 
 
 @pytest.fixture

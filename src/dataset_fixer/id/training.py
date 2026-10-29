@@ -371,16 +371,18 @@ class _TrainingBridge(ModelCheckpoint):
         if not report:
             return
         self.last_progress = now
-        if self.result.wandb_run is not None:
-            self.result.wandb_run.log({
-                "progress/global_step": trainer.global_step,
-                "progress/epoch": trainer.current_epoch,
-                "progress/batch": batch_idx + 1,
-                # Lightning divides callback loss by the accumulation factor.
-                "train/batch_loss": float(outputs["loss"].detach()) * trainer.accumulate_grad_batches,
-                "train/batch_size": len(batch[1]),
-                "train/batch_identities": int(batch[1].unique().numel()),
-            })
+        from ..wandb import _optional_logging
+        with _optional_logging(self.result.wandb_run) as run:
+            if run is not None:
+                run.log({
+                    "progress/global_step": trainer.global_step,
+                    "progress/epoch": trainer.current_epoch,
+                    "progress/batch": batch_idx + 1,
+                    # Lightning divides callback loss by the accumulation factor.
+                    "train/batch_loss": float(outputs["loss"].detach()) * trainer.accumulate_grad_batches,
+                    "train/batch_size": len(batch[1]),
+                    "train/batch_identities": int(batch[1].unique().numel()),
+                })
 
     def on_train_epoch_start(self, trainer, pl_module):
         self.epoch_started = self.last_progress = time.monotonic()

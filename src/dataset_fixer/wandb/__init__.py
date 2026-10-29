@@ -6,6 +6,7 @@ import importlib
 import inspect
 import json
 import warnings
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
@@ -249,27 +250,29 @@ def configure(run: Any, config: Config | Mapping[str, Any]) -> Any:
         The configured run object.
     """
 
-    if run is None:
-        raise ValueError("wandb.configure() requires an explicit existing run")
+    if not _run_available(run):
+        warnings.warn("No active W&B run; configuration remains local.", stacklevel=2)
+        return run
     values, tags = _values(config)
-    target_config = getattr(run, "config", None)
-    if target_config is None:
-        raise TypeError("The supplied W&B run has no config")
-    for key, value in _native_training_aliases(target_config).items():
-        values.setdefault(key, value)
-    try:
-        target_config.update(values, allow_val_change=True)
-    except TypeError:
-        target_config.update(values)
-    existing = list(getattr(run, "tags", ()) or ())
-    dataset_source = values.get("dataset_source")
-    if dataset_source and str(dataset_source).lower().endswith(".zip"):
-        legacy_source_tag = f"source-zip-{Path(str(dataset_source)).stem}"
-        existing = [tag for tag in existing if tag != legacy_source_tag]
-    run.tags = tuple(dict.fromkeys([*existing, *tags]))
-    update = getattr(run, "update", None)
-    if callable(update):
-        update()
+    with _optional_logging(run):
+        target_config = getattr(run, "config", None)
+        if target_config is None:
+            raise TypeError("The supplied W&B run has no config")
+        for key, value in _native_training_aliases(target_config).items():
+            values.setdefault(key, value)
+        try:
+            target_config.update(values, allow_val_change=True)
+        except TypeError:
+            target_config.update(values)
+        existing = list(getattr(run, "tags", ()) or ())
+        dataset_source = values.get("dataset_source")
+        if dataset_source and str(dataset_source).lower().endswith(".zip"):
+            legacy_source_tag = f"source-zip-{Path(str(dataset_source)).stem}"
+            existing = [tag for tag in existing if tag != legacy_source_tag]
+        run.tags = tuple(dict.fromkeys([*existing, *tags]))
+        update = getattr(run, "update", None)
+        if callable(update):
+            update()
     return run
 
 
@@ -278,7 +281,22 @@ def _active_run() -> Any:
         sdk = importlib.import_module("wandb")
     except ImportError:
         return None
-    return getattr(sdk, "run", None)
+    run = getattr(sdk, "run", None)
+    return run if _run_available(run) else None
+
+
+def _run_available(run):
+    """Finished SDK runs reject writes; public API run objects remain editable."""
+    return run is not None and not getattr(run, "_is_finished", False)
+
+
+@contextmanager
+def _optional_logging(run):
+    """Keep optional telemetry failures outside model/data operations."""
+    try:
+        yield run if _run_available(run) else None
+    except Exception as error:
+        warnings.warn(f"W&B logging unavailable; local work continues: {error}", stacklevel=2)
 
 
 def _set_summary(run: Any, values: Mapping[str, Any]) -> None:
@@ -442,7 +460,7 @@ def upload(
     if not isinstance(bundle, Bundle):
         raise TypeError("bundle must be bundle.Bundle")
     selected = run if run is not None else _active_run()
-    if selected is None or not getattr(selected, "id", None):
+    if not _run_available(selected) or not getattr(selected, "id", None):
         message = (
             f"No active W&B run; kept local bundle {bundle.path} "
             f"({bundle.size:,} bytes, sha256={bundle.sha256})."

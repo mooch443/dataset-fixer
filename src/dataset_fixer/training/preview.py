@@ -219,6 +219,8 @@ def publish_augmentation_preview(result, augmentations):
             weights=result.selection.weights, type=result.selection.family, version=None, s=None,
             model_type=result.selection.task, config=config, split="train", options=options)
     result.auxiliary_files["training/augmentations.png"] = path
-    if result.wandb_run is not None:
-        import wandb
-        result.wandb_run.log({"training/augmentations": wandb.Image(str(path))})
+    from ..wandb import _optional_logging
+    with _optional_logging(result.wandb_run) as run:
+        if run is not None:
+            import wandb
+            run.log({"training/augmentations": wandb.Image(str(path))})

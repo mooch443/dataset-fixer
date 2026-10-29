@@ -16,6 +16,7 @@ from ..bundle import Config, Outcome, create
 from ..geometry import Geometry
 from ..sources import _atomic_json, cache_root, in_colab, sha256_progress
 from ..utils import to_jsonable
+from ..wandb import _optional_logging, _run_available
 from .config import CheckpointConfig, Checkpoints, ModelTypes, TrainingEvent, WandbConfig
 from .selection import dataset_schema
 
@@ -101,6 +102,7 @@ class TrainingResult:
     prepared: Any = field(default=None, repr=False)
     _model: Any = field(default=None, repr=False)
     _uploaded_best: Any = field(default=None, repr=False)
+    _persisted_digest: str | None = field(default=None, repr=False)
 
     @property
     def _best_selection(self):
@@ -115,7 +117,7 @@ class TrainingResult:
 
     @property
     def _best_upload_pending(self):
-        return (self.wandb_run is not None and self.checkpoint_config.wandb_upload == "best"
+        return (_run_available(self.wandb_run) and self.checkpoint_config.wandb_upload == "best"
                 and self._best_selection is not None and self._best_selection != self._uploaded_best)
 
     def _announce(self, resolution):
@@ -126,7 +128,7 @@ class TrainingResult:
     def retention_pending(self) -> bool:
         """Whether confirmed W&B checkpoints still need old-version cleanup."""
         return bool(self.checkpoint_config.keep_wandb_versions is not None
-                    and self.wandb_run is not None and self.wandb_bundle is not None
+                    and _run_available(self.wandb_run) and self.wandb_bundle is not None
                     and (self.best_weights is not None or self.resumable_checkpoint is not None)
                     and self.uploaded_digest == self.wandb_bundle.sha256
                     and self.retained_digest != self.wandb_bundle.sha256)
@@ -179,11 +181,9 @@ class TrainingResult:
         self.checkpoints = replace(checkpoints, best=self.best_weights, latest=self.resumable_checkpoint)
         self._model = None
         self.metrics.update(to_jsonable(metrics or {}))
-        if self.wandb_run is not None and metrics:
-            try:
-                self.wandb_run.log({"epoch": checkpoints.epoch, **to_jsonable(metrics)})
-            except Exception as exc:
-                warnings.warn(f"W&B metrics logging failed: {exc}")
+        with _optional_logging(self.wandb_run) as run:
+            if run is not None and metrics:
+                run.log({"epoch": checkpoints.epoch, **to_jsonable(metrics)})
         self.auxiliary_files.update(checkpoints.files)
         self._emit("checkpoint_saved", trainer=trainer, epoch=checkpoints.epoch, checkpoints=self.checkpoints, metrics=self.metrics)
         if final or self._best_upload_pending or (checkpoints.epoch is not None and (checkpoints.epoch + 1) % self.checkpoint_config.every_n_epochs == 0):
@@ -212,8 +212,9 @@ class TrainingResult:
             for path in report.location.rglob("*"):
                 if path.is_file():
                     self.auxiliary_files[f"evaluation/{split}/{path.relative_to(report.location).as_posix()}"] = path
-            if self.wandb_run is not None:
-                self.wandb_run.summary.update({f"evaluation/{split}": self.metrics[f"evaluation/{split}"]})
+            with _optional_logging(self.wandb_run) as run:
+                if run is not None:
+                    run.summary.update({f"evaluation/{split}": self.metrics[f"evaluation/{split}"]})
             self.finished = False
             return report
         if rejection is not None:
@@ -275,12 +276,10 @@ class TrainingResult:
         report = self.output_dir / "failure.txt"
         report.write_text(self.error)
         self.auxiliary_files["failure.txt"] = report
-        if self.wandb_run is not None:
-            try:
-                self.wandb_run.summary.update({"session_failed": True, "failure_type": type(error).__name__,
+        with _optional_logging(self.wandb_run) as run:
+            if run is not None:
+                run.summary.update({"session_failed": True, "failure_type": type(error).__name__,
                     "failure_message": str(error)[:1000] or type(error).__name__, "failure_report": "failure.txt"})
-            except Exception as exc:
-                warnings.warn(f"Could not record W&B failure summary; failure.txt is retained: {exc}")
 
     def _bundle_inputs(self, *, resumable=True):
         has_checkpoint = self.best_weights is not None or self.resumable_checkpoint is not None
@@ -341,7 +340,7 @@ class TrainingResult:
                 self.copied_digest = digest
             except Exception as exc:
                 warnings.warn(f"Checkpoint backup failed: {exc}")
-        if self.wandb_run is not None and (final or self.checkpoint_config.wandb_upload == "interval" or self._best_upload_pending):
+        if _run_available(self.wandb_run) and (final or self.checkpoint_config.wandb_upload == "interval" or self._best_upload_pending):
             from ..wandb import configure, upload
             previous_upload = self.wandb_bundle
             self.wandb_bundle = None
@@ -371,7 +370,7 @@ class TrainingResult:
                     self._uploaded_best = self._best_selection
             except Exception as exc:
                 warnings.warn(f"Checkpoint upload failed: {exc}")
-        safe = (has_checkpoint and (self.wandb_run is None or (
+        safe = (has_checkpoint and (not _run_available(self.wandb_run) or (
                     self.wandb_bundle is not None and self.uploaded_digest == self.wandb_bundle.sha256))
                 and (not self.checkpoint_config.backup_dir or self.copied_digest == digest))
         if safe:
@@ -468,17 +467,20 @@ class TrainingSession:
         if selected_wandb not in (None, False):
             if not isinstance(selected_wandb, WandbConfig):
                 raise TypeError("wandb must be WandbConfig or False")
-            import wandb as sdk
             run = selected_wandb.run
             if run is None:
-                if sdk.run is not None:
-                    raise ValueError("An active W&B run exists; pass WandbConfig(run=wandb.run) to adopt it explicitly")
-                options = dict(selected_wandb.init)
-                options.update(project=selected_wandb.project, entity=selected_wandb.entity,
-                               name=selected_wandb.name or output.name, dir=str(output))
-                print("Initializing W&B run", flush=True)
-                run, owns = sdk.init(**options), True
-                print("W&B run ready", flush=True)
+                try:
+                    import wandb as sdk
+                    if _run_available(sdk.run):
+                        raise ValueError("An active W&B run exists; pass WandbConfig(run=wandb.run) to adopt it explicitly")
+                    options = dict(selected_wandb.init)
+                    options.update(project=selected_wandb.project, entity=selected_wandb.entity,
+                                   name=selected_wandb.name or output.name, dir=str(output))
+                    print("Initializing W&B run", flush=True)
+                    run, owns = sdk.init(**options), True
+                    print("W&B run ready", flush=True)
+                except Exception as error:
+                    warnings.warn(f"W&B initialization unavailable; training continues locally: {error}")
         result = TrainingResult(dataset, selection, config, output, self, settings, provider,
                                 (*self.callbacks, *callbacks), run, owns)
         self.results.append(result)
@@ -493,16 +495,19 @@ class TrainingSession:
                 probe.flush()
                 os.fsync(probe.fileno())
             print("Checkpoint backup directory is writable", flush=True)
-        if self.disconnect and run is None and not settings.backup_dir:
-            raise ValueError("Safe disconnect needs W&B or a persistent backup destination")
+        if self.disconnect and not _run_available(run) and not settings.backup_dir:
+            warnings.warn("Automatic disconnect disabled: no active W&B run or persistent backup destination.")
+            self.disconnect = False
         return result
 
     def finish(self):
         """Retry pending publications; only disconnect once every run is safe."""
         all_safe = bool(self.results)
+        all_persisted = bool(self.results)
         failures = []
         for result in self.results:
             if result.finished and not result.retention_pending:
+                all_persisted &= bool(result.bundle and result._persisted_digest == result.bundle.sha256)
                 continue
             safe = False
             for attempt in range(result.checkpoint_config.final_attempts):
@@ -513,9 +518,13 @@ class TrainingSession:
                 if (safe and not result.retention_pending) or (result.best_weights is None and result.resumable_checkpoint is None):
                     break
             all_safe = all_safe and safe
+            persisted = bool(safe and (result.checkpoint_config.backup_dir or _run_available(result.wandb_run)))
+            if persisted:
+                result._persisted_digest = result.bundle.sha256
+            all_persisted &= persisted
             if safe:
                 try:
-                    if not result.finished and result.wandb_run is not None and (result.owns_run or self.disconnect):
+                    if not result.finished and _run_available(result.wandb_run) and (result.owns_run or self.disconnect):
                         result.wandb_run.finish(exit_code=1 if result.error else 0)
                     result.finished = True
                     result._model = None
@@ -524,14 +533,16 @@ class TrainingSession:
                     failures.append(f"W&B finalization failed for {result.output_dir}: {failure}")
             elif result.best_weights is not None or result.resumable_checkpoint is not None:
                 failures.append(f"Snapshots retained at {result.output_dir}")
-            elif result.wandb_run is not None and result.owns_run:
+            elif _run_available(result.wandb_run) and result.owns_run:
                 try:
                     result.wandb_run.finish(exit_code=1)
                 except Exception as failure:
                     failures.append(f"W&B finalization failed for {result.output_dir}: {failure}")
         if failures:
             raise RuntimeError("Publication incomplete; " + "; ".join(failures) + ". Retry session.finish().")
-        if self.disconnect and all_safe and not self.disconnected and in_colab():
+        if self.disconnect and all_safe and not all_persisted:
+            warnings.warn("Automatic disconnect skipped: updated results are only stored locally.")
+        if self.disconnect and all_safe and all_persisted and not self.disconnected and in_colab():
             from google.colab import runtime
             status = "Session failed; checkpoints and failure reports confirmed safe." if any(r.error for r in self.results) else "Checkpoints confirmed safe."
             print(f"{status} Disconnecting in {self.disconnect_delay} seconds.", flush=True)

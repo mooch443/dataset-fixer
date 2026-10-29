@@ -268,6 +268,7 @@ def visualize_records(
                     panel.footer or "",
                     mode=options.label_mode,
                     maximum=maximum,
+                    maximum_lines=max(2, len((panel.footer or "").splitlines())),
                 ),
             )
             heading, heading_height = heading_specs[id(panel)]

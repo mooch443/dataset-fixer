@@ -192,6 +192,32 @@ def test_confirmed_upload_backup_bundle_and_warm_start(pose, tmp_path, run):
         select(pose, resume=result.best_weights)
 
 
+@pytest.mark.parametrize("backup", [False, True])
+def test_finished_logger_allows_local_reports_and_only_disconnects_after_backup(pose, tmp_path, run, monkeypatch, backup):
+    session, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(
+        backup_dir=tmp_path / "drive" if backup else None), disconnect_delay=0)
+    result._capture(None, checkpoints(tmp_path))
+    assert session.finish()
+    run._is_finished = True
+    artifact_count = len(run.artifacts)
+    report = result.output_dir / "evaluation.json"
+    report.write_text('{"rank1": 0.9}')
+    result.auxiliary_files["evaluation/metrics.json"] = report
+    result.finished = False
+    session.disconnect = "after_safe"
+    calls = []
+    monkeypatch.setattr("dataset_fixer.training.session.in_colab", lambda: True)
+    monkeypatch.setitem(sys.modules, "google.colab", SimpleNamespace(runtime=SimpleNamespace(unassign=lambda: calls.append(True))))
+    assert session.finish() and session.finish()
+    assert len(run.artifacts) == artifact_count
+    assert calls == ([True] if backup else [])
+    with zipfile.ZipFile(result.bundle.path) as archive:
+        assert archive.read("evaluation/metrics.json") == report.read_bytes()
+    if backup:
+        assert result.copied_digest == result.bundle.sha256
+        assert (tmp_path / "drive" / result.output_dir.name / "model.zip").read_bytes() == result.bundle.path.read_bytes()
+
+
 def test_timeout_keeps_backup_and_runtime_then_retry(pose, tmp_path, run, monkeypatch):
     session, result = job(pose, tmp_path, run, checkpointing=df.CheckpointConfig(backup_dir=tmp_path / "drive", final_attempts=1), disconnect="after_safe", disconnect_delay=0)
     calls = []

@@ -80,11 +80,26 @@ class Gallery:
 
     def visualize(self, **kwargs):
         """Show the selected source images using Dataset.visualize options."""
+        return as_dataset(self._index(), location=Path.cwd()).visualize(**kwargs)
+
+    def _index(self):
         index = input_index([ImageRef(*json.loads(r["source_ref"])) for r in self.references])
         frame = index.frame.assign(identity_id=list(self.labels))
         for key in ("clip_id", "tracklet_id", "original_id"):
             frame[key] = [r.get(key) for r in self.references]
-        return as_dataset(SampleIndex(frame), location=Path.cwd()).visualize(**kwargs)
+        return SampleIndex(frame)
+
+    def visualize_attention(self, model, *, samples_per_identity=20, **kwargs):
+        """Average reference evidence per identity over a real embedding medoid.
+
+        Uses at most samples_per_identity clip-balanced references per identity.
+        Each reference is scored without itself or identical gallery pixels.
+        Other options match id.visualize_attention (except identity_id); samples
+        limits identities here, defaulting to all enrolled identities. Orientation
+        and crop alignment must be comparable for spatial averaging to be useful.
+        """
+        from .inspection import _visualize_reference_attention
+        return _visualize_reference_attention(model, self, samples_per_identity=samples_per_identity, **kwargs)
 
     def save(self, path):
         """Save an enrollment gallery without Python pickle objects.
@@ -154,8 +169,6 @@ def _candidate_rows(index, count, seed):
 
 def _medoid_rows(index, embeddings, count, seed):
     """Keep hierarchical clip/tracklet quotas; choose representatives within them."""
-    from kmedoids import fasterpam
-    from sklearn.metrics.pairwise import cosine_distances
     chosen = _candidate_rows(index, count, seed)
     fields = [key for key in ("identity_id", "clip_id", "tracklet_id") if index.frame[key].notna().all()]
     groups = index.frame.groupby(fields, observed=True, sort=True).ngroup().to_numpy()
@@ -163,10 +176,16 @@ def _medoid_rows(index, embeddings, count, seed):
     for group, quota in zip(*np.unique(groups[chosen], return_counts=True)):
         rows = np.flatnonzero(groups == group)
         if len(rows) > quota:
-            distances = cosine_distances(embeddings[rows]).astype(np.float32)
-            rows = rows[fasterpam(distances, int(quota), random_state=seed, n_cpu=1).medoids]
+            rows = rows[_embedding_medoids(embeddings[rows], int(quota), seed)]
         selected.extend(rows)
     return selected
+
+
+def _embedding_medoids(embeddings, count, seed):
+    from kmedoids import fasterpam
+    from sklearn.metrics.pairwise import cosine_distances
+    distances = cosine_distances(embeddings).astype(np.float32)
+    return fasterpam(distances, count, random_state=seed, n_cpu=1).medoids
 
 
 def enroll(model, source, *, samples_per_identity=None, selection=None, candidates_per_identity=None,

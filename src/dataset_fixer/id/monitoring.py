@@ -1,12 +1,12 @@
 """Bounded epoch monitoring without a second logger or training loop."""
 import time
-import warnings
 from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import pandas as pd
 
 from .data import balanced_rows, index_of
+from ..wandb import _optional_logging, _run_available
 
 _MAX_EMBEDDING_SAMPLES = 2048
 
@@ -51,22 +51,23 @@ def _save_monitor_cohort(result):
 def evaluation_progress(result, split):
     """Mirror post-training stages to the session-owned run, independently of stdout."""
     run = result.wandb_run
-    if run is None:
+    if not _run_available(run):
         yield None
         return
     prefix = f"evaluation/{split}"
-    run.define_metric(f"{prefix}/elapsed_seconds")
-    run.define_metric(f"{prefix}/*", step_metric=f"{prefix}/elapsed_seconds")
+    with _optional_logging(run) as active:
+        if active is not None:
+            active.define_metric(f"{prefix}/elapsed_seconds")
+            active.define_metric(f"{prefix}/*", step_metric=f"{prefix}/elapsed_seconds")
     started = time.monotonic()
 
     def report(stage, completed, total):
         status = "complete" if stage == "report" and completed == total else stage
-        try:
-            run.summary[f"{prefix}/stage"] = status
-            run.log({f"{prefix}/elapsed_seconds": time.monotonic() - started,
-                     f"{prefix}/{stage}_completed": completed, f"{prefix}/{stage}_total": total})
-        except Exception as exc:
-            warnings.warn(f"W&B evaluation progress logging failed: {exc}")
+        with _optional_logging(run) as active:
+            if active is not None:
+                active.summary[f"{prefix}/stage"] = status
+                active.log({f"{prefix}/elapsed_seconds": time.monotonic() - started,
+                            f"{prefix}/{stage}_completed": completed, f"{prefix}/{stage}_total": total})
 
     report("starting", 0, 1)
     try:
@@ -98,17 +99,17 @@ def prepare_monitor(result):
         result._embedding_disabled = True
         _monitor_notice(result, 'disabled', f"disabled after cohort preparation failed "
                         f"({type(error).__name__}: {error}). Training will continue.")
-    run = result.wandb_run
-    if run is not None:
-        run.define_metric("epoch")
-        for namespace in ("train/*", "val/*", "optim/*", "time/*", "embeddings/*", "dataset_coverage/*"):
-            run.define_metric(namespace, step_metric="epoch")
-        run.define_metric("val/loss", step_metric="epoch", summary="min")
-        run.define_metric("val/monitor_rank1", step_metric="epoch", summary="max")
-        run.define_metric("progress/global_step")
-        run.define_metric("progress/*", step_metric="progress/global_step")
-        for name in ('loss', 'size', 'identities'):
-            run.define_metric(f"train/batch_{name}", step_metric="progress/global_step")
+    with _optional_logging(result.wandb_run) as run:
+        if run is not None:
+            run.define_metric("epoch")
+            for namespace in ("train/*", "val/*", "optim/*", "time/*", "embeddings/*", "dataset_coverage/*"):
+                run.define_metric(namespace, step_metric="epoch")
+            run.define_metric("val/loss", step_metric="epoch", summary="min")
+            run.define_metric("val/monitor_rank1", step_metric="epoch", summary="max")
+            run.define_metric("progress/global_step")
+            run.define_metric("progress/*", step_metric="progress/global_step")
+            for name in ('loss', 'size', 'identities'):
+                run.define_metric(f"train/batch_{name}", step_metric="progress/global_step")
 
 
 def coverage_epoch(result, data, epoch):
@@ -135,10 +136,11 @@ def coverage_epoch(result, data, epoch):
         table = folder / 'coverage.csv'
         pd.DataFrame(rows).to_csv(table, mode='a', header=not table.exists(), index=False)
         result.auxiliary_files.update({'monitoring/coverage.png': path, 'monitoring/coverage.csv': table})
-        if result.wandb_run is not None:
-            import wandb
-            result.wandb_run.log({'epoch': epoch, 'dataset_coverage/chart': wandb.Image(str(path),
-                caption=f'Epoch {epoch+1}: cumulative distinct source images used')})
+        with _optional_logging(result.wandb_run) as run:
+            if run is not None:
+                import wandb
+                run.log({'epoch': epoch, 'dataset_coverage/chart': wandb.Image(str(path),
+                    caption=f'Epoch {epoch+1}: cumulative distinct source images used')})
     except Exception as error:
         result._coverage_plot_failed = True
         _monitor_notice(result, 'chart', f'chart disabled ({type(error).__name__}: {error}); '
@@ -250,7 +252,8 @@ def _monitor_epoch(result, module, epoch):
         truth = labels[val]
         correct = [label in enrolled and np.sum(row >= row[enrolled.index(label)]) == 1 for row, label in zip(scores, truth)]
         metrics["val/monitor_rank1"] = float(np.mean(correct))
-    if result.wandb_run is not None:
-        import wandb
-        result.wandb_run.log({"epoch": epoch, f"embeddings/{method}": wandb.Image(str(path), caption=f"Epoch {epoch+1}: fixed cohort")})
+    with _optional_logging(result.wandb_run) as run:
+        if run is not None:
+            import wandb
+            run.log({"epoch": epoch, f"embeddings/{method}": wandb.Image(str(path), caption=f"Epoch {epoch+1}: fixed cohort")})
     return metrics

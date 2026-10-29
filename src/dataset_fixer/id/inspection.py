@@ -81,8 +81,9 @@ def _identity_panel(pixels, metadata, options):
         return text_region(format_label(text, mode=options.label_mode, maximum=max(18, width // 7)), width=width, **style)
 
     color = "#6B7280" if metadata["correct"] is None else "#218739" if metadata["correct"] else "#C53030"
+    prediction_prefix = "Rep. pred" if metadata.get("aggregation_count") else "Pred"
     headings = [caption(f"GT: {metadata['ground_truth'] or 'unlabeled'}"),
-                caption(f"Pred: {metadata['prediction']}", color=color, font_weight="bold")]
+                caption(f"{prediction_prefix}: {metadata['prediction']}", color=color, font_weight="bold")]
     if metadata.get("target_override", False):
         headings.append(caption(f"Target: {metadata['identity_id']}"))
     if metadata["similarity"] is None:
@@ -94,6 +95,12 @@ def _identity_panel(pixels, metadata, options):
                   f"Margin: {metadata['margin']:+.4f} · sim: {metadata['similarity']:.4f}")
     if metadata.get("rejected") and metadata.get("identity_id"):
         footer = f"Best: {metadata['identity_id']} · {footer}"
+    if metadata.get("aggregation_count"):
+        footer = footer.replace("Margin:", "Rep. margin:").replace("Similarity:", "Rep. similarity:")
+        footer += f"\nMean evidence: {metadata['aggregation_count']} references"
+    if "max_abs_effect" in metadata:
+        effect = "mean Δ" if metadata.get("aggregation_count") else "Δ"
+        footer += f"\nMax |{effect}|: {metadata['max_abs_effect']:.4g}"
     return VisualizationPanel("", pixels, footer=footer, heading=alt.vconcat(*headings, spacing=0))
 
 
@@ -111,7 +118,8 @@ def _attention_item(sample, rgb, heat, metadata, bound, options):
 
 
 def visualize_attention(model, source, *, gallery, identity_id=None, contrast=True,
-                        samples=4, columns=2, patch_fraction=0.15, device=None, destination=None, show=True):
+                        samples=4, columns=2, patch_fraction=0.15, color_scale="shared",
+                        device=None, destination=None, show=True):
     """Visualize Captum occlusion attribution for identity similarity.
 
     Parameters:
@@ -123,51 +131,88 @@ def visualize_attention(model, source, *, gallery, identity_id=None, contrast=Tr
         samples: Maximum number of balanced query crops to inspect.
         columns: Number of overlay cards per grid row, default 2.
         patch_fraction: Occlusion window fraction of model input width, in (0, 1].
+        color_scale: "shared" compares effect magnitudes across images; "per_image"
+            reveals each map's pattern. Each card reports its actual maximum effect.
         device: Optional cpu, cuda:0, or mps override; otherwise use the Model device.
         destination: Optional output image path, with raw attribution NPZ/JSON sidecars.
         show: Display through the existing visualization renderer.
 
     Red indicates regions supporting the target score, blue indicates opposing
     regions. This is sensitivity to mean-color occlusion, not anatomical proof or
-    a transformer attention map. All overlays share one symmetric color scale.
+    a transformer attention map. Shared scaling is the default.
     Prediction text is green for correct, red for incorrect (including tied
     top scores), and gray when ground truth is unavailable. Margins compare the
     explained target with its strongest competitor on the original input.
     """
-    import json
-    import altair as alt
+    from .model import input_index
+    options = _attention_options(samples, columns, patch_fraction, color_scale, destination, show)
+    if samples is None:
+        raise ValueError("samples must be positive")
+    index = input_index(source)
+    observations = _attention_observations(model, index, balanced_rows(index, samples), gallery,
+        identity_id=identity_id, contrast=contrast, patch_fraction=patch_fraction, device=device)
+    return _render_attention(observations, options, color_scale=color_scale, contrast=contrast)
+
+
+def _attention_options(samples, columns, patch_fraction, color_scale, destination, show):
+    from ..visualization import visualization_options
+    options = visualization_options(samples=samples, columns=columns, destination=destination, show=show)
+    if not 0 < patch_fraction <= 1:
+        raise ValueError("patch_fraction must be in (0, 1]")
+    if color_scale not in {"shared", "per_image"}:
+        raise ValueError("color_scale must be 'shared' or 'per_image'")
+    return options
+
+
+def _attention_observations(model, index, selected, gallery, *, identity_id=None, contrast=True,
+                            patch_fraction, device, reference_mode=False):
     import torch
     from captum.attr import Occlusion
-    from .model import input_index, runtime, preprocess
+    from .model import runtime, preprocess
     from .gallery import identity_scores
-    from ..visualization import visualization_options, visualize_records, finish_visualization
-    options = visualization_options(samples=samples, columns=columns, destination=destination, show=show)
-    if samples is None or not 0 < patch_fraction <= 1:
-        raise ValueError("samples must be positive and patch_fraction must be in (0, 1]")
     gallery.validate(model)
     if contrast and len(gallery.identities) < 2:
         raise ValueError("Contrast attribution needs at least two enrolled individuals")
     if identity_id is not None and str(identity_id) not in gallery.identities:
         raise ValueError(f"Identity {identity_id!r} is not enrolled")
-    index = input_index(source)
-    selected = balanced_rows(index, samples)
     module = runtime(model)
     previous_device, was_training = next(module.parameters()).device, module.training
     target_device = device or model._device or str(previous_device)
-    observations, maps, metadata = [], {}, []
+    observations = []
+    hashes = []
+    if reference_mode:
+        import hashlib
+        for row, ref in enumerate(gallery.references):
+            digest = ref.get("pixel_sha256")
+            if digest is None:
+                pixels = index[row].image_ref.read()
+                digest = hashlib.sha256(str(pixels.shape).encode() + pixels.tobytes()).hexdigest()
+            hashes.append(digest)
     try:
         module.to(target_device).eval()
         references = torch.as_tensor(gallery.embeddings.copy(), device=target_device)
-        def scores(images):
-            return identity_scores(module(images), references, gallery.labels)
         with torch.no_grad():
             for number, row in enumerate(selected):
                 sample = index[row]
+                keep = np.ones(len(gallery.labels), dtype=bool)
+                if reference_mode:
+                    keep = np.array([digest != hashes[row] and ref["source_ref"] != sample.image_ref.key
+                                     for digest, ref in zip(hashes, gallery.references)])
+                    if not any(keep[i] and label == sample.identity_id for i, label in enumerate(gallery.labels)):
+                        raise ValueError(f"Reference attention needs at least two distinct images for {sample.identity_id!r}")
+                labels = tuple(label for label, use in zip(gallery.labels, keep) if use)
+                identities = tuple(sorted(set(labels)))
+                if contrast and len(identities) < 2:
+                    raise ValueError("Reference attention needs a distinct competing identity after duplicate exclusion")
+                vectors = references[torch.as_tensor(np.flatnonzero(keep), device=target_device)]
+                def scores(images):
+                    return identity_scores(module(images), vectors, labels)
                 tensor = preprocess(sample.image_ref.read(), module.identity["preprocessing"])[None].to(target_device)
                 initial = scores(tensor)[0]
                 predicted = int(initial.argmax())
-                target = gallery.identities.index(str(identity_id)) if identity_id is not None else predicted
-                others = [i for i in range(len(gallery.identities)) if i != target]
+                target_label = sample.identity_id if reference_mode else str(identity_id) if identity_id is not None else identities[predicted]
+                target = identities.index(target_label)
+                others = [i for i in range(len(identities)) if i != target]
                 competitor = max(others, key=lambda i: float(initial[i])) if others else None
                 def objective(images):
                     values = scores(images)
@@ -181,37 +226,77 @@ def visualize_attention(model, source, *, gallery, identity_id=None, contrast=Tr
                 rgb = tensor[0].cpu().numpy().transpose(1,2,0)*np.array(prep["std"])+np.array(prep["mean"])
                 rgb = np.clip(rgb, 0, 1)
                 bound = float(np.abs(heat).max())
-                target_label = gallery.identities[target]
-                prediction = gallery.identities[predicted]
+                prediction = identities[predicted]
                 truth = sample.identity_id
-                maps[f"attribution_{number}"] = heat
                 record = dict(source_ref=sample.image_ref.key, identity_id=target_label,
-                    target_override=identity_id is not None,
+                    target_override=identity_id is not None or reference_mode,
                     ground_truth=truth, prediction=prediction,
                     correct=None if truth is None else bool(truth == prediction and int((initial == initial[predicted]).sum()) == 1),
-                    competitor=None if competitor is None else gallery.identities[competitor],
+                    competitor=None if competitor is None else identities[competitor],
                     margin=None if competitor is None else float(initial[target] - initial[competitor]),
                     similarity=float(initial[target]), contrast=contrast, baseline="preprocessing channel mean",
                     patch_pixels=patch, max_abs_effect=bound, model_fingerprint=gallery.model_fingerprint,
                     gallery_fingerprint=gallery.fingerprint)
-                metadata.append(record)
+                if reference_mode:
+                    record.update(reference_row=int(row), map_key=f"reference_{number}",
+                                  excluded_reference_rows=np.flatnonzero(~keep).tolist())
                 observations.append((sample, rgb, heat, record))
     finally:
         module.to(previous_device).train(was_training)
+    return observations
+
+
+def _render_attention(observations, options, *, color_scale, contrast, reference_maps=None):
+    import json
+    import altair as alt
+    from ..visualization import visualize_records, finish_visualization
+    metadata = [item[3] for item in observations]
     bound = max((record["max_abs_effect"] for record in metadata), default=0.)
-    for record in metadata:
-        record.update(color_scale="shared", color_bound=bound)
+    for number, record in enumerate(metadata):
+        record.update(map_key=f"attribution_{number}", color_scale=color_scale,
+                      color_bound=record["max_abs_effect"] if color_scale == "per_image" else bound)
     chart = visualize_records(observations, options=options,
-        prepare=lambda item: _attention_item(*item, bound, options))
-    chart = chart.properties(title=alt.TitleParams(text="Identity evidence · occlusion sensitivity",
+        prepare=lambda item: _attention_item(*item, item[3]["color_bound"], options))
+    title = "Reference identity evidence · mean occlusion sensitivity" if reference_maps is not None else "Identity evidence · occlusion sensitivity"
+    chart = chart.properties(title=alt.TitleParams(text=title,
         anchor="middle", fontSize=16, offset=14, subtitle=[
             f"Overlay: red supports · blue opposes {'margin' if contrast else 'similarity'}",
-            f"Shared effect scale: ±{bound:.4g}",
+            f"Shared effect scale: ±{bound:.4g}" if color_scale == "shared" else "Per-image scale · effect magnitudes shown on each card",
+            *(["Mean maps in input coordinates · real medoid image · self-matches excluded"] if reference_maps is not None else []),
             *_PREDICTION_LEGEND,
         ]))
     finish_visualization(chart, options)
-    if destination:
-        path = Path(destination)
-        np.savez_compressed(path.with_suffix(".npz"), **maps)
+    if options.destination:
+        path = Path(options.destination)
+        maps = {f"attribution_{i}": item[2] for i, item in enumerate(observations)}
+        np.savez_compressed(path.with_suffix(".npz"), **maps, **(reference_maps or {}))
         path.with_suffix(".json").write_text(json.dumps(metadata, indent=2))
     return chart
+
+
+def _visualize_reference_attention(model, gallery, *, samples_per_identity=20, samples=None,
+                                  columns=3, patch_fraction=0.15, color_scale="shared", contrast=True,
+                                  device=None, destination=None, show=True):
+    from .gallery import _candidate_rows, _embedding_medoids
+    options = _attention_options(samples, columns, patch_fraction, color_scale, destination, show)
+    if isinstance(samples_per_identity, bool) or not isinstance(samples_per_identity, int) or samples_per_identity < 1:
+        raise ValueError("samples_per_identity must be a positive integer")
+    gallery.validate(model)
+    index = gallery._index()
+    identities = gallery.identities if samples is None else gallery.identities[:samples]
+    selected = [row for row in _candidate_rows(index, samples_per_identity, 7)
+                if index.frame.identity_id.iloc[row] in identities]
+    observations = _attention_observations(model, index, selected, gallery, contrast=contrast,
+        patch_fraction=patch_fraction, device=device, reference_mode=True)
+    combined = []
+    for label in identities:
+        members = [item for item in observations if item[3]["identity_id"] == label]
+        rows = [item[3]["reference_row"] for item in members]
+        representative = int(_embedding_medoids(gallery.embeddings[rows], 1, 7)[0])
+        sample, rgb, _, record = members[representative]
+        heat = np.mean([item[2] for item in members], axis=0)
+        metadata = dict(record, aggregation="mean", aggregation_count=len(members), representative="embedding_medoid",
+                        max_abs_effect=float(np.abs(heat).max()), sources=[item[3] for item in members])
+        combined.append((sample, rgb, heat, metadata))
+    return _render_attention(combined, options, color_scale=color_scale, contrast=contrast,
+                             reference_maps={f"reference_{i}": item[2] for i, item in enumerate(observations)})
