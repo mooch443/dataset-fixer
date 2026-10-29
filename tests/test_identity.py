@@ -751,13 +751,23 @@ def test_attention_uses_captum_and_preserves_model(identity_data, tmp_path, monk
         return native(self,*args,**kwargs)
     monkeypatch.setattr(Occlusion,'attribute',observe)
     before = model.embed(identity_data.sample(1),prediction_cache=False)[0].embedding.copy()
-    id.visualize_attention(model,identity_data.sample(2,split='test'),gallery=gallery,
-        patch_fraction=.5,samples=2,destination=tmp_path/'attention.png',show=False)
+    chart = id.visualize_attention(model,identity_data.sample(2,split='test'),gallery=gallery,
+        patch_fraction=.5,samples=2,columns=2,destination=tmp_path/'attention.png',show=False)
     assert len(calls)==2 and calls[0]['sliding_window_shapes']==(3,8,8)
     np.testing.assert_array_equal(before,model.embed(identity_data.sample(1),prediction_cache=False)[0].embedding)
     with np.load(tmp_path/'attention.npz') as maps:
         assert maps['attribution_0'].shape==(16,16) and np.isfinite(maps['attribution_0']).all()
-    assert json.loads((tmp_path/'attention.json').read_text())[0]['contrast'] is True
+    records = json.loads((tmp_path/'attention.json').read_text())
+    assert records[0]['contrast'] is True
+    with np.load(tmp_path/'attention.npz') as maps:
+        bound = max(float(np.abs(heat).max()) for heat in maps.values())
+    assert all(r['color_scale'] == 'shared' and r['color_bound'] == bound for r in records)
+    assert all(r['correct'] == (r['ground_truth'] == r['prediction']) for r in records)
+    assert all(r['margin'] >= 0 and r['competitor'] != r['prediction'] for r in records)
+    spec = chart.to_dict()
+    assert len(spec['vconcat']) == 1 and len(spec['vconcat'][0]['hconcat']) == 2
+    images = [row for rows in spec['datasets'].values() for row in rows if 'url' in row]
+    assert len(images) == 2  # One overlay per query, without a second input panel.
 
 
 def test_black_border_option_for_png_npz_manifest_and_custom_augmentation(tmp_path):
