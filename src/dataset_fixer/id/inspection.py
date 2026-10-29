@@ -109,15 +109,20 @@ def _identity_panel(pixels, metadata, options):
 
 def _attention_item(sample, rgb, heat, metadata, bound, options):
     from matplotlib import colormaps
-    from ..visualization import VisualizationItem
+    from ..visualization import VisualizationItem, VisualizationPanel
 
     scaled = heat / max(bound, 1e-12)
     colors = colormaps["RdBu_r"]((scaled + 1) / 2)[..., :3]
     alpha = np.abs(scaled)[..., None] * .65
     overlay = ((rgb * (1 - alpha) + colors * alpha) * 255).astype(np.uint8)
     panel = _identity_panel(overlay, metadata, options)
+    panels = (panel,)
+    if metadata.get("aggregation_count"):
+        reference = VisualizationPanel("Reference", np.rint(rgb * 255).astype(np.uint8),
+                                       footer="Representative image")
+        panels = (reference, panel)
     return VisualizationItem(sample.image_path, sample.clip_id or sample.image_path.name,
-                             (panel,), np.ones(heat.shape, bool))
+                             panels, np.ones(heat.shape, bool))
 
 
 def visualize_attention(model, source, *, gallery, identity_id=None, contrast=True,
@@ -275,7 +280,7 @@ def _render_attention(observations, options, *, color_scale, contrast, reference
 
 
 def _visualize_reference_attention(model, gallery, *, samples_per_identity=20, samples=None,
-                                  columns=3, patch_fraction=0.15, color_scale="shared", contrast=True,
+                                  columns=2, patch_fraction=0.15, color_scale="shared", contrast=True,
                                   device=None, destination=None, show=True):
     from .gallery import _candidate_rows, _embedding_medoids
     options = _attention_options(samples, columns, patch_fraction, color_scale, destination, show)

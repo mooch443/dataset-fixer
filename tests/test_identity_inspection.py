@@ -96,6 +96,13 @@ def test_attention_overlay_strength_uses_shared_scale():
     assert np.abs(weak.panels[0].image.astype(float) - rgb*255).max() < 2
     assert np.abs(strong.panels[0].image.astype(float) - rgb*255).max() > 50
 
+    reference_record = dict(record, aggregation_count=2, max_abs_effect=1.)
+    paired = _attention_item(sample, rgb, np.ones((4, 4)), reference_record, 1., VisualizationOptions())
+    assert len(paired.panels) == 2
+    np.testing.assert_array_equal(paired.panels[0].image, np.full((4, 4, 3), 128, dtype=np.uint8))
+    assert paired.panels[0].image.shape == paired.panels[1].image.shape
+    np.testing.assert_array_equal(paired.panels[1].image, strong.panels[0].image)
+
 
 @pytest.mark.parametrize("contrast", [False, True])
 @pytest.mark.parametrize("count", [1, 4])

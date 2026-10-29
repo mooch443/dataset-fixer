@@ -101,6 +101,8 @@ class Gallery:
         identities' own-similarity attribution maps, computed on their images.
         These are separate calls/plots. Query id.visualize_attention instead
         contrasts scores on the same input image.
+        Each reference card pairs the unoverlaid representative with its overlay;
+        columns counts identity pairs per row (default 2).
         Other options match id.visualize_attention (except identity_id); samples
         limits identities here, defaulting to all enrolled identities. Orientation
         and crop alignment must be comparable for spatial averaging to be useful.
