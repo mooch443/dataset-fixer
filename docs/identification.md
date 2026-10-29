@@ -554,22 +554,44 @@ The attention visualizer calls [Captum Occlusion](https://captum.ai/api/occlusio
 
 Cards show ground truth and prediction. Prediction text alone indicates correctness: green for a correct unique top prediction, red for an incorrect prediction or tied top scores, and gray without ground truth. The footer names the original input's strongest competing identity and shows the target's signed similarity margin and cosine similarity; these are not probabilities. `identity_id=` explains a specified enrolled individual and can produce a negative margin; otherwise the target is the model's own top prediction. The competitor may change during occlusion. With a single enrolled identity and `contrast=False`, only similarity is shown. Raw attribution arrays and metadata (including ground truth, prediction, correctness, competitor, margin, actual effect magnitude, and chosen color scale) are saved alongside the grid. This measures sensitivity to masking, not anatomical ground truth or internal transformer attention. The method supports custom encoders without layer-specific hooks.
 
-To summarize the enrolled references, average their evidence maps over a real representative image:
+To summarize the enrolled references, make two separate plots. The averaging limit only affects the visualization; the enrolled gallery and prediction scores remain unchanged:
 
 ```python
 gallery.visualize_attention(
     model,
-    samples_per_identity=20,
+    samples_per_identity=4,
+    contrast=False,
     color_scale="per_image",
     columns=3,
     destination="reference_attention.png",
 )
+gallery.visualize_attention(
+    model,
+    samples_per_identity=4,
+    contrast=True,
+    color_scale="per_image",
+    columns=3,
+    destination="reference_contrast.png",
+)
 ```
 
-This inspects up to 20 references per identity, balanced across clips and tracklets, and shows one card per identity (`samples=` optionally limits identities). Each reference explains its enrolled identity against the strongest score among all other identities. Its own source and any exact pixel duplicates are excluded from the gallery for that calculation; at least two distinct reference images per identity are required.
+Each call inspects up to four references per identity here, balanced across clips and tracklets, and shows one card per identity (`samples=` optionally limits displayed identities). For each reference, Captum explains similarity to its own identity. Its own source and any exact pixel duplicates are excluded from scoring; at least two distinct reference images per identity are required. Scoring still uses the complete remaining gallery, regardless of `samples_per_identity`.
 
-The raw signed maps are averaged in model-input coordinates before color scaling. The backdrop is a real embedding medoid chosen by the existing `kmedoids` implementation from the inspected images, rather than an artificial pixel-median wolf. The prediction and margin on the card belong to that representative; the overlay and `Max |mean Δ|` summarize all inspected references. Their count is printed on the card. Orientation-normalized, similarly cropped images are appropriate for this view: pose or position differences can blur the average, and positive/negative effects can cancel. It does not align body parts automatically.
+With `contrast=False`, the plot shows each identity's mean raw signed attribution map. With `contrast=True` (the method's default), it shows that mean minus the equally weighted mean of all other identities' mean maps. Each other identity contributes equally, even if its reference count differs. Other identities still participate when `samples=` limits which cards are displayed. This compares evidence across images; it differs from query `id.visualize_attention(..., contrast=True)`, which explains own similarity minus strongest-rival similarity on the same query image.
 
-The NPZ includes both the displayed `attribution_*` averages and individual `reference_*` maps. JSON records the contributing sources, their scores, the excluded reference rows, the medoid source and effect magnitudes. To improve the enrolled reference set itself, the existing `model.enroll(..., selection="medoids")` option still applies; enrollment defaults and W&B metrics are unchanged.
+In the mean plot, red supports the wolf's own similarity and blue opposes it. In the difference plot, red means greater signed supporting evidence at that location for this wolf than for the others; blue means less. Differences use raw attribution units, never differences between independently normalized heatmaps. The backdrop is a real embedding medoid chosen from the inspected images by the existing `kmedoids` implementation. Each card includes the count and actual peak effect. These spatial averages can blur across poses and can cancel positive/negative effects; they do not align body parts or prove which anatomical features are unique.
+
+The NPZ includes the displayed `attribution_*` maps, the `mean_*` identity maps and individual `reference_*` maps. JSON identifies all contributing sources, other-identity map keys, scores, self-exclusions, the medoid source and effect magnitudes. To improve the enrolled reference set itself, the existing `model.enroll(..., selection="medoids")` option still applies.
+
+ID training automatically generates both figures from the selected best checkpoint, displays them locally, includes their PNG/NPZ/JSON files in the final bundle and backup, and logs the two images to `inspection/reference_attention` and `inspection/reference_contrast` in the session-owned W&B run. This adds no scalar training metrics. The default averages up to four references per identity with per-image display scaling. Customize it without changing enrollment:
+
+```python
+backend_options={
+    # Other training settings...
+    "reference_attention": {"samples_per_identity": 2, "color_scale": "shared"},
+}
+```
+
+Set `reference_attention=False` to disable automatic end-of-training plots. Diagnostic failures, including insufficient distinct references, leave training results and checkpoints intact and report a warning. Without an active W&B run, figures remain local.
 
 The [wolf Colab notebook](../notebooks/wolves_identity_colab.ipynb) installs the optional dependencies, extracts Drive NPZs into `/mnt/local-scratch`, reports identity/clip coverage, enrolls all labeled wolves, and trains on CUDA (or local MPS). `DATASET_FIXER_CACHE_DIR` directs the shared cache into scratch. Drive backups retain resumable state and final reports. Install from a published revision containing these changes; staging alone does not update GitHub.

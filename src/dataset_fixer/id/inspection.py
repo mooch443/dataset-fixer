@@ -82,9 +82,10 @@ def _identity_panel(pixels, metadata, options):
 
     color = "#6B7280" if metadata["correct"] is None else "#218739" if metadata["correct"] else "#C53030"
     prediction_prefix = "Rep. pred" if metadata.get("aggregation_count") else "Pred"
-    headings = [caption(f"GT: {metadata['ground_truth'] or 'unlabeled'}"),
+    truth_label = "ID" if metadata.get("aggregation_count") else "GT"
+    headings = [caption(f"{truth_label}: {metadata['ground_truth'] or 'unlabeled'}"),
                 caption(f"{prediction_prefix}: {metadata['prediction']}", color=color, font_weight="bold")]
-    if metadata.get("target_override", False):
+    if metadata.get("target_override", False) and not metadata.get("aggregation_count"):
         headings.append(caption(f"Target: {metadata['identity_id']}"))
     if metadata["similarity"] is None:
         footer = "Embedding only"
@@ -96,10 +97,12 @@ def _identity_panel(pixels, metadata, options):
     if metadata.get("rejected") and metadata.get("identity_id"):
         footer = f"Best: {metadata['identity_id']} · {footer}"
     if metadata.get("aggregation_count"):
-        footer = footer.replace("Margin:", "Rep. margin:").replace("Similarity:", "Rep. similarity:")
-        footer += f"\nMean evidence: {metadata['aggregation_count']} references"
+        footer = f"Mean of {metadata['aggregation_count']} references"
+        if metadata.get("other_identity_means"):
+            footer += f" · vs {len(metadata['other_identity_means'])} IDs"
     if "max_abs_effect" in metadata:
-        effect = "mean Δ" if metadata.get("aggregation_count") else "Δ"
+        effect = ("Δ difference" if metadata.get("other_identity_means") else
+                  "mean Δ" if metadata.get("aggregation_count") else "Δ")
         footer += f"\nMax |{effect}|: {metadata['max_abs_effect']:.4g}"
     return VisualizationPanel("", pixels, footer=footer, heading=alt.vconcat(*headings, spacing=0))
 
@@ -257,14 +260,11 @@ def _render_attention(observations, options, *, color_scale, contrast, reference
                       color_bound=record["max_abs_effect"] if color_scale == "per_image" else bound)
     chart = visualize_records(observations, options=options,
         prepare=lambda item: _attention_item(*item, item[3]["color_bound"], options))
-    title = "Reference identity evidence · mean occlusion sensitivity" if reference_maps is not None else "Identity evidence · occlusion sensitivity"
+    title = ("Reference evidence difference" if contrast else "Mean reference evidence") if reference_maps is not None else "Identity evidence"
+    scale = f"shared ±{bound:.4g}" if color_scale == "shared" else "per-image scale"
     chart = chart.properties(title=alt.TitleParams(text=title,
-        anchor="middle", fontSize=16, offset=14, subtitle=[
-            f"Overlay: red supports · blue opposes {'margin' if contrast else 'similarity'}",
-            f"Shared effect scale: ±{bound:.4g}" if color_scale == "shared" else "Per-image scale · effect magnitudes shown on each card",
-            *(["Mean maps in input coordinates · real medoid image · self-matches excluded"] if reference_maps is not None else []),
-            *_PREDICTION_LEGEND,
-        ]))
+        anchor="middle", fontSize=12, offset=8,
+        subtitle=[f"Red + · blue − · {scale}"]))
     finish_visualization(chart, options)
     if options.destination:
         path = Path(options.destination)
@@ -282,21 +282,34 @@ def _visualize_reference_attention(model, gallery, *, samples_per_identity=20, s
     if isinstance(samples_per_identity, bool) or not isinstance(samples_per_identity, int) or samples_per_identity < 1:
         raise ValueError("samples_per_identity must be a positive integer")
     gallery.validate(model)
+    if contrast and len(gallery.identities) < 2:
+        raise ValueError("Reference evidence differences need at least two enrolled individuals")
     index = gallery._index()
     identities = gallery.identities if samples is None else gallery.identities[:samples]
-    selected = [row for row in _candidate_rows(index, samples_per_identity, 7)
-                if index.frame.identity_id.iloc[row] in identities]
-    observations = _attention_observations(model, index, selected, gallery, contrast=contrast,
+    # Compute each identity's own-score attribution, including identities that
+    # are not displayed: all other identities contribute equally to a contrast.
+    selected = _candidate_rows(index, samples_per_identity, 7)
+    observations = _attention_observations(model, index, selected, gallery, contrast=False,
         patch_fraction=patch_fraction, device=device, reference_mode=True)
+    members = {label: [item for item in observations if item[3]["identity_id"] == label]
+               for label in gallery.identities}
+    means = {label: np.mean([item[2] for item in group], axis=0) for label, group in members.items()}
+    mean_keys = {label: f"mean_{i}" for i, label in enumerate(gallery.identities)}
+    maps = {item[3]["map_key"]: item[2] for item in observations}
+    maps.update({mean_keys[label]: heat for label, heat in means.items()})
     combined = []
     for label in identities:
-        members = [item for item in observations if item[3]["identity_id"] == label]
-        rows = [item[3]["reference_row"] for item in members]
+        group = members[label]
+        rows = [item[3]["reference_row"] for item in group]
         representative = int(_embedding_medoids(gallery.embeddings[rows], 1, 7)[0])
-        sample, rgb, _, record = members[representative]
-        heat = np.mean([item[2] for item in members], axis=0)
-        metadata = dict(record, aggregation="mean", aggregation_count=len(members), representative="embedding_medoid",
-                        max_abs_effect=float(np.abs(heat).max()), sources=[item[3] for item in members])
+        sample, rgb, _, record = group[representative]
+        others = {other: mean_keys[other] for other in means if other != label} if contrast else {}
+        heat = means[label] - np.mean([means[other] for other in others], axis=0) if others else means[label]
+        metadata = dict(record, aggregation="difference_of_identity_means" if contrast else "mean",
+                        contrast=contrast, aggregation_count=len(group), representative="embedding_medoid",
+                        mean_map_key=mean_keys[label], other_identity_means=others,
+                        max_abs_effect=float(np.abs(heat).max()), sources=[item[3] for item in group],
+                        other_sources={other: [item[3] for item in members[other]] for other in others})
         combined.append((sample, rgb, heat, metadata))
     return _render_attention(combined, options, color_scale=color_scale, contrast=contrast,
-                             reference_maps={f"reference_{i}": item[2] for i, item in enumerate(observations)})
+                             reference_maps=maps)

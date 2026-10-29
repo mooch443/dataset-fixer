@@ -97,7 +97,9 @@ def test_attention_overlay_strength_uses_shared_scale():
     assert np.abs(strong.panels[0].image.astype(float) - rgb*255).max() > 50
 
 
-def test_reference_attention_averages_raw_maps_and_excludes_self_matches(attention_case, tmp_path, monkeypatch):
+@pytest.mark.parametrize("contrast", [False, True])
+@pytest.mark.parametrize("count", [1, 4])
+def test_reference_attention_averages_raw_maps_and_excludes_self_matches(attention_case, tmp_path, monkeypatch, contrast, count):
     from dataset_fixer.id import model as identity_model
     from dataset_fixer.id.data import ImageRef
     model, module, _, _ = attention_case
@@ -105,27 +107,41 @@ def test_reference_attention_averages_raw_maps_and_excludes_self_matches(attenti
     monkeypatch.setattr('dataset_fixer.id.gallery.fingerprint', lambda model: 'test-model')
     labels, vectors, refs = [], [], []
     colors = [(220, 20, 0), (190, 45, 0), (150, 65, 0),
-              (20, 220, 0), (45, 190, 0), (65, 150, 0), (220, 20, 0)]
+              (20, 220, 0), (45, 190, 0), (65, 150, 0), (220, 20, 0),
+              (170, 140, 0), (140, 170, 0)]
     for i, color in enumerate(colors):
         path = tmp_path / f'ref-{i}.png'
         pixels = np.full((16, 16, 3), 40, dtype=np.uint8)
         pixels[2:14, 3 + i % 3:11 + i % 3] = color
         Image.fromarray(pixels).save(path)
-        labels.append('wolf-a' if i < 3 or i == 6 else 'wolf-b')
+        labels.append('wolf-a' if i < 3 or i == 6 else 'wolf-b' if i < 6 else 'wolf-c')
         vector = pixels[:, :, :2].mean(axis=(0, 1)).astype(np.float32)
         vectors.append(vector / np.linalg.norm(vector))
         refs.append(dict(source_ref=ImageRef(str(path)).key, clip_id=f'clip-{i % 2}'))
     gallery = id.Gallery(np.asarray(vectors), tuple(labels), tuple(refs), 'test-model')
+    fingerprint = gallery.fingerprint
+    scores = gallery.scores(np.eye(2, dtype=np.float32))
     path = tmp_path / 'reference-attention.png'
-    gallery.visualize_attention(model, samples_per_identity=4, patch_fraction=.5,
+    gallery.visualize_attention(model, samples_per_identity=count, contrast=contrast, patch_fraction=.5,
                                 color_scale='per_image', destination=path, show=False)
     records = json.loads(path.with_suffix('.json').read_text())
-    assert [r['identity_id'] for r in records] == ['wolf-a', 'wolf-b']
+    assert [r['identity_id'] for r in records] == ['wolf-a', 'wolf-b', 'wolf-c']
     with np.load(path.with_suffix('.npz')) as maps:
+        means = {r['identity_id']: np.mean([maps[s['map_key']] for s in r['sources']], axis=0)
+                 for r in records}
         for i, record in enumerate(records):
-            expected = np.mean([maps[s['map_key']] for s in record['sources']], axis=0)
+            expected = means[record['identity_id']].copy()
+            np.testing.assert_allclose(maps[record['mean_map_key']], expected)
+            if contrast:
+                expected -= np.mean([value for label, value in means.items() if label != record['identity_id']], axis=0)
+                assert len(record['other_identity_means']) == 2
+                if count == 4:
+                    pooled = np.mean([maps[s['map_key']] for other in records
+                        if other['identity_id'] != record['identity_id'] for s in other['sources']], axis=0)
+                    assert not np.allclose(expected, means[record['identity_id']] - pooled)
             assert np.abs(expected).max() > .001
             np.testing.assert_allclose(maps[f'attribution_{i}'], expected)
+            assert record['aggregation_count'] == min(count, gallery.labels.count(record['identity_id']))
             assert record['color_bound'] == pytest.approx(np.abs(expected).max())
             assert record['representative'] == 'embedding_medoid'
             assert record['source_ref'] in [s['source_ref'] for s in record['sources']]
@@ -133,7 +149,8 @@ def test_reference_attention_averages_raw_maps_and_excludes_self_matches(attenti
                 assert source['reference_row'] in source['excluded_reference_rows']
                 if source['reference_row'] in (0, 6):
                     assert set(source['excluded_reference_rows']) == {0, 6}
-    assert module.training
+    assert module.training and gallery.fingerprint == fingerprint
+    np.testing.assert_array_equal(gallery.scores(np.eye(2, dtype=np.float32)), scores)
     singleton = id.Gallery(np.asarray(vectors)[[0, 3]], ('wolf-a', 'wolf-b'), (refs[0], refs[3]), 'test-model')
     with pytest.raises(ValueError, match='at least two distinct'):
         singleton.visualize_attention(model, show=False)

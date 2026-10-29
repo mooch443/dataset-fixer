@@ -330,6 +330,12 @@ def test_identity_wandb_lifecycle(identity_data, tmp_path, monkeypatch, run):
         assert len(run.artifacts) == 3  # first best plus two improvements, no plateau upload
         result.evaluate(split='test',plots=0)
     assert any('training/augmentations' in entry for entry in logged)
+    for name in ('reference_attention', 'reference_contrast'):
+        assert sum(f'inspection/{name}' in entry for entry in logged) == 1
+        records = json.loads(result.auxiliary_files[f'inspection/{name}.json'].read_text())
+        assert all(r['aggregation_count'] == 4 for r in records)
+        assert all(r['contrast'] == (name == 'reference_contrast') for r in records)
+        assert all(r['model_fingerprint'] == result._enrollment().model_fingerprint for r in records)
     batches = [entry for entry in logged if 'progress/batch' in entry]
     assert [entry['progress/epoch'] for entry in batches] == [0, 0, 1, 1, 2, 2, 3, 3]
     assert [entry['progress/batch'] for entry in batches] == [1, 3]*4
@@ -353,6 +359,8 @@ def test_identity_wandb_lifecycle(identity_data, tmp_path, monkeypatch, run):
         assert 'evaluation/test/metrics.json' in archive.namelist()
         assert 'monitoring/embeddings.png' in archive.namelist()
         assert 'monitoring/cohort.json' in archive.namelist()
+        for name in ('reference_attention', 'reference_contrast'):
+            assert all(f'inspection/{name}.{suffix}' in archive.namelist() for suffix in ('png', 'npz', 'json'))
         checkpoint = next(name for name in archive.namelist() if name.startswith('weights/') and name.endswith('.ckpt'))
         assert 'optimizer_states' not in torch.load(io.BytesIO(archive.read(checkpoint)),weights_only=False)
     monkeypatch.setattr('dataset_fixer.model_sources._download_wandb', lambda *a, **k: (result.wandb_bundle.path,run))

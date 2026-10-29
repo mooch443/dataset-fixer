@@ -459,7 +459,7 @@ def train_identity(result, prepared, augmentations):
     config, selection = result.config, result.selection
     seed_everything(config.seed, workers=True)
     allowed = {"embedding_dim", "loss", "sub_centers", "freeze_backbone", "lr", "weight_decay", "pretrained", "preprocessing", "trainer",
-               "embedding_samples", "embedding_method", "validation_samples", "validation_sampling"}
+               "embedding_samples", "embedding_method", "validation_samples", "validation_sampling", "reference_attention"}
     unknown = set(config.backend_options)-allowed
     if unknown:
         raise ValueError(f"Unsupported ID backend options: {sorted(unknown)}; Lightning options belong under trainer")

@@ -90,10 +90,17 @@ class Gallery:
         return SampleIndex(frame)
 
     def visualize_attention(self, model, *, samples_per_identity=20, **kwargs):
-        """Average reference evidence per identity over a real embedding medoid.
+        """Mean own-identity evidence, or its difference from other identity means.
 
         Uses at most samples_per_identity clip-balanced references per identity.
+        This only limits maps being averaged; it does not change the gallery,
+        reference selection for prediction, or the references used for scoring.
         Each reference is scored without itself or identical gallery pixels.
+        contrast=False shows each identity's mean own-similarity attribution.
+        contrast=True (default) subtracts the equally weighted mean of the other
+        identities' own-similarity attribution maps, computed on their images.
+        These are separate calls/plots. Query id.visualize_attention instead
+        contrasts scores on the same input image.
         Other options match id.visualize_attention (except identity_id); samples
         limits identities here, defaulting to all enrolled identities. Orientation
         and crop alignment must be comparable for spatial averaging to be useful.

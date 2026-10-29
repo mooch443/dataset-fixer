@@ -96,6 +96,9 @@ def _train(dataset, selection, config, augmentations, checkpointing, wandb, call
         _clear_accelerator_memory(config.device)
         if result.best_weights is None:
             raise RuntimeError("Trainer produced no best checkpoint; available recovery weights will still be published")
+        if selection.family == ModelTypes.ID:
+            from ..id.monitoring import publish_reference_attention
+            publish_reference_attention(result)
         return result
     except BaseException as error:
         result._record_error(error)

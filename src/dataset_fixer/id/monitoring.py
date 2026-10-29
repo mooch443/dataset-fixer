@@ -148,6 +148,32 @@ def coverage_epoch(result, data, epoch):
     return metrics
 
 
+def publish_reference_attention(result):
+    """Inspect selected best weights once, before the session publishes its final bundle."""
+    settings = result.config.backend_options.get("reference_attention", {})
+    if settings is False:
+        return
+    try:
+        options = dict(samples_per_identity=4, color_scale="per_image")
+        options.update(settings)
+        print("Preparing reference identity evidence from the best checkpoint", flush=True)
+        gallery = result._enrollment()
+        for contrast, name in ((False, "reference_attention"), (True, "reference_contrast")):
+            path = result.output_dir / "inspection" / f"{name}.png"
+            gallery.visualize_attention(result.model, contrast=contrast, device=result.config.device,
+                destination=path, show=True, **options)
+            for file in (path, path.with_suffix(".npz"), path.with_suffix(".json")):
+                result.auxiliary_files[f"inspection/{file.name}"] = file
+            with _optional_logging(result.wandb_run) as run:
+                if run is not None:
+                    import wandb
+                    run.log({"epoch": result.checkpoints.epoch,
+                             f"inspection/{name}": wandb.Image(str(path))})
+    except Exception as error:
+        import warnings
+        warnings.warn(f"Reference attention unavailable; model checkpoints are retained: {error}")
+
+
 def monitor_epoch(result, module, epoch):
     """Best-effort diagnostics; resource failures shrink the next epoch's cohort."""
     index = result._embedding_cohort
