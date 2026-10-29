@@ -185,7 +185,7 @@ profiler = PyTorchProfiler(
     dirpath='/tmp/id-profile', filename='input', record_module_names=False,
     schedule=torch.profiler.schedule(wait=1, warmup=1, active=4, repeat=1),
     record_shapes=False, profile_memory=False, with_stack=False,
-    acc_events=True, row_limit=40,
+    acc_events=True, row_limit=40, sort_by_key='cpu_time_total',
 )
 # Merge into config.backend_options['trainer'] for a disposable, one-epoch run:
 trainer_options = {
