@@ -508,4 +508,8 @@ def train_identity(result, prepared, augmentations):
         warnings.filterwarnings("ignore", category=FutureWarning,
             message=r"`isinstance\(treespec, LeafSpec\)` is deprecated,.*",
             module=r"lightning\.pytorch\.utilities\._pytree$")
+        # Epoch reloads above deliberately recreate workers before prefetch.
+        warnings.filterwarnings("ignore", category=UserWarning,
+            message=r"Consider setting `persistent_workers=True` in '(train|val)_dataloader' to speed up the dataloader worker initialization\.",
+            module=r"lightning\.pytorch\.trainer\.connectors\.data_connector$")
         trainer.fit(module, datamodule=data, ckpt_path=str(selection.resume) if selection.resume else None)
