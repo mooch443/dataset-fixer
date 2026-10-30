@@ -20,7 +20,23 @@ import pandas as pd
 from PIL import Image
 
 from ..models import Annotation, DatasetMetadata, Sample, Task
-from ..utils import normalize_split, settings_fingerprint, qualified_tracklet_id
+from ..utils import IMAGE_SUFFIXES, normalize_split, settings_fingerprint, qualified_tracklet_id
+
+
+IDENTITY_IMAGE_SUFFIXES = IMAGE_SUFFIXES | {".jxl"}
+
+
+def _require_jxl():
+    try:
+        import pillow_jxl  # noqa: F401; registers Pillow's JPEG XL encoder/decoder
+    except ImportError as error:
+        raise ImportError("JPEG XL images require pip install pillow-jxl-plugin; reinstall dataset-fixer to restore dependencies") from error
+
+
+def _open_image(path):
+    if Path(path).suffix.lower() == ".jxl":
+        _require_jxl()
+    return Image.open(path)
 
 
 @dataclass(frozen=True)
@@ -36,10 +52,12 @@ class ImageRef:
         values = (self.path, self.array, self.row, self.crop)
         return json.dumps((*values, True) if self.trim_black_borders else values, separators=(",", ":"))
 
-    def read(self):
+    def read(self, *, preserve_alpha=False):
+        """Decode RGB training pixels, optionally retaining file alpha for export."""
         if self.array is None:
-            with Image.open(self.path) as image:
-                pixels = np.array(image.convert("RGB"))
+            with _open_image(self.path) as image:
+                alpha = preserve_alpha and ("A" in image.getbands() or "transparency" in image.info)
+                pixels = np.array(image.convert("RGBA" if alpha else "RGB"))
         else:
             pixels = np.array(_reader(self.path)[self.array][self.row], copy=True)
             if pixels.ndim == 2:
@@ -52,7 +70,7 @@ class ImageRef:
             x0, y0, x1, y1 = self.crop
             pixels = pixels[y0:y1, x0:x1]
         if self.trim_black_borders:
-            foreground = np.any(pixels != 0, axis=2)
+            foreground = np.any(pixels[..., :3] != 0, axis=2)
             rows = np.flatnonzero(foreground.any(axis=1))
             columns = np.flatnonzero(foreground.any(axis=0))
             if len(rows) and len(columns):
@@ -241,7 +259,7 @@ def open_dataset(location, *, format, layout=None, identities=None, name=None, t
         pattern = re.compile("".join(parts))
         records = []
         for file in sorted(path.rglob("*")):
-            if file.is_file() and file.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}:
+            if file.is_file() and file.suffix.lower() in IDENTITY_IMAGE_SUFFIXES:
                 match = pattern.fullmatch(file.relative_to(path).as_posix())
                 if match is None:
                     raise ValueError(f"Image does not match layout: {file}")
@@ -301,7 +319,7 @@ def _file_record(record, root):
             raise ValueError(f"Invalid image array/row: {path}, {row}")
         record.update(row=row, width=array.shape[2], height=array.shape[1])
     else:
-        with Image.open(path) as image:
+        with _open_image(path) as image:
             record.update(width=image.width, height=image.height)
     if record.get("crop") is not None:
         crop = json.loads(record["crop"]) if isinstance(record["crop"], str) else record["crop"]
@@ -590,11 +608,12 @@ def balanced_rows(index, n, seed=7):
 
 
 
-def export_manifest(dataset, destination, *, copy_images=False):
+def export_manifest(dataset, destination, *, copy_images=False, image_format=None):
     """Persist references, or publish a portable directory of decoded crops.
 
     Portable exports resolve file/NPZ/crop references through ImageRef, clear
-    their source selectors, and use relative PNG paths. Metadata stays intact.
+    their source selectors, and use relative lossless image paths. File alpha
+    and identity metadata stay intact; JPEG XL is the default, PNG is optional.
     """
     import os
     import tempfile
@@ -603,6 +622,10 @@ def export_manifest(dataset, destination, *, copy_images=False):
 
     destination = Path(destination).expanduser().resolve()
     index = index_of(dataset)
+    image_format = image_format or "jxl"
+    if copy_images and image_format == "jxl":
+        _require_jxl()
+    save_options = {"lossless": True} if image_format == "jxl" else {}
 
     def write(path, *, portable):
         with path.open("x") as handle:
@@ -611,11 +634,11 @@ def export_manifest(dataset, destination, *, copy_images=False):
                 record = {k: (None if v is None or (np.isscalar(v) and pd.isna(v)) else v) for k, v in record.items()}
                 if portable:
                     sample = index[number]
-                    relative = Path("images") / f"{number:08d}.png"
+                    relative = Path("images") / f"{number:08d}.{image_format}"
                     target = path.parent / relative
                     target.parent.mkdir(exist_ok=True)
-                    pixels = sample.image_ref.read()
-                    Image.fromarray(pixels).save(target)
+                    pixels = sample.image_ref.read(preserve_alpha=True)
+                    Image.fromarray(pixels).save(target, **save_options)
                     record.update(path=relative.as_posix(), array=None, row=None, crop=None, trim_black_borders=False,
                                   width=pixels.shape[1], height=pixels.shape[0],
                                   original_id=sample.provenance["original_id"])
@@ -637,7 +660,8 @@ def export_manifest(dataset, destination, *, copy_images=False):
         manifest = staging / "samples.jsonl"
         write(manifest, portable=copy_images)
         write_json(dataset_info_path(staging), {**dataset.manifest, "name": dataset.name,
-                   "format": "identity_manifest", "task": "id", "copy_images": copy_images})
+                   "format": "identity_manifest", "task": "id", "copy_images": copy_images,
+                   "image_format": image_format if copy_images else None})
         open_dataset(manifest, format="identity_manifest", name=dataset.name)
     return open_dataset(destination / "samples.jsonl", format="identity_manifest", name=dataset.name)
 

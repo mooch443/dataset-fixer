@@ -1919,6 +1919,7 @@ class Dataset:
         name: str | None = None,
         format: Literal["yolo", "semantic_masks", "identity_manifest"] = "yolo",
         copy_images: bool = False,
+        image_format: Literal["png", "jxl"] | None = None,
         splits: Iterable[Literal["train", "val", "test"]] | None = None,
         allow_lossy: bool | Literal["bridge-holes"] = False,
         visualize: bool = True,
@@ -1945,6 +1946,9 @@ class Dataset:
                 every available split. Unselected splits are omitted.
             copy_images: For identity manifests, materialize referenced pixels
                 into a portable repository with relative image paths.
+            image_format: Lossless image format for identity ``copy_images=True``
+                exports: ``"jxl"`` (JPEG XL, default) or ``"png"``.
+                Preserves source transparency.
             allow_lossy: ``True`` permits explicit lossy conversion of COCO
                 RLE/multipart masks and fills polygon holes.
                 ``"bridge-holes"`` instead opens each polygon hole to the
@@ -1963,6 +1967,11 @@ class Dataset:
             virtual dataset.
         """
 
+        if image_format is not None:
+            if self.task != Task.ID or not copy_images:
+                raise ValueError("image_format requires identity_manifest export with copy_images=True")
+            if image_format not in {"png", "jxl"}:
+                raise ValueError("image_format must be 'png' or 'jxl'")
         if self.task == Task.ID:
             from .id.data import export_manifest, index_of, as_dataset
             if format != "identity_manifest":
@@ -1972,7 +1981,7 @@ class Dataset:
             if dry_run:
                 return self
             selected = as_dataset(index_of(self).where(split=list(splits)), parent=self) if splits else self
-            return export_manifest(selected, destination, copy_images=copy_images)
+            return export_manifest(selected, destination, copy_images=copy_images, image_format=image_format)
         if copy_images:
             raise ValueError("copy_images applies only to identity_manifest export")
         self._require_vector_annotations("Dataset.export")

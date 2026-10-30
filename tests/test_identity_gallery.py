@@ -259,7 +259,7 @@ def test_training_result_uses_protocol_and_bundles_local_report(identity_data, e
     assert TrainingResult._enrollment(result) is gallery
     assert len(calls) == 1
     assert set(result.auxiliary_files) == {'identity/gallery.npz', 'identity/enrollment.csv', 'identity/gallery.references'}
-    assert len(list(result.auxiliary_files['identity/gallery.references'].glob('images/*.png'))) == 4
+    assert len(list(result.auxiliary_files['identity/gallery.references'].glob('images/*.jxl'))) == 4
 
 
 def test_monitor_uses_opt_in_selector_without_new_metrics(identity_data, tmp_path, monkeypatch):

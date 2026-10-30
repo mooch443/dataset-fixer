@@ -106,6 +106,30 @@ cumulative source-coverage tracking.
 
 CSV/JSONL rows require `identity_id` (null is allowed) and either `image_path`/`path`, or `archive`, `array`, `row`. Optional fields include `split`, `clip_id`, `tracklet_id`, `local_id`, `frame_index`, `notes`, and `original_id`. Paths are relative to the manifest. Unsplit rows belong to `train`. A JSONL `crop: [left, top, right, bottom]` is an optional deterministic pixel crop. Use `data.export(destination=..., format='identity_manifest')` to save a view without copying pixels.
 
+For a portable export, `copy_images=True` materializes crops and NPZ rows into
+lossless JPEG XL (`.jxl`) files by default. The codec is included in the standard
+installation; update dataset-fixer in environments that read these files.
+The size saving compared with PNG depends on the images:
+
+```python
+portable = data.export(
+    destination='/data/portable-identities', format='identity_manifest',
+    copy_images=True,  # JPEG XL; use image_format='png' for PNG instead.
+)
+```
+
+Both formats preserve source-file transparency and the RGB values underneath it.
+Training and inference still read RGB. Existing crop and black-border trimming
+settings are applied before encoding. The output contains relative paths and
+retains identity, split, clip, and tracklet metadata, so the entire directory can
+be moved and reopened with `Dataset.open(..., format='identity_manifest')`.
+JPEG XL is also accepted by identity-folder loading and prediction-directory
+discovery. Reference-only manifests do not re-encode images and cannot take
+`image_format`.
+Existing PNG-based exports remain readable without migration, including older
+manifests without `image_format` metadata. Only new portable exports change their
+default encoding; use `image_format='png'` when exporting for older readers.
+
 `tracklet_id` always identifies the same source tracklet across dataset views.
 Import qualifies native tracklet IDs with their clip ID, so repeated native
 numbers in different clips cannot collide. Filtering, splitting, cropping,

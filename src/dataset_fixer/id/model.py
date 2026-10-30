@@ -10,7 +10,7 @@ import time
 
 import numpy as np
 
-from .data import ImageRef, SampleIndex, index_of, _file_record
+from .data import IDENTITY_IMAGE_SUFFIXES, ImageRef, SampleIndex, index_of, _file_record
 
 # Factories reconstruct architectures; checkpoints contain tensors, not pickled models.
 _BACKBONES = {}
@@ -235,7 +235,7 @@ def input_index(source, split=None):
                 identity_id=provenance.get("identity_id"), clip_id=provenance.get("clip_id")), Path.cwd()))
         return SampleIndex(records)
     if len(paths) == 1 and Path(paths[0]).is_dir():
-        paths = sorted(p for p in Path(paths[0]).rglob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"})
+        paths = sorted(p for p in Path(paths[0]).rglob("*") if p.is_file() and p.suffix.lower() in IDENTITY_IMAGE_SUFFIXES)
     return SampleIndex([_file_record({"path": str(Path(p).resolve())}, Path.cwd()) for p in paths])
 
 
