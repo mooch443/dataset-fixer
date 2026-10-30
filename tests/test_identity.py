@@ -328,6 +328,18 @@ def test_identity_wandb_lifecycle(identity_data, tmp_path, monkeypatch, run):
                 backend_options=dict(pretrained=False,embedding_dim=8,trainer=dict(enable_progress_bar=False,enable_model_summary=False,num_sanity_val_steps=0))))
         assert result.checkpoint_config.wandb_upload == 'best'
         assert len(run.artifacts) == 3  # first best plus two improvements, no plateau upload
+        fingerprints = []
+        for number, artifact in enumerate(run.artifacts):
+            path = tmp_path / f'published-{number}.zip'
+            path.write_bytes(next(iter(artifact.files.values())))
+            published = df.Model(path)
+            gallery = published.gallery
+            gallery.validate(published)
+            fingerprints.append(gallery.model_fingerprint)
+            features = published.embed(gallery._index(), prediction_cache=False, progress=False)
+            np.testing.assert_allclose([r.embedding for r in features], gallery.embeddings, atol=1e-6)
+        assert len(set(fingerprints)) == 3
+        assert len(list((result.output_dir / 'enrollment').iterdir())) == 1
         result.evaluate(split='test',plots=0)
     assert any('training/augmentations' in entry for entry in logged)
     for name in ('reference_attention', 'reference_contrast'):
@@ -366,6 +378,7 @@ def test_identity_wandb_lifecycle(identity_data, tmp_path, monkeypatch, run):
     monkeypatch.setattr('dataset_fixer.model_sources._download_wandb', lambda *a, **k: (result.wandb_bundle.path,run))
     remote = df.Model('wandb:team/project/runs/test')
     assert remote.kind == 'id'
+    assert remote.gallery.fingerprint == result._enrollment().fingerprint
     result._enrollment().validate(remote)
     np.testing.assert_allclose(remote.embed(identity_data.sample(3),prediction_cache=False)[0].embedding,
                                result.model.embed(identity_data.sample(3),prediction_cache=False)[0].embedding)

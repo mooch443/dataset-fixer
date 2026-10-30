@@ -348,6 +348,36 @@ Model details appear once above the grid; `show_model_slugs=False` hides them.
 
 Gallery and calibration fingerprints bind to the exact model. A changed model or gallery requires recalibration. `Gallery.load(...)` and `RejectionCalibration.load(...)` restore saved artifacts. Embeddings use the existing verified prediction cache; gallery/rejection changes reuse the encoder output.
 
+Identity training bundles automatically include the selected gallery, even when
+evaluation and reference-attention plots are disabled. Every published best
+checkpoint includes embeddings computed with those exact weights, the selected
+reference pixels, and their identity/clip/tracklet metadata. Selection follows
+the Protocol's `gallery_samples` (20 per identity by default) and selection mode;
+only the selected crops are copied, not the full training or candidate pool.
+
+```python
+model = df.Model("wandb:team/project/runs/run-id")  # Or a local model.zip.
+gallery = model.gallery
+predictions = model.predict(query_crops, gallery=gallery)
+gallery.visualize(samples=12, columns=4)
+
+# Available when result.calibrate(...) ran before final publication.
+if model.rejection is not None:
+    opened = model.predict(query_crops, gallery=gallery,
+                           mode="open", rejection=model.rejection)
+```
+
+Loading uses saved embeddings and bundled images, without re-enrollment or access
+to the original dataset. Moving the bundle preserves its gallery fingerprint and
+compatible calibration. Stale calibration is omitted when the selected model or
+gallery changes. Raw weights and older bundles without enrollment return
+`model.gallery is None`; bundles without calibration return `model.rejection is None`.
+
+For a standalone portable gallery, use `gallery.save("gallery.npz", copy_images=True)`
+and move both `gallery.npz` and the new `gallery.references/` directory together.
+`id.Gallery.load("gallery.npz")` restores it. The default `copy_images=False`
+retains the lightweight reference-only export.
+
 Reference selection defaults to the existing seeded, clip/tracklet-balanced random
 selection. Opt into representative images with `kmedoids` (included in the `id`
 extra); this changes enrollment, not model training:
@@ -388,10 +418,11 @@ reports the deficit. Balanced selection keeps its previous selection and
 post-selection deduplication behavior for comparability.
 
 The gallery NPZ stores the seed, settings, candidate source references, selected
-tracklet metadata, and per-identity counts. Training-result evaluation also puts
-`identity/enrollment.csv` into the bundle. `gallery.visualize()` delegates to the
-existing dataset renderer and requires the original reference images to remain
-accessible. These reports add **no W&B metrics or automatic gallery plots**.
+tracklet metadata, and per-identity counts. Training bundles also include
+`identity/enrollment.csv` and the selected images in `identity/gallery.references/`.
+`gallery.visualize()` delegates to the existing dataset renderer; portable
+galleries use their copied images, while reference-only galleries need the
+original source images. Enrollment reports add no separate W&B metrics.
 
 The epoch embedding monitor keeps its existing cohort, scoring, and W&B keys by
 default. With medoids enabled it applies the same selector to the training half

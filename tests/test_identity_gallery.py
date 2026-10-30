@@ -25,7 +25,8 @@ def encoder(monkeypatch):
             result.append(SimpleNamespace(embedding=vector, metadata=dict(
                 source_ref=sample.image_ref.key, pixel_sha256=hashlib.sha256(pixels.tobytes()).hexdigest(),
                 reference_identity=sample.identity_id, original_id=sample.provenance['original_id'],
-                clip_id=sample.clip_id, tracklet_id=sample.provenance['tracklet_id'])))
+                clip_id=sample.clip_id, tracklet_id=sample.provenance['tracklet_id'],
+                frame_index=sample.frame_index, local_id=sample.local_id)))
         return result
     monkeypatch.setattr(implementation, 'embed', embed)
     monkeypatch.setattr(implementation, 'fingerprint', lambda model: 'encoder')
@@ -78,6 +79,98 @@ def test_medoid_enrollment_deduplicates_candidates_and_persists_report(identity_
     # An exhausted candidate pool is reported, rather than filled with duplicates.
     short = model.enroll(protocol, samples_per_identity=5)
     assert short.summary.shortfall.tolist() == [1, 1]
+
+
+def test_portable_gallery_preserves_lazy_pixels_and_provenance(encoder, tmp_path):
+    import shutil
+    from PIL import Image
+    model, _ = encoder
+    source = tmp_path / 'source'
+    source.mkdir()
+    records = []
+    for row in range(4):
+        pixels = np.random.default_rng(row).integers(1, 255, (18, 22, 3), dtype=np.uint8)
+        pixels[:2] = 0
+        path = source / f'{row}.png'
+        record = dict(path=str(path), width=22, height=18, identity_id=f'wolf-{row // 2}',
+                      clip_id='clip', tracklet_id=str(row), frame_index=row, local_id='local',
+                      trim_black_borders=True, crop=(1, 1, 20, 16))
+        if row % 2:
+            path = path.with_suffix('.npz')
+            np.savez(path, images=pixels[None])
+            record.update(path=str(path), array='images', row=0)
+        else:
+            Image.fromarray(pixels).save(path)
+        records.append(record)
+    gallery = model.enroll(as_dataset(SampleIndex(records), location=source), samples_per_identity=2)
+    original = gallery._index()
+    expected = [s.image_ref.read() for s in original]
+    gallery.save(tmp_path / 'saved' / 'gallery.npz', copy_images=True)
+    shutil.move(tmp_path / 'saved', tmp_path / 'moved')
+    shutil.rmtree(source)
+    restored = id.Gallery.load(tmp_path / 'moved' / 'gallery.npz')
+    assert restored.fingerprint == gallery.fingerprint
+    assert restored.references == gallery.references
+    assert restored.metadata == gallery.metadata
+    np.testing.assert_array_equal(restored.embeddings, gallery.embeddings)
+    fields = ['identity_id', 'clip_id', 'tracklet_id', 'frame_index', 'local_id', 'original_id']
+    assert restored._index().frame[fields].equals(original.frame[fields])
+    for pixels, sample in zip(expected, restored._index()):
+        np.testing.assert_array_equal(pixels, sample.image_ref.read())
+        assert sample.clip_id == 'clip'
+        assert sample.image_ref.array is None and sample.image_ref.crop is None
+    # A second portable export must read the relocated copies, not old sources.
+    copied = id.Gallery.load(restored.save(tmp_path / 'copied' / 'gallery.npz', copy_images=True))
+    assert copied.fingerprint == gallery.fingerprint
+    copied.visualize(samples=4, columns=2, destination=tmp_path / 'gallery.png', show=False)
+
+
+def test_training_bundle_gallery_survives_source_removal(identity_data, tmp_path, monkeypatch):
+    import shutil
+    from dataclasses import replace
+    from dataset_fixer import TrainingConfig
+    from dataset_fixer.id.evaluation import RejectionCalibration
+    from test_identity import tiny_model
+    id.register_backbone('portable-tiny', tiny_model, feature_dim=4,
+                         preprocessing=dict(resolution=16, mean=[0]*3, std=[1]*3))
+    result = id.train(id.Protocol(identity_data, gallery_samples=3), backbone='portable-tiny',
+        augmentations=[], config=TrainingConfig(epochs=1, batch_size=4, workers=0,
+            augmentation_samples=0, output_dir=tmp_path/'run', backend_options=dict(
+                loss='cross_entropy', pretrained=False, embedding_dim=8, embedding_samples=0,
+                reference_attention=False, trainer=dict(enable_progress_bar=False,
+                    enable_model_summary=False, num_sanity_val_steps=0))))
+    # No evaluation or attention call is required to publish the selected gallery.
+    gallery = Model(result.bundle.path).gallery
+    assert len(gallery.labels) == 6
+    assert gallery.fingerprint == result.model.gallery.fingerprint
+    assert Model(result.best_weights).gallery is None
+    assert Model(result.bundle.path).rejection is None
+    query = identity_data.sample(2, split='test')
+    before = result.model.predict(query, gallery=gallery, prediction_cache=False)
+    pixels = [s.image_ref.read() for s in gallery._index()]
+    calibration = RejectionCalibration(.5, .1, 0., gallery.model_fingerprint, gallery.fingerprint,
+                                       'fixture', 2, 2)
+    result.auxiliary_files['identity/rejection.json'] = calibration.save(tmp_path/'rejection.json')
+    assert result._publish(final=True)
+    moved = tmp_path/'portable.zip'
+    shutil.copy2(result.bundle.path, moved)
+    # A stale calibration must never ship alongside a different gallery.
+    replace(calibration, gallery_fingerprint='outdated').save(tmp_path/'rejection.json')
+    assert result._publish(final=True)
+    assert 'identity/rejection.json' not in result.bundle.files
+    for folder in ('train', 'val', 'run', 'package-cache'):
+        shutil.rmtree(tmp_path/folder)
+    monkeypatch.setattr('dataset_fixer.model_sources._download_wandb', lambda *a, **k: (moved, None))
+    restored = Model('wandb:team/project/runs/portable')
+    assert restored.gallery.fingerprint == gallery.fingerprint
+    restored.rejection.validate(restored, restored.gallery)
+    for expected, sample in zip(pixels, restored.gallery._index()):
+        np.testing.assert_array_equal(expected, sample.image_ref.read())
+    after = restored.predict(query, gallery=restored.gallery, prediction_cache=False)
+    assert [r.identity_id for r in after] == [r.identity_id for r in before]
+    np.testing.assert_allclose([r.similarity for r in after], [r.similarity for r in before])
+    restored.unload()
+    assert restored.gallery.fingerprint == gallery.fingerprint
 
 
 def test_medoid_selection_matches_library_with_clip_tracklet_quotas():
@@ -149,17 +242,24 @@ def test_shared_scores_match_numpy_and_differentiable_torch_and_legacy_save(tmp_
 
 def test_training_result_uses_protocol_and_bundles_local_report(identity_data, encoder, monkeypatch, tmp_path):
     pytest.importorskip('kmedoids')
+    import torch
     from dataset_fixer.training.session import TrainingResult
     monkeypatch.setattr('dataset_fixer.id.model.fingerprint', lambda model: 'encoder')
     model, calls = encoder
-    result = SimpleNamespace(model=model, output_dir=tmp_path, auxiliary_files={},
+    model._runtime = {}
+    module = torch.nn.Linear(3, 3)
+    monkeypatch.setattr('dataset_fixer.id.model.runtime', lambda model: module)
+    result = SimpleNamespace(model=model, output_dir=tmp_path, auxiliary_files={}, config=SimpleNamespace(seed=7),
         _identity_protocol=id.Protocol(identity_data, gallery_samples=2, gallery_selection='medoids', gallery_candidates=5))
+    state = torch.get_rng_state()
     gallery = TrainingResult._enrollment(result)
+    torch.testing.assert_close(torch.get_rng_state(), state, rtol=0, atol=0)
     assert gallery.metadata['selection'] == 'medoids'
     assert len(calls) == 1
     assert TrainingResult._enrollment(result) is gallery
     assert len(calls) == 1
-    assert set(result.auxiliary_files) == {'identity/gallery.npz', 'identity/enrollment.csv'}
+    assert set(result.auxiliary_files) == {'identity/gallery.npz', 'identity/enrollment.csv', 'identity/gallery.references'}
+    assert len(list(result.auxiliary_files['identity/gallery.references'].glob('images/*.png'))) == 4
 
 
 def test_monitor_uses_opt_in_selector_without_new_metrics(identity_data, tmp_path, monkeypatch):

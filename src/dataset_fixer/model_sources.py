@@ -344,6 +344,11 @@ def _resolve_bundle(path: Path, *, name: str | None, progress: bool) -> Resolved
         _validate_checkpoint(source_path, manifest, progress=progress)
         options.update(kind="id" if is_id else "rfdetr", task=model_metadata.get("task", manifest.get("task")),
                        model_type=model_metadata.get("model_name", "rfdetr"))
+        if is_id:
+            for key, filename in (("gallery", "gallery.npz"), ("rejection", "rejection.json")):
+                artifact = manifest_root / "identity" / filename
+                if artifact.is_file():
+                    options[f"identity_{key}"] = artifact
         if geometry.input_size and geometry.input_size[0] == geometry.input_size[1]:
             options["resolution"] = geometry.input_size[0]
     elif is_nnunet:

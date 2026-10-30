@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .data import balanced_rows, SampleIndex, ImageRef, as_dataset
+from .data import balanced_rows, SampleIndex, ImageRef, as_dataset, index_of, open_dataset
 from .model import input_index, embed, fingerprint
 from ..utils import qualified_tracklet_id
 
@@ -16,10 +16,13 @@ from ..utils import qualified_tracklet_id
 def _reference_hashes(gallery):
     """Pixel identities for leave-one-observation-out inspection of a gallery."""
     hashes = []
-    for reference in gallery.references:
+    index = None
+    for row, reference in enumerate(gallery.references):
         digest = reference.get("pixel_sha256")
         if digest is None:
-            pixels = ImageRef(*json.loads(reference["source_ref"])).read()
+            if index is None:
+                index = gallery._index()
+            pixels = index[row].image_ref.read()
             digest = hashlib.sha256(str(pixels.shape).encode() + pixels.tobytes()).hexdigest()
         hashes.append(digest)
     return hashes
@@ -45,6 +48,7 @@ class Gallery:
     references: tuple[dict, ...]
     model_fingerprint: str
     metadata: dict = field(default_factory=dict)
+    _reference_dataset: Path | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         vectors = np.array(self.embeddings, dtype=np.float32, copy=True)
@@ -100,9 +104,13 @@ class Gallery:
         return as_dataset(self._index(), location=Path.cwd()).visualize(**kwargs)
 
     def _index(self):
-        index = input_index([ImageRef(*json.loads(r["source_ref"])) for r in self.references])
+        index = (index_of(open_dataset(self._reference_dataset, format="identity_manifest"))
+                 if self._reference_dataset is not None else
+                 input_index([ImageRef(*json.loads(r["source_ref"])) for r in self.references]))
+        if len(index) != len(self.labels):
+            raise ValueError("Gallery reference images do not match its embeddings")
         frame = index.frame.assign(identity_id=list(self.labels))
-        for key in ("clip_id", "tracklet_id", "original_id"):
+        for key in ("clip_id", "tracklet_id", "original_id", "frame_index", "local_id"):
             frame[key] = [r.get(key) for r in self.references]
         return SampleIndex(frame)
 
@@ -127,16 +135,26 @@ class Gallery:
         from .inspection import _visualize_reference_attention
         return _visualize_reference_attention(model, self, samples_per_identity=samples_per_identity, **kwargs)
 
-    def save(self, path):
+    def save(self, path, *, copy_images=False):
         """Save an enrollment gallery without Python pickle objects.
 
         Parameters:
             path: Output NPZ filename.
+            copy_images: Materialize the selected crops in a new sibling
+                ``<stem>.references`` directory. Move it together with the NPZ.
+                Original provenance and gallery/calibration fingerprints stay intact.
         """
-        path = Path(path)
+        path = Path(path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         metadata = dict(labels=self.labels, references=self.references, model=self.model_fingerprint,
                         enrollment=self.metadata)
+        if copy_images:
+            from .data import export_manifest
+            destination = path.with_name(f"{path.stem}.references")
+            export_manifest(as_dataset(self._index(), location=path), destination, copy_images=True)
+            metadata["reference_dataset"] = f"{destination.name}/samples.jsonl"
+        elif self._reference_dataset is not None:
+            metadata["reference_dataset"] = str(self._reference_dataset)
         with path.open("wb") as handle:
             np.savez(handle, embeddings=self.embeddings, metadata=json.dumps(metadata))
         return path
@@ -148,10 +166,12 @@ class Gallery:
         Parameters:
             path: Saved gallery NPZ filename.
         """
+        path = Path(path).expanduser().resolve()
         with np.load(path, allow_pickle=False) as data:
             meta = json.loads(str(data["metadata"]))
+            dataset = (path.parent / meta["reference_dataset"]).resolve() if meta.get("reference_dataset") else None
             return cls(data["embeddings"], tuple(meta["labels"]), tuple(meta["references"]), meta["model"],
-                       meta.get("enrollment", {}))
+                       meta.get("enrollment", {}), dataset)
 
 
 def identity_scores(embeddings, references, labels):

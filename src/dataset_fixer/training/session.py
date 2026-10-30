@@ -147,6 +147,11 @@ class TrainingResult:
                 path = self.best_weights.parent.parent
                 options.update(folds=(self.best_weights.parent.name.removeprefix("fold_"),), checkpoint=self.best_weights.name)
             self._model = Model(path, **options)
+            gallery = getattr(self, "_identity_gallery", None)
+            if gallery is not None:
+                from ..id.model import fingerprint
+                if gallery.model_fingerprint == fingerprint(self._model):
+                    self._model._runtime["gallery"] = gallery
         return self._model
 
     def _emit(self, name, *, trainer=None, epoch=None, metrics=None, checkpoints=None, error=None):
@@ -236,17 +241,42 @@ class TrainingResult:
             raise
 
     def _enrollment(self, *, on_progress=None):
-        from ..id.model import fingerprint
-        gallery = getattr(self, "_identity_gallery", None)
-        if gallery is None or gallery.model_fingerprint != fingerprint(self.model):
-            protocol = self._identity_protocol
-            callback = (lambda stage, completed, total: on_progress("enrollment", completed, total)) if on_progress else None
-            gallery = self.model.enroll(protocol, _on_progress=callback)
-            self._identity_gallery = gallery
-            self.auxiliary_files["identity/gallery.npz"] = gallery.save(self.output_dir / "gallery.npz")
-            path = self.output_dir / "enrollment.csv"
-            gallery.summary.to_csv(path, index=False)
-            self.auxiliary_files["identity/enrollment.csv"] = path
+        from ..id.model import fingerprint, runtime
+        from ..id.gallery import Gallery
+        from ..id.evaluation import RejectionCalibration
+        from .preview import _preview_seed
+        # Enrollment may run inside a checkpoint callback. Loading the selected
+        # model must not consume the live trainer's random stream or keep a
+        # second encoder on its accelerator.
+        with _preview_seed(self.config.seed):
+            model = self.model
+            gallery = getattr(self, "_identity_gallery", None)
+            if gallery is None or gallery.model_fingerprint != fingerprint(model):
+                callback = (lambda stage, completed, total: on_progress("enrollment", completed, total)) if on_progress else None
+                previous_device = next(runtime(model).parameters()).device
+                try:
+                    gallery = model.enroll(self._identity_protocol, _on_progress=callback)
+                finally:
+                    runtime(model).to(previous_device)
+                folder = self.output_dir / "enrollment" / gallery.fingerprint
+                path = folder / "gallery.npz"
+                if not path.is_file():
+                    from ..writer import staged_directory
+                    with staged_directory(folder) as staging:
+                        gallery.save(staging / "gallery.npz", copy_images=True)
+                        gallery.summary.to_csv(staging / "enrollment.csv", index=False)
+                gallery = Gallery.load(path)
+                self.auxiliary_files.update({"identity/gallery.npz": path,
+                    "identity/gallery.references": folder / "gallery.references",
+                    "identity/enrollment.csv": folder / "enrollment.csv"})
+                self._identity_gallery = gallery
+            model._runtime["gallery"] = gallery
+        calibration = self.auxiliary_files.get("identity/rejection.json")
+        if calibration is not None:
+            saved = RejectionCalibration.load(calibration)
+            if (saved.model_fingerprint, saved.gallery_fingerprint) != (gallery.model_fingerprint, gallery.fingerprint):
+                # Keep the original file locally, but never ship a stale threshold.
+                self.auxiliary_files.pop("identity/rejection.json")
         return gallery
 
     def calibrate(self, *, target_fpir=0.01):
@@ -325,8 +355,10 @@ class TrainingResult:
         report = self.output_dir / "training.json"
         _atomic_json(report, {"model": self.selection.name, "task": self.selection.task, "metrics": self.metrics,
                               "epoch": self.checkpoints.epoch, "failed": self.error is not None})
-        self.bundle_config, outcome = self._bundle_inputs()
         try:
+            if self.selection.family == ModelTypes.ID and self.best_weights is not None:
+                self._enrollment()
+            self.bundle_config, outcome = self._bundle_inputs()
             self.bundle = create(self.bundle_config, outcome, destination=self.output_dir / "bundles", progress=False)
         except Exception as exc:
             warnings.warn(f"Could not bundle checkpoints; local snapshots remain at {self.output_dir}: {exc}")
@@ -398,6 +430,11 @@ class TrainingResult:
             for bundle_path in (self.output_dir / "bundles").glob("*.zip"):
                 if bundle_path not in bundles:
                     bundle_path.unlink()
+            gallery_path = self.auxiliary_files.get("identity/gallery.npz")
+            if gallery_path is not None:
+                for folder in (self.output_dir / "enrollment").iterdir():
+                    if folder != gallery_path.parent:
+                        shutil.rmtree(folder)
         return safe
 
 

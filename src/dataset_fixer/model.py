@@ -1513,6 +1513,42 @@ class Model:
         )
         self._slug = slugify(self._name)
 
+    @property
+    def gallery(self):
+        """The bundle's enrollment gallery, or None for weights without one.
+
+        Reference pixels in new training bundles travel with their embeddings;
+        loading does not re-enroll or require the original training dataset.
+        """
+        if self.kind != "id":
+            return None
+        from .id.gallery import Gallery
+        def load():
+            path = self._resolved_source.options.get("identity_gallery")
+            if path is None:
+                return None
+            gallery = Gallery.load(path)
+            gallery.validate(self)
+            return gallery
+        return self._runtime_model("gallery", load)
+
+    @property
+    def rejection(self):
+        """Bundled open-set calibration, validated against model.gallery, or None."""
+        if self.kind != "id":
+            return None
+        from .id.evaluation import RejectionCalibration
+        def load():
+            path = self._resolved_source.options.get("identity_rejection")
+            if path is None:
+                return None
+            if self.gallery is None:
+                raise ValueError("Bundled rejection calibration requires an enrollment gallery")
+            calibration = RejectionCalibration.load(path)
+            calibration.validate(self, self.gallery)
+            return calibration
+        return self._runtime_model("identity_rejection", load)
+
     def enroll(self, source, *, samples_per_identity=None, **kwargs):
         """Enroll reference images without changing model weights.
 
