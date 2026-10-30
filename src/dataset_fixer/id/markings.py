@@ -106,23 +106,6 @@ def _proposals(images, identity_id, patches):
     return selected
 
 
-def _lookalike(proposal, images, identity_id):
-    """Nearest other-identity descriptor, explicitly not an accepted match."""
-    import cv2
-    anchor = images[proposal["anchor"]]
-    descriptor = anchor["descriptors"][proposal["key"]:proposal["key"] + 1]
-    candidates = []
-    for i, image in enumerate(images):
-        if image["sample"].identity_id == identity_id:
-            continue
-        match = cv2.BFMatcher(cv2.NORM_L2).match(descriptor, image["descriptors"])[0]
-        scale = image["points"][match.trainIdx].size / anchor["points"][proposal["key"]].size
-        if .5 <= scale <= 2:
-            box = _box(image["points"][match.trainIdx].pt, anchor["patch_size"] * scale, image["rgb"].shape)
-            candidates.append((i, box, float(match.distance), None, "other_identity"))
-    return min(candidates, key=lambda item: item[2]) if candidates else None
-
-
 def _control_box(box, rgb):
     x0, y0, x1, y1 = box
     size = x1 - x0
@@ -197,24 +180,26 @@ def explain_markings(model, source=None, *, gallery, identity_id, samples_per_id
     """Show cross-clip patch matches and their Captum-measured effects.
 
     source defaults to the gallery's references; otherwise pass a labeled ID
-    Dataset with clip metadata. Inspect at most samples_per_identity images per
-    enrolled identity, balanced across clips/tracklets. patches bounds reported
+    Dataset with clip metadata. Inspect at most samples_per_identity images of
+    the requested identity, balanced across clips/tracklets. patches bounds reported
     candidates; patch_fraction sets their width at the model's input resolution.
-    Each identity gets one figure, grouped by marking, showing all matched clips.
+    One figure contains at most patches rows, one per marking, and up to columns
+    matched examples of the requested identity per row, one image per cell.
     context_fraction adds display context on each side of the outlined patch
-    (default 1 gives three times its width); columns counts image pairs per row.
+    (default 1 gives three times its width). Fewer examples are shown when fewer
+    independent matches are available; all measurements remain in the table.
     These display settings never change the measured ablation regions.
 
     Returns a DataFrame with one measurement per patch/image. Its attrs contain
     settings, limitations and equally weighted per-clip summaries. Positive
     effect means blurring the patch reduces the focal-vs-strongest-rival margin.
-    This same focal objective is used on the other wolves' images too.
     destination saves the grid plus CSV/JSON and original/altered input NPZs.
     No training, enrollment changes, or W&B metrics are performed.
     """
     import pandas as pd
     from .model import input_index, runtime
-    from .gallery import _candidate_rows, _reference_hashes
+    from .data import balanced_rows
+    from .gallery import _reference_hashes
     from .inspection import _render_markings
     from ..visualization import visualization_options
     options = visualization_options(context_fraction=context_fraction, columns=columns,
@@ -229,26 +214,27 @@ def explain_markings(model, source=None, *, gallery, identity_id, samples_per_id
     if identity_id not in gallery.identities or len(gallery.identities) < 2:
         raise ValueError("Choose an enrolled identity from a gallery with at least two individuals")
     index = gallery._index() if source is None else input_index(source)
-    eligible = index.frame.identity_id.isin(gallery.identities) & index.frame.clip_id.notna()
+    index = index.where(identity_id=identity_id)
+    eligible = index.frame.clip_id.notna()
     omitted = int((~eligible).sum())
     index = index.take(np.flatnonzero(eligible))
-    if index.where(identity_id=identity_id).frame.clip_id.nunique() < 2:
+    if index.frame.clip_id.nunique() < 2:
         raise ValueError("Cross-clip marking evidence requires focal images from at least two clips")
     module = runtime(model)
     preprocessing = module.identity["preprocessing"]
-    images = _load_candidates(index, _candidate_rows(index, samples_per_identity, 7), preprocessing, patch_fraction)
+    images = _load_candidates(index, balanced_rows(index, samples_per_identity, 7), preprocessing, patch_fraction)
     proposals = _proposals(images, identity_id, patches)
     metadata = dict(identity_id=identity_id, samples_per_identity=samples_per_identity, patches=patches,
         patch_fraction=patch_fraction, model_fingerprint=gallery.model_fingerprint,
         gallery_fingerprint=gallery.fingerprint, preprocessing=preprocessing, seed=7,
-        omitted_unlabeled_or_missing_clip=omitted,
+        omitted_missing_clip=omitted,
         images_with_descriptors=len(images), candidates_measured=len(proposals),
         objective="cosine(focal) - max(cosine(other enrolled identities))",
         effect="margin(original) - margin(patch blurred)", baseline="within-patch Gaussian blur; sigma=width/4, min 1",
         matcher="OpenCV SIFT; mutual nearest neighbor and ratio < 0.75",
         display=dict(context_fraction=context_fraction, columns=columns),
         coordinates="xyxy exclusive, model input; source_box refers to decoded ImageRef crop",
-        limitations=["Candidate texture correspondence, not verified anatomical alignment or fur segmentation.",
+        limitations=["Candidate texture correspondence, not verified anatomical alignment or body segmentation.",
                      "Discovery and effect ranking use these same images; this is not held-out confirmation or statistical significance.",
                      "Nearby controls may cover different anatomy or background; blurring can also change coarse structure.",
                      "Scoring excludes self and exact pixel duplicates, but can include other images from the same clip."])
@@ -265,14 +251,9 @@ def explain_markings(model, source=None, *, gallery, identity_id, samples_per_id
                 for image_row, box, distance, ratio, role in proposal["observations"]:
                     values, altered = _measure(module, images[image_row], box, gallery, hashes, identity_id, target_device)
                     results.append((image_row, box, distance, ratio, role, values, altered))
-                measured.append((float(np.mean([item[5]["effect"] for item in results])), proposal, results))
+                measured.append((float(np.mean([item[5]["effect"] for item in results])), results))
             measured.sort(key=lambda item: item[0], reverse=True)
-            for number, (_, proposal, results) in enumerate(measured[:patches], 1):
-                other = _lookalike(proposal, images, identity_id)
-                if other is not None:
-                    row, box, distance, ratio, role = other
-                    values, altered = _measure(module, images[row], box, gallery, hashes, identity_id, target_device)
-                    results.append((*other, values, altered))
+            for number, (_, results) in enumerate(measured[:patches], 1):
                 for row, box, distance, ratio, role, values, altered in results:
                     image = images[row]
                     sample = image["sample"]
@@ -289,13 +270,13 @@ def explain_markings(model, source=None, *, gallery, identity_id, samples_per_id
                         descriptor_distance=distance, match_ratio=ratio, **values))
     finally:
         module.to(previous_device).train(training)
-    columns = ["patch", "identity_id", "focal_identity", "clip_id", "source_ref", "pixel_sha256", "role",
+    fields = ["patch", "identity_id", "focal_identity", "clip_id", "source_ref", "pixel_sha256", "role",
                "box", "source_box", "array_key", "descriptor_distance", "match_ratio", "margin_before",
                "margin_after", "effect", "control_box", "control_effect", "effect_minus_control",
                "prediction", "competitor", "excluded_reference_rows"]
-    table = pd.DataFrame(records, columns=columns)
+    table = pd.DataFrame(records, columns=fields)
     metadata["clip_summary"] = []
-    for patch, group in table[table.role != "other_identity"].groupby("patch"):
+    for patch, group in table.groupby("patch"):
         effects = group.groupby("clip_id").effect.mean()
         metadata["clip_summary"].append(dict(patch=int(patch), clips=len(effects),
             mean_effect=float(effects.mean()), min_effect=float(effects.min()), max_effect=float(effects.max()),

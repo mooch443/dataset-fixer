@@ -315,51 +315,36 @@ def _visualize_reference_attention(model, gallery, *, samples_per_identity=20, s
 
 
 def _render_markings(records, arrays, metadata, *, options):
-    """Prepare marking evidence for the canonical context/patch image grid."""
+    """One row per marking, one same-identity example per image column."""
     import cv2
     import altair as alt
     from ..static_rendering import concat_grid
     from ..visualization import (VisualizationItem, VisualizationPanel, foreground_crop_bounds,
-                                 visualize_records, finish_visualization, draw_mask_outline)
+                                 visualize_records, finish_visualization)
 
     def prepare(record):
         original = arrays[f"{record['array_key']}_original"]
         x0, y0, x1, y1 = record["box"]
         mask = np.zeros(original.shape[:2], bool)
         mask[y0:y1, x0:x1] = True
-        context = original
-        if record["control_box"] is not None:
-            a, b, c, d = record["control_box"]
-            control_mask = np.zeros(mask.shape, bool)
-            control_mask[b:d, a:c] = True
-            context = draw_mask_outline(original, control_mask, color="#00A6B2", line_width=options.line_width,
-                                        outline_width=options.outline_width, alpha=options.outline_alpha)
         a, b, c, d = foreground_crop_bounds(mask, context_fraction=options.context_fraction, minimum_context=0)
         def enlarge(pixels):
             return cv2.resize(pixels[b:d, a:c], (original.shape[1], original.shape[0]), interpolation=cv2.INTER_NEAREST)
-        control = "n/a" if record["control_effect"] is None else f"{record['control_effect']:+.4f}"
-        panels = (
-            VisualizationPanel("Location", context, mask=mask, color="#E98224",
-                footer=f"Pred: {record['prediction']}\nMargin: {record['margin_before']:+.4f} → {record['margin_after']:+.4f}"),
-            VisualizationPanel("Detail with context", enlarge(original), mask=enlarge(mask.astype(np.uint8)).astype(bool),
-                color="#E98224", footer=f"Effect Δ: {record['effect']:+.4f}\nNearby control Δ: {control}"),
-        )
-        role = {"anchor": "anchor", "cross_clip": "cross-clip match", "other_identity": "nearest other-wolf texture (unverified)"}[record["role"]]
-        return VisualizationItem(Path(record["array_key"]),
-            f"{record['identity_id']} · {record['clip_id']}\n{role}", panels, np.ones(mask.shape, bool))
+        panel = VisualizationPanel("", enlarge(original), mask=enlarge(mask.astype(np.uint8)).astype(bool),
+            color="#E98224", footer=f"Effect Δ: {record['effect']:+.3g}")
+        return VisualizationItem(Path(record["array_key"]), record["clip_id"], (panel,), np.ones(mask.shape, bool))
 
     groups = []
     for summary in metadata["clip_summary"]:
-        group = [record for record in records if record["patch"] == summary["patch"]]
+        group = [record for record in records if record["patch"] == summary["patch"]][:options.columns]
         grid = visualize_records(group, options=options, prepare=prepare).properties(
             title=alt.TitleParams(fontSize=12, anchor="middle",
-            text=f"Marking {summary['patch']} · {summary['clips']} focal clips · mean Δ {summary['mean_effect']:+.4f}"))
+            text=f"Marking #{summary['patch']}"))
         # Vega-Lite permits configuration only on the outermost chart.
         grid.config = alt.Undefined
         groups.append(grid)
     chart = concat_grid(groups, columns=1, spacing=24).properties(title=alt.TitleParams(
         text=f"Marking evidence · {metadata['identity_id']}", fontSize=12, anchor="middle", offset=8,
-        subtitle=["margin = focal similarity - strongest rival similarity; effect = original margin - blurred margin",
-                  "Orange: measured patch · cyan: nearby control · candidate matches, not anatomical proof"]))
+        subtitle=["Effect = margin(original) - margin(patch blurred)", "Orange outline: measured patch"]))
     finish_visualization(chart, options)
     return chart

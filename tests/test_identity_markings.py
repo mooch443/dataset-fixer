@@ -36,7 +36,7 @@ def marking_case(tmp_path, monkeypatch):
     texture = cv2.GaussianBlur(rng.integers(0, 256, (64, 64), dtype=np.uint8), (3, 3), .5)
     # Repeatable local texture, translated and illuminated differently per clip.
     rows, references, embeddings = [], [], []
-    for identity, channel in (("wolf-a", 0), ("wolf-b", 1)):
+    for identity, channel in (("individual-a", 0), ("individual-b", 1)):
         for clip in range(3):
             pixels = np.full((96, 96, 3), 30 + clip, np.uint8)
             start = 14 + clip
@@ -72,19 +72,38 @@ def test_captum_group_effect_equals_full_image_margin_change():
     np.testing.assert_array_equal(image[0, :, outside], altered[:, outside])
 
 
-def test_markings_match_across_clips_and_save_measured_evidence(marking_case, tmp_path):
+def test_markings_match_across_clips_and_save_measured_evidence(marking_case, tmp_path, monkeypatch):
     model, module, index, gallery = marking_case
+    from dataset_fixer import visualization
+    from dataset_fixer.id import markings
+    render = visualization.visualize_records
+    load = markings._load_candidates
+    rows_rendered = []
+    def render_rows(records, *, options, prepare, **kwargs):
+        rows_rendered.append(records)
+        assert len(records) <= options.columns == 2
+        assert all(len(prepare(record).panels) == 1 for record in records)
+        return render(records, options=options, prepare=prepare, **kwargs)
+    def load_focal(index, selected, *args):
+        assert set(index.frame.identity_id) == {"individual-a"}
+        assert len(selected) <= 3
+        return load(index, selected, *args)
+    monkeypatch.setattr(visualization, "visualize_records", render_rows)
+    monkeypatch.setattr(markings, "_load_candidates", load_focal)
     destination = tmp_path / "markings.png"
     fingerprint = gallery.fingerprint
-    table = id.explain_markings(model, gallery=gallery, identity_id="wolf-a", samples_per_identity=3,
+    table = id.explain_markings(model, gallery=gallery, identity_id="individual-a", samples_per_identity=3,
                                patches=2, patch_fraction=.2, destination=destination, show=False)
     assert not table.empty
-    assert set(table.role) == {"anchor", "cross_clip", "other_identity"}
+    assert set(table.role) == {"anchor", "cross_clip"}
+    assert set(table.identity_id) == {"individual-a"}
     assert table.patch.nunique() <= 2
+    assert len(rows_rendered) == table.patch.nunique()
+    assert all(len({row["patch"] for row in rows}) == 1 for rows in rows_rendered)
     assert np.isfinite(table.effect).all()
     np.testing.assert_allclose(table.margin_before - table.margin_after, table.effect, atol=1e-6)
     np.testing.assert_allclose(table.effect - table.control_effect, table.effect_minus_control, atol=1e-6)
-    for _, group in table[table.role != "other_identity"].groupby("patch"):
+    for _, group in table.groupby("patch"):
         assert group.clip_id.nunique() == len(group) >= 2
         assert group.pixel_sha256.nunique() == len(group)
         assert (group[group.role == "cross_clip"].match_ratio < .75).all()
@@ -124,16 +143,16 @@ def test_no_claim_of_cross_clip_matches_for_duplicates_or_flat_images(marking_ca
     duplicated["clip_id"] = ["clip-a", "clip-b"]
     images = _load_candidates(SampleIndex(duplicated), [0, 1], module.identity["preprocessing"], .2)
     assert len(images) == 1
-    assert _proposals(images, "wolf-a", 2) == []
+    assert _proposals(images, "individual-a", 2) == []
     flat_path = index[0].image_path.parent / "flat.png"
     Image.new("RGB", (96, 96), (80, 80, 80)).save(flat_path)
-    flat = SampleIndex([dict(path=str(flat_path), width=96, height=96, identity_id="wolf-a", clip_id="clip-flat")])
+    flat = SampleIndex([dict(path=str(flat_path), width=96, height=96, identity_id="individual-a", clip_id="clip-flat")])
     assert _load_candidates(flat, [0], module.identity["preprocessing"], .2) == []
     # Same-clip images cannot become cross-clip confirmations.
     same_clip = index.frame.copy()
     same_clip["clip_id"] = "single"
     with pytest.raises(ValueError, match="at least two clips"):
-        id.explain_markings(model, SampleIndex(same_clip), gallery=gallery, identity_id="wolf-a", show=False)
+        id.explain_markings(model, SampleIndex(same_clip), gallery=gallery, identity_id="individual-a", show=False)
 
 
 def test_marking_model_state_restored_after_score_failure(marking_case, monkeypatch):
@@ -142,5 +161,5 @@ def test_marking_model_state_restored_after_score_failure(marking_case, monkeypa
         raise RuntimeError("model scoring failed")
     monkeypatch.setattr("dataset_fixer.id.markings._measure", fail)
     with pytest.raises(RuntimeError, match="model scoring failed"):
-        id.explain_markings(model, gallery=gallery, identity_id="wolf-a", samples_per_identity=3, show=False)
+        id.explain_markings(model, gallery=gallery, identity_id="individual-a", samples_per_identity=3, show=False)
     assert module.training and next(module.parameters()).device.type == "cpu"

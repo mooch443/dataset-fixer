@@ -596,7 +596,8 @@ effects = id.explain_markings(
     identity_id="MUDH00_02",
     samples_per_identity=8,
     patches=2,
-    destination="wolf-markings.png",
+    columns=4,
+    destination="markings.png",
 )
 display(effects[["patch", "identity_id", "clip_id", "role", "effect", "control_effect"]])
 display(effects.attrs["clip_summary"])
@@ -607,7 +608,8 @@ the second argument to inspect different images, for example
 `id.explain_markings(model, validation_data, gallery=gallery, identity_id="MUDH00_02")`.
 Images need identity and clip metadata; at least two focal clips are required.
 Selection uses the existing clip/tracklet-balanced sampler, with at most
-`samples_per_identity` images per enrolled individual (default 20). The gallery
+`samples_per_identity` images of the requested individual (default 20). Only that
+identity's images are searched for markings or displayed. The gallery
 and the model remain unchanged. This call does not add W&B metrics or run during
 training automatically.
 
@@ -617,10 +619,9 @@ below 0.75. Exact duplicate pixels and same-clip pairs cannot supply independent
 matches. Each candidate uses at most one observation per clip. Nearby duplicate
 proposals are suppressed. Up to `min(12, 4 * patches)` candidates (at least
 `patches`) are measured, then ranked by their mean signed effect across focal
-clips. The nearest texture on another identity is also shown, explicitly labeled
-as an unverified lookalike rather than an accepted correspondence. The algorithm
-does not force matches when no candidates pass; it returns an empty table and a
-warning. Increasing the sample budget can expose additional clips and poses.
+clips. The algorithm does not force matches when no candidates pass; it returns
+an empty table and a warning. Increasing the sample budget can expose additional
+clips and poses.
 
 [Captum FeatureAblation](https://captum.ai/api/feature_ablation.html) replaces each
 patch with a blurred version of that patch **inside the full model input**. Pixels
@@ -632,8 +633,7 @@ effect = margin(original image) - margin(image with patch blurred)
 ```
 
 Positive effect means the original local texture supports the focal identity's
-margin; negative means it opposes that margin. The same focal identity is used
-on every image, including other wolves' images. Scores are maximum cosine
+margin; negative means it opposes that margin. Scores are maximum cosine
 similarities to remaining gallery references. Self references and exact pixel
 duplicates are excluded; other images from the same clip may remain. The
 strongest competing identity can change after ablation. These are score changes,
@@ -641,14 +641,17 @@ not probabilities. A non-overlapping nearby patch of equal area provides a
 control effect when space permits; the table includes `effect_minus_control`.
 It is a spatial control, not an anatomically matched control.
 
-Each call makes one figure for the requested identity, with a separate grid
-for each marking. Every matched clip and the nearest other-identity lookalike
-appear in that grid. Each observation pairs its full image (orange patch, cyan
-control) with a wider detail view, with the actual measured patch outlined in
-orange. Captions give before/after margins and measured effects. The default
+Each call makes one figure for the required `identity_id`. `patches=M` limits the
+number of marking rows. `columns=N` limits each row to N examples of that same
+identity, with one image per column. Each row is labeled `Marking #1`, `Marking #2`,
+and so on. If fewer cross-clip matches pass the checks, the row has fewer examples;
+it never wraps onto additional rows or repeats images to fill columns. All measured
+examples remain in the returned table, even when only N are displayed.
+Each image shows the marking with surrounding context, its clip label, an orange
+outline of the measured patch, and its effect. The default
 `context_fraction=1` includes one patch width of context on each side, giving
 a detail view three times the patch width, subject to image boundaries. Increase
-it to zoom in less. `columns=2` sets image pairs per row. Neither display option
+it to zoom in less. `columns` defaults to 2. Neither display option
 changes ablation regions, matching, or reported effects.
 `patch_fraction` (default 0.15) controls anchor width relative to the model input;
 SIFT scale changes adjust the matching region's size. Enlargement uses nearest
@@ -667,11 +670,11 @@ Coordinates refer to the decoded
 
 This is an exploratory model-sensitivity diagnostic. SIFT can match background,
 and apparent correspondences are not verified anatomy. Blur can affect coarse
-structure as well as fur texture; the nearby control does not remove that
+structure as well as surface texture; the nearby control does not remove that
 ambiguity. Ranking and inspection use the same images, so clip consistency is
 not a significance test or an independent validation result. Use fresh clips
 and visual confirmation before calling a proposed patch a reliable human
-identification cue. A 128-pixel model input cannot establish individual hairs
+identification cue. A 128-pixel model input cannot establish fine details
 that were lost during resizing.
 
 ID training automatically generates the mean-reference and reference-difference attention figures from the selected best checkpoint, displays them locally, includes their PNG/NPZ/JSON files in the final bundle and backup, and logs the two images to `inspection/reference_attention` and `inspection/reference_contrast` in the session-owned W&B run. This adds no scalar training metrics. The default averages up to four references per identity with per-image display scaling. Customize it without changing enrollment:
